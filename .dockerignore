@@ -1,0 +1,30 @@
+# VCS and host build output
+.git
+.gitignore
+target
+**/target
+
+# Local runtime state and generated configuration
+.local
+**/.local
+.env
+.env.*
+**/.env
+**/.env.*
+
+# Host credentials must never become build inputs
+.ssh
+**/.ssh
+.netrc
+**/.netrc
+.cargo/credentials
+.cargo/credentials.toml
+**/.cargo/credentials
+**/.cargo/credentials.toml
+
+# Editor, OS, and transient artifacts
+.DS_Store
+.vscode
+.idea
+*.swp
+*.tmp

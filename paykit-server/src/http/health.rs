@@ -1,0 +1,58 @@
+use std::sync::Arc;
+
+use axum::{
+    Json, Router,
+    extract::State,
+    http::{StatusCode, header},
+    response::IntoResponse,
+    routing::get,
+};
+use serde::Serialize;
+
+use crate::runtime::{ComponentState, Runtime};
+
+#[derive(Serialize)]
+struct LiveResponse {
+    status: &'static str,
+}
+#[derive(Serialize)]
+struct ReadyResponse {
+    status: &'static str,
+    postgres: &'static str,
+    electrum: &'static str,
+    paykit_delivery: &'static str,
+    outbox: &'static str,
+}
+
+pub fn router(runtime: Arc<Runtime>) -> Router {
+    Router::new()
+        .route("/health/live", get(live))
+        .route("/health/ready", get(ready))
+        .with_state(runtime)
+}
+
+async fn live() -> Json<LiveResponse> {
+    Json(LiveResponse { status: "live" })
+}
+
+async fn ready(State(runtime): State<Arc<Runtime>>) -> impl IntoResponse {
+    let report = runtime.readiness().await;
+    let status = match report.status {
+        ComponentState::Ready => "ready",
+        ComponentState::Degraded => "degraded",
+        ComponentState::NotReady => "not_ready",
+    };
+    let body = Json(ReadyResponse {
+        status,
+        postgres: report.postgres.as_str(),
+        electrum: report.electrum.as_str(),
+        paykit_delivery: report.paykit_delivery.as_str(),
+        outbox: report.outbox.as_str(),
+    });
+    let code = if report.status == ComponentState::NotReady {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::OK
+    };
+    (code, [(header::CONTENT_TYPE, "application/json")], body)
+}

@@ -1,0 +1,22 @@
+/target
+/.local/paykit-server/
+
+# Local secrets and operator configuration
+.env
+.env.*
+!.env.example
+!.env.*.example
+.direnv/
+/config/paykit-server.toml
+
+# Coverage and profiling output
+/coverage/
+/lcov.info
+*.profraw
+
+# Editor, OS, and transient files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.tmp

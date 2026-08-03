@@ -1,0 +1,34 @@
+[package]
+name = "paykit-server-e2e"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+description = "End-to-end test support for Paykit Server"
+publish = false
+
+[dependencies]
+sqlx.workspace = true
+tokio.workspace = true
+url.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+axum.workspace = true
+base64.workspace = true
+bitcoin.workspace = true
+ed25519-dalek.workspace = true
+locks-core.workspace = true
+paykit-lib.workspace = true
+paykit-sdk.workspace = true
+paykit-server = { path = "../paykit-server", features = ["test-utils"] }
+pubky.workspace = true
+pubky-testnet.workspace = true
+postcard.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+time.workspace = true
+tower = { version = "0.5", features = ["util"] }

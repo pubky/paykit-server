@@ -1,0 +1,54 @@
+[package]
+name = "paykit-server"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+description = "Receiver-side Paykit service for Locks invoice and Bitcoin settlement workflows"
+publish = false
+
+[features]
+test-utils = []
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+base64.workspace = true
+bitcoin.workspace = true
+bdk_electrum.workspace = true
+blake3.workspace = true
+chacha20poly1305.workspace = true
+crypto_secretbox.workspace = true
+ed25519-dalek.workspace = true
+hkdf.workspace = true
+hmac.workspace = true
+humantime-serde.workspace = true
+locks-core.workspace = true
+paykit-lib.workspace = true
+paykit-sdk.workspace = true
+pubky.workspace = true
+prometheus-client.workspace = true
+postcard.workspace = true
+serde.workspace = true
+serde_ignored.workspace = true
+serde_json.workspace = true
+serde_json_canonicalizer.workspace = true
+rand.workspace = true
+sha2.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+url.workspace = true
+uuid.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+http-relay = { version = "0.7", default-features = false, features = ["server"] }
+tower = { version = "0.5", features = ["util"] }
