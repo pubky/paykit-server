@@ -1,10 +1,29 @@
 # Local Locks demo image
 
-`Dockerfile.local` packages Paykit Server for sibling Locks Compose stack. It is local/demo packaging, not production image.
+`Dockerfile.local` packages Paykit Server for the Locks Compose stack. It is local/demo packaging, not a production image.
 
-## Build
+## Build from public pinned sources
 
-Build from this repository with checked-out Paykit Rust and Locks source trees supplied as named BuildKit contexts:
+From a fresh anonymous clone of this repository, build with the exact Paykit
+Rust and Locks revisions pinned in `Cargo.toml`:
+
+```bash
+docker buildx build --load \
+  --build-context paykit-lib='https://github.com/pubky/paykit-rs.git#52a852995bfc457b78d32f5a45f6741766a89bba:paykit-lib' \
+  --build-context paykit-sdk='https://github.com/pubky/paykit-rs.git#52a852995bfc457b78d32f5a45f6741766a89bba:paykit-sdk' \
+  --build-context locks='https://github.com/pubky/locks.git#df5ea1b6d8dcdec3a9b5a915c3f57bca69d75c8a' \
+  -f Dockerfile.local \
+  -t paykit-server:local .
+```
+
+These contexts are anonymously reachable and reproducible. Update the URLs
+together with the corresponding `Cargo.toml` pins; exact dependency-pin matches
+make source drift fail closed.
+
+## Build from local worktrees
+
+For coordinated development, override the named contexts with local source
+trees. This mode intentionally includes uncommitted source edits:
 
 ```bash
 docker buildx build --load \
@@ -15,7 +34,9 @@ docker buildx build --load \
   -t paykit-server:local .
 ```
 
-Build uses exact local source-tree contents, including uncommitted source edits. Crate-level `paykit-lib` and `paykit-sdk` contexts avoid transferring Paykit Rust workspace target directory and require no Docker files in that repository. Locks context must exist and applies its existing source-tree exclusions.
+Crate-level `paykit-lib` and `paykit-sdk` contexts avoid transferring the Paykit
+Rust workspace target directory and require no Docker-owned files in that
+repository. The Locks context applies its existing source-tree exclusions.
 
 Builder runs [`scripts/prepare-local-docker-sources.sh`](../scripts/prepare-local-docker-sources.sh) against copied manifests to resolve `paykit-lib`, `paykit-sdk`, and `locks-core` from named contexts. Committed Git dependency declarations and lockfile remain unchanged. No SSH agent or Cargo credentials are mounted. Exact dependency-pin matches make source drift fail closed.
 
@@ -29,11 +50,11 @@ Final pinned Debian image:
 - adds CA certificates and three application binaries to pinned runtime base;
 - contains no source tree, Cargo cache, runnable config, DB credentials, or application secrets.
 
-Supply `PAYKIT_CONFIG`, `PAYKIT_DATABASE_URL`, and `PAYKIT_MASTER_KEY` at runtime. Mount generated ignored local config. Sibling Compose definition owns mounts, env values, infrastructure image pins, and helper command overrides.
+Supply `PAYKIT_CONFIG`, `PAYKIT_DATABASE_URL`, and `PAYKIT_MASTER_KEY` at runtime. Mount generated ignored local config. The calling Compose definition owns mounts, environment values, infrastructure image pins, and helper command overrides.
 
 ## Generated local config contract
 
-Sibling Locks orchestration generates `.local/paykit-server/config.toml` only after local Lock Server identity exists. Directory is Git-ignored. It must replace deliberately invalid `<ACTUAL_CANONICAL_LOCK_SERVER_PUBKY>` token below with exact canonical `pubky...` value exposed by Lock Server as `credentials.lock_server_public_key`. This block is not runnable config.
+Locks orchestration generates `.local/paykit-server/config.toml` only after the local Lock Server identity exists. The directory is Git-ignored. It must replace the deliberately invalid `<ACTUAL_CANONICAL_LOCK_SERVER_PUBKY>` token below with the exact canonical `pubky...` value exposed by Lock Server as `credentials.lock_server_public_key`. This block is not runnable config.
 
 ```toml
 [http]

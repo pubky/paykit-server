@@ -6,9 +6,9 @@ ARG RUNTIME_IMAGE=debian:bookworm-20260112-slim@sha256:56ff6d36d4eb3db13a741b342
 FROM ${RUST_IMAGE} AS builder
 WORKDIR /build
 
-# These named contexts are supplied by the sibling Locks Compose project. The
-# Paykit contexts are crate directories, so the paykit-rs repository needs no
-# Docker-owned files and its workspace target directory is never transferred.
+# These named contexts are supplied by the calling build or Compose project.
+# The Paykit contexts are crate directories, so the paykit-rs repository needs
+# no Docker-owned files and its workspace target directory is never transferred.
 RUN --mount=from=paykit-lib,target=/contexts/paykit-lib,ro \
     --mount=from=paykit-sdk,target=/contexts/paykit-sdk,ro \
     --mount=from=locks,target=/contexts/locks,ro \
