@@ -730,8 +730,9 @@ async fn assert_persisted_workflow_inputs(
             endpoint.operation(),
             DeliveryOperationV1::EndpointPublication { receiving_details }
                 if receiving_details.len() == 1
-                    && receiving_details[0].identifier == "btc-bitcoin-p2wpkh"
-                    && receiving_details[0].payload == fixture.address
+                    && receiving_details[0].identifier == "btc-regtest-p2wpkh"
+                    && receiving_details[0].payload
+                        == serde_json::json!({ "value": fixture.address }).to_string()
         ));
 
         let payment_plaintext = crypto
@@ -767,7 +768,7 @@ async fn assert_persisted_workflow_inputs(
                             && reference.get_variant() == uuid::Variant::RFC4122
                             && terms.payment_reference == reference.hyphenated().to_string())
                     && terms.proposal_expires_at.is_none()
-                    && terms.accepted_endpoint_identifiers == ["btc-bitcoin-p2wpkh"]
+                    && terms.accepted_endpoint_identifiers == ["btc-regtest-p2wpkh"]
                     && terms.metadata.get("bundle_id") == Some(&serde_json::json!(bundle))
                     && terms.metadata.get("lock_resource")
                         == Some(&serde_json::json!(fixture.lock_resource))
