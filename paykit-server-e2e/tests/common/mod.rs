@@ -37,7 +37,7 @@ pub fn payment_intent(reader: &ReaderPubky) -> DeliveryIntentV1 {
         &marker(),
         PaykitReceiverPath::new("paykit/server").unwrap(),
         &PaymentRequestTerms {
-            amount: PaymentAmount::new("0.00000100", "BTC").unwrap(),
+            amount: PaymentAmount::new("0.00000100", "btc").unwrap(),
             payment_reference: PaymentReference::new(uuid::Uuid::new_v4().to_string()).unwrap(),
             proposal_expires_at: None,
             recurrence: None,

@@ -153,8 +153,25 @@ pub trait IntentBuilder: Send + Sync {
     ) -> Result<Vec<(PaymentEndpointIdentifier, PaymentEndpointPayload)>, CreateInvoiceError>;
 }
 
-#[derive(Default)]
-pub struct PaykitIntentBuilder;
+pub struct PaykitIntentBuilder {
+    bitcoin_network: crate::config::BitcoinNetwork,
+}
+
+impl PaykitIntentBuilder {
+    pub fn new(bitcoin_network: crate::config::BitcoinNetwork) -> Self {
+        Self { bitcoin_network }
+    }
+
+    fn p2wpkh_identifier(&self) -> &'static str {
+        match self.bitcoin_network {
+            crate::config::BitcoinNetwork::Mainnet => "btc-bitcoin-p2wpkh",
+            crate::config::BitcoinNetwork::Testnet => "btc-testnet-p2wpkh",
+            crate::config::BitcoinNetwork::Signet => "btc-signet-p2wpkh",
+            crate::config::BitcoinNetwork::Regtest => "btc-regtest-p2wpkh",
+        }
+    }
+}
+
 impl IntentBuilder for PaykitIntentBuilder {
     fn payment_request_terms(
         &self,
@@ -176,7 +193,7 @@ impl IntentBuilder for PaykitIntentBuilder {
         Ok(PaymentRequestTerms {
             amount: PaymentAmount::new(
                 format!("{}.{:08}", sats / 100_000_000, sats % 100_000_000),
-                "BTC",
+                "btc",
             )
             .map_err(|_| CreateInvoiceError::InvalidRequest)?,
             payment_reference: PaymentReference::new(uuid::Uuid::new_v4().hyphenated().to_string())
@@ -184,7 +201,7 @@ impl IntentBuilder for PaykitIntentBuilder {
             proposal_expires_at: None,
             recurrence: None,
             accepted_payment_endpoint_identifiers: vec![
-                PaymentEndpointIdentifier::new("btc-bitcoin-p2wpkh")
+                PaymentEndpointIdentifier::new(self.p2wpkh_identifier())
                     .map_err(|_| CreateInvoiceError::InvalidRequest)?,
             ],
             metadata,
@@ -198,9 +215,11 @@ impl IntentBuilder for PaykitIntentBuilder {
         if address.is_empty() {
             return Err(CreateInvoiceError::InvalidRequest);
         }
-        let identifier = PaymentEndpointIdentifier::new("btc-bitcoin-p2wpkh")
+        let identifier = PaymentEndpointIdentifier::new(self.p2wpkh_identifier())
             .map_err(|_| CreateInvoiceError::InvalidRequest)?;
-        Ok(vec![(identifier, PaymentEndpointPayload::new(address))])
+        let payload = serde_json::to_string(&serde_json::json!({ "value": address }))
+            .map_err(|_| CreateInvoiceError::InvalidRequest)?;
+        Ok(vec![(identifier, PaymentEndpointPayload::new(payload))])
     }
 }
 

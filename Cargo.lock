@@ -2991,8 +2991,8 @@ checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
 name = "paykit-lib"
-version = "0.1.0-rc39"
-source = "git+https://github.com/pubky/paykit-rs.git?rev=52a852995bfc457b78d32f5a45f6741766a89bba#52a852995bfc457b78d32f5a45f6741766a89bba"
+version = "0.1.0-rc43"
+source = "git+https://github.com/pubky/paykit-rs.git?rev=6b241878a9bba5cecea919c0298c3f90624be6ff#6b241878a9bba5cecea919c0298c3f90624be6ff"
 dependencies = [
  "anyhow",
  "base64",
@@ -3010,8 +3010,8 @@ dependencies = [
 
 [[package]]
 name = "paykit-sdk"
-version = "0.1.0-rc39"
-source = "git+https://github.com/pubky/paykit-rs.git?rev=52a852995bfc457b78d32f5a45f6741766a89bba#52a852995bfc457b78d32f5a45f6741766a89bba"
+version = "0.1.0-rc43"
+source = "git+https://github.com/pubky/paykit-rs.git?rev=6b241878a9bba5cecea919c0298c3f90624be6ff#6b241878a9bba5cecea919c0298c3f90624be6ff"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5828,7 +5828,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]

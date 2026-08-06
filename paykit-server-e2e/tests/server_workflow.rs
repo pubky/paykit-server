@@ -761,7 +761,7 @@ async fn assert_persisted_workflow_inputs(
             payment.operation(),
             DeliveryOperationV1::PaymentRequestProposal { terms }
                 if terms.amount == amount
-                    && terms.asset == "BTC"
+                    && terms.asset == "btc"
                     && uuid::Uuid::parse_str(&terms.payment_reference)
                         .is_ok_and(|reference| reference.get_version_num() == 4
                             && reference.get_variant() == uuid::Variant::RFC4122
