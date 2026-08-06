@@ -50,8 +50,35 @@ fn at_stage(error: HandoffError, stage: RetryableHandoffStage) -> HandoffFailure
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProcessingHealth {
     Available,
-    Retryable,
+    Retryable(Duration),
     PermanentFailure,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RetrySchedule {
+    default: Duration,
+    link_establishment: Duration,
+}
+
+impl RetrySchedule {
+    pub fn new(default: Duration, link_establishment: Duration) -> Self {
+        Self {
+            default,
+            link_establishment,
+        }
+    }
+
+    pub fn default_delay(self) -> Duration {
+        self.default
+    }
+
+    pub(crate) fn delay_for(self, stage: RetryableHandoffStage) -> Duration {
+        if stage == RetryableHandoffStage::LinkEstablishment {
+            self.link_establishment
+        } else {
+            self.default
+        }
+    }
 }
 
 /// Public-SDK-only adapter. Production implementations must persist SDK state
@@ -155,16 +182,21 @@ pub async fn process_claim(
     claim: &ClaimedOutbox,
     retry_delay: Duration,
 ) -> Result<bool, PersistenceError> {
-    process_claim_with_health(store, adapter, claim, retry_delay)
-        .await
-        .map(|(transitioned, _)| transitioned)
+    process_claim_with_health(
+        store,
+        adapter,
+        claim,
+        RetrySchedule::new(retry_delay, retry_delay),
+    )
+    .await
+    .map(|(transitioned, _)| transitioned)
 }
 
 pub async fn process_claim_with_health(
     store: &OutboxStore,
     adapter: &dyn Adapter,
     claim: &ClaimedOutbox,
-    retry_delay: Duration,
+    retry_schedule: RetrySchedule,
 ) -> Result<(bool, ProcessingHealth), PersistenceError> {
     let intent = match store.delivery_intent(claim) {
         Ok(intent) => intent,
@@ -180,10 +212,13 @@ pub async fn process_claim_with_health(
             .mark_handed_off(claim, &result)
             .await
             .map(|transitioned| (transitioned, ProcessingHealth::Available)),
-        Err(HandoffFailure::Retryable(stage)) => store
-            .mark_retryable(claim, retry_delay, stage)
-            .await
-            .map(|transitioned| (transitioned, ProcessingHealth::Retryable)),
+        Err(HandoffFailure::Retryable(stage)) => {
+            let delay = retry_schedule.delay_for(stage);
+            store
+                .mark_retryable(claim, delay, stage)
+                .await
+                .map(|transitioned| (transitioned, ProcessingHealth::Retryable(delay)))
+        }
         Err(HandoffFailure::Permanent) => store
             .mark_permanently_failed(claim)
             .await
@@ -241,11 +276,11 @@ pub async fn process_reconciliation_with_health(
                 RetryableHandoffStage::ReconciliationPending,
             )
             .await
-            .map(|transitioned| (transitioned, ProcessingHealth::Retryable)),
+            .map(|transitioned| (transitioned, ProcessingHealth::Retryable(retry_delay))),
         Err(HandoffError::Retryable(_)) => store
             .retry_reconciliation(claim, retry_delay, RetryableHandoffStage::Reconciliation)
             .await
-            .map(|transitioned| (transitioned, ProcessingHealth::Retryable)),
+            .map(|transitioned| (transitioned, ProcessingHealth::Retryable(retry_delay))),
         Err(HandoffError::Permanent) => store
             .mark_reconciliation_permanently_failed(claim)
             .await
