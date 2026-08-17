@@ -51,7 +51,7 @@ payment_deadline = checked(invoice_created_at + payment_in hours)
    - rejection committed before snapshot: terminal rejected;
    - unanswered before snapshot: durably enqueue cancellation;
    - acceptance arriving after cancellation commit loses, even if emitted earlier.
-15. Exact drain replay returns the same classification and never reclassifies delayed events.
+15. Exact drain replay returns the same frozen per-item classification and never reclassifies delayed lifecycle events. Aggregate progress is monotonic: each frozen accepted item becomes aggregate-terminal when its invoice is application-expired or has a timely durable first amount-matched observation; `accepted_count` decreases by that number, `terminal_count` increases by the same number, `cancellation_enqueued_count` remains fixed, and `completed` is irreversible once `accepted_count == 0`. Locks still polls each Bundle and applies its own confirmation/reorg rule, so Paykit aggregate completion is not sufficient for deletion advancement.
 16. Durable cancellation enqueue is sufficient; no SDK Sent state or payer acknowledgment blocks cleanup.
 17. Rejected and canceled requests do not block Locks cleanup. Accepted requests block until application expiry or factual payment progress permits Locks to satisfy its frozen criterion.
 18. Paykit owns the durable drain and aggregate factual status. Locks owns the overall content-deletion job.
@@ -146,11 +146,12 @@ Both drain endpoints return `200` with the same closed aggregate body:
   "status": "active",
   "accepted_count": 0,
   "terminal_count": 0,
-  "cancellation_enqueued_count": 0
+  "cancellation_enqueued_count": 0,
+  "cleanup_token": "<43-character-unpadded-base64url>"
 }
 ```
 
-`status` is exactly `active` or `completed`. The response contains no drain ID, replay flag, Bundle ID, reader, Payment Request ID, address, payment reference, or raw error. Exact replay returns the same aggregate body.
+`status` is exactly `active` or `completed`. The response contains no drain ID, replay flag, Bundle ID, reader, Payment Request ID, address, payment reference, or raw error. Replay preserves the frozen drain identity, cancellation count, and cleanup token while returning its latest monotonic aggregate progress.
 
 ### Per-Bundle lifecycle/payment status
 
@@ -192,6 +193,8 @@ The canonical persisted `request_state` is one of these exact closed snake-case 
 - `expired`
 
 `expired` is returned when the invoice has a durable `payment_expired_at`; otherwise the persisted observation state maps one-to-one to `undetected`, `detected`, or `confirmed`. `confirmations` and `amount_matched` remain orthogonal factual fields.
+
+Locks maps `rejected`, `canceled`, and `proposal_expired` requests to `VerificationTaskStatus::Expired`. An `accepted` request whose `payment_state` is `expired` also maps to `Expired`. These terminal outcomes carry no failure message and never map to `Failed`.
 
 Drain classification uses the persisted state without inference from invoice delivery or Bitcoin observation:
 

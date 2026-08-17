@@ -125,6 +125,11 @@ impl PaymentDrainStore {
             .crypto
             .lookup_hash(lock_resource.creator().to_string().as_bytes());
         let lock_hash = self.crypto.lookup_hash(canonical_lock.as_bytes());
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
         let existing = sqlx::query_as::<_, ExistingDrainRow>(
             "SELECT drains.id, drains.lock_resource_envelope, drains.accepted_count,
                     drains.terminal_count, drains.cancellation_enqueued_count,
@@ -132,11 +137,12 @@ impl PaymentDrainStore {
              FROM payment_drains AS drains
              JOIN creators ON creators.id = drains.creator_id
              WHERE creators.creator_lookup_hash = $1
-               AND drains.lock_resource_lookup_hash = $2",
+               AND drains.lock_resource_lookup_hash = $2
+             FOR UPDATE OF drains",
         )
         .bind(creator_hash.as_bytes().as_slice())
         .bind(lock_hash.as_bytes().as_slice())
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *transaction)
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
         let Some(existing) = existing else {
@@ -152,7 +158,64 @@ impl PaymentDrainStore {
         if plaintext != canonical_lock.as_bytes() {
             return Err(PersistenceError::Conflict);
         }
-        snapshot(existing, true).map(Some)
+        let progressed = sqlx::query_as::<_, ExistingDrainRow>(
+            "WITH frozen AS (
+                 SELECT
+                     COUNT(*) FILTER (
+                         WHERE item.classification = 'accepted'
+                           AND invoice.payment_expired_at IS NULL
+                           AND NOT (
+                               invoice.first_amount_matched_observed_at IS NOT NULL
+                               AND invoice.first_amount_matched_observed_at <= invoice.payment_deadline
+                           )
+                     ) AS accepted_count,
+                     COUNT(*) FILTER (
+                         WHERE item.classification IN ('rejected', 'canceled', 'proposal_expired')
+                            OR (
+                                item.classification = 'accepted'
+                                AND (
+                                    invoice.payment_expired_at IS NOT NULL
+                                    OR (
+                                        invoice.first_amount_matched_observed_at IS NOT NULL
+                                        AND invoice.first_amount_matched_observed_at <= invoice.payment_deadline
+                                    )
+                                )
+                            )
+                     ) AS terminal_count
+                 FROM payment_drain_items AS item
+                 JOIN invoices AS invoice ON invoice.id = item.invoice_id
+                 WHERE item.drain_id = $1
+             )
+             UPDATE payment_drains AS drain
+             SET accepted_count = frozen.accepted_count,
+                 terminal_count = frozen.terminal_count,
+                 status = CASE WHEN frozen.accepted_count = 0 THEN 'completed' ELSE 'active' END,
+                 completed_at = CASE
+                     WHEN frozen.accepted_count = 0
+                         THEN COALESCE(drain.completed_at, transaction_timestamp())
+                     ELSE NULL
+                 END,
+                 updated_at = transaction_timestamp()
+             FROM frozen
+             WHERE drain.id = $1
+               AND frozen.accepted_count <= drain.accepted_count
+               AND frozen.terminal_count >= drain.terminal_count
+               AND frozen.terminal_count - drain.terminal_count
+                   = drain.accepted_count - frozen.accepted_count
+             RETURNING drain.id, drain.lock_resource_envelope, drain.accepted_count,
+                       drain.terminal_count, drain.cancellation_enqueued_count,
+                       drain.status, drain.created_at",
+        )
+        .bind(existing.id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?
+        .ok_or(PersistenceError::CorruptOrMissing)?;
+        transaction
+            .commit()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        snapshot(progressed, true).map(Some)
     }
 
     /// Idempotently removes a completed operational drain while retaining its
@@ -352,7 +415,10 @@ impl PaymentDrainStore {
                 .commit()
                 .await
                 .map_err(|_| PersistenceError::Unavailable)?;
-            return snapshot(existing, true);
+            return self
+                .exact_replay(lock_resource)
+                .await?
+                .ok_or(PersistenceError::CorruptOrMissing);
         }
 
         sqlx::query(

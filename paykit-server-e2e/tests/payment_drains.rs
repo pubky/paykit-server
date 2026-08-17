@@ -400,6 +400,61 @@ async fn drain_atomically_freezes_classification_and_cancellation_intent_for_exa
 }
 
 #[tokio::test]
+async fn replay_monotonically_completes_accepted_item_after_timely_amount_match() {
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(&[55; 32]).unwrap());
+    let creator_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO creators (creator_lookup_hash, credential_envelope)
+         VALUES ($1, $2) RETURNING id",
+    )
+    .bind(crypto.lookup_hash(CREATOR.as_bytes()).as_bytes().as_slice())
+    .bind(b"encrypted-creator".as_slice())
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    let (accepted_invoice, _) = insert_invoice(
+        &database,
+        &crypto,
+        creator_id,
+        0,
+        0,
+        PaymentRequestLifecycleState::Accepted,
+    )
+    .await;
+    let store = PaymentDrainStore::new(database.pool(), crypto);
+    let active = store.create(&lock_resource()).await.unwrap();
+    assert!(!active.completed());
+    assert_eq!(active.accepted_count(), 1);
+    assert_eq!(active.terminal_count(), 0);
+
+    sqlx::query(
+        "UPDATE invoices
+         SET payment_status = 'detected', amount_matched = TRUE,
+             first_amount_matched_observed_at = invoice_created_at
+         WHERE id = $1",
+    )
+    .bind(accepted_invoice)
+    .execute(database.pool())
+    .await
+    .unwrap();
+
+    let completed = store.exact_replay(&lock_resource()).await.unwrap().unwrap();
+    assert!(completed.completed());
+    assert_eq!(completed.accepted_count(), 0);
+    assert_eq!(completed.terminal_count(), 1);
+    assert_eq!(completed.cancellation_enqueued_count(), 0);
+    assert_eq!(completed.drain_id(), active.drain_id());
+
+    let replay = store.exact_replay(&lock_resource()).await.unwrap().unwrap();
+    assert_eq!(replay.accepted_count(), 0);
+    assert_eq!(replay.terminal_count(), 1);
+    assert!(replay.completed());
+
+    database.cleanup().await;
+}
+
+#[tokio::test]
 async fn durable_cancellation_enqueue_is_sufficient_for_completion() {
     let database = TestDatabase::create().await;
     run_migrations(database.pool()).await.unwrap();
