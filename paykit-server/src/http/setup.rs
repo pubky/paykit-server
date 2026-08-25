@@ -91,6 +91,9 @@ fn iframe_response(flow: StartedFlow) -> Response<Body> {
 /// the creator acts on.
 const SETUP_CSS: &str = r#"html,body{margin:0;height:100%}
 body{display:flex;align-items:center;justify-content:center;background:transparent;font:700 14px/20px system-ui,-apple-system,sans-serif;color:#d4d4db}
+/* Without this the flex item shrinks to its content, so the touch button's width:100% only
+   reaches the QR panel's width instead of the frame's. */
+main{width:100%;display:flex;align-items:center;justify-content:center}
 .qr{display:flex;align-items:center;justify-content:center;box-sizing:border-box;width:192px;height:192px;padding:12px;border-radius:8px;background:#fff}
 .qr svg{display:block;width:100%;height:100%}
 .bitkit-btn{display:none}
