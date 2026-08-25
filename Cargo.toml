@@ -29,6 +29,7 @@ paykit-sdk = { git = "https://github.com/pubky/paykit-rs.git", rev = "6b241878a9
 pubky = "=0.8.0"
 pubky-testnet = "=0.8.0"
 prometheus-client = "0.25"
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 postcard = { version = "1.1", features = ["use-std"] }
 serde = { version = "1", features = ["derive"] }
 serde_ignored = "0.1"

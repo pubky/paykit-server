@@ -257,6 +257,28 @@ impl SetupCompleter for MockCompleter {
     }
 }
 
+/// A completer that hands back a caller-chosen authorization URL, for asserting how the shell
+/// renders one.
+struct UrlCompleter(String);
+
+#[async_trait]
+impl SetupCompleter for UrlCompleter {
+    async fn start(&self) -> Result<StartedSetup, Completion> {
+        Ok(StartedSetup::new(self.0.clone(), Box::new(MockAttempt)))
+    }
+
+    async fn complete(&self, _: Box<dyn SetupAttempt>) -> Completion {
+        Completion::DurableSuccess
+    }
+}
+
+fn service_with_authorization_url(authorization_url: &str) -> SetupService {
+    service(
+        Arc::new(UrlCompleter(authorization_url.to_owned())),
+        Arc::new(ManualClock::default()),
+    )
+}
+
 fn service(completer: Arc<dyn SetupCompleter>, clock: Arc<ManualClock>) -> SetupService {
     let limits = runtime_limits(2, 4, 100, 100);
     SetupService::with_poll_timeout(
@@ -964,6 +986,30 @@ async fn cancelling_start_and_completion_releases_reservation() {
 }
 
 #[tokio::test]
+async fn setup_shell_renders_a_scannable_qr_for_a_full_length_auth_url() {
+    // Real Bitkit setup URLs carry two capability paths and the companion claim, so they are far
+    // longer than the mock ones elsewhere in this file. High error correction shrinks QR capacity,
+    // so assert a realistic URL still fits instead of panicking at request time.
+    let authorization_url = "pubkyauth://signin?caps=/pub/paykit/v0/bitkit/server/:rw,/pub/paykit/v0/private/bitkit/server/:rw&relay=https://httprelay.pubky.app/inbox&secret=3bmNMhsg_OZDWvpmfLU2vWAHXm8xaGNe0aI7xO5AVhM&x-bitkit-claim=watch-only-account-v1";
+    let response = request(
+        setup_router(service_with_authorization_url(authorization_url)),
+        Method::GET,
+        "/setup?return_to=https://app.example&state=state-1",
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 512 * 1024)
+        .await
+        .expect("setup shell body");
+    let shell = String::from_utf8(bytes.to_vec()).expect("utf8 shell");
+    assert!(shell.contains(r#"<svg aria-label="Bitkit authorization QR code""#));
+    // The same URL stays in the DOM as a deep link for touch devices, HTML-escaped.
+    assert!(shell.contains("x-bitkit-claim=watch-only-account-v1"));
+    assert!(shell.contains(r#"class="bitkit-btn""#));
+}
+
+#[tokio::test]
 async fn valid_setup_preserves_polling_and_secret_free_callback_shell() {
     let response = request(
         setup_router(service(
@@ -990,6 +1036,10 @@ async fn valid_setup_preserves_polling_and_secret_free_callback_shell() {
     assert_eq!(shell.matches("postMessage(").count(), 2);
     assert!(!shell.contains("</script><img"));
     assert!(shell.contains("\\u003c/script\\u003e\\u003cimg\\u003e"));
+    assert!(shell.contains(r#"data-testid="paykit-auth-qr""#));
+    assert!(shell.contains(r#"<svg aria-label="Bitkit authorization QR code""#));
+    // The SVG is inlined into HTML, so the standalone-document prolog must be gone.
+    assert!(!shell.contains("<?xml"));
 
     let script = shell
         .split_once("<script>")
@@ -1016,7 +1066,7 @@ async fn valid_setup_preserves_polling_and_secret_free_callback_shell() {
 }
 
 #[tokio::test]
-async fn setup_iframe_displays_escaped_auth_url_and_approved_cli_command() {
+async fn setup_iframe_escapes_the_auth_url_and_keeps_it_out_of_the_script() {
     let response = request(
         setup_router(service(
             Arc::new(InstructionCompleter),
@@ -1032,12 +1082,12 @@ async fn setup_iframe_displays_escaped_auth_url_and_approved_cli_command() {
     let (instructions, script) = shell
         .split_once("<script>")
         .expect("setup shell contains polling script");
-    assert!(instructions.contains("pubkyauth://signin?secret=mock&amp;label=&lt;approve&gt;"));
-    assert!(!script.contains("pubkyauth://signin?secret=mock"));
+    // The URL reaches the page only as the touch-device deep link, HTML-escaped, and never as a
+    // value the polling script could read or forward.
     assert!(instructions.contains(
-        "docker compose exec creator-demo npm --prefix examples/js-sdk run authenticate-paykit -- --role content-creator"
+        r#"<a class="bitkit-btn" href="pubkyauth://signin?secret=mock&amp;label=&lt;approve&gt;""#
     ));
-    assert!(instructions.contains("npm --prefix examples/js-sdk run generate-paykit-account-tpub"));
+    assert!(!script.contains("pubkyauth://signin?secret=mock"));
 }
 
 #[tokio::test]

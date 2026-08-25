@@ -6,6 +6,7 @@ use axum::{
     response::Response,
     routing::{get, post},
 };
+use qrcode::{QrCode, render::svg};
 use serde_json::json;
 use std::net::SocketAddr;
 
@@ -67,8 +68,10 @@ fn iframe_response(flow: StartedFlow) -> Response<Body> {
     let state = json_for_script(&flow.state);
     let origin = json_for_script(&flow.origin);
     let authorization_url = html_for_text(&flow.authorization_url);
+    let qr_svg = render_authorization_qr_svg(&flow.authorization_url);
+    let css = SETUP_CSS;
     let shell = format!(
-        "<!doctype html><meta charset=\"utf-8\"><main><p>Paykit auth URL:</p><code>{authorization_url}</code><p>Generate the regtest BIP84 account tpub:</p><code>npm --prefix examples/js-sdk run generate-paykit-account-tpub</code><p>Then authenticate and paste the auth URL, tpub, and account index:</p><code>docker compose exec creator-demo npm --prefix examples/js-sdk run authenticate-paykit -- --role content-creator</code></main><script>\nconst flowId={flow_id};const state={state};const targetOrigin={origin};\nconst retryable=new Set([408,425,429,502,503,504]);let delay=500;\nasync function poll(){{try{{const response=await fetch('/setup/'+flowId+'/complete',{{method:'POST'}});if(response.status===200){{window.parent.postMessage({{type:'paykit-setup-callback',state}},targetOrigin);return;}}if(!retryable.has(response.status)){{window.parent.postMessage({{type:'paykit-setup-callback',state,error:'setup-failed'}},targetOrigin);return;}}}}catch(_error){{}}setTimeout(poll,delay);delay=Math.min(delay*2,5000);}}setTimeout(poll,delay);\n</script>"
+        "<!doctype html><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><style>{css}</style><main><span class=\"qr\" data-testid=\"paykit-auth-qr\">{qr_svg}</span><a class=\"bitkit-btn\" href=\"{authorization_url}\">Continue with Bitkit</a></main><script>\nconst flowId={flow_id};const state={state};const targetOrigin={origin};\nconst retryable=new Set([408,425,429,502,503,504]);let delay=500;\nasync function poll(){{try{{const response=await fetch('/setup/'+flowId+'/complete',{{method:'POST'}});if(response.status===200){{window.parent.postMessage({{type:'paykit-setup-callback',state}},targetOrigin);return;}}if(!retryable.has(response.status)){{window.parent.postMessage({{type:'paykit-setup-callback',state,error:'setup-failed'}},targetOrigin);return;}}}}catch(_error){{}}setTimeout(poll,delay);delay=Math.min(delay*2,5000);}}setTimeout(poll,delay);\n</script>"
     );
     let mut response = Response::new(Body::from(shell));
     *response.status_mut() = StatusCode::OK;
@@ -82,6 +85,39 @@ fn iframe_response(flow: StartedFlow) -> Response<Body> {
             .expect("validated origin is a header value"),
     );
     response
+}
+
+/// Setup shell styles. The embedding app owns the modal chrome, so this page paints only the code
+/// the creator acts on.
+const SETUP_CSS: &str = r#"html,body{margin:0;height:100%}
+body{display:flex;align-items:center;justify-content:center;background:transparent;font:700 14px/20px system-ui,-apple-system,sans-serif;color:#d4d4db}
+.qr{display:flex;align-items:center;justify-content:center;box-sizing:border-box;width:192px;height:192px;padding:12px;border-radius:8px;background:#fff}
+.qr svg{display:block;width:100%;height:100%}
+.bitkit-btn{display:none}
+/* Touch devices cannot scan their own screen, so they get the same URL as a deep link. Keyed on the
+   pointer type, not viewport width: this page renders inside a small parent iframe, which would
+   always read as narrow. */
+@media (hover:none) and (pointer:coarse){.qr{display:none}.bitkit-btn{display:flex;align-items:center;justify-content:center;box-sizing:border-box;width:100%;height:60px;padding:20px 32px;border-radius:9999px;background:#303034;color:#d4d4db;text-decoration:none}}
+"#;
+
+/// The QR a creator scans with Bitkit. High error correction so a centered brand badge added by the
+/// embedder stays scannable.
+fn render_authorization_qr_svg(authorization_url: &str) -> String {
+    QrCode::with_error_correction_level(authorization_url.as_bytes(), qrcode::EcLevel::H)
+        .expect("Pubky authorization URL fits QR capacity")
+        .render::<svg::Color>()
+        .min_dimensions(192, 192)
+        // No built-in quiet zone: the white panel's padding is the margin.
+        .quiet_zone(false)
+        .dark_color(svg::Color("#111111"))
+        .light_color(svg::Color("transparent"))
+        .build()
+        // Strip the XML prolog — this SVG is inlined into HTML, not served as a document.
+        .replace("<?xml version=\"1.0\" standalone=\"yes\"?>", "")
+        .replace(
+            "<svg",
+            "<svg aria-label=\"Bitkit authorization QR code\" role=\"img\"",
+        )
 }
 
 fn html_for_text(value: &str) -> String {

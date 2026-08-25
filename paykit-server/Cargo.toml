@@ -31,6 +31,7 @@ paykit-lib.workspace = true
 paykit-sdk.workspace = true
 pubky.workspace = true
 prometheus-client.workspace = true
+qrcode.workspace = true
 postcard.workspace = true
 serde.workspace = true
 serde_ignored.workspace = true
