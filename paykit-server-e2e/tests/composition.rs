@@ -173,7 +173,7 @@ fn payment_intent(reader: &ReaderPubky, marker: &PaykitReceiverMarker) -> Delive
         marker,
         PaykitReceiverPath::new("paykit/server").unwrap(),
         &PaymentRequestTerms {
-            amount: PaymentAmount::new("0.00000100", "BTC").unwrap(),
+            amount: PaymentAmount::new("0.00000100", "btc").unwrap(),
             payment_reference: PaymentReference::new(Uuid::new_v4().to_string()).unwrap(),
             proposal_expires_at: None,
             recurrence: None,
