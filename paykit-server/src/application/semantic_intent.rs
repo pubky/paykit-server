@@ -336,7 +336,7 @@ mod tests {
             operation: DeliveryOperationV1::PaymentRequestProposal {
                 terms: PaymentTermsV1 {
                     amount: "0.00000100".into(),
-                    asset: "BTC".into(),
+                    asset: "btc".into(),
                     payment_reference: "550e8400-e29b-41d4-a716-446655440000".into(),
                     proposal_expires_at: None,
                     accepted_endpoint_identifiers: vec!["btc-bitcoin-p2wpkh".into()],

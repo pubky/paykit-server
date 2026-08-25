@@ -6,13 +6,13 @@ lockfile=${2:-Cargo.lock}
 
 sed -i \
     -e 's#locks-core = { git = "https://github.com/pubky/locks.git", rev = "df5ea1b6d8dcdec3a9b5a915c3f57bca69d75c8a" }#locks-core = { path = "/build/locks/locks-core" }#' \
-    -e 's#paykit-lib = { git = "https://github.com/pubky/paykit-rs.git", rev = "52a852995bfc457b78d32f5a45f6741766a89bba" }#paykit-lib = { path = "/build/paykit-rs/paykit-lib" }#' \
-    -e 's#paykit-sdk = { git = "https://github.com/pubky/paykit-rs.git", rev = "52a852995bfc457b78d32f5a45f6741766a89bba" }#paykit-sdk = { path = "/build/paykit-rs/paykit-sdk" }#' \
+    -e 's#paykit-lib = { git = "https://github.com/pubky/paykit-rs.git", rev = "6b241878a9bba5cecea919c0298c3f90624be6ff" }#paykit-lib = { path = "/build/paykit-rs/paykit-lib" }#' \
+    -e 's#paykit-sdk = { git = "https://github.com/pubky/paykit-rs.git", rev = "6b241878a9bba5cecea919c0298c3f90624be6ff" }#paykit-sdk = { path = "/build/paykit-rs/paykit-sdk" }#' \
     "$manifest"
 
 sed -i \
     -e '/source = "git+https:\/\/github.com\/pubky\/locks.git?rev=df5ea1b6d8dcdec3a9b5a915c3f57bca69d75c8a#df5ea1b6d8dcdec3a9b5a915c3f57bca69d75c8a"/d' \
-    -e '/source = "git+https:\/\/github.com\/pubky\/paykit-rs.git?rev=52a852995bfc457b78d32f5a45f6741766a89bba#52a852995bfc457b78d32f5a45f6741766a89bba"/d' \
+    -e '/source = "git+https:\/\/github.com\/pubky\/paykit-rs.git?rev=6b241878a9bba5cecea919c0298c3f90624be6ff#6b241878a9bba5cecea919c0298c3f90624be6ff"/d' \
     "$lockfile"
 
 grep -Fx 'locks-core = { path = "/build/locks/locks-core" }' "$manifest"

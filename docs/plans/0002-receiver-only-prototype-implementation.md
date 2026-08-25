@@ -6,12 +6,12 @@
 
 **Architecture:** A virtual Rust workspace contains one server crate and one black-box E2E crate. `paykit-server` owns HTTP, application workflows, encrypted PostgreSQL persistence, and worker orchestration; it calls `paykit-sdk` rather than recreating Paykit protocols. Creator authority, one BIP84 account xpub/account index, address allocation, receiver Noise key, and SDK state are isolated per Creator inside one supported server process. `paykit-server-e2e` starts the real Axum application against PostgreSQL and verifies committed cross-boundary and cross-Creator isolation contracts.
 
-**Tech Stack:** Rust edition 2024 (MSRV 1.91.1), Tokio, Axum, SQLx/PostgreSQL, `paykit-sdk`/`paykit-lib` pinned to inspected `paykit-rs` commit `81fd0e5124aac1fd782811fd968109a5972cd323`, XChaCha20-Poly1305, HKDF-SHA256, Ed25519, Electrum client.
+**Tech Stack:** Rust edition 2024 (MSRV 1.91.1), Tokio, Axum, SQLx/PostgreSQL, `paykit-sdk`/`paykit-lib` pinned to inspected `paykit-rs` commit `52a852995bfc457b78d32f5a45f6741766a89bba`, XChaCha20-Poly1305, HKDF-SHA256, Ed25519, Electrum client.
 
 **Authoritative requirements:**
 - `docs/plans/0001-receiver-only-prototype-design.md`
-- `../../Pubky/locks/docs/ADRs/0020-locks-paykit-v1-integration-boundary.md`
-- Matching Locks behavior in `../../Pubky/locks/locks-server/src/paykit_http_client.rs`
+- [Locks ADR 0020](https://github.com/pubky/locks/blob/df5ea1b6d8dcdec3a9b5a915c3f57bca69d75c8a/docs/ADRs/0020-locks-paykit-v1-integration-boundary.md)
+- Matching [Locks Paykit HTTP client](https://github.com/pubky/locks/blob/df5ea1b6d8dcdec3a9b5a915c3f57bca69d75c8a/locks-server/src/paykit_http_client.rs)
 
 **Hard boundary:** Do not implement unsupported Paykit wire/Encrypted-Link behavior locally. Delegate it to the pinned `paykit-sdk` dependency.
 

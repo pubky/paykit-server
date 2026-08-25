@@ -5,11 +5,18 @@ use paykit_sdk::{
     PaymentRequestLifecycleState, PaymentRequestLocalRole, PaymentRequestRecord,
     PrivatePaymentListView, PubkyPublicKey,
 };
+use serde::Deserialize;
 
 use super::{Failure, ReceiveOutput};
 
-pub(super) const BITCOIN_ENDPOINT: &str = "btc-bitcoin-p2wpkh";
+pub(super) const BITCOIN_ENDPOINT: &str = "btc-regtest-p2wpkh";
 const MAX_BITCOIN_SATS: u64 = 2_100_000_000_000_000;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BitcoinEndpointPayload {
+    value: String,
+}
 
 pub(super) fn select_actionable_request(
     requests: &[PaymentRequestRecord],
@@ -50,7 +57,7 @@ pub(super) fn payment_instructions(
         return Err(Failure::ProtocolFailed);
     }
     let terms = request.terms.as_ref().ok_or(Failure::ProtocolFailed)?;
-    if terms.amount.asset != "BTC"
+    if terms.amount.asset != "btc"
         || terms.recurrence.is_some()
         || terms.proposal_expires_at.is_some()
         || terms.accepted_payment_endpoint_identifiers != [BITCOIN_ENDPOINT.to_owned()]
@@ -71,15 +78,18 @@ pub(super) fn payment_instructions(
     if private_list.payment_endpoints.len() != 1 {
         return Err(Failure::ProtocolFailed);
     }
-    let raw_address = private_list
+    let raw_payload = private_list
         .payment_endpoints
         .get(BITCOIN_ENDPOINT)
         .ok_or(Failure::ProtocolFailed)?;
-    let address = Address::from_str(raw_address)
+    let raw_address = serde_json::from_str::<BitcoinEndpointPayload>(raw_payload)
+        .map_err(|_| Failure::ProtocolFailed)?
+        .value;
+    let address = Address::from_str(&raw_address)
         .map_err(|_| Failure::ProtocolFailed)?
         .require_network(Network::Regtest)
         .map_err(|_| Failure::ProtocolFailed)?;
-    if address.address_type() != Some(AddressType::P2wpkh) || address.to_string() != *raw_address {
+    if address.address_type() != Some(AddressType::P2wpkh) || address.to_string() != raw_address {
         return Err(Failure::ProtocolFailed);
     }
     let address = address.to_string();
@@ -93,7 +103,7 @@ pub(super) fn payment_instructions(
         status: "received",
         payment_request_id: request.payment_request_id.clone(),
         address: address.clone(),
-        asset: "BTC",
+        asset: "btc",
         amount_sats: amount_sats.to_string(),
         payment_command: format!(
             "docker compose exec -T bitcoin sh -ec 'bitcoin-cli -conf=\"$BITCOIN_DATA/bitcoin.conf\" -regtest -rpcwallet=miner sendtoaddress \"{address}\" \"{bitcoin_amount}\"'"
@@ -139,7 +149,7 @@ mod tests {
             proposal_event_id: Some("8a0d8b4c-913f-4e31-9f2c-2a6f5bb4d101".into()),
             terms: Some(PaymentRequestTermsRecord {
                 amount: AmountRecord {
-                    asset: "BTC".into(),
+                    asset: "btc".into(),
                     value: "0.00050000".into(),
                 },
                 payment_reference: "reference-1".into(),
@@ -166,7 +176,10 @@ mod tests {
     fn private_list(address: &str) -> PrivatePaymentListView {
         PrivatePaymentListView {
             latest_stream_item_id: Some(2),
-            payment_endpoints: HashMap::from([(BITCOIN_ENDPOINT.into(), address.into())]),
+            payment_endpoints: HashMap::from([(
+                BITCOIN_ENDPOINT.into(),
+                serde_json::json!({ "value": address }).to_string(),
+            )]),
             last_refresh_at: None,
         }
     }
@@ -206,7 +219,7 @@ mod tests {
                 "status": "received",
                 "payment_request_id": request().payment_request_id,
                 "address": regtest_p2wpkh(),
-                "asset": "BTC",
+                "asset": "btc",
                 "amount_sats": "50000",
                 "payment_command": format!(
                     "docker compose exec -T bitcoin sh -ec 'bitcoin-cli -conf=\"$BITCOIN_DATA/bitcoin.conf\" -regtest -rpcwallet=miner sendtoaddress \"{}\" \"0.00050000\"'",

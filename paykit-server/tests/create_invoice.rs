@@ -100,11 +100,11 @@ fn capable_marker() -> paykit_lib::PaykitReceiverMarker {
 #[test]
 fn library_payment_request_has_exact_terms_amount_and_metadata() {
     let request = request();
-    let terms = PaykitIntentBuilder
+    let terms = PaykitIntentBuilder::new(BitcoinNetwork::Mainnet)
         .payment_request_terms(&request, &valid_lock())
         .unwrap();
     assert_eq!(terms.amount.value, "0.00050000");
-    assert_eq!(terms.amount.asset, "BTC");
+    assert_eq!(terms.amount.asset, "btc");
     assert_eq!(terms.proposal_expires_at, None);
     assert_eq!(terms.recurrence, None);
     assert_eq!(
@@ -115,6 +115,28 @@ fn library_payment_request_has_exact_terms_amount_and_metadata() {
         serde_json::Value::Object(terms.metadata),
         serde_json::json!({"bundle_id":BUNDLE,"lock_resource":LOCK_RESOURCE,"reader":reader()})
     );
+}
+
+#[test]
+fn payment_request_and_private_payment_list_use_the_configured_network() {
+    for (network, expected_identifier) in [
+        (BitcoinNetwork::Mainnet, "btc-bitcoin-p2wpkh"),
+        (BitcoinNetwork::Testnet, "btc-testnet-p2wpkh"),
+        (BitcoinNetwork::Signet, "btc-signet-p2wpkh"),
+        (BitcoinNetwork::Regtest, "btc-regtest-p2wpkh"),
+    ] {
+        let builder = PaykitIntentBuilder::new(network);
+        let terms = builder
+            .payment_request_terms(&request(), &valid_lock())
+            .unwrap();
+        let details = builder.receiving_details("address").unwrap();
+
+        assert_eq!(
+            terms.accepted_payment_endpoint_identifiers[0].as_str(),
+            expected_identifier
+        );
+        assert_eq!(details[0].0.as_str(), expected_identifier);
+    }
 }
 
 #[test]
@@ -140,11 +162,14 @@ fn private_payment_list_uses_derived_bech32_p2wpkh_address() {
     let xpub = Xpub::from_priv(&secp, &account).to_string();
     let address = derive_bip84_p2wpkh_address(&xpub, 0, &BitcoinNetwork::Mainnet, 0)
         .expect("valid account xpub derives an address");
-    let details = PaykitIntentBuilder
+    let details = PaykitIntentBuilder::new(BitcoinNetwork::Mainnet)
         .receiving_details(&address)
         .expect("canonical library types accept endpoint");
     assert_eq!(details[0].0.as_str(), "btc-bitcoin-p2wpkh");
-    assert_eq!(details[0].1.as_str(), address);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(details[0].1.as_str()).unwrap(),
+        serde_json::json!({ "value": address })
+    );
 }
 
 struct FakeStore {
@@ -299,7 +324,7 @@ fn service(
         Arc::new(FakeCredentials),
         BitcoinNetwork::Mainnet,
         store,
-        Arc::new(PaykitIntentBuilder),
+        Arc::new(PaykitIntentBuilder::new(BitcoinNetwork::Mainnet)),
     )
 }
 
@@ -439,7 +464,7 @@ async fn fifteen_second_deadline_is_safe_and_does_not_commit() {
         Arc::new(FakeCredentials),
         BitcoinNetwork::Mainnet,
         store.clone(),
-        Arc::new(PaykitIntentBuilder),
+        Arc::new(PaykitIntentBuilder::new(BitcoinNetwork::Mainnet)),
         Arc::new(FixedClock::new([start, start + Duration::from_secs(15)])),
     );
 
@@ -477,7 +502,7 @@ async fn marker_discovery_cannot_start_after_the_whole_request_deadline() {
         Arc::new(FakeCredentials),
         BitcoinNetwork::Mainnet,
         store.clone(),
-        Arc::new(PaykitIntentBuilder),
+        Arc::new(PaykitIntentBuilder::new(BitcoinNetwork::Mainnet)),
         Arc::new(FixedClock::new([
             start,
             start,
@@ -521,7 +546,7 @@ async fn signed_router_maps_deadline_exhaustion_to_dependency_timeout() {
         Arc::new(FakeCredentials),
         BitcoinNetwork::Mainnet,
         store,
-        Arc::new(PaykitIntentBuilder),
+        Arc::new(PaykitIntentBuilder::new(BitcoinNetwork::Mainnet)),
         Arc::new(FixedClock::new([start, start + Duration::from_secs(15)])),
     );
     let router = invoices_router(Arc::new(service)).layer(Extension(signed_auth(&key)));
@@ -793,7 +818,7 @@ async fn new_invoice_discovers_marker_before_atomic_persistence_and_pins_it_in_b
         Arc::new(FakeCredentials),
         BitcoinNetwork::Mainnet,
         store.clone(),
-        Arc::new(PaykitIntentBuilder),
+        Arc::new(PaykitIntentBuilder::new(BitcoinNetwork::Mainnet)),
     );
 
     service.create(request()).await.unwrap();

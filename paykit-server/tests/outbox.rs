@@ -86,7 +86,7 @@ fn payment_intent(marker: &PaykitReceiverMarker) -> DeliveryIntentV1 {
         marker,
         PaykitReceiverPath::new("paykit/server").unwrap(),
         &PaymentRequestTerms {
-            amount: PaymentAmount::new("0.00050000", "BTC").unwrap(),
+            amount: PaymentAmount::new("0.00050000", "btc").unwrap(),
             payment_reference: PaymentReference::new(uuid::Uuid::new_v4().to_string()).unwrap(),
             proposal_expires_at: None,
             recurrence: None,

@@ -26,7 +26,10 @@ use crate::{
     setup_orchestration::PubkyCompanionRelay,
     workers::{
         observer::{ElectrumAdapter, ElectrumPort, ObserverError, observe_once},
-        outbox::{ProcessingHealth, process_claim_with_health, process_reconciliation_with_health},
+        outbox::{
+            ProcessingHealth, RetrySchedule, process_claim_with_health,
+            process_reconciliation_with_health,
+        },
     },
 };
 use async_trait::async_trait;
@@ -185,7 +188,9 @@ impl Server {
             Arc::new(creators.clone()),
             config.deployment_invariants().bitcoin_network.clone(),
             Arc::new(invoices.clone()),
-            Arc::new(PaykitIntentBuilder),
+            Arc::new(PaykitIntentBuilder::new(
+                config.deployment_invariants().bitcoin_network.clone(),
+            )),
         ));
         let status_service = Arc::new(PaymentStatusService::new(Arc::new(invoices.clone())));
         let signed_auth = Arc::new(SignedLocksAuth::from_config(&config));
@@ -366,14 +371,34 @@ fn retry_delay(initial: Duration, maximum: Duration, attempt_count: i32) -> Dura
     initial.saturating_mul(1_u32 << exponent).min(maximum)
 }
 
+const RAPID_LINK_ESTABLISHMENT_RETRY_ATTEMPTS: i32 = 20;
+const RAPID_LINK_ESTABLISHMENT_RETRY_DELAY: Duration = Duration::from_secs(1);
+
+fn outbox_retry_schedule(
+    initial: Duration,
+    maximum: Duration,
+    attempt_count: i32,
+) -> RetrySchedule {
+    let default = retry_delay(initial, maximum, attempt_count);
+    let link_establishment = if attempt_count <= RAPID_LINK_ESTABLISHMENT_RETRY_ATTEMPTS {
+        RAPID_LINK_ESTABLISHMENT_RETRY_DELAY
+    } else {
+        retry_delay(
+            initial,
+            maximum,
+            attempt_count - RAPID_LINK_ESTABLISHMENT_RETRY_ATTEMPTS,
+        )
+    };
+    RetrySchedule::new(default, link_establishment)
+}
+
 async fn outbox_enqueue_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtime>) {
     let owner = Uuid::new_v4();
-    let mut interval = tokio::time::interval(workers.outbox_poll_interval);
-    interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut next_poll_delay = Duration::ZERO;
     loop {
         tokio::select! {
             _ = runtime.cancelled() => break,
-            _ = interval.tick() => {}
+            _ = tokio::time::sleep(next_poll_delay) => {}
         }
         if !runtime.may_start_worker_claim() {
             break;
@@ -393,6 +418,7 @@ async fn outbox_enqueue_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtim
             }
             Err(_) => {
                 runtime.set_outbox_enqueue_available(false);
+                next_poll_delay = workers.outbox_poll_interval;
                 continue;
             }
         };
@@ -400,14 +426,15 @@ async fn outbox_enqueue_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtim
         for claim in claims {
             let workers = workers.clone();
             batch.spawn(async move {
-                let delay = retry_delay(
+                let retry_schedule = outbox_retry_schedule(
                     workers.outbox_retry_initial,
                     workers.outbox_retry_max,
                     claim.attempt_count(),
                 );
                 match creator_adapter(&workers, claim.creator_id()).await {
                     Ok(adapter) => {
-                        process_claim_with_health(&workers.outbox, &adapter, &claim, delay).await
+                        process_claim_with_health(&workers.outbox, &adapter, &claim, retry_schedule)
+                            .await
                     }
                     Err(AdapterBuildError::Permanent) => workers
                         .outbox
@@ -416,18 +443,32 @@ async fn outbox_enqueue_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtim
                         .map(|transitioned| (transitioned, ProcessingHealth::PermanentFailure)),
                     Err(AdapterBuildError::Unavailable) => workers
                         .outbox
-                        .mark_retryable(&claim, delay, OutboxRetryClass::AdapterUnavailable)
+                        .mark_retryable(
+                            &claim,
+                            retry_schedule.default_delay(),
+                            OutboxRetryClass::AdapterUnavailable,
+                        )
                         .await
-                        .map(|transitioned| (transitioned, ProcessingHealth::Retryable)),
+                        .map(|transitioned| {
+                            (
+                                transitioned,
+                                ProcessingHealth::Retryable(retry_schedule.default_delay()),
+                            )
+                        }),
                 }
             });
         }
         let mut delivery_available = true;
         let mut outbox_available = true;
+        next_poll_delay = workers.outbox_poll_interval;
         while let Some(result) = batch.join_next().await {
             match result {
                 Ok(Ok((_, ProcessingHealth::Available))) => {}
-                Ok(Ok((_, ProcessingHealth::Retryable | ProcessingHealth::PermanentFailure))) => {
+                Ok(Ok((_, ProcessingHealth::Retryable(delay)))) => {
+                    delivery_available = false;
+                    next_poll_delay = next_poll_delay.min(delay);
+                }
+                Ok(Ok((_, ProcessingHealth::PermanentFailure))) => {
                     delivery_available = false;
                 }
                 Ok(Err(_)) => outbox_available = false,
@@ -501,7 +542,7 @@ async fn outbox_reconciliation_loop(workers: Arc<WorkerComponents>, runtime: Arc
                         .outbox
                         .retry_reconciliation(&claim, delay, OutboxRetryClass::AdapterUnavailable)
                         .await
-                        .map(|transitioned| (transitioned, ProcessingHealth::Retryable)),
+                        .map(|transitioned| (transitioned, ProcessingHealth::Retryable(delay))),
                 }
             });
         }
@@ -510,7 +551,10 @@ async fn outbox_reconciliation_loop(workers: Arc<WorkerComponents>, runtime: Arc
         while let Some(result) = batch.join_next().await {
             match result {
                 Ok(Ok((_, ProcessingHealth::Available))) => {}
-                Ok(Ok((_, ProcessingHealth::Retryable | ProcessingHealth::PermanentFailure))) => {
+                Ok(Ok((
+                    _,
+                    ProcessingHealth::Retryable(_) | ProcessingHealth::PermanentFailure,
+                ))) => {
                     delivery_available = false;
                 }
                 Ok(Err(_)) => outbox_available = false,
@@ -724,6 +768,36 @@ mod tests {
         assert_eq!(
             map_session_import_error(error),
             SessionValidationError::Invalid
+        );
+    }
+
+    #[test]
+    fn link_establishment_retries_rapidly_before_restarting_exponential_backoff() {
+        let initial = Duration::from_secs(1);
+        let maximum = Duration::from_secs(300);
+
+        for attempt in 1..=RAPID_LINK_ESTABLISHMENT_RETRY_ATTEMPTS {
+            let schedule = outbox_retry_schedule(initial, maximum, attempt);
+            assert_eq!(
+                schedule.delay_for(OutboxRetryClass::LinkEstablishment),
+                Duration::from_secs(1)
+            );
+        }
+
+        assert_eq!(
+            outbox_retry_schedule(initial, maximum, 21)
+                .delay_for(OutboxRetryClass::LinkEstablishment),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            outbox_retry_schedule(initial, maximum, 22)
+                .delay_for(OutboxRetryClass::LinkEstablishment),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            outbox_retry_schedule(initial, maximum, 30)
+                .delay_for(OutboxRetryClass::LinkEstablishment),
+            Duration::from_secs(300)
         );
     }
 

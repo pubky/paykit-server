@@ -127,7 +127,10 @@ Startup fails before bind if configuration, secrets, PostgreSQL, migrations, aut
 
 ### Local Locks demo image
 
-`Dockerfile.local` packages this repository for sibling Locks Compose stack. It consumes checked-out Paykit Rust and Locks trees through named BuildKit contexts, then produces unprivileged local image containing server and helper binaries.
+`Dockerfile.local` packages this repository for the Locks Compose stack. It
+accepts pinned public Git sources or deliberate local-worktree overrides through
+named BuildKit contexts, then produces an unprivileged local image containing
+the server and helper binaries.
 
 Build command, image contract, source-rewrite behavior, and generated config contract live in [`docs/local-locks-demo.md`](docs/local-locks-demo.md).
 

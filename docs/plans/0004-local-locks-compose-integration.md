@@ -8,6 +8,12 @@
 
 **Tech stack:** Rust 1.91.1, Axum, `paykit-sdk`, PostgreSQL/SQLx, Docker multi-stage builds, Pubky static testnet, Bitcoin Core regtest, BDK Electrum.
 
+**Publication note:** The original peer implementation plan was intentionally
+not included in the fresh public Locks history. The public cross-service
+contract is [Locks ADR 0020](https://github.com/pubky/locks/blob/df5ea1b6d8dcdec3a9b5a915c3f57bca69d75c8a/docs/ADRs/0020-locks-paykit-v1-integration-boundary.md).
+Public image builds use anonymous pinned Git contexts; sibling worktrees remain
+an explicit local-development override.
+
 ---
 
 ## Requirement provenance
@@ -26,12 +32,12 @@
 
 ### AUTHORITATIVE SOURCE
 
-- `../paykit-rs/specs/pubky-auth-companion-claims.md`.
-- `../paykit-rs/paykit-sdk/src/pubky_session/companion_claim.rs`.
+- [Paykit companion-claim specification](https://github.com/pubky/paykit-rs/blob/52a852995bfc457b78d32f5a45f6741766a89bba/specs/pubky-auth-companion-claims.md).
+- [Paykit SDK companion-claim implementation](https://github.com/pubky/paykit-rs/blob/52a852995bfc457b78d32f5a45f6741766a89bba/paykit-sdk/src/pubky_session/companion_claim.rs).
 - `paykit-server/src/bitkit_claim.rs` for exact `watch-only-account-v1` payload and receiver validation.
 - `paykit-server/src/real_setup.rs` for setup commit ordering and xpub validation.
 - `README.md` and `config/paykit-server.example.toml` for supported runtime/config behavior.
-- Peer plan: `../../Pubky/locks/docs/plans/0042-local-paykit-integration-demo.md`.
+- Public peer contract: [Locks ADR 0020](https://github.com/pubky/locks/blob/df5ea1b6d8dcdec3a9b5a915c3f57bca69d75c8a/docs/ADRs/0020-locks-paykit-v1-integration-boundary.md).
 
 ### CONSTRAINTS OBSERVED IN CURRENT CODE
 
@@ -126,7 +132,7 @@ No implementation task may invent an answer to these gates.
 
 **Files:**
 - Create/Modify: `docs/plans/0004-local-locks-compose-integration.md`
-- Review: `../../Pubky/locks/docs/plans/0042-local-paykit-integration-demo.md`
+- Review: public [Locks ADR 0020](https://github.com/pubky/locks/blob/df5ea1b6d8dcdec3a9b5a915c3f57bca69d75c8a/docs/ADRs/0020-locks-paykit-v1-integration-boundary.md)
 
 **Steps:**
 1. Resolve all gates one question at a time.
@@ -265,8 +271,12 @@ No implementation task may invent an answer to these gates.
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --check
-docker buildx build --build-context paykit-lib=../paykit-rs/paykit-lib --build-context paykit-sdk=../paykit-rs/paykit-sdk --build-context locks=../../Pubky/locks -f Dockerfile.local -t paykit-server:local .
+docker buildx build --load \
+  --build-context paykit-lib='https://github.com/pubky/paykit-rs.git#52a852995bfc457b78d32f5a45f6741766a89bba:paykit-lib' \
+  --build-context paykit-sdk='https://github.com/pubky/paykit-rs.git#52a852995bfc457b78d32f5a45f6741766a89bba:paykit-sdk' \
+  --build-context locks='https://github.com/pubky/locks.git#df5ea1b6d8dcdec3a9b5a915c3f57bca69d75c8a' \
+  -f Dockerfile.local -t paykit-server:local .
 git diff --check
 ```
 
-The sibling Locks plan must add executable wrapper commands that load ignored generated credentials and run explicit `TEST_DATABASE_URL` suites plus the Compose smoke without printing secrets.
+The corresponding Locks integration must add executable wrapper commands that load ignored generated credentials and run explicit `TEST_DATABASE_URL` suites plus the Compose smoke without printing secrets.

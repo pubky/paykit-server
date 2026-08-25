@@ -204,7 +204,7 @@ async fn live_pubky_marker_discovery_and_payment_request_delivery() {
             payer_key.clone(),
             payer_path.clone(),
             PaymentRequestTerms {
-                amount: PaymentAmount::new("0.00000100", "BTC").unwrap(),
+                amount: PaymentAmount::new("0.00000100", "btc").unwrap(),
                 payment_reference: PaymentReference::new(reference.clone()).unwrap(),
                 proposal_expires_at: None,
                 recurrence: None,
