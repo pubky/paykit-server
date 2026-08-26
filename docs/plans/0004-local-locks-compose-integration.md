@@ -32,8 +32,8 @@ an explicit local-development override.
 
 ### AUTHORITATIVE SOURCE
 
-- [Paykit companion-claim specification](https://github.com/pubky/paykit-rs/blob/52a852995bfc457b78d32f5a45f6741766a89bba/specs/pubky-auth-companion-claims.md).
-- [Paykit SDK companion-claim implementation](https://github.com/pubky/paykit-rs/blob/52a852995bfc457b78d32f5a45f6741766a89bba/paykit-sdk/src/pubky_session/companion_claim.rs).
+- [Paykit companion-claim specification](https://github.com/pubky/paykit-rs/blob/v0.1.0-rc47/specs/pubky-auth-companion-claims.md).
+- [Paykit SDK companion-claim implementation](https://github.com/pubky/paykit-rs/blob/v0.1.0-rc47/paykit-sdk/src/pubky_session/companion_claim.rs).
 - `paykit-server/src/bitkit_claim.rs` for exact `watch-only-account-v1` payload and receiver validation.
 - `paykit-server/src/real_setup.rs` for setup commit ordering and xpub validation.
 - `README.md` and `config/paykit-server.example.toml` for supported runtime/config behavior.
@@ -272,8 +272,8 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --check
 docker buildx build --load \
-  --build-context paykit-lib='https://github.com/pubky/paykit-rs.git#52a852995bfc457b78d32f5a45f6741766a89bba:paykit-lib' \
-  --build-context paykit-sdk='https://github.com/pubky/paykit-rs.git#52a852995bfc457b78d32f5a45f6741766a89bba:paykit-sdk' \
+  --build-context paykit-lib='https://github.com/pubky/paykit-rs.git#v0.1.0-rc47:paykit-lib' \
+  --build-context paykit-sdk='https://github.com/pubky/paykit-rs.git#v0.1.0-rc47:paykit-sdk' \
   --build-context locks='https://github.com/pubky/locks.git#df5ea1b6d8dcdec3a9b5a915c3f57bca69d75c8a' \
   -f Dockerfile.local -t paykit-server:local .
 git diff --check
