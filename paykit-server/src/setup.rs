@@ -11,7 +11,7 @@ use std::{
 
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use rand::{TryRngCore, rngs::OsRng};
+use rand::{TryRng, rngs::SysRng};
 use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore};
 use url::Url;
 
@@ -331,7 +331,7 @@ impl SetupService {
             .await
             .map_err(|_| BeginError::Unavailable)?;
         let mut bytes = [0_u8; 32];
-        OsRng
+        SysRng
             .try_fill_bytes(&mut bytes)
             .map_err(|_| BeginError::Unavailable)?;
         let flow_id = URL_SAFE_NO_PAD.encode(bytes);

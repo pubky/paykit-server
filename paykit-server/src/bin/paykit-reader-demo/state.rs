@@ -11,7 +11,7 @@ use chacha20poly1305::{
 };
 use hkdf::Hkdf;
 use paykit_sdk::SdkBackupState;
-use rand::RngCore;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use zeroize::{Zeroize, Zeroizing};
@@ -128,7 +128,7 @@ impl EncryptedReaderStateStore {
         let ciphertext = XChaCha20Poly1305::new_from_slice(&*key)
             .map_err(|_| ())?
             .encrypt(
-                XNonce::from_slice(&nonce),
+                &XNonce::try_from(nonce.as_slice()).map_err(|_| ())?,
                 Payload {
                     msg: &plaintext,
                     aad: DOMAIN,
@@ -187,7 +187,7 @@ impl EncryptedReaderStateStore {
             XChaCha20Poly1305::new_from_slice(&*key)
                 .map_err(|_| ())?
                 .decrypt(
-                    XNonce::from_slice(nonce),
+                    &XNonce::try_from(nonce).map_err(|_| ())?,
                     Payload {
                         msg: ciphertext,
                         aad: DOMAIN,
