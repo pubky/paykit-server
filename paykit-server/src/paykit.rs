@@ -2,17 +2,19 @@
 
 use std::{
     collections::HashMap,
+    future::Future,
     sync::{Arc, Mutex as StdMutex, OnceLock, Weak},
 };
 
 use async_trait::async_trait;
 use paykit_lib::{
     PaykitReceiverPath, PaymentAmount, PaymentEndpointIdentifier, PaymentReference,
-    PaymentRequestTerms,
+    PaymentRequestId, PaymentRequestTerms,
 };
 use paykit_sdk::{
     LinkedPeerState, OutboundPrivateMessageStatus, PaykitSdk, PaykitSdkConfig, PaykitSdkError,
-    PaymentAdapter, PrivateReceivingDetail, PubkyPublicKey, PubkySessionAccess,
+    PaymentAdapter, PaymentRequestLifecycleState as SdkPaymentRequestLifecycleState,
+    PaymentRequestRecord, PrivateReceivingDetail, PubkyPublicKey, PubkySessionAccess,
     PubkySessionProvider, StorageAdapter,
 };
 use pubky::{Pubky, PubkySession};
@@ -20,10 +22,22 @@ use tokio::sync::Mutex as TokioMutex;
 use uuid::Uuid;
 
 use crate::{
-    application::semantic_intent::{DeliveryIntentV1, PaymentTermsV1, ReceivingDetailV1},
+    application::{
+        payment_drain::{PaymentDrainError, PaymentDrainResult},
+        semantic_intent::{DeliveryIntentV1, PaymentTermsV1, ReceivingDetailV1},
+    },
     config::PaykitConfig,
-    domain::locks::CreatorPubky,
-    persistence::{CreatorStore, PostgresStorageAdapter},
+    domain::{
+        locks::{CreatorPubky, PubkyLockResource},
+        payment_request_lifecycle::{
+            PaymentRequestLifecycleProjection,
+            PaymentRequestLifecycleState as PersistedPaymentRequestLifecycleState,
+        },
+    },
+    persistence::{
+        CreatorStore, PaymentDrainStore, PaymentRequestLifecycleStore, PersistenceError,
+        PostgresStorageAdapter,
+    },
     workers::outbox::{
         Adapter, HandoffError, HandoffFailure, HandoffResult, RetryableHandoffCause, handoff_steps,
     },
@@ -127,7 +141,16 @@ type CreatorSdk =
 pub struct PaykitAdapter {
     sdk: CreatorSdk,
     storage: PostgresStorageAdapter,
+    creator: CreatorPubky,
     mutation_lock: Arc<TokioMutex<()>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LifecycleSyncError {
+    Sdk,
+    Persistence,
+    InvalidProjection,
+    PartialReceive,
 }
 
 impl std::fmt::Debug for PaykitAdapter {
@@ -142,6 +165,7 @@ impl PaykitAdapter {
         sessions: CreatorSessionProvider,
         config: &PaykitConfig,
     ) -> Result<Self, PaykitSdkError> {
+        let creator = sessions.creator.clone();
         let sdk = PaykitSdk::new(
             storage.clone(),
             sessions,
@@ -152,7 +176,190 @@ impl PaykitAdapter {
             sdk,
             mutation_lock: creator_mutation_lock(storage.creator_id()),
             storage,
+            creator,
         })
+    }
+
+    /// Receives linked-peer messages and durably projects the SDK's canonical
+    /// lifecycle view while serializing Creator-local SDK mutations.
+    pub async fn receive_and_project_payment_requests(
+        &self,
+        lifecycles: &PaymentRequestLifecycleStore,
+    ) -> Result<(), LifecycleSyncError> {
+        let _guard = self.mutation_lock.lock().await;
+        let reports = self
+            .sdk
+            .receive_private_messages_from_linked_peers()
+            .await
+            .map_err(|_| LifecycleSyncError::Sdk)?;
+        let partial_receive = reports.iter().any(|report| report.error.is_some());
+        let records = self
+            .sdk
+            .payment_requests()
+            .await
+            .map_err(|_| LifecycleSyncError::Sdk)?;
+        let projections = records
+            .iter()
+            .map(lifecycle_projection)
+            .collect::<Result<Vec<_>, _>>()?;
+        let creator_id = self.storage.creator_id();
+        project_lifecycles_after_receive(projections, partial_receive, |projection| async move {
+            lifecycles
+                .apply(creator_id, &projection)
+                .await
+                .map_err(map_projection_persistence_error)?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Reconciles the canonical SDK reducer and atomically snapshots one lock's
+    /// drain while holding the same Creator-local mutation lock used by receive.
+    pub async fn reconcile_and_create_payment_drain(
+        &self,
+        lifecycles: &PaymentRequestLifecycleStore,
+        drains: &PaymentDrainStore,
+        lock_resource: &PubkyLockResource,
+    ) -> Result<PaymentDrainResult, PaymentDrainError> {
+        if lock_resource.creator() != &self.creator {
+            return Err(PaymentDrainError::CreatorMismatch);
+        }
+        let _guard = self.mutation_lock.lock().await;
+        if let Some(replay) = drains
+            .exact_replay(lock_resource)
+            .await
+            .map_err(map_drain_persistence_error)?
+        {
+            return Ok(replay);
+        }
+        let records = self
+            .sdk
+            .payment_requests()
+            .await
+            .map_err(|_| PaymentDrainError::Unavailable)?;
+        for record in &records {
+            let projection = lifecycle_projection(record).map_err(|error| match error {
+                LifecycleSyncError::InvalidProjection => PaymentDrainError::Conflict,
+                _ => PaymentDrainError::Unavailable,
+            })?;
+            lifecycles
+                .apply(self.storage.creator_id(), &projection)
+                .await
+                .map_err(map_drain_persistence_error)?;
+        }
+        drains
+            .create(lock_resource)
+            .await
+            .map_err(map_drain_persistence_error)
+    }
+}
+
+async fn project_lifecycles_after_receive<F, Fut>(
+    projections: Vec<PaymentRequestLifecycleProjection>,
+    partial_receive: bool,
+    mut persist: F,
+) -> Result<(), LifecycleSyncError>
+where
+    F: FnMut(PaymentRequestLifecycleProjection) -> Fut,
+    Fut: Future<Output = Result<(), LifecycleSyncError>>,
+{
+    for projection in projections {
+        persist(projection).await?;
+    }
+    if partial_receive {
+        return Err(LifecycleSyncError::PartialReceive);
+    }
+    Ok(())
+}
+
+fn map_projection_persistence_error(_: PersistenceError) -> LifecycleSyncError {
+    LifecycleSyncError::Persistence
+}
+
+fn map_drain_persistence_error(error: PersistenceError) -> PaymentDrainError {
+    match error {
+        PersistenceError::Conflict => PaymentDrainError::Conflict,
+        _ => PaymentDrainError::Unavailable,
+    }
+}
+
+fn lifecycle_projection(
+    record: &PaymentRequestRecord,
+) -> Result<PaymentRequestLifecycleProjection, LifecycleSyncError> {
+    let request_state = persisted_lifecycle_state(record.state)?;
+    let state_event_id = match record.state {
+        SdkPaymentRequestLifecycleState::Proposed
+        | SdkPaymentRequestLifecycleState::ProposalExpired => record.proposal_event_id.clone(),
+        SdkPaymentRequestLifecycleState::Accepted
+        | SdkPaymentRequestLifecycleState::ActiveRecurring => record.accepted_event_id.clone(),
+        SdkPaymentRequestLifecycleState::Rejected => record.rejected_event_id.clone(),
+        SdkPaymentRequestLifecycleState::Canceled => record.canceled_event_id.clone(),
+        SdkPaymentRequestLifecycleState::ProofSubmitted => record
+            .payment_proofs
+            .last()
+            .map(|proof| proof.event_id.clone()),
+        SdkPaymentRequestLifecycleState::RecoveryRequired
+        | SdkPaymentRequestLifecycleState::InvalidConflict => record
+            .canceled_event_id
+            .clone()
+            .or_else(|| record.rejected_event_id.clone())
+            .or_else(|| record.accepted_event_id.clone())
+            .or_else(|| record.proposal_event_id.clone()),
+        _ => return Err(LifecycleSyncError::InvalidProjection),
+    };
+    let last_event_at = record
+        .last_event_at
+        .ok_or(LifecycleSyncError::InvalidProjection)?;
+    let seconds = i128::from(last_event_at.timestamp());
+    let nanos = i128::from(last_event_at.timestamp_subsec_nanos());
+    let timestamp_nanos = seconds
+        .checked_mul(1_000_000_000)
+        .and_then(|value| value.checked_add(nanos))
+        .ok_or(LifecycleSyncError::InvalidProjection)?;
+    let last_event_at = time::OffsetDateTime::from_unix_timestamp_nanos(timestamp_nanos)
+        .map_err(|_| LifecycleSyncError::InvalidProjection)?;
+    Ok(PaymentRequestLifecycleProjection {
+        payment_request_id: record.payment_request_id.clone(),
+        request_state,
+        state_event_id,
+        last_stream_item_id: record.last_stream_item_id,
+        last_outbound_message_id: record.last_outbound_message_id,
+        last_event_at,
+    })
+}
+
+fn persisted_lifecycle_state(
+    state: SdkPaymentRequestLifecycleState,
+) -> Result<PersistedPaymentRequestLifecycleState, LifecycleSyncError> {
+    match state {
+        SdkPaymentRequestLifecycleState::Proposed => {
+            Ok(PersistedPaymentRequestLifecycleState::Proposed)
+        }
+        SdkPaymentRequestLifecycleState::ProposalExpired => {
+            Ok(PersistedPaymentRequestLifecycleState::ProposalExpired)
+        }
+        SdkPaymentRequestLifecycleState::Accepted => {
+            Ok(PersistedPaymentRequestLifecycleState::Accepted)
+        }
+        SdkPaymentRequestLifecycleState::Rejected => {
+            Ok(PersistedPaymentRequestLifecycleState::Rejected)
+        }
+        SdkPaymentRequestLifecycleState::Canceled => {
+            Ok(PersistedPaymentRequestLifecycleState::Canceled)
+        }
+        SdkPaymentRequestLifecycleState::ProofSubmitted => {
+            Ok(PersistedPaymentRequestLifecycleState::ProofSubmitted)
+        }
+        SdkPaymentRequestLifecycleState::ActiveRecurring => {
+            Ok(PersistedPaymentRequestLifecycleState::ActiveRecurring)
+        }
+        SdkPaymentRequestLifecycleState::RecoveryRequired => {
+            Ok(PersistedPaymentRequestLifecycleState::RecoveryRequired)
+        }
+        SdkPaymentRequestLifecycleState::InvalidConflict => {
+            Ok(PersistedPaymentRequestLifecycleState::InvalidConflict)
+        }
+        _ => Err(LifecycleSyncError::InvalidProjection),
     }
 }
 
@@ -297,6 +504,29 @@ impl Adapter for PaykitAdapter {
                 .proposal_outbound_message_id
                 .ok_or(HandoffError::Permanent)?,
             event_id: record.proposal_event_id.ok_or(HandoffError::Permanent)?,
+            payment_request_id: record.payment_request_id,
+        })
+    }
+
+    async fn cancel_payment_request(
+        &self,
+        reader: &str,
+        path: &str,
+        payment_request_id: &str,
+    ) -> Result<HandoffResult, HandoffError> {
+        let (reader, path) = parse_peer(reader, path)?;
+        let payment_request_id = PaymentRequestId::new(payment_request_id.to_owned())
+            .map_err(|_| HandoffError::Permanent)?;
+        let record = self
+            .sdk
+            .cancel_payment_request(reader, path, &payment_request_id, None)
+            .await
+            .map_err(classify)?;
+        Ok(HandoffResult::PaymentRequestCancellation {
+            outbound_message_id: record
+                .last_outbound_message_id
+                .ok_or(HandoffError::Permanent)?,
+            event_id: record.canceled_event_id.ok_or(HandoffError::Permanent)?,
             payment_request_id: record.payment_request_id,
         })
     }
@@ -457,5 +687,86 @@ mod tests {
             bind_session_to_creator(actual, &expected),
             Err(PaykitSdkError::Identity { .. })
         ));
+    }
+
+    #[test]
+    fn every_known_sdk_lifecycle_state_maps_one_to_one() {
+        let cases = [
+            (
+                SdkPaymentRequestLifecycleState::Proposed,
+                PersistedPaymentRequestLifecycleState::Proposed,
+            ),
+            (
+                SdkPaymentRequestLifecycleState::ProposalExpired,
+                PersistedPaymentRequestLifecycleState::ProposalExpired,
+            ),
+            (
+                SdkPaymentRequestLifecycleState::Accepted,
+                PersistedPaymentRequestLifecycleState::Accepted,
+            ),
+            (
+                SdkPaymentRequestLifecycleState::Rejected,
+                PersistedPaymentRequestLifecycleState::Rejected,
+            ),
+            (
+                SdkPaymentRequestLifecycleState::Canceled,
+                PersistedPaymentRequestLifecycleState::Canceled,
+            ),
+            (
+                SdkPaymentRequestLifecycleState::ProofSubmitted,
+                PersistedPaymentRequestLifecycleState::ProofSubmitted,
+            ),
+            (
+                SdkPaymentRequestLifecycleState::ActiveRecurring,
+                PersistedPaymentRequestLifecycleState::ActiveRecurring,
+            ),
+            (
+                SdkPaymentRequestLifecycleState::RecoveryRequired,
+                PersistedPaymentRequestLifecycleState::RecoveryRequired,
+            ),
+            (
+                SdkPaymentRequestLifecycleState::InvalidConflict,
+                PersistedPaymentRequestLifecycleState::InvalidConflict,
+            ),
+        ];
+        for (sdk, persisted) in cases {
+            assert_eq!(persisted_lifecycle_state(sdk), Ok(persisted));
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_receive_projects_every_canonical_record_before_returning_degraded() {
+        let projections = [
+            PersistedPaymentRequestLifecycleState::Proposed,
+            PersistedPaymentRequestLifecycleState::Accepted,
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, request_state)| PaymentRequestLifecycleProjection {
+            payment_request_id: Uuid::new_v4().to_string(),
+            request_state,
+            state_event_id: Some(Uuid::new_v4().to_string()),
+            last_stream_item_id: Some(index as u64 + 1),
+            last_outbound_message_id: None,
+            last_event_at: time::OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap(),
+        })
+        .collect::<Vec<_>>();
+        let persisted = Arc::new(StdMutex::new(Vec::new()));
+        let captured = persisted.clone();
+
+        let result = project_lifecycles_after_receive(projections, true, move |projection| {
+            captured.lock().unwrap().push(projection.request_state);
+            std::future::ready(Ok(()))
+        })
+        .await;
+
+        assert_eq!(result, Err(LifecycleSyncError::PartialReceive));
+        assert_eq!(
+            *persisted.lock().unwrap(),
+            vec![
+                PersistedPaymentRequestLifecycleState::Proposed,
+                PersistedPaymentRequestLifecycleState::Accepted,
+            ]
+        );
     }
 }

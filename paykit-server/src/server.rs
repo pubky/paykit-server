@@ -8,6 +8,11 @@ use crate::{
             CreateInvoiceError, CreateInvoiceService, LockFetchError, LockFetcher, MarkerDiscovery,
             PaykitIntentBuilder, SessionValidationError, SessionValidator,
         },
+        payment_drain::{
+            PaymentDrainCleanupToken, PaymentDrainError, PaymentDrainOperations,
+            PaymentDrainSummary,
+        },
+        payment_request_status::PaymentRequestStatusOperations,
         payment_status::PaymentStatusService,
     },
     bitkit_setup::BitkitAuthStarter,
@@ -17,8 +22,8 @@ use crate::{
     http::{self, auth::SignedLocksAuth},
     paykit::{CreatorSessionProvider, PaykitAdapter},
     persistence::{
-        CreatorStore, InvoiceStore, OutboxRetryClass, OutboxStore, PersistenceError,
-        PostgresStorageAdapter, SdkStateStore,
+        CreatorStore, InvoiceStore, OutboxRetryClass, OutboxStore, PaymentDrainStore,
+        PaymentRequestLifecycleStore, PersistenceError, PostgresStorageAdapter, SdkStateStore,
     },
     real_setup::RealSetupCompleter,
     runtime::{PostgresDependency, Runtime, operational_router},
@@ -68,6 +73,7 @@ struct WorkerComponents {
     creators: CreatorStore,
     outbox: OutboxStore,
     invoices: InvoiceStore,
+    payment_request_lifecycles: PaymentRequestLifecycleStore,
     electrum: Arc<dyn ElectrumPort>,
     pubky: Pubky,
     paykit: PaykitConfig,
@@ -138,6 +144,8 @@ impl Server {
         let creators = CreatorStore::new(&pool, crypto.clone());
         let invoices = InvoiceStore::new(&pool, crypto.clone());
         let outbox = OutboxStore::new(&pool, crypto.clone());
+        let payment_request_lifecycles = PaymentRequestLifecycleStore::new(&pool, crypto.clone());
+        let payment_drains = PaymentDrainStore::new(&pool, crypto.clone());
 
         let bootstrap = PubkySessionBootstrap::with_pubky(pubky.clone());
         let relay = Arc::new(PubkyCompanionRelay::new(pubky.client().clone()));
@@ -193,10 +201,28 @@ impl Server {
             )),
         ));
         let status_service = Arc::new(PaymentStatusService::new(Arc::new(invoices.clone())));
+        let payment_drain_operations: Arc<dyn PaymentDrainOperations> =
+            Arc::new(ProductionPaymentDrainOperations {
+                pool: pool.clone(),
+                crypto: crypto.clone(),
+                creators: creators.clone(),
+                lifecycles: payment_request_lifecycles.clone(),
+                drains: payment_drains,
+                pubky: pubky.clone(),
+                paykit: config.paykit.clone(),
+            });
+        let payment_request_status_operations: Arc<dyn PaymentRequestStatusOperations> =
+            Arc::new(invoices.clone());
         let signed_auth = Arc::new(SignedLocksAuth::from_config(&config));
         let business_routes = http::setup::setup_router(setup).merge(
             http::invoices::invoices_router(invoice_service)
                 .merge(http::status::status_router(status_service))
+                .merge(http::payment_drains::payment_drains_router(
+                    payment_drain_operations,
+                ))
+                .merge(http::payment_requests::payment_requests_router(
+                    payment_request_status_operations,
+                ))
                 .layer(Extension(signed_auth)),
         );
 
@@ -211,6 +237,7 @@ impl Server {
             creators,
             outbox,
             invoices,
+            payment_request_lifecycles,
             electrum,
             pubky,
             paykit: config.paykit.clone(),
@@ -332,6 +359,93 @@ fn outbox_batch_size(config: &OutboxConfig) -> i64 {
 enum AdapterBuildError {
     Permanent,
     Unavailable,
+}
+
+#[derive(Clone)]
+struct ProductionPaymentDrainOperations {
+    pool: PgPool,
+    crypto: Arc<Crypto>,
+    creators: CreatorStore,
+    lifecycles: PaymentRequestLifecycleStore,
+    drains: PaymentDrainStore,
+    pubky: Pubky,
+    paykit: PaykitConfig,
+}
+
+#[async_trait]
+impl PaymentDrainOperations for ProductionPaymentDrainOperations {
+    async fn create(
+        &self,
+        lock_resource: &PubkyLockResource,
+    ) -> Result<PaymentDrainSummary, PaymentDrainError> {
+        if let Some(replay) = self
+            .drains
+            .exact_replay(lock_resource)
+            .await
+            .map_err(|_| PaymentDrainError::Unavailable)?
+        {
+            return Ok(self.summary(replay));
+        }
+        let (creator_id, credentials) = self
+            .creators
+            .load_with_id(lock_resource.creator())
+            .await
+            .map_err(|_| PaymentDrainError::Unavailable)?;
+        if credentials.creator() != lock_resource.creator() {
+            return Err(PaymentDrainError::Unavailable);
+        }
+        SdkStateStore::new(&self.pool, self.crypto.clone())
+            .load(lock_resource.creator())
+            .await
+            .map_err(|_| PaymentDrainError::Unavailable)?;
+        let storage = PostgresStorageAdapter::new(&self.pool, self.crypto.clone(), creator_id);
+        let sessions = CreatorSessionProvider::with_pubky(
+            self.creators.clone(),
+            lock_resource.creator().clone(),
+            self.pubky.clone(),
+        );
+        let adapter = PaykitAdapter::new(storage, sessions, &self.paykit)
+            .map_err(|_| PaymentDrainError::Unavailable)?;
+        adapter
+            .reconcile_and_create_payment_drain(&self.lifecycles, &self.drains, lock_resource)
+            .await
+            .map(|snapshot| self.summary(snapshot))
+    }
+
+    async fn lookup(
+        &self,
+        lock_resource: &PubkyLockResource,
+    ) -> Result<Option<PaymentDrainSummary>, PaymentDrainError> {
+        self.drains
+            .exact_replay(lock_resource)
+            .await
+            .map(|snapshot| snapshot.map(|snapshot| self.summary(snapshot)))
+            .map_err(|_| PaymentDrainError::Unavailable)
+    }
+
+    async fn cleanup(
+        &self,
+        lock_resource: &PubkyLockResource,
+        cleanup_token: PaymentDrainCleanupToken,
+    ) -> Result<(), PaymentDrainError> {
+        self.drains
+            .cleanup_completed(lock_resource, cleanup_token.as_bytes())
+            .await
+            .map_err(|error| match error {
+                PersistenceError::Conflict => PaymentDrainError::Conflict,
+                _ => PaymentDrainError::Unavailable,
+            })
+    }
+}
+
+impl ProductionPaymentDrainOperations {
+    fn summary(&self, snapshot: crate::persistence::PaymentDrainSnapshot) -> PaymentDrainSummary {
+        let token = self.crypto.payment_drain_cleanup_token(snapshot.drain_id());
+        PaymentDrainSummary::from_snapshot(
+            snapshot,
+            PaymentDrainCleanupToken::from_bytes(*token.as_bytes()),
+        )
+    }
 }
 
 async fn creator_adapter(
@@ -570,9 +684,37 @@ async fn outbox_reconciliation_loop(workers: Arc<WorkerComponents>, runtime: Arc
                 outbox_available = false;
             }
         }
+        delivery_available &= reconcile_payment_request_lifecycles(workers.clone()).await;
         runtime.set_paykit_reconciliation_available(delivery_available);
         runtime.set_outbox_reconciliation_available(outbox_available);
     }
+}
+
+async fn reconcile_payment_request_lifecycles(workers: Arc<WorkerComponents>) -> bool {
+    let creator_ids = match workers.payment_request_lifecycles.creator_ids().await {
+        Ok(creator_ids) => creator_ids,
+        Err(_) => return false,
+    };
+    let mut batch = JoinSet::new();
+    for creator_id in creator_ids {
+        let workers = workers.clone();
+        batch.spawn(async move {
+            let adapter = creator_adapter(&workers, creator_id)
+                .await
+                .map_err(|_| ())?;
+            adapter
+                .receive_and_project_payment_requests(&workers.payment_request_lifecycles)
+                .await
+                .map_err(|_| ())
+        });
+    }
+    let mut available = true;
+    while let Some(result) = batch.join_next().await {
+        if !matches!(result, Ok(Ok(()))) {
+            available = false;
+        }
+    }
+    available
 }
 
 async fn observer_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtime>) {

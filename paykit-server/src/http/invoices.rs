@@ -7,11 +7,16 @@ use axum::{
     response::{IntoResponse, Response},
     routing::post,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use time::format_description::well_known::Rfc3339;
 
 use crate::{
     application::create_invoice::{CreateInvoiceError, CreateInvoiceRequest, CreateInvoiceService},
-    domain::locks::{parse_addressed_lock_resource, parse_bundle_id, parse_reader},
+    domain::{
+        invoice::CriterionPaymentWindowHours,
+        locks::{parse_addressed_lock_resource, parse_bundle_id, parse_reader},
+    },
     http::{auth::AuthenticatedJson, error::ApiError},
 };
 
@@ -20,6 +25,13 @@ struct InvoiceBody {
     bundle_id: String,
     lock_resource: String,
     reader: String,
+    payment_in: Value,
+}
+
+#[derive(Serialize)]
+struct InvoiceResponse {
+    invoice_created_at: String,
+    payment_deadline: String,
 }
 
 pub fn invoices_router(service: Arc<CreateInvoiceService>) -> Router {
@@ -37,9 +49,25 @@ async fn create(
         Err(error) => return error.into_response(),
     };
     match service.create(request).await {
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Ok(result) => match response(result) {
+            Ok(body) => (StatusCode::OK, axum::Json(body)).into_response(),
+            Err(error) => error.into_response(),
+        },
         Err(error) => invoice_error(error),
     }
+}
+
+fn response(result: crate::persistence::AtomicInvoiceResult) -> Result<InvoiceResponse, ApiError> {
+    Ok(InvoiceResponse {
+        invoice_created_at: result
+            .invoice_created_at()
+            .format(&Rfc3339)
+            .map_err(|_| ApiError::InternalError)?,
+        payment_deadline: result
+            .payment_deadline()
+            .format(&Rfc3339)
+            .map_err(|_| ApiError::InternalError)?,
+    })
 }
 
 fn parse(body: InvoiceBody) -> Result<CreateInvoiceRequest, ApiError> {
@@ -48,6 +76,8 @@ fn parse(body: InvoiceBody) -> Result<CreateInvoiceRequest, ApiError> {
         lock_resource: parse_addressed_lock_resource(&body.lock_resource)
             .map_err(|_| ApiError::InvalidRequest)?,
         reader: parse_reader(&body.reader).map_err(|_| ApiError::InvalidRequest)?,
+        payment_in: CriterionPaymentWindowHours::parse(&body.payment_in)
+            .map_err(|_| ApiError::InvalidRequest)?,
     })
 }
 
