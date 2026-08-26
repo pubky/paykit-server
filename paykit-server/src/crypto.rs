@@ -8,7 +8,7 @@ use std::fmt;
 
 use chacha20poly1305::{
     XChaCha20Poly1305, XNonce,
-    aead::{Aead, AeadCore, KeyInit, OsRng, Payload},
+    aead::{Aead, Generate, KeyInit, Payload},
 };
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
@@ -64,7 +64,7 @@ impl Crypto {
         plaintext: &[u8],
     ) -> Result<EncryptedEnvelope, CryptoError> {
         let cipher = self.cipher()?;
-        let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+        let nonce = XNonce::generate();
         let ciphertext = cipher
             .encrypt(
                 &nonce,
@@ -94,10 +94,11 @@ impl Crypto {
             return Err(CryptoError::InvalidEnvelope);
         }
 
-        let nonce = XNonce::from_slice(&stored[1..=NONCE_LENGTH]);
+        let nonce = XNonce::try_from(&stored[1..=NONCE_LENGTH])
+            .map_err(|_| CryptoError::InvalidEnvelope)?;
         self.cipher()?
             .decrypt(
-                nonce,
+                &nonce,
                 Payload {
                     msg: &stored[1 + NONCE_LENGTH..],
                     aad: &context.associated_data(),
@@ -108,7 +109,8 @@ impl Crypto {
 
     /// Produces the raw 32-byte keyed lookup value for supplied logical bytes.
     pub fn lookup_hash(&self, logical_bytes: &[u8]) -> LookupHash {
-        let mut mac = match <Hmac<Sha256> as Mac>::new_from_slice(&*self.lookup_hmac_key) {
+        let mut mac = match <Hmac<Sha256> as hmac::KeyInit>::new_from_slice(&*self.lookup_hmac_key)
+        {
             Ok(mac) => mac,
             Err(_) => unreachable!("a fixed-length HMAC-SHA256 key is valid"),
         };
@@ -139,7 +141,8 @@ impl Crypto {
     }
 
     fn domain_separated_lookup_hash(&self, domain: &[u8], logical_bytes: &[u8]) -> LookupHash {
-        let mut mac = match <Hmac<Sha256> as Mac>::new_from_slice(&*self.lookup_hmac_key) {
+        let mut mac = match <Hmac<Sha256> as hmac::KeyInit>::new_from_slice(&*self.lookup_hmac_key)
+        {
             Ok(mac) => mac,
             Err(_) => unreachable!("a fixed-length HMAC-SHA256 key is valid"),
         };
