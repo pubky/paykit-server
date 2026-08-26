@@ -43,8 +43,11 @@ Business routes:
 - `POST /setup/{flow_id}/complete`
 - signed `POST /invoices`
 - signed `POST /transactions/status`
+- signed `POST /setup/status`
 
-Invoice/status signatures use the configured trusted Locks Ed25519 key. Setup uses the Bitkit Pubky Auth companion-claim flow and an exact configured browser origin.
+Business-route signatures use the configured trusted Locks Ed25519 key. Setup uses the Bitkit Pubky Auth companion-claim flow and an exact configured browser origin.
+
+`POST /setup/status` is the Locks-only readiness check for an authenticated Creator. Its closed canonical body is `{"creator":"pubky..."}`; the signature covers the exact compact canonical JSON bytes. It returns exactly one coarse state: `ready` when the persisted Creator session imports and matches that Creator, `setup_required` when authority is absent or definitively invalid, and `unavailable` when persistence or Pubky validation cannot currently establish either result. Callers must not convert `unavailable` into a new authorization flow.
 
 ### Setup iframe
 

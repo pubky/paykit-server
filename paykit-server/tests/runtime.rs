@@ -298,6 +298,10 @@ async fn production_constructor_mounts_all_routes() {
             StatusCode::UNAUTHORIZED,
         ),
         (
+            Request::post("/setup/status").body(Body::empty()).unwrap(),
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
             Request::delete("/health/ready")
                 .body(Body::empty())
                 .unwrap(),
