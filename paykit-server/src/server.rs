@@ -9,6 +9,7 @@ use crate::{
             PaykitIntentBuilder, SessionValidationError, SessionValidator,
         },
         payment_status::PaymentStatusService,
+        setup_status::SetupStatusService,
     },
     bitkit_setup::BitkitAuthStarter,
     config::{Config, OutboxConfig, PaykitConfig, PaykitNetwork},
@@ -170,11 +171,12 @@ impl Server {
             },
         );
 
+        let session_validator = Arc::new(CreatorSessionValidator {
+            creators: creators.clone(),
+            pubky: pubky.clone(),
+        });
         let invoice_service = Arc::new(CreateInvoiceService::new(
-            Arc::new(CreatorSessionValidator {
-                creators: creators.clone(),
-                pubky: pubky.clone(),
-            }),
+            session_validator.clone(),
             Arc::new(PubkyLockFetcher {
                 storage: pubky.public_storage(),
                 max_bytes: config.limits.lock_resource_bytes,
@@ -193,10 +195,14 @@ impl Server {
             )),
         ));
         let status_service = Arc::new(PaymentStatusService::new(Arc::new(invoices.clone())));
+        let setup_status_service = Arc::new(SetupStatusService::new(session_validator));
         let signed_auth = Arc::new(SignedLocksAuth::from_config(&config));
         let business_routes = http::setup::setup_router(setup).merge(
             http::invoices::invoices_router(invoice_service)
                 .merge(http::status::status_router(status_service))
+                .merge(http::setup_status::setup_status_router(
+                    setup_status_service,
+                ))
                 .layer(Extension(signed_auth)),
         );
 
