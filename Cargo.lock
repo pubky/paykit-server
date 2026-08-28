@@ -2566,13 +2566,13 @@ dependencies = [
 
 [[package]]
 name = "locks-core"
-version = "0.1.0"
-source = "git+https://github.com/pubky/locks.git?rev=b3a054fcdfc5e4bc21b6daa2f9e48138bc6375c4#b3a054fcdfc5e4bc21b6daa2f9e48138bc6375c4"
+version = "0.1.0-rc1"
+source = "git+https://github.com/pubky/locks.git?tag=v0.1.0-rc1#8502ef79c443c640976a2a901b80c5e717319149"
 dependencies = [
  "base32",
  "blake3",
  "mime",
- "pubky 0.10.0",
+ "pubky",
  "serde",
  "serde_json",
  "serde_json_canonicalizer",
@@ -2626,28 +2626,6 @@ name = "lru-slab"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
-
-[[package]]
-name = "mainline"
-version = "7.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6dfad9601b9117218868271c05403853593d4817e7abeab5c95e11eee16382bb"
-dependencies = [
- "crc",
- "document-features",
- "dyn-clone",
- "ed25519-dalek 3.0.0",
- "flume 0.12.0",
- "futures-lite",
- "getrandom 0.4.3",
- "lru 0.16.4",
- "serde",
- "serde_bencode",
- "serde_bytes",
- "sha1_smol",
- "thiserror 2.0.20",
- "tracing",
-]
 
 [[package]]
 name = "mainline"
@@ -3004,7 +2982,7 @@ dependencies = [
  "base64 0.22.1",
  "chacha20poly1305 0.10.1",
  "chrono",
- "pubky 0.11.0",
+ "pubky",
  "pubky-noise",
  "serde",
  "serde_json",
@@ -3028,7 +3006,7 @@ dependencies = [
  "crypto_secretbox",
  "hex",
  "paykit-lib",
- "pubky 0.11.0",
+ "pubky",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -3060,7 +3038,7 @@ dependencies = [
  "paykit-sdk",
  "postcard",
  "prometheus-client",
- "pubky 0.11.0",
+ "pubky",
  "qrcode",
  "rand 0.10.2",
  "serde",
@@ -3095,7 +3073,7 @@ dependencies = [
  "paykit-sdk",
  "paykit-server",
  "postcard",
- "pubky 0.11.0",
+ "pubky",
  "pubky-testnet",
  "serde",
  "serde_json",
@@ -3208,43 +3186,6 @@ checksum = "8b870d8c151b6f2fb93e84a13146138f05d02ed11c7e7c54f8826aaaf7c9f184"
 
 [[package]]
 name = "pkarr"
-version = "7.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0b8d06aecdd0cb2166c14af7abf72a8e2f125e04071bbed81b69c9b802c2a50a"
-dependencies = [
- "async-compat",
- "base32",
- "byteorder",
- "bytes",
- "cfg_aliases",
- "document-features",
- "dyn-clone",
- "ed25519-dalek 3.0.0",
- "futures-buffered",
- "futures-lite",
- "genawaiter",
- "getrandom 0.4.3",
- "heed",
- "log",
- "lru 0.16.4",
- "mainline 7.0.0",
- "ntimestamp",
- "page_size",
- "reqwest 0.13.4",
- "rustls",
- "rustls-webpki",
- "self_cell",
- "serde",
- "sha1_smol",
- "simple-dns 0.11.3",
- "thiserror 2.0.20",
- "tokio",
- "tracing",
- "url",
-]
-
-[[package]]
-name = "pkarr"
 version = "8.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3248274a604751c9a6749137cebfe0ddfc8b4b0e31c779515c4f984c937a4dac"
@@ -3264,7 +3205,7 @@ dependencies = [
  "heed",
  "log",
  "lru 0.18.2",
- "mainline 8.0.0",
+ "mainline",
  "ntimestamp",
  "page_size",
  "reqwest 0.13.4",
@@ -3273,7 +3214,7 @@ dependencies = [
  "self_cell",
  "serde",
  "sha1_smol",
- "simple-dns 0.12.0",
+ "simple-dns",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
@@ -3294,7 +3235,7 @@ dependencies = [
  "governor",
  "http",
  "httpdate",
- "pkarr 8.0.0",
+ "pkarr",
  "serde",
  "tokio",
  "toml 1.1.4+spec-1.1.0",
@@ -3508,37 +3449,6 @@ checksum = "33cb294fe86a74cbcf50d4445b37da762029549ebeea341421c7c70370f86cac"
 
 [[package]]
 name = "pubky"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "773c09666db817b1d2cf13866e053b790e95ec99c78385b86fa848d23bb36e70"
-dependencies = [
- "async-trait",
- "base64 0.22.1",
- "cookie",
- "eventsource-stream",
- "flume 0.11.1",
- "futures-lite",
- "futures-util",
- "httpdate",
- "log",
- "percent-encoding",
- "pkarr 7.0.0",
- "pubky-common 0.10.0",
- "reqwest 0.13.4",
- "rustls",
- "serde",
- "serde_json",
- "thiserror 2.0.20",
- "tokio",
- "tracing",
- "url",
- "wasm-bindgen-futures",
- "web-time",
- "webpki-roots 1.0.9",
-]
-
-[[package]]
-name = "pubky"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "15a7b191157d57d5095f1577c8064aeda85f96606957fcf4c0a6f4b675adb96d"
@@ -3553,8 +3463,8 @@ dependencies = [
  "httpdate",
  "log",
  "percent-encoding",
- "pkarr 8.0.0",
- "pubky-common 0.11.0",
+ "pkarr",
+ "pubky-common",
  "reqwest 0.13.4",
  "rustls",
  "serde",
@@ -3570,28 +3480,6 @@ dependencies = [
 
 [[package]]
 name = "pubky-common"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e772ea228e1d7be7590c7a15ce975605df30e257ddeb272be8d6c0c23c98f57c"
-dependencies = [
- "argon2",
- "base64 0.22.1",
- "blake3",
- "crypto_secretbox",
- "ed25519-dalek 3.0.0",
- "percent-encoding",
- "pkarr 7.0.0",
- "postcard",
- "pubky-timestamp",
- "rand 0.10.2",
- "serde",
- "serde_json",
- "thiserror 2.0.20",
- "url",
-]
-
-[[package]]
-name = "pubky-common"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ee26f4cf7d9d11a300180b351f1ea0efebf17ec66f0e615a8867f8aba47dc5f"
@@ -3602,7 +3490,7 @@ dependencies = [
  "crypto_secretbox",
  "ed25519-dalek 3.0.0",
  "percent-encoding",
- "pkarr 8.0.0",
+ "pkarr",
  "postcard",
  "pubky-timestamp",
  "rand 0.10.2",
@@ -3649,9 +3537,9 @@ dependencies = [
  "opentelemetry-prometheus",
  "opentelemetry_sdk",
  "percent-encoding",
- "pkarr 8.0.0",
+ "pkarr",
  "prometheus",
- "pubky-common 0.11.0",
+ "pubky-common",
  "pubky_test_utils",
  "rand 0.10.2",
  "reqwest 0.13.4",
@@ -3686,7 +3574,7 @@ dependencies = [
  "ed25519-dalek 3.0.0",
  "getrandom 0.3.4",
  "hex",
- "pubky 0.11.0",
+ "pubky",
  "rand 0.9.5",
  "sha2 0.11.0",
  "snow",
@@ -3701,11 +3589,11 @@ dependencies = [
  "anyhow",
  "clap",
  "http-relay",
- "mainline 8.0.0",
- "pkarr 8.0.0",
+ "mainline",
+ "pkarr",
  "pkarr-relay",
- "pubky 0.11.0",
- "pubky-common 0.11.0",
+ "pubky",
+ "pubky-common",
  "pubky-homeserver",
  "pubky_test_utils",
  "tempfile",
@@ -4700,15 +4588,6 @@ name = "simdutf8"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
-
-[[package]]
-name = "simple-dns"
-version = "0.11.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7a75cbde1bf934313596a004973e462f9a82caa814dcf1a5f507bdf51597eeb4"
-dependencies = [
- "bitflags",
-]
 
 [[package]]
 name = "simple-dns"

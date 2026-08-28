@@ -10,7 +10,7 @@
 
 **Publication note:** The original peer implementation plan was intentionally
 not included in the fresh public Locks history. The public cross-service
-contract is [Locks ADR 0020](https://github.com/pubky/locks/blob/b3a054fcdfc5e4bc21b6daa2f9e48138bc6375c4/docs/ADRs/0020-locks-paykit-v1-integration-boundary.md).
+contract is [Locks ADR 0020](https://github.com/pubky/locks/blob/v0.1.0-rc1/docs/ADRs/0020-locks-paykit-v1-integration-boundary.md).
 Public image builds use anonymous pinned Git contexts; sibling worktrees remain
 an explicit local-development override.
 
@@ -37,7 +37,7 @@ an explicit local-development override.
 - `paykit-server/src/bitkit_claim.rs` for exact `watch-only-account-v1` payload and receiver validation.
 - `paykit-server/src/real_setup.rs` for setup commit ordering and xpub validation.
 - `README.md` and `config/paykit-server.example.toml` for supported runtime/config behavior.
-- Public peer contract: [Locks ADR 0020](https://github.com/pubky/locks/blob/b3a054fcdfc5e4bc21b6daa2f9e48138bc6375c4/docs/ADRs/0020-locks-paykit-v1-integration-boundary.md).
+- Public peer contract: [Locks ADR 0020](https://github.com/pubky/locks/blob/v0.1.0-rc1/docs/ADRs/0020-locks-paykit-v1-integration-boundary.md).
 
 ### CONSTRAINTS OBSERVED IN CURRENT CODE
 
@@ -132,7 +132,7 @@ No implementation task may invent an answer to these gates.
 
 **Files:**
 - Create/Modify: `docs/plans/0004-local-locks-compose-integration.md`
-- Review: public [Locks ADR 0020](https://github.com/pubky/locks/blob/b3a054fcdfc5e4bc21b6daa2f9e48138bc6375c4/docs/ADRs/0020-locks-paykit-v1-integration-boundary.md)
+- Review: public [Locks ADR 0020](https://github.com/pubky/locks/blob/v0.1.0-rc1/docs/ADRs/0020-locks-paykit-v1-integration-boundary.md)
 
 **Steps:**
 1. Resolve all gates one question at a time.
@@ -274,7 +274,7 @@ cargo fmt --check
 docker buildx build --load \
   --build-context paykit-lib='https://github.com/pubky/paykit-rs.git#v0.1.0-rc48:paykit-lib' \
   --build-context paykit-sdk='https://github.com/pubky/paykit-rs.git#v0.1.0-rc48:paykit-sdk' \
-  --build-context locks='https://github.com/pubky/locks.git#b3a054fcdfc5e4bc21b6daa2f9e48138bc6375c4' \
+  --build-context locks='https://github.com/pubky/locks.git#v0.1.0-rc1' \
   -f Dockerfile.local -t paykit-server:local .
 git diff --check
 ```

@@ -5,13 +5,13 @@
 ## Build from public release sources
 
 From a fresh anonymous clone of this repository, build with the Paykit release
-and exact Locks revision selected in `Cargo.toml`:
+and exact Locks release selected in `Cargo.toml`:
 
 ```bash
 docker buildx build --load \
   --build-context paykit-lib='https://github.com/pubky/paykit-rs.git#v0.1.0-rc48:paykit-lib' \
   --build-context paykit-sdk='https://github.com/pubky/paykit-rs.git#v0.1.0-rc48:paykit-sdk' \
-  --build-context locks='https://github.com/pubky/locks.git#b3a054fcdfc5e4bc21b6daa2f9e48138bc6375c4' \
+  --build-context locks='https://github.com/pubky/locks.git#v0.1.0-rc1' \
   -f Dockerfile.local \
   -t paykit-server:local .
 ```

@@ -23,7 +23,7 @@ ed25519-dalek = "2"
 hkdf = "0.13"
 hmac = "0.13"
 humantime-serde = "1"
-locks-core = { git = "https://github.com/pubky/locks.git", rev = "b3a054fcdfc5e4bc21b6daa2f9e48138bc6375c4" }
+locks-core = { git = "https://github.com/pubky/locks.git", tag = "v0.1.0-rc1" }
 paykit-lib = { git = "https://github.com/pubky/paykit-rs.git", tag = "v0.1.0-rc48" }
 paykit-sdk = { git = "https://github.com/pubky/paykit-rs.git", tag = "v0.1.0-rc48" }
 pubky = "=0.11.0"
