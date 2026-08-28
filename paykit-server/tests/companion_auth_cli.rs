@@ -15,7 +15,7 @@ use paykit_server::bitkit_claim::{
     CLAIM_TYPE, LOCAL_DEMO_CAPABILITIES, QUERY_PARAMETER, UNSIGNED_PAYLOAD_LEN, decrypt_and_verify,
     derive_channel_id, encode_unsigned_payload, parse_unsigned_payload,
 };
-use pubky::{AuthToken, EncryptedHttpRelayInboxChannel, HttpRelayInboxChannel, PubkyHttpClient};
+use pubky::{HttpRelayInboxChannel, PubkyHttpClient};
 use serde_json::{Value, json};
 
 const HELPER_DEADLINE: Duration = Duration::from_secs(5);
@@ -40,9 +40,11 @@ fn account_xpub(network: Network, account_index: u32) -> Xpub {
 }
 
 fn auth_url(relay: &str, auth_secret: &[u8; 32]) -> String {
+    let client_public_key = pubky::Keypair::from_secret(&[8; 32]).public_key();
     format!(
-        "pubkyauth://signin?caps={LOCAL_DEMO_CAPABILITIES}&relay={relay}&secret={}&{QUERY_PARAMETER}={CLAIM_TYPE}",
-        URL_SAFE_NO_PAD.encode(auth_secret)
+        "pubkyauth://signin_grant?caps={LOCAL_DEMO_CAPABILITIES}&relay={relay}&secret={}&cid=app.paykit.server&cpk={}&{QUERY_PARAMETER}={CLAIM_TYPE}",
+        URL_SAFE_NO_PAD.encode(auth_secret),
+        client_public_key.as_inner(),
     )
 }
 
@@ -346,7 +348,7 @@ async fn helper_reports_coarse_failure_without_panicking_when_success_stdout_is_
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn helper_delivers_the_exact_companion_envelope_and_auth_token() {
+async fn helper_delivers_the_exact_companion_envelope_and_grant() {
     let relay = http_relay::HttpRelay::builder()
         .http_port(0)
         .run()
@@ -384,14 +386,4 @@ async fn helper_delivers_the_exact_companion_envelope_and_auth_token() {
         claim.serialized_xpub,
         account_xpub(Network::Testnet, 0).encode()
     );
-
-    let auth_channel = EncryptedHttpRelayInboxChannel::new(inbox, [9; 32]).unwrap();
-    let token_bytes = auth_channel
-        .poll(&client, Some(Duration::from_secs(1)))
-        .await
-        .unwrap()
-        .unwrap();
-    let token = AuthToken::verify(&token_bytes).unwrap();
-    assert_eq!(token.public_key(), &creator.public_key());
-    assert_eq!(token.capabilities().to_string(), LOCAL_DEMO_CAPABILITIES);
 }

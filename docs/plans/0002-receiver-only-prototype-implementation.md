@@ -10,8 +10,8 @@
 
 **Authoritative requirements:**
 - `docs/plans/0001-receiver-only-prototype-design.md`
-- [Locks ADR 0020](https://github.com/pubky/locks/blob/df5ea1b6d8dcdec3a9b5a915c3f57bca69d75c8a/docs/ADRs/0020-locks-paykit-v1-integration-boundary.md)
-- Matching [Locks Paykit HTTP client](https://github.com/pubky/locks/blob/df5ea1b6d8dcdec3a9b5a915c3f57bca69d75c8a/locks-server/src/paykit_http_client.rs)
+- [Locks ADR 0020](https://github.com/pubky/locks/blob/b3a054fcdfc5e4bc21b6daa2f9e48138bc6375c4/docs/ADRs/0020-locks-paykit-v1-integration-boundary.md)
+- Matching [Locks Paykit HTTP client](https://github.com/pubky/locks/blob/b3a054fcdfc5e4bc21b6daa2f9e48138bc6375c4/locks-server/src/paykit_http_client.rs)
 
 **Hard boundary:** Do not implement unsupported Paykit wire/Encrypted-Link behavior locally. Delegate it to the pinned `paykit-sdk` dependency.
 

@@ -25,6 +25,7 @@ trusted_public_key = "{KEY}"
 allowed_origins = ["https://app.example"]
 
 [paykit]
+client_id = "app.paykit.server"
 receiver_path = "paykit/server"
 network = "testnet"
 
@@ -53,6 +54,7 @@ trusted_public_key = "{KEY}"
 allowed_origins = ["http://localhost:8080"]
 
 [paykit]
+client_id = "app.paykit.server"
 receiver_path = "bitkit/server"
 receiver_path_priority = ["bitkit"]
 network = "testnet"
@@ -78,6 +80,11 @@ fn parses_exact_local_compose_config_contract() {
     assert_eq!(config.http.listen_addr, "0.0.0.0:3001");
     assert_eq!(config.setup.allowed_origins, vec!["http://localhost:8080"]);
     assert_eq!(config.paykit.network, PaykitNetwork::Testnet);
+    assert_eq!(config.paykit.client_id.as_str(), "app.paykit.server");
+    assert_eq!(
+        config.deployment_invariants().paykit_client_id.as_str(),
+        "app.paykit.server"
+    );
     assert_eq!(config.paykit.receiver_path.as_str(), "bitkit/server");
     assert_eq!(config.paykit.receiver_path_priority.len(), 1);
     assert_eq!(config.paykit.receiver_path_priority[0].as_str(), "bitkit");
@@ -129,6 +136,15 @@ fn rejects_unknown_toml_fields() {
     );
 
     assert!(Config::from_toml_and_environment(&config, environment()).is_err());
+}
+
+#[test]
+fn requires_a_nonempty_paykit_client_id() {
+    let missing = valid_toml().replace("client_id = \"app.paykit.server\"\n", "");
+    let empty = valid_toml().replace("client_id = \"app.paykit.server\"", "client_id = \"\"");
+
+    assert!(Config::from_toml_and_environment(&missing, environment()).is_err());
+    assert!(Config::from_toml_and_environment(&empty, environment()).is_err());
 }
 
 #[test]

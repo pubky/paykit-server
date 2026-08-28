@@ -42,6 +42,7 @@ trusted_public_key = "{KEY}"
 [setup]
 allowed_origins = ["https://app.example"]
 [paykit]
+client_id = "app.paykit.server"
 receiver_path = "paykit/server"
 network = "testnet"
 [bitcoin]
@@ -558,6 +559,22 @@ async fn deployment_initialization_is_restart_safe_and_rejects_mismatches() {
         mismatch.to_string(),
         "deployment metadata does not match configuration"
     );
+    sqlx::query("UPDATE deployment_metadata SET paykit_client_id = 'other.paykit.server'")
+        .execute(database.pool())
+        .await
+        .unwrap();
+    let client_mismatch = store
+        .initialize(config("testnet").deployment_invariants())
+        .await
+        .unwrap_err();
+    assert_eq!(
+        client_mismatch.to_string(),
+        "deployment metadata does not match configuration"
+    );
+    sqlx::query("UPDATE deployment_metadata SET paykit_client_id = 'app.paykit.server'")
+        .execute(database.pool())
+        .await
+        .unwrap();
     store
         .initialize(config("testnet").deployment_invariants())
         .await

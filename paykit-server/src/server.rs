@@ -37,8 +37,8 @@ use async_trait::async_trait;
 use axum::{Extension, Router};
 use locks_core::lock_policy::ContentLock;
 use paykit_lib::{PaykitReceiverMarker, get_paykit_receiver_marker, list_paykit_receiver_paths};
-use paykit_sdk::{PubkyPublicKey, PubkySessionBootstrap};
-use pubky::{Pubky, PubkySession, errors::RequestError};
+use paykit_sdk::{PaykitSdkError, PubkyPublicKey, PubkySessionBootstrap, PubkySessionProvider};
+use pubky::{Pubky, errors::RequestError};
 use sqlx::PgPool;
 use thiserror::Error;
 use tokio::{task::JoinSet, time::MissedTickBehavior};
@@ -140,7 +140,9 @@ impl Server {
         let invoices = InvoiceStore::new(&pool, crypto.clone());
         let outbox = OutboxStore::new(&pool, crypto.clone());
 
-        let bootstrap = PubkySessionBootstrap::with_pubky(pubky.clone());
+        let bootstrap =
+            PubkySessionBootstrap::with_pubky(pubky.clone(), config.paykit.client_id.as_str())
+                .map_err(|_| ServerBuildError::Pubky)?;
         let relay = Arc::new(PubkyCompanionRelay::new(pubky.client().clone()));
         let setup_completer = Arc::new(RealSetupCompleter::new(
             BitkitAuthStarter::new(bootstrap, &config.paykit.receiver_path),
@@ -174,6 +176,7 @@ impl Server {
         let session_validator = Arc::new(CreatorSessionValidator {
             creators: creators.clone(),
             pubky: pubky.clone(),
+            paykit: config.paykit.clone(),
         });
         let invoice_service = Arc::new(CreateInvoiceService::new(
             session_validator.clone(),
@@ -366,6 +369,7 @@ async fn creator_adapter(
         workers.creators.clone(),
         creator,
         workers.pubky.clone(),
+        &workers.paykit,
     );
     PaykitAdapter::new(storage, sessions, &workers.paykit).map_err(|_| AdapterBuildError::Permanent)
 }
@@ -632,40 +636,30 @@ fn map_electrum_error(_: ObserverError) -> ServerBuildError {
 struct CreatorSessionValidator {
     creators: CreatorStore,
     pubky: Pubky,
+    paykit: PaykitConfig,
 }
 
 #[async_trait]
 impl SessionValidator for CreatorSessionValidator {
     async fn validate(&self, creator: &CreatorPubky) -> Result<(), SessionValidationError> {
-        let credentials = self
-            .creators
-            .load(creator)
-            .await
-            .map_err(|error| match error {
-                crate::persistence::PersistenceError::CorruptOrMissing => {
-                    SessionValidationError::Invalid
-                }
-                _ => SessionValidationError::Unavailable,
-            })?;
-        let session = PubkySession::import_secret(
-            credentials.session_secret(),
-            Some(self.pubky.client().clone()),
+        CreatorSessionProvider::with_pubky(
+            self.creators.clone(),
+            creator.clone(),
+            self.pubky.clone(),
+            &self.paykit,
         )
+        .load_session_access()
         .await
-        .map_err(map_session_import_error)?;
-        let expected = PubkyPublicKey::from_raw_or_app_key(creator.to_string())
-            .map_err(|_| SessionValidationError::Invalid)?;
-        let actual = PubkyPublicKey::from_public_key(session.info().public_key());
-        if actual != expected {
-            return Err(SessionValidationError::Invalid);
-        }
-        Ok(())
+        .map(|_| ())
+        .map_err(map_session_validation_error)
     }
 }
 
-fn map_session_import_error(error: pubky::Error) -> SessionValidationError {
+fn map_session_validation_error(error: PaykitSdkError) -> SessionValidationError {
     match error {
-        pubky::Error::Authentication(_) | pubky::Error::Parse(_) => SessionValidationError::Invalid,
+        PaykitSdkError::Identity { .. }
+        | PaykitSdkError::Protocol { .. }
+        | PaykitSdkError::Policy { .. } => SessionValidationError::Invalid,
         _ => SessionValidationError::Unavailable,
     }
 }
@@ -769,10 +763,13 @@ mod tests {
     const CONFIG_MASTER_KEY: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE";
 
     #[test]
-    fn expired_persisted_session_is_invalid_not_dependency_unavailable() {
-        let error = pubky::Error::Authentication(pubky::errors::AuthError::RequestExpired);
+    fn invalid_grant_session_is_invalid_not_dependency_unavailable() {
+        let error = PaykitSdkError::Identity {
+            context: "expired grant".into(),
+            source: None,
+        };
         assert_eq!(
-            map_session_import_error(error),
+            map_session_validation_error(error),
             SessionValidationError::Invalid
         );
     }
@@ -819,6 +816,7 @@ trusted_public_key = "{CONFIG_KEY}"
 [setup]
 allowed_origins = ["https://app.example"]
 [paykit]
+client_id = "app.paykit.server"
 receiver_path = "paykit/server"
 network = "testnet"
 [bitcoin]

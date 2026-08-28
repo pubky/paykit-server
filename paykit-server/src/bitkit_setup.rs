@@ -59,11 +59,6 @@ impl BitkitAuthStarter {
             .map_err(|_| ClaimError::InvalidAuthRequest)?;
         let authorization_url =
             append_bitkit_claim(request.authorization_url(), &self.capabilities)?;
-        let request = self
-            .bootstrap
-            .resume_auth(&authorization_url, &self.capabilities)
-            .await
-            .map_err(|_| ClaimError::InvalidAuthRequest)?;
         let companion = parse_auth_request(&authorization_url, &self.capabilities)?;
         Ok(StartedBitkitAuth {
             authorization_url,

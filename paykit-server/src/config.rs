@@ -3,7 +3,7 @@ use std::{fmt, time::Duration};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use ed25519_dalek::VerifyingKey;
 use paykit_lib::PaykitReceiverPath;
-use pubky::PublicKey;
+use pubky::{ClientId, PublicKey};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -37,6 +37,8 @@ impl Config {
         let trusted_locks_key_fingerprint = trusted_public_key.fingerprint();
         let receiver_path = PaykitReceiverPath::new(raw.paykit.receiver_path)
             .map_err(|_| ConfigError::InvalidReceiverPath)?;
+        let client_id =
+            ClientId::new(&raw.paykit.client_id).map_err(|_| ConfigError::InvalidPaykitClientId)?;
         let receiver_path_priority = raw
             .paykit
             .receiver_path_priority
@@ -65,6 +67,7 @@ impl Config {
             locks: LocksConfig { trusted_public_key },
             setup: SetupConfig { allowed_origins },
             paykit: PaykitConfig {
+                client_id: client_id.clone(),
                 receiver_path: receiver_path.clone(),
                 receiver_path_priority,
                 network: PaykitNetwork::parse(&raw.paykit.network)?,
@@ -83,6 +86,7 @@ impl Config {
             master_key,
             deployment_invariants: DeploymentInvariants {
                 bitcoin_network,
+                paykit_client_id: client_id,
                 receiver_path,
                 trusted_locks_key_fingerprint,
             },
@@ -180,6 +184,7 @@ pub struct ConfigEnvironment {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeploymentInvariants {
     pub bitcoin_network: BitcoinNetwork,
+    pub paykit_client_id: ClientId,
     pub receiver_path: PaykitReceiverPath,
     pub trusted_locks_key_fingerprint: TrustedLocksKeyFingerprint,
 }
@@ -302,6 +307,7 @@ pub struct SetupConfig {
 
 #[derive(Clone, Debug)]
 pub struct PaykitConfig {
+    pub client_id: ClientId,
     pub receiver_path: PaykitReceiverPath,
     /// Ordered first-segment preference for discovered reader receiver paths.
     pub receiver_path_priority: Vec<ReceiverPathPriority>,
@@ -430,6 +436,8 @@ pub enum ConfigError {
     InvalidOrigin,
     #[error("paykit.receiver_path must be a valid Paykit receiver path")]
     InvalidReceiverPath,
+    #[error("paykit.client_id must be a valid non-empty Pubky client ID")]
+    InvalidPaykitClientId,
     #[error("paykit.network must be mainnet or testnet")]
     InvalidPaykitNetwork,
     #[error("paykit.receiver_path_priority entries must be canonical Paykit receiver app segments")]
@@ -531,6 +539,7 @@ struct RawSetupConfig {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawPaykitConfig {
+    client_id: String,
     receiver_path: String,
     #[serde(default = "default_receiver_path_priority")]
     receiver_path_priority: Vec<String>,

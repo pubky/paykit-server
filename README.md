@@ -86,6 +86,7 @@ Startup holds a session advisory lock while applying the single schema baseline.
 Immutable deployment values are:
 
 - Bitcoin network;
+- Paykit Pubky client ID;
 - Paykit receiver path;
 - trusted Locks public-key fingerprint.
 

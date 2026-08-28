@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 /// Application services and explicit side-effect ports.
 pub mod application;
 /// Bitcoin output observation values and injected transport boundary.
