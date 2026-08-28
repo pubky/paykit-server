@@ -78,6 +78,9 @@ pub fn parse_auth_request(
     expected_capabilities: &str,
 ) -> Result<AuthRequest, ClaimError> {
     let url = Url::parse(value).map_err(|_| ClaimError::InvalidAuthRequest)?;
+    if url.scheme() != "pubkyauth" {
+        return Err(ClaimError::InvalidAuthRequest);
+    }
     let auth = parse_pubky_auth_url(value).map_err(|_| ClaimError::InvalidAuthRequest)?;
     let claim_type = unique_query(&url, QUERY_PARAMETER)?;
     if claim_type != CLAIM_TYPE
@@ -245,6 +248,14 @@ mod tests {
             derive_channel_id(&secret),
             URL_SAFE_NO_PAD
                 .encode(blake3::hash(&[CLAIM_TYPE.as_bytes(), b"|", &secret].concat()).as_bytes())
+        );
+    }
+    #[test]
+    fn rejects_legacy_pubkyring_scheme() {
+        let legacy = auth(&[7; 32]).replacen("pubkyauth://", "pubkyring://", 1);
+        assert_eq!(
+            parse_auth_request(&legacy, LOCAL_DEMO_CAPABILITIES),
+            Err(ClaimError::InvalidAuthRequest)
         );
     }
     #[test]
