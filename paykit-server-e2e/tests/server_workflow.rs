@@ -197,13 +197,22 @@ async fn create_creator(
         counter_seed,
     } = spec;
     let receiver_path = PaykitReceiverPath::new("paykit/server").unwrap();
+    let keypair = Keypair::random();
     let account = bootstrap
         .sign_up(
-            &PubkyLocalSecretKey::new(Keypair::random().secret_key()),
+            &PubkyLocalSecretKey::new(keypair.secret_key()),
             ReceiverNoiseSecretKey::random(),
             homeserver,
             None,
             &PaykitSdkConfig::new(receiver_path.clone()).required_session_capabilities(),
+        )
+        .await
+        .unwrap();
+    let lock_writer = bootstrap
+        .sign_in(
+            &PubkyLocalSecretKey::new(keypair.secret_key()),
+            ReceiverNoiseSecretKey::random(),
+            "/pub/locks.app/:rw",
         )
         .await
         .unwrap();
@@ -214,7 +223,7 @@ async fn create_creator(
         derive_bip84_p2wpkh_address(&xpub, account_index, &BitcoinNetwork::Testnet, 0).unwrap();
     let lock = content_lock(&creator, amount_sats);
     let lock_path = lock.content_lock_path().unwrap().to_string();
-    account
+    lock_writer
         .access
         .session
         .storage()
