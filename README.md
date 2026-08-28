@@ -59,7 +59,7 @@ docker compose exec creator-demo npm --prefix examples/js-sdk run authenticate-p
 
 The iframe continues polling `POST /setup/{flow_id}/complete`. It does not receive, store, post, or log an xpub, and there is no manual claim route. Completion posts only `{ type: "paykit-setup-callback", state }` or the same callback with a coarse error to the exact caller origin.
 
-`paykit-companion-auth` accepts one closed version-1 JSON object on stdin with `auth_url`, a base64url 32-byte `creator_secret`, `account_xpub`, and `account_index`. It rejects missing or unknown fields, unsupported versions, and grant URLs whose client ID is not the trusted `app.paykit.server`. Success stdout is exactly `{"version":1,"status":"approved"}\n`; failures remain coarse and do not echo input.
+`paykit-companion-auth` accepts one closed version-1 JSON object on stdin with `auth_url`, a base64url 32-byte `creator_secret`, `account_xpub`, and `account_index`. It rejects missing or unknown fields and unsupported versions. Success stdout is exactly `{"version":1,"status":"approved"}\n`; failures remain coarse and do not echo input.
 
 The composed PostgreSQL workflow is tested with two independent Creators across restart. Live adapter evidence covers a separate local Pubky relay/homeserver process and one public mainnet Fulcrum endpoint; see [`docs/live-adapter-smoke.md`](docs/live-adapter-smoke.md). Those checks bound interoperability to the recorded versions and environments rather than claiming compatibility with every provider.
 
@@ -86,7 +86,6 @@ Startup holds a session advisory lock while applying the single schema baseline.
 Immutable deployment values are:
 
 - Bitcoin network;
-- Paykit Pubky client ID;
 - Paykit receiver path;
 - trusted Locks public-key fingerprint.
 

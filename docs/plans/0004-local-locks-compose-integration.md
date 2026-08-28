@@ -10,7 +10,7 @@
 
 **Publication note:** The original peer implementation plan was intentionally
 not included in the fresh public Locks history. The public cross-service
-contract is [Locks ADR 0020](https://github.com/pubky/locks/blob/v0.1.0-rc1/docs/ADRs/0020-locks-paykit-v1-integration-boundary.md).
+contract is [Locks ADR 0020](https://github.com/pubky/locks/blob/df5ea1b6d8dcdec3a9b5a915c3f57bca69d75c8a/docs/ADRs/0020-locks-paykit-v1-integration-boundary.md).
 Public image builds use anonymous pinned Git contexts; sibling worktrees remain
 an explicit local-development override.
 
@@ -32,12 +32,12 @@ an explicit local-development override.
 
 ### AUTHORITATIVE SOURCE
 
-- [Paykit companion-claim specification](https://github.com/pubky/paykit-rs/blob/v0.1.0-rc48/specs/pubky-auth-companion-claims.md).
-- [Paykit SDK companion-claim implementation](https://github.com/pubky/paykit-rs/blob/v0.1.0-rc48/paykit-sdk/src/pubky_session/companion_claim.rs).
+- [Paykit companion-claim specification](https://github.com/pubky/paykit-rs/blob/v0.1.0-rc47/specs/pubky-auth-companion-claims.md).
+- [Paykit SDK companion-claim implementation](https://github.com/pubky/paykit-rs/blob/v0.1.0-rc47/paykit-sdk/src/pubky_session/companion_claim.rs).
 - `paykit-server/src/bitkit_claim.rs` for exact `watch-only-account-v1` payload and receiver validation.
 - `paykit-server/src/real_setup.rs` for setup commit ordering and xpub validation.
 - `README.md` and `config/paykit-server.example.toml` for supported runtime/config behavior.
-- Public peer contract: [Locks ADR 0020](https://github.com/pubky/locks/blob/v0.1.0-rc1/docs/ADRs/0020-locks-paykit-v1-integration-boundary.md).
+- Public peer contract: [Locks ADR 0020](https://github.com/pubky/locks/blob/df5ea1b6d8dcdec3a9b5a915c3f57bca69d75c8a/docs/ADRs/0020-locks-paykit-v1-integration-boundary.md).
 
 ### CONSTRAINTS OBSERVED IN CURRENT CODE
 
@@ -132,7 +132,7 @@ No implementation task may invent an answer to these gates.
 
 **Files:**
 - Create/Modify: `docs/plans/0004-local-locks-compose-integration.md`
-- Review: public [Locks ADR 0020](https://github.com/pubky/locks/blob/v0.1.0-rc1/docs/ADRs/0020-locks-paykit-v1-integration-boundary.md)
+- Review: public [Locks ADR 0020](https://github.com/pubky/locks/blob/df5ea1b6d8dcdec3a9b5a915c3f57bca69d75c8a/docs/ADRs/0020-locks-paykit-v1-integration-boundary.md)
 
 **Steps:**
 1. Resolve all gates one question at a time.
@@ -272,9 +272,9 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --check
 docker buildx build --load \
-  --build-context paykit-lib='https://github.com/pubky/paykit-rs.git#v0.1.0-rc48:paykit-lib' \
-  --build-context paykit-sdk='https://github.com/pubky/paykit-rs.git#v0.1.0-rc48:paykit-sdk' \
-  --build-context locks='https://github.com/pubky/locks.git#v0.1.0-rc1' \
+  --build-context paykit-lib='https://github.com/pubky/paykit-rs.git#v0.1.0-rc47:paykit-lib' \
+  --build-context paykit-sdk='https://github.com/pubky/paykit-rs.git#v0.1.0-rc47:paykit-sdk' \
+  --build-context locks='https://github.com/pubky/locks.git#df5ea1b6d8dcdec3a9b5a915c3f57bca69d75c8a' \
   -f Dockerfile.local -t paykit-server:local .
 git diff --check
 ```

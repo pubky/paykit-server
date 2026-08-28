@@ -91,7 +91,6 @@ async fn create_creator(
         )
         .await
         .unwrap();
-    let session_secret = account.export_session_secret().await.unwrap().into_inner();
     let creator = parse_creator(&format!("pubky{}", account.public_key)).unwrap();
     let state = StorageState {
         next_outbound_private_message_id: counter_seed,
@@ -101,7 +100,7 @@ async fn create_creator(
         .create(
             &CreatorCredentials::new(
                 creator.clone(),
-                session_secret,
+                account.access.session.export_secret(),
                 account.access.receiver_noise_secret_key.clone(),
                 format!("test-xpub-{counter_seed}"),
                 0,
@@ -200,7 +199,6 @@ trusted_public_key = "{TRUSTED_KEY}"
 allowed_origins = ["https://app.example"]
 
 [paykit]
-client_id = "app.paykit.server"
 receiver_path = "paykit/server"
 network = "testnet"
 
@@ -237,7 +235,7 @@ async fn production_server_workers_process_two_creators_without_sdk_state_fallba
     run_migrations(database.pool()).await.unwrap();
     let testnet = build_pubky_testnet().await;
     let pubky = testnet.sdk().unwrap();
-    let bootstrap = PubkySessionBootstrap::with_pubky(pubky.clone(), "app.paykit.server").unwrap();
+    let bootstrap = PubkySessionBootstrap::with_pubky(pubky.clone());
     let homeserver = PubkyPublicKey::from_public_key(&testnet.homeserver_app().public_key());
     let crypto = Arc::new(Crypto::from_master_key(&[1; 32]).unwrap());
     let creators = CreatorStore::new(database.pool(), crypto.clone());

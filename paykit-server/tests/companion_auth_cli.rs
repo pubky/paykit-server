@@ -15,7 +15,7 @@ use paykit_server::bitkit_claim::{
     CLAIM_TYPE, LOCAL_DEMO_CAPABILITIES, QUERY_PARAMETER, UNSIGNED_PAYLOAD_LEN, decrypt_and_verify,
     derive_channel_id, encode_unsigned_payload, parse_unsigned_payload,
 };
-use pubky::{HttpRelayInboxChannel, PubkyHttpClient};
+use pubky::{AuthToken, EncryptedHttpRelayInboxChannel, HttpRelayInboxChannel, PubkyHttpClient};
 use serde_json::{Value, json};
 
 const HELPER_DEADLINE: Duration = Duration::from_secs(5);
@@ -40,11 +40,9 @@ fn account_xpub(network: Network, account_index: u32) -> Xpub {
 }
 
 fn auth_url(relay: &str, auth_secret: &[u8; 32]) -> String {
-    let client_public_key = pubky::Keypair::from_secret(&[8; 32]).public_key();
     format!(
-        "pubkyauth://signin_grant?caps={LOCAL_DEMO_CAPABILITIES}&relay={relay}&secret={}&cid=app.paykit.server&cpk={}&{QUERY_PARAMETER}={CLAIM_TYPE}",
-        URL_SAFE_NO_PAD.encode(auth_secret),
-        client_public_key.as_inner(),
+        "pubkyauth://signin?caps={LOCAL_DEMO_CAPABILITIES}&relay={relay}&secret={}&{QUERY_PARAMETER}={CLAIM_TYPE}",
+        URL_SAFE_NO_PAD.encode(auth_secret)
     )
 }
 
@@ -227,32 +225,6 @@ fn helper_rejects_account_indexes_outside_the_bip32_hardened_index_range() {
 }
 
 #[test]
-fn helper_rejects_another_client_id_before_relay_delivery() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.set_nonblocking(true).unwrap();
-    let relay = format!("http://{}/inbox", listener.local_addr().unwrap());
-    let mut input = valid_input(&relay);
-    let substituted = input["auth_url"]
-        .as_str()
-        .unwrap()
-        .replace("cid=app.paykit.server", "cid=other.paykit.server");
-    input["auth_url"] = json!(substituted);
-
-    let output = run_helper(&input);
-
-    assert!(!output.status.success());
-    assert!(output.stdout.is_empty());
-    assert_eq!(
-        String::from_utf8(output.stderr).unwrap(),
-        "companion authentication failed\n"
-    );
-    assert!(matches!(
-        listener.accept(),
-        Err(error) if error.kind() == io::ErrorKind::WouldBlock
-    ));
-}
-
-#[test]
 fn helper_failure_is_coarse_and_redacts_every_sensitive_input() {
     let input = valid_input("http://127.0.0.1:1/inbox/private-channel");
 
@@ -374,7 +346,7 @@ async fn helper_reports_coarse_failure_without_panicking_when_success_stdout_is_
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn helper_delivers_the_exact_companion_envelope_and_grant() {
+async fn helper_delivers_the_exact_companion_envelope_and_auth_token() {
     let relay = http_relay::HttpRelay::builder()
         .http_port(0)
         .run()
@@ -412,4 +384,14 @@ async fn helper_delivers_the_exact_companion_envelope_and_grant() {
         claim.serialized_xpub,
         account_xpub(Network::Testnet, 0).encode()
     );
+
+    let auth_channel = EncryptedHttpRelayInboxChannel::new(inbox, [9; 32]).unwrap();
+    let token_bytes = auth_channel
+        .poll(&client, Some(Duration::from_secs(1)))
+        .await
+        .unwrap()
+        .unwrap();
+    let token = AuthToken::verify(&token_bytes).unwrap();
+    assert_eq!(token.public_key(), &creator.public_key());
+    assert_eq!(token.capabilities().to_string(), LOCAL_DEMO_CAPABILITIES);
 }

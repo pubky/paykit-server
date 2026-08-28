@@ -4,7 +4,6 @@
 CREATE TABLE deployment_metadata (
     id SMALLINT PRIMARY KEY DEFAULT 1,
     bitcoin_network TEXT NOT NULL,
-    paykit_client_id TEXT NOT NULL,
     receiver_path TEXT NOT NULL,
     locks_key_fingerprint BYTEA NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),

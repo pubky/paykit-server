@@ -5,13 +5,13 @@
 ## Build from public release sources
 
 From a fresh anonymous clone of this repository, build with the Paykit release
-and exact Locks release selected in `Cargo.toml`:
+and exact Locks revision selected in `Cargo.toml`:
 
 ```bash
 docker buildx build --load \
-  --build-context paykit-lib='https://github.com/pubky/paykit-rs.git#v0.1.0-rc48:paykit-lib' \
-  --build-context paykit-sdk='https://github.com/pubky/paykit-rs.git#v0.1.0-rc48:paykit-sdk' \
-  --build-context locks='https://github.com/pubky/locks.git#v0.1.0-rc1' \
+  --build-context paykit-lib='https://github.com/pubky/paykit-rs.git#v0.1.0-rc47:paykit-lib' \
+  --build-context paykit-sdk='https://github.com/pubky/paykit-rs.git#v0.1.0-rc47:paykit-sdk' \
+  --build-context locks='https://github.com/pubky/locks.git#df5ea1b6d8dcdec3a9b5a915c3f57bca69d75c8a' \
   -f Dockerfile.local \
   -t paykit-server:local .
 ```
@@ -67,7 +67,6 @@ trusted_public_key = "<ACTUAL_CANONICAL_LOCK_SERVER_PUBKY>"
 allowed_origins = ["http://localhost:8080"]
 
 [paykit]
-client_id = "app.paykit.server"
 receiver_path = "bitkit/server"
 receiver_path_priority = ["bitkit"]
 network = "testnet"

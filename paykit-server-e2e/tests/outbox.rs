@@ -554,8 +554,7 @@ async fn public_sdk_payment_request_retry_persists_distinct_ids_and_only_active_
     let testnet = build_pubky_testnet().await;
     let crypto = Arc::new(Crypto::from_master_key(&[11; 32]).unwrap());
     let homeserver = PubkyPublicKey::from_public_key(&testnet.homeserver_app().public_key());
-    let bootstrap =
-        PubkySessionBootstrap::with_pubky(testnet.sdk().unwrap(), "app.paykit.server").unwrap();
+    let bootstrap = PubkySessionBootstrap::with_pubky(testnet.sdk().unwrap());
 
     let creator_receiver_path = PaykitReceiverPath::new("bitkit/server").unwrap();
     let creator_keypair = Keypair::random();
@@ -569,17 +568,12 @@ async fn public_sdk_payment_request_retry_persists_distinct_ids_and_only_active_
         )
         .await
         .unwrap();
-    let creator_session_secret = creator_bootstrap
-        .export_session_secret()
-        .await
-        .unwrap()
-        .into_inner();
     let creator = parse_creator(&format!("pubky{}", creator_bootstrap.public_key)).unwrap();
     let creator_row = CreatorStore::new(database.pool(), crypto.clone())
         .create(
             &CreatorCredentials::new(
                 creator.clone(),
-                creator_session_secret,
+                creator_bootstrap.access.session.export_secret(),
                 creator_bootstrap.access.receiver_noise_secret_key.clone(),
                 "unused-test-xpub".into(),
                 0,
