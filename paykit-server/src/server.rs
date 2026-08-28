@@ -657,9 +657,18 @@ impl SessionValidator for CreatorSessionValidator {
 
 fn map_session_validation_error(error: PaykitSdkError) -> SessionValidationError {
     match error {
-        PaykitSdkError::Identity { .. }
-        | PaykitSdkError::Protocol { .. }
-        | PaykitSdkError::Policy { .. } => SessionValidationError::Invalid,
+        PaykitSdkError::Identity { source, .. } => match source {
+            None => SessionValidationError::Invalid,
+            Some(source) => match source.downcast_ref::<pubky::Error>() {
+                Some(pubky::Error::Authentication(_) | pubky::Error::Parse(_)) => {
+                    SessionValidationError::Invalid
+                }
+                Some(_) | None => SessionValidationError::Unavailable,
+            },
+        },
+        PaykitSdkError::Protocol { .. } | PaykitSdkError::Policy { .. } => {
+            SessionValidationError::Invalid
+        }
         _ => SessionValidationError::Unavailable,
     }
 }
@@ -772,6 +781,41 @@ mod tests {
             map_session_validation_error(error),
             SessionValidationError::Invalid
         );
+    }
+
+    #[test]
+    fn transient_pubky_server_error_is_unavailable_not_invalid() {
+        let error = PaykitSdkError::Identity {
+            context: "restore Pubky grant session".into(),
+            source: Some(
+                pubky::Error::Request(pubky::errors::RequestError::Server {
+                    status: pubky::StatusCode::SERVICE_UNAVAILABLE,
+                    message: "temporary outage".into(),
+                })
+                .into(),
+            ),
+        };
+
+        assert_eq!(
+            map_session_validation_error(error),
+            SessionValidationError::Unavailable
+        );
+    }
+
+    #[test]
+    fn definitive_pubky_auth_and_parse_errors_are_invalid() {
+        for error in [
+            pubky::Error::Authentication(pubky::errors::AuthError::RequestExpired),
+            pubky::Error::Parse(url::ParseError::EmptyHost),
+        ] {
+            assert_eq!(
+                map_session_validation_error(PaykitSdkError::Identity {
+                    context: "restore Pubky grant session".into(),
+                    source: Some(error.into()),
+                }),
+                SessionValidationError::Invalid
+            );
+        }
     }
 
     #[test]
