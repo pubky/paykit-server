@@ -22,7 +22,9 @@ use bitcoin::{
     secp256k1::Secp256k1,
 };
 use paykit_server::{
-    config::BitcoinNetwork,
+    bitkit_claim::LOCAL_DEMO_CAPABILITIES,
+    bitkit_setup::append_bitkit_claim,
+    config::{BitcoinNetwork, PAYKIT_CLIENT_ID},
     http::setup::setup_router,
     real_setup::validate_xpub,
     setup::{
@@ -990,9 +992,15 @@ async fn setup_shell_renders_a_scannable_qr_for_a_full_length_auth_url() {
     // Real Bitkit setup URLs carry two capability paths and the companion claim, so they are far
     // longer than the mock ones elsewhere in this file. High error correction shrinks QR capacity,
     // so assert a realistic URL still fits instead of panicking at request time.
-    let authorization_url = "pubkyauth://signin?caps=/pub/paykit/v0/bitkit/server/:rw,/pub/paykit/v0/private/bitkit/server/:rw&relay=https://httprelay.pubky.app/inbox&secret=3bmNMhsg_OZDWvpmfLU2vWAHXm8xaGNe0aI7xO5AVhM&x-bitkit-claim=watch-only-account-v1";
+    let auth_request = paykit_sdk::PubkySessionBootstrap::new(PAYKIT_CLIENT_ID)
+        .unwrap()
+        .start_sign_in_auth(LOCAL_DEMO_CAPABILITIES)
+        .await
+        .unwrap();
+    let authorization_url =
+        append_bitkit_claim(auth_request.authorization_url(), LOCAL_DEMO_CAPABILITIES).unwrap();
     let response = request(
-        setup_router(service_with_authorization_url(authorization_url)),
+        setup_router(service_with_authorization_url(&authorization_url)),
         Method::GET,
         "/setup?return_to=https://app.example&state=state-1",
     )

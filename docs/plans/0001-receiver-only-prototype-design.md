@@ -20,8 +20,8 @@ Only **EXPLICIT**, **AUTHORITATIVE SOURCE**, and **CONSTRAINT** entries may driv
 
 The user designated these as authoritative for Locks Server ↔ Paykit Server HTTP behavior:
 
-- [Locks ADR 0020](https://github.com/pubky/locks/blob/df5ea1b6d8dcdec3a9b5a915c3f57bca69d75c8a/docs/ADRs/0020-locks-paykit-v1-integration-boundary.md)
-- matching [Locks Paykit HTTP client](https://github.com/pubky/locks/blob/df5ea1b6d8dcdec3a9b5a915c3f57bca69d75c8a/locks-server/src/paykit_http_client.rs)
+- [Locks ADR 0020](https://github.com/pubky/locks/blob/v0.1.0-rc1/docs/ADRs/0020-locks-paykit-v1-integration-boundary.md)
+- matching [Locks Paykit HTTP client](https://github.com/pubky/locks/blob/v0.1.0-rc1/locks-server/src/paykit_http_client.rs)
 
 ### Product flow
 
@@ -40,8 +40,8 @@ Current `../paykit-rs` code/specifications define dependency behavior. They are 
 **EXPLICIT**:
 
 - Canonical Locks creator, reader, bundle, addressed lock-resource identifiers,
-  and Paykit-payment policy validation use `locks-core` pinned at public revision
-  `df5ea1b6d8dcdec3a9b5a915c3f57bca69d75c8a`; Paykit Server does not duplicate
+  and Paykit-payment policy validation use `locks-core` pinned at public release
+  `v0.1.0-rc1`; Paykit Server does not duplicate
   their parsing, canonicalization, or policy grammar.
 
 ## Actors and key boundaries

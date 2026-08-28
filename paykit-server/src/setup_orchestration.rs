@@ -141,9 +141,11 @@ mod tests {
         }
     }
     fn request() -> AuthRequest {
+        let client_public_key = pubky::Keypair::from_secret(&[7; 32]).public_key();
         crate::bitkit_claim::parse_auth_request(&format!(
-            "pubkyauth://signin?caps={}&relay=https://relay.example/inbox&secret=AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM&x-bitkit-claim=watch-only-account-v1",
-            crate::bitkit_claim::LOCAL_DEMO_CAPABILITIES
+            "pubkyauth://signin_grant?caps={}&relay=https://relay.example/inbox&secret=AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM&cid=app.paykit.server&cpk={}&x-bitkit-claim=watch-only-account-v1",
+            crate::bitkit_claim::LOCAL_DEMO_CAPABILITIES,
+            client_public_key.as_inner(),
         ), crate::bitkit_claim::LOCAL_DEMO_CAPABILITIES)
         .unwrap()
     }

@@ -13,9 +13,9 @@ use paykit_lib::{
 use paykit_sdk::{
     LinkedPeerState, OutboundPrivateMessageStatus, PaykitSdk, PaykitSdkConfig, PaykitSdkError,
     PaymentAdapter, PrivateReceivingDetail, PubkyPublicKey, PubkySessionAccess,
-    PubkySessionProvider, StorageAdapter,
+    PubkySessionBootstrap, PubkySessionProvider, StorageAdapter,
 };
-use pubky::{Pubky, PubkySession};
+use pubky::Pubky;
 use tokio::sync::Mutex as TokioMutex;
 use uuid::Uuid;
 
@@ -35,23 +35,37 @@ pub struct CreatorSessionProvider {
     creators: CreatorStore,
     creator: CreatorPubky,
     public_client: Pubky,
+    client_id: String,
+    required_capabilities: String,
 }
 
 impl CreatorSessionProvider {
-    pub fn new(creators: CreatorStore, creator: CreatorPubky) -> Result<Self, PaykitSdkError> {
+    pub fn new(
+        creators: CreatorStore,
+        creator: CreatorPubky,
+        config: &PaykitConfig,
+    ) -> Result<Self, PaykitSdkError> {
         let public_client = Pubky::new().map_err(|error| PaykitSdkError::Identity {
             context: "could not construct Pubky client".into(),
             source: Some(anyhow::anyhow!(error.to_string())),
         })?;
-        Ok(Self::with_pubky(creators, creator, public_client))
+        Ok(Self::with_pubky(creators, creator, public_client, config))
     }
 
     /// Uses the process-selected Pubky network for this Creator's restored session.
-    pub fn with_pubky(creators: CreatorStore, creator: CreatorPubky, public_client: Pubky) -> Self {
+    pub fn with_pubky(
+        creators: CreatorStore,
+        creator: CreatorPubky,
+        public_client: Pubky,
+        config: &PaykitConfig,
+    ) -> Self {
         Self {
             creators,
             creator,
             public_client,
+            client_id: config.client_id.to_string(),
+            required_capabilities: PaykitSdkConfig::new(config.receiver_path.clone())
+                .required_session_capabilities(),
         }
     }
 }
@@ -59,29 +73,33 @@ impl CreatorSessionProvider {
 #[async_trait]
 impl PubkySessionProvider for CreatorSessionProvider {
     async fn load_session_access(&self) -> paykit_sdk::Result<Option<PubkySessionAccess>> {
-        let credentials =
-            self.creators
-                .load(&self.creator)
-                .await
-                .map_err(|_| PaykitSdkError::Storage {
+        let credentials = self
+            .creators
+            .load(&self.creator)
+            .await
+            .map_err(|error| match error {
+                crate::persistence::PersistenceError::CorruptOrMissing => {
+                    PaykitSdkError::Identity {
+                        context: "creator credentials are missing or invalid".into(),
+                        source: None,
+                    }
+                }
+                _ => PaykitSdkError::Storage {
                     context: "creator credentials are unavailable".into(),
                     source: None,
-                })?;
-        let session = PubkySession::import_secret(
-            credentials.session_secret(),
-            Some(self.public_client.client().clone()),
-        )
-        .await
-        .map_err(|error| PaykitSdkError::Identity {
-            context: "creator Pubky session is unavailable".into(),
-            source: Some(anyhow::anyhow!(error.to_string())),
-        })?;
-        let access = PubkySessionAccess {
-            session,
-            outbox_client: self.public_client.clone(),
-            local_secret_key: None,
-            receiver_noise_secret_key: credentials.receiver_noise_secret().clone(),
-        };
+                },
+            })?;
+        let bootstrap =
+            PubkySessionBootstrap::with_pubky(self.public_client.clone(), &self.client_id)?;
+        let access = bootstrap
+            .import_session(
+                credentials.session_secret(),
+                None,
+                credentials.receiver_noise_secret().clone(),
+                &self.required_capabilities,
+            )
+            .await?
+            .access;
         bind_session_to_creator(access.public_key()?, &self.creator)?;
         access.validate()?;
         Ok(Some(access))

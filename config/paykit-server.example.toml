@@ -16,6 +16,9 @@ listen_addr = "127.0.0.1:8080"
 allowed_origins = ["https://app.example.invalid"]
 
 [paykit]
+# Stable grant owner checked by both Paykit Server and its companion helper.
+# Other values are rejected.
+client_id = "app.paykit.server"
 receiver_path = "bitkit/server"
 receiver_path_priority = ["bitkit"]
 # "testnet" targets the pinned Pubky client's fixed localhost testnet ports.

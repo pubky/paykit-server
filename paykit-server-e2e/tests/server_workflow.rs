@@ -197,9 +197,10 @@ async fn create_creator(
         counter_seed,
     } = spec;
     let receiver_path = PaykitReceiverPath::new("paykit/server").unwrap();
+    let keypair = Keypair::random();
     let account = bootstrap
         .sign_up(
-            &PubkyLocalSecretKey::new(Keypair::random().secret_key()),
+            &PubkyLocalSecretKey::new(keypair.secret_key()),
             ReceiverNoiseSecretKey::random(),
             homeserver,
             None,
@@ -207,13 +208,22 @@ async fn create_creator(
         )
         .await
         .unwrap();
+    let lock_writer = bootstrap
+        .sign_in(
+            &PubkyLocalSecretKey::new(keypair.secret_key()),
+            ReceiverNoiseSecretKey::random(),
+            "/pub/locks.app/:rw",
+        )
+        .await
+        .unwrap();
+    let session_secret = account.export_session_secret().await.unwrap().into_inner();
     let creator = parse_creator(&format!("pubky{}", account.public_key)).unwrap();
     let xpub = account_xpub(seed, account_index);
     let address =
         derive_bip84_p2wpkh_address(&xpub, account_index, &BitcoinNetwork::Testnet, 0).unwrap();
     let lock = content_lock(&creator, amount_sats);
     let lock_path = lock.content_lock_path().unwrap().to_string();
-    account
+    lock_writer
         .access
         .session
         .storage()
@@ -229,7 +239,7 @@ async fn create_creator(
         .create(
             &CreatorCredentials::new(
                 creator.clone(),
-                account.access.session.export_secret(),
+                session_secret,
                 account.access.receiver_noise_secret_key.clone(),
                 xpub.clone(),
                 account_index,
@@ -355,6 +365,7 @@ trusted_public_key = "{trusted_key}"
 [setup]
 allowed_origins = ["https://app.example"]
 [paykit]
+client_id = "app.paykit.server"
 receiver_path = "paykit/server"
 network = "testnet"
 [bitcoin]
@@ -793,7 +804,7 @@ async fn composed_two_creator_receiver_workflow_survives_restart() {
     let first_pool = initialize_database(&first_config).await.unwrap();
     let testnet = build_pubky_testnet().await;
     let pubky = testnet.sdk().unwrap();
-    let bootstrap = PubkySessionBootstrap::with_pubky(pubky.clone());
+    let bootstrap = PubkySessionBootstrap::with_pubky(pubky.clone(), "app.paykit.server").unwrap();
     let homeserver = PubkyPublicKey::from_public_key(&testnet.homeserver_app().public_key());
     let crypto = Arc::new(Crypto::from_master_key(&[1; 32]).unwrap());
     let creators = CreatorStore::new(&first_pool, crypto.clone());

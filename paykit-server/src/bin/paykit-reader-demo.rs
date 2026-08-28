@@ -22,7 +22,7 @@ use paykit_sdk::{
         StorageAdapter, StorageState, StorageTransactionCallback, run_storage_state_transaction,
     },
 };
-use paykit_server::paykit::ExplicitInputsPaymentAdapter;
+use paykit_server::{config::PAYKIT_CLIENT_ID, paykit::ExplicitInputsPaymentAdapter};
 use pubky::{Pubky, PubkyHttpClient};
 use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
@@ -252,11 +252,13 @@ async fn execute(
     let sdk_config = PaykitSdkConfig::new(config.local_receiver_path.clone());
     let session = within_receive_deadline(
         receive_deadline,
-        PubkySessionBootstrap::with_pubky(pubky.clone()).sign_in(
-            &PubkyLocalSecretKey::new(*reader_secret),
-            ReceiverNoiseSecretKey::new(*receiver_noise_secret),
-            &sdk_config.required_session_capabilities(),
-        ),
+        PubkySessionBootstrap::with_pubky(pubky.clone(), PAYKIT_CLIENT_ID)
+            .map_err(|_| Failure::ProtocolFailed)?
+            .sign_in(
+                &PubkyLocalSecretKey::new(*reader_secret),
+                ReceiverNoiseSecretKey::new(*receiver_noise_secret),
+                &sdk_config.required_session_capabilities(),
+            ),
     )
     .await?
     .map_err(|_| Failure::ProtocolFailed)?;
