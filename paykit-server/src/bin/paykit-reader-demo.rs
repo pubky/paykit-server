@@ -22,7 +22,7 @@ use paykit_sdk::{
         StorageAdapter, StorageState, StorageTransactionCallback, run_storage_state_transaction,
     },
 };
-use paykit_server::paykit::ExplicitInputsPaymentAdapter;
+use paykit_server::{config::PAYKIT_CLIENT_ID, paykit::ExplicitInputsPaymentAdapter};
 use pubky::{Pubky, PubkyHttpClient};
 use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
@@ -38,7 +38,6 @@ const SERVER_PUBKY_ENV: &str = "PAYKIT_READER_SERVER_PUBKY";
 const SERVER_PATH_ENV: &str = "PAYKIT_READER_SERVER_PATH";
 const RECEIVE_TIMEOUT: Duration = Duration::from_secs(300);
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
-const PUBKY_CLIENT_ID: &str = "app.paykit.server";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -253,7 +252,7 @@ async fn execute(
     let sdk_config = PaykitSdkConfig::new(config.local_receiver_path.clone());
     let session = within_receive_deadline(
         receive_deadline,
-        PubkySessionBootstrap::with_pubky(pubky.clone(), PUBKY_CLIENT_ID)
+        PubkySessionBootstrap::with_pubky(pubky.clone(), PAYKIT_CLIENT_ID)
             .map_err(|_| Failure::ProtocolFailed)?
             .sign_in(
                 &PubkyLocalSecretKey::new(*reader_secret),

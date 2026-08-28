@@ -142,9 +142,14 @@ fn rejects_unknown_toml_fields() {
 fn requires_a_nonempty_paykit_client_id() {
     let missing = valid_toml().replace("client_id = \"app.paykit.server\"\n", "");
     let empty = valid_toml().replace("client_id = \"app.paykit.server\"", "client_id = \"\"");
+    let other = valid_toml().replace(
+        "client_id = \"app.paykit.server\"",
+        "client_id = \"other.paykit.server\"",
+    );
 
     assert!(Config::from_toml_and_environment(&missing, environment()).is_err());
     assert!(Config::from_toml_and_environment(&empty, environment()).is_err());
+    assert!(Config::from_toml_and_environment(&other, environment()).is_err());
 }
 
 #[test]

@@ -11,7 +11,7 @@ use paykit_sdk::{
 };
 use paykit_server::{
     bitkit_claim::{CLAIM_TYPE, LOCAL_DEMO_CAPABILITIES, QUERY_PARAMETER, encode_unsigned_payload},
-    config::BitcoinNetwork,
+    config::{BitcoinNetwork, PAYKIT_CLIENT_ID},
     real_setup::validate_xpub,
 };
 use serde::Deserialize;
@@ -85,8 +85,11 @@ async fn run() -> Result<(), Failure> {
     let claim = PubkyAuthCompanionClaim::new(QUERY_PARAMETER, CLAIM_TYPE, payload.to_vec())
         .map_err(|_| Failure::Authentication)?;
     let auth = parse_pubky_auth_url(&input.auth_url).map_err(|_| Failure::Authentication)?;
+    if auth.client_id != PAYKIT_CLIENT_ID {
+        return Err(Failure::Authentication);
+    }
     let bootstrap =
-        PubkySessionBootstrap::new(&auth.client_id).map_err(|_| Failure::Authentication)?;
+        PubkySessionBootstrap::new(PAYKIT_CLIENT_ID).map_err(|_| Failure::Authentication)?;
     bootstrap
         .approve_auth_with_companion_claim(
             &input.auth_url,

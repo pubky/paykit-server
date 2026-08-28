@@ -9,6 +9,9 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use url::Url;
 
+/// Stable Pubky grant client ID owned by this Paykit Server application.
+pub const PAYKIT_CLIENT_ID: &str = "app.paykit.server";
+
 #[derive(Debug)]
 pub struct Config {
     pub http: HttpConfig,
@@ -39,6 +42,9 @@ impl Config {
             .map_err(|_| ConfigError::InvalidReceiverPath)?;
         let client_id =
             ClientId::new(&raw.paykit.client_id).map_err(|_| ConfigError::InvalidPaykitClientId)?;
+        if client_id.as_str() != PAYKIT_CLIENT_ID {
+            return Err(ConfigError::UnsupportedPaykitClientId);
+        }
         let receiver_path_priority = raw
             .paykit
             .receiver_path_priority
@@ -438,6 +444,8 @@ pub enum ConfigError {
     InvalidReceiverPath,
     #[error("paykit.client_id must be a valid non-empty Pubky client ID")]
     InvalidPaykitClientId,
+    #[error("paykit.client_id must be app.paykit.server")]
+    UnsupportedPaykitClientId,
     #[error("paykit.network must be mainnet or testnet")]
     InvalidPaykitNetwork,
     #[error("paykit.receiver_path_priority entries must be canonical Paykit receiver app segments")]
