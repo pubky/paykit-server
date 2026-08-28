@@ -675,17 +675,9 @@ fn classify_pubky_session_error(error: &pubky::Error) -> SessionValidationError 
     match error {
         pubky::Error::Authentication(_) | pubky::Error::Parse(_) => SessionValidationError::Invalid,
         pubky::Error::Request(RequestError::Validation { .. }) => SessionValidationError::Invalid,
-        pubky::Error::Request(RequestError::Server { status, .. })
-            if status.is_client_error()
-                && !matches!(
-                    *status,
-                    pubky::StatusCode::REQUEST_TIMEOUT
-                        | pubky::StatusCode::TOO_EARLY
-                        | pubky::StatusCode::TOO_MANY_REQUESTS
-                ) =>
-        {
-            SessionValidationError::Invalid
-        }
+        // Pubky 0.11 exposes homeserver failures only as status + message. Even 401 can mean a
+        // recoverable PoP audience or timestamp failure, so no server status proves this stored
+        // grant is invalid. Keep these retryable until upstream preserves a typed rejection cause.
         pubky::Error::Request(_) | pubky::Error::Pkarr(_) | pubky::Error::Build(_) => {
             SessionValidationError::Unavailable
         }
@@ -803,8 +795,10 @@ mod tests {
     }
 
     #[test]
-    fn transient_pubky_server_errors_are_unavailable_not_invalid() {
+    fn pubky_server_errors_without_typed_rejection_are_unavailable() {
         for status in [
+            pubky::StatusCode::UNAUTHORIZED,
+            pubky::StatusCode::MISDIRECTED_REQUEST,
             pubky::StatusCode::SERVICE_UNAVAILABLE,
             pubky::StatusCode::TOO_MANY_REQUESTS,
         ] {
@@ -827,16 +821,12 @@ mod tests {
     }
 
     #[test]
-    fn definitive_pubky_auth_and_parse_errors_are_invalid() {
+    fn definitive_pubky_auth_parse_and_validation_errors_are_invalid() {
         for error in [
             pubky::Error::Authentication(pubky::errors::AuthError::RequestExpired),
             pubky::Error::Parse(url::ParseError::EmptyHost),
             pubky::Error::Request(pubky::errors::RequestError::Validation {
                 message: "malformed stored grant".into(),
-            }),
-            pubky::Error::Request(pubky::errors::RequestError::Server {
-                status: pubky::StatusCode::UNAUTHORIZED,
-                message: "grant rejected".into(),
             }),
         ] {
             assert_eq!(
