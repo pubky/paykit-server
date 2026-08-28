@@ -6,7 +6,7 @@
 
 **Architecture:** A virtual Rust workspace contains one server crate and one black-box E2E crate. `paykit-server` owns HTTP, application workflows, encrypted PostgreSQL persistence, and worker orchestration; it calls `paykit-sdk` rather than recreating Paykit protocols. Creator authority, one BIP84 account xpub/account index, address allocation, receiver Noise key, and SDK state are isolated per Creator inside one supported server process. `paykit-server-e2e` starts the real Axum application against PostgreSQL and verifies committed cross-boundary and cross-Creator isolation contracts.
 
-**Tech Stack:** Rust edition 2024 (MSRV 1.91.1), Tokio, Axum, SQLx/PostgreSQL, `paykit-sdk`/`paykit-lib` pinned to inspected `paykit-rs` commit `52a852995bfc457b78d32f5a45f6741766a89bba`, XChaCha20-Poly1305, HKDF-SHA256, Ed25519, Electrum client.
+**Tech Stack:** Rust edition 2024 (MSRV 1.91.1), Tokio, Axum, SQLx/PostgreSQL, `paykit-sdk`/`paykit-lib` pinned to release `v0.1.0-rc48` (resolved commit `9b56a0eacd6874137370fa79ec0f40b809140809`), XChaCha20-Poly1305, HKDF-SHA256, Ed25519, Electrum client.
 
 **Authoritative requirements:**
 - `docs/plans/0001-receiver-only-prototype-design.md`
