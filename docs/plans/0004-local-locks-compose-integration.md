@@ -22,10 +22,10 @@ an explicit local-development override.
 
 - The sibling Locks Compose environment must include Paykit Server.
 - Selecting `paykit-payment` embeds a Paykit Server-hosted setup iframe.
-- The iframe shows Paykit auth URL and exact local CLI instructions.
+- The iframe shows the Bitkit QR/deep link and a short-lived local companion handle; it never passes the auth URL to the CLI.
 - The iframe does not receive or know xpub/tpub.
 - No separate manual xpub HTTP route is allowed.
-- A local script accepts auth URL and xpub/tpub and uses the same companion-auth flow expected from Bitkit.
+- A local script accepts the server-issued companion handle and xpub/tpub, exchanges the handle against the configured Paykit Server origin, and uses the same companion-auth flow expected from Bitkit.
 - Compose must support full PostgreSQL + Bitcoin regtest + Electrum payment testing.
 - A protocol-real reader helper replaces Bitkit for marker publication and Payment Request receipt.
 - Detailed plans must be written in both repositories before implementation.
@@ -41,7 +41,7 @@ an explicit local-development override.
 
 ### CONSTRAINTS OBSERVED IN CURRENT CODE
 
-- `GET /setup` currently starts setup and immediately navigates iframe to the secret-bearing auth URL.
+- `GET /setup` renders the server-created Bitkit QR/deep link and an opaque local companion handle while keeping the secret-bearing auth URL out of helper input and callback messages.
 - `POST /setup/{flow_id}/complete` already waits for normal Pubky AUTH plus companion relay claim, then validates/publishes/read-backs/persists.
 - Exact local-demo companion request is `x-bitkit-claim=watch-only-account-v1` with capabilities `/pub/paykit/v0/bitkit/server/:rw,/pub/paykit/v0/private/bitkit/server/:rw`; production derives the equivalent public/private pair from the configured server receiver path.
 - Unsigned payload is 84 bytes: version byte, big-endian account index, reserved byte, 78-byte serialized BIP32 account xpub.
@@ -54,10 +54,10 @@ an explicit local-development override.
 ## Accepted decisions
 
 1. Keep the existing standard server companion receiver; do not add a manual claim route or bypass mode.
-2. Setup iframe displays auth URL + approved Docker CLI command instead of automatically navigating.
+2. Setup iframe displays the Bitkit auth QR/deep link and a short-lived opaque companion handle instead of forwarding the auth URL to the local helper.
 3. iframe never receives, stores, posts, or logs xpub.
 4. Companion CLI is Paykit-owned Rust, invokes public `paykit-sdk`, and runs inside Locks `creator-demo`.
-5. Locks Node wrapper loads creator key and pipes secret/auth URL/xpub/account index to helper stdin; sensitive values never enter argv/logs.
+5. Locks Node wrapper loads the creator key and pipes the companion handle, secret, xpub, and account index to helper stdin. The trusted Paykit Server origin comes from Locks Server `[paykit].server_url` through generated demo config and controlled helper environment; sensitive values never enter argv/logs.
 6. Reader helper uses Paykit SDK to publish reader marker, persist reader SDK state, and receive/decrypt Payment Requests.
 7. Reader helper prints address/sats, a manual Bitcoin payment command, and a separately labeled optional mining command; it does not pay or mine.
 8. Compose includes PostgreSQL, Bitcoin Core regtest, and Electrum indexer.
@@ -92,7 +92,7 @@ an explicit local-development override.
 15. Helper process contract:
     - this repository owns binaries `paykit-companion-auth` and `paykit-reader-demo`; Locks owns user-facing Node wrappers;
     - each invocation accepts exactly one closed, version-1 JSON object on stdin, rejects unknown fields/versions, and never echoes sensitive input;
-    - companion input contains `auth_url`, base64url 32-byte `creator_secret`, `account_xpub`, and `account_index`; success output is only version plus `approved` status;
+    - companion input contains a base64url 32-byte `companion_handle`, base64url 32-byte `creator_secret`, `account_xpub`, and `account_index`; caller-supplied auth URLs are rejected, and success output is only version plus `approved` status;
     - reader input contains operation `prepare` or `receive` plus base64url 32-byte `reader_secret`; state path and local Pubky endpoints come only from Compose environment;
     - receive timeout is five minutes;
     - prepare output is limited to reader Pubky/receiver path, receive output to BTC address/sats/manual commands, and failures use stable redacted error codes.
@@ -153,10 +153,10 @@ No implementation task may invent an answer to these gates.
 - Modify: `README.md`
 
 **TDD sequence:**
-1. Add route tests asserting returned HTML displays the escaped auth URL and approved static CLI command.
+1. Add route tests asserting returned HTML displays the unchanged Bitkit QR/deep link, an opaque companion handle, and the approved static CLI command without exposing the auth URL to the helper.
 2. Assert HTML has no xpub input, claim endpoint, automatic `window.location.assign`, or leaked completion result.
 3. Assert CSP/frame-ancestor and concrete postMessage origin behavior remain exact.
-4. Render instructions and auth URL while preserving existing completion polling.
+4. Render the QR/deep link, companion handle, and instructions while preserving existing completion polling; prohibit caller-supplied helper auth URLs.
 5. Run `cargo test -p paykit-server --test setup`.
 6. Stop for review.
 

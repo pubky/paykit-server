@@ -51,15 +51,15 @@ Business-route signatures use the configured trusted Locks Ed25519 key. Setup us
 
 ### Setup iframe
 
-`GET /setup` renders the Paykit auth URL and this local approval command instead of automatically navigating the iframe:
+`GET /setup` renders the Bitkit QR/deep link plus a short-lived opaque companion handle and this local approval command; the helper never accepts the auth URL from the operator:
 
 ```bash
-docker compose exec creator-demo npm --prefix examples/js-sdk run authenticate-paykit -- --role content-creator
+npm --prefix examples/js-sdk run authenticate-paykit -- --role content-creator
 ```
 
 The iframe continues polling `POST /setup/{flow_id}/complete`. It does not receive, store, post, or log an xpub, and there is no manual claim route. Completion posts only `{ type: "paykit-setup-callback", state }` or the same callback with a coarse error to the exact caller origin.
 
-`paykit-companion-auth` accepts one closed version-1 JSON object on stdin with `auth_url`, a base64url 32-byte `creator_secret`, `account_xpub`, and `account_index`. It rejects missing or unknown fields, unsupported versions, and grant URLs whose client ID is not the trusted `app.paykit.server`. Success stdout is exactly `{"version":1,"status":"approved"}\n`; failures remain coarse and do not echo input.
+`paykit-companion-auth` accepts one closed version-1 JSON object on stdin with a base64url 32-byte `companion_handle`, a base64url 32-byte `creator_secret`, `account_xpub`, and `account_index`. The trusted Paykit Server origin comes from `PAYKIT_SERVER_URL`, never stdin. The helper exchanges the handle at `POST /setup/companion-auth-request`, requires a no-store closed response, and approves only the exact server-retained grant URL. It rejects missing or unknown fields, unsupported versions, caller-supplied auth URLs, unsafe server origins, redirects, oversized responses, and grant URLs whose client ID is not the trusted `app.paykit.server`. Success stdout is exactly `{"version":1,"status":"approved"}\n`; failures remain coarse and do not echo input.
 
 The composed PostgreSQL workflow is tested with two independent Creators across restart. Live adapter evidence covers a separate local Pubky relay/homeserver process and one public mainnet Fulcrum endpoint; see [`docs/live-adapter-smoke.md`](docs/live-adapter-smoke.md). Those checks bound interoperability to the recorded versions and environments rather than claiming compatibility with every provider.
 

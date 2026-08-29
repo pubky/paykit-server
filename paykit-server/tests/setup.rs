@@ -16,6 +16,7 @@ use axum::{
     http::{Method, Request, StatusCode},
     response::Response,
 };
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use bitcoin::{
     Network,
     bip32::{ChildNumber, Xpriv, Xpub},
@@ -28,8 +29,8 @@ use paykit_server::{
     http::setup::setup_router,
     real_setup::validate_xpub,
     setup::{
-        BeginError, Completion, ManualClock, PollResult, SetupAttempt, SetupCompleter, SetupLimits,
-        SetupService, StartedSetup,
+        BeginError, CompanionAuthRequestResult, Completion, ManualClock, PollResult, SetupAttempt,
+        SetupCompleter, SetupLimits, SetupService, StartedSetup,
     },
 };
 use tokio::sync::{Mutex, Notify, Semaphore};
@@ -326,6 +327,197 @@ fn peer() -> IpAddr {
     IpAddr::V4(Ipv4Addr::LOCALHOST)
 }
 
+#[tokio::test]
+async fn companion_handle_resolves_the_exact_stored_request_idempotently_until_terminal() {
+    let service = service(
+        Arc::new(MockCompleter::new([Completion::DurableSuccess])),
+        Arc::new(ManualClock::default()),
+    );
+    let flow = service
+        .begin(peer(), "https://app.example/callback", "state-1")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        URL_SAFE_NO_PAD
+            .decode(&flow.companion_handle)
+            .unwrap()
+            .len(),
+        32
+    );
+    assert!(!format!("{flow:?}").contains(&flow.companion_handle));
+    assert!(!format!("{flow:?}").contains(&flow.authorization_url));
+    let expected = CompanionAuthRequestResult::Ready {
+        authorization_url: flow.authorization_url.clone(),
+    };
+    assert!(!format!("{expected:?}").contains(&flow.authorization_url));
+    assert_eq!(
+        service.companion_auth_request(&flow.companion_handle).await,
+        expected
+    );
+    assert_eq!(
+        service.companion_auth_request(&flow.companion_handle).await,
+        expected
+    );
+
+    assert_eq!(
+        service.trigger_completion(&flow.flow_id).await,
+        PollResult::Complete
+    );
+    assert_eq!(
+        service.companion_auth_request(&flow.companion_handle).await,
+        CompanionAuthRequestResult::Unavailable
+    );
+}
+
+#[tokio::test]
+async fn companion_handle_remains_available_while_completion_waits_then_closes_on_success() {
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let service = service(
+        Arc::new(BlockingCompleter {
+            entered: entered.clone(),
+            release: release.clone(),
+        }),
+        Arc::new(ManualClock::default()),
+    );
+    let flow = service
+        .begin(peer(), "https://app.example/callback", "state-1")
+        .await
+        .unwrap();
+    let completing = {
+        let service = service.clone();
+        let flow_id = flow.flow_id.clone();
+        tokio::spawn(async move { service.trigger_completion(&flow_id).await })
+    };
+    entered.notified().await;
+    assert_eq!(
+        service.companion_auth_request(&flow.companion_handle).await,
+        CompanionAuthRequestResult::Ready {
+            authorization_url: flow.authorization_url.clone(),
+        }
+    );
+    release.notify_one();
+    assert_eq!(completing.await.unwrap(), PollResult::Complete);
+    assert_eq!(
+        service.companion_auth_request(&flow.companion_handle).await,
+        CompanionAuthRequestResult::Unavailable
+    );
+}
+
+#[tokio::test]
+async fn companion_handle_closes_after_failed_completion() {
+    let service = service(
+        Arc::new(MockCompleter::new([Completion::DefinitiveFailure])),
+        Arc::new(ManualClock::default()),
+    );
+    let flow = service
+        .begin(peer(), "https://app.example/callback", "state-1")
+        .await
+        .unwrap();
+    assert_eq!(
+        service.trigger_completion(&flow.flow_id).await,
+        PollResult::Failed
+    );
+    assert_eq!(
+        service.companion_auth_request(&flow.companion_handle).await,
+        CompanionAuthRequestResult::Unavailable
+    );
+}
+
+#[tokio::test]
+async fn companion_handle_rejects_malformed_unknown_and_expired_values() {
+    let clock = Arc::new(ManualClock::default());
+    let service = service(
+        Arc::new(MockCompleter::new([Completion::DurableSuccess])),
+        clock.clone(),
+    );
+    let flow = service
+        .begin(peer(), "https://app.example/callback", "state-1")
+        .await
+        .unwrap();
+
+    for handle in ["not-base64", &URL_SAFE_NO_PAD.encode([9_u8; 32])] {
+        assert_eq!(
+            service.companion_auth_request(handle).await,
+            CompanionAuthRequestResult::Unavailable
+        );
+    }
+    clock.advance(Duration::from_secs(5 * 60));
+    assert_eq!(
+        service.companion_auth_request(&flow.companion_handle).await,
+        CompanionAuthRequestResult::Unavailable
+    );
+}
+
+#[tokio::test]
+async fn companion_auth_request_route_returns_only_the_exact_stored_url_without_cors_or_caching() {
+    let service = service(
+        Arc::new(MockCompleter::new([Completion::DurableSuccess])),
+        Arc::new(ManualClock::default()),
+    );
+    let flow = service
+        .begin(peer(), "https://app.example/callback", "state-1")
+        .await
+        .unwrap();
+    let payload = serde_json::json!({"version": 1, "handle": flow.companion_handle});
+
+    for _ in 0..2 {
+        let response = request_json(
+            setup_router(service.clone()),
+            "/setup/companion-auth-request",
+            payload.clone(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        assert!(
+            !response
+                .headers()
+                .contains_key("access-control-allow-origin")
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body(response).await).unwrap(),
+            serde_json::json!({"version": 1, "auth_url": flow.authorization_url})
+        );
+    }
+}
+
+#[tokio::test]
+async fn companion_auth_request_route_rejects_open_malformed_and_unknown_requests() {
+    let router = setup_router(service(
+        Arc::new(MockCompleter::new([Completion::DurableSuccess])),
+        Arc::new(ManualClock::default()),
+    ));
+    for (payload, expected_status) in [
+        (
+            serde_json::json!({"version": 1, "handle": URL_SAFE_NO_PAD.encode([9_u8; 32])}),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            serde_json::json!({"version": 1, "handle": "invalid"}),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            serde_json::json!({"version": 1, "handle": URL_SAFE_NO_PAD.encode([9_u8; 32]), "extra": true}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            serde_json::json!({"version": 2, "handle": URL_SAFE_NO_PAD.encode([9_u8; 32])}),
+            StatusCode::BAD_REQUEST,
+        ),
+    ] {
+        let response = request_json(router.clone(), "/setup/companion-auth-request", payload).await;
+        assert_eq!(response.status(), expected_status);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        assert!(
+            !response
+                .headers()
+                .contains_key("access-control-allow-origin")
+        );
+    }
+}
+
 async fn request(router: axum::Router, method: Method, uri: &str) -> Response {
     request_with_body(router, method, uri, Body::empty()).await
 }
@@ -340,6 +532,19 @@ async fn request_with_body(
         .method(method)
         .uri(uri)
         .body(request_body)
+        .unwrap();
+    request
+        .extensions_mut()
+        .insert(ConnectInfo(SocketAddr::new(peer(), 12345)));
+    router.oneshot(request).await.unwrap()
+}
+
+async fn request_json(router: axum::Router, uri: &str, payload: serde_json::Value) -> Response {
+    let mut request = Request::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .header("content-type", "application/json")
+        .body(Body::from(payload.to_string()))
         .unwrap();
     request
         .extensions_mut()
@@ -437,7 +642,7 @@ async fn expired_flows_drop_secret_attempts_but_retain_a_bounded_expired_tombsto
     clock.advance(Duration::from_secs(300));
     assert_eq!(setup.poll(&flow.flow_id).await, PollResult::Expired);
     assert_eq!(dropped.load(Ordering::SeqCst), 1);
-    assert!(setup.flow(&flow.flow_id).await.is_none());
+    assert!(!setup.flow_exists(&flow.flow_id).await);
     assert_eq!(
         setup.trigger_completion(&flow.flow_id).await,
         PollResult::Expired
@@ -1033,6 +1238,7 @@ async fn valid_setup_preserves_polling_and_secret_free_callback_shell() {
         response.headers()["content-security-policy"],
         "frame-ancestors https://app.example"
     );
+    assert_eq!(response.headers()["cache-control"], "no-store");
     let shell = body(response).await;
     assert!(shell.contains("new Set([408,425,429,502,503,504])"));
     assert!(shell.contains("delay=500"));
@@ -1045,6 +1251,11 @@ async fn valid_setup_preserves_polling_and_secret_free_callback_shell() {
     assert!(!shell.contains("</script><img"));
     assert!(shell.contains("\\u003c/script\\u003e\\u003cimg\\u003e"));
     assert!(shell.contains(r#"data-testid="paykit-auth-qr""#));
+    assert!(shell.contains(r#"data-testid="paykit-companion-handle""#));
+    assert!(shell.contains(
+        "npm --prefix examples/js-sdk run authenticate-paykit -- --role content-creator"
+    ));
+    assert!(!shell.contains("docker compose exec"));
     assert!(shell.contains(r#"<svg aria-label="Bitkit authorization QR code""#));
     // The SVG is inlined into HTML, so the standalone-document prolog must be gone.
     assert!(!shell.contains("<?xml"));
@@ -1053,6 +1264,13 @@ async fn valid_setup_preserves_polling_and_secret_free_callback_shell() {
         .split_once("<script>")
         .expect("setup shell contains polling script")
         .1;
+    let companion_handle = shell
+        .split_once(r#"data-testid="paykit-companion-handle">"#)
+        .and_then(|(_, rest)| rest.split_once("</code>"))
+        .map(|(handle, _)| handle)
+        .expect("setup shell contains companion handle text");
+    assert_eq!(URL_SAFE_NO_PAD.decode(companion_handle).unwrap().len(), 32);
+    assert!(!script.contains(companion_handle));
     for forbidden in ["pubkyauth://", "response.json", "response.text", "console."] {
         assert!(
             !script.contains(forbidden),

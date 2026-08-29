@@ -130,9 +130,8 @@ struct State {
 }
 
 struct Flow {
-    state: String,
-    origin: String,
     authorization_url: String,
+    companion_handle_hash: [u8; 32],
     attempt: Option<Box<dyn SetupAttempt>>,
     reservation: Option<OwnedSemaphorePermit>,
     expires_at: Duration,
@@ -234,12 +233,43 @@ impl SetupRateLimiter {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub struct StartedFlow {
     pub flow_id: String,
+    pub companion_handle: String,
     pub state: String,
     pub origin: String,
     pub authorization_url: String,
+}
+
+impl core::fmt::Debug for StartedFlow {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("StartedFlow")
+            .field("flow_id", &self.flow_id)
+            .field("companion_handle", &"<redacted>")
+            .field("state", &self.state)
+            .field("origin", &self.origin)
+            .field("authorization_url", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub enum CompanionAuthRequestResult {
+    Ready { authorization_url: String },
+    Unavailable,
+}
+
+impl core::fmt::Debug for CompanionAuthRequestResult {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Ready { .. } => f
+                .debug_struct("Ready")
+                .field("authorization_url", &"<redacted>")
+                .finish(),
+            Self::Unavailable => f.write_str("Unavailable"),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -330,13 +360,13 @@ impl SetupService {
             .start()
             .await
             .map_err(|_| BeginError::Unavailable)?;
-        let mut bytes = [0_u8; 32];
-        SysRng
-            .try_fill_bytes(&mut bytes)
-            .map_err(|_| BeginError::Unavailable)?;
-        let flow_id = URL_SAFE_NO_PAD.encode(bytes);
+        let flow_id = random_token().map_err(|_| BeginError::Unavailable)?;
+        let companion_handle = random_token().map_err(|_| BeginError::Unavailable)?;
+        let companion_handle_hash =
+            companion_handle_hash(&companion_handle).expect("generated companion handle is valid");
         let started = StartedFlow {
             flow_id: flow_id.clone(),
+            companion_handle: companion_handle.clone(),
             state: state.to_owned(),
             origin,
             authorization_url: started_setup.authorization_url.clone(),
@@ -346,9 +376,8 @@ impl SetupService {
         guard.flows.insert(
             flow_id,
             Flow {
-                state: state.to_owned(),
-                origin: started.origin.clone(),
                 authorization_url: started_setup.authorization_url,
+                companion_handle_hash,
                 attempt: Some(started_setup.attempt),
                 reservation: Some(reservation),
                 expires_at: self.inner.clock.now() + FLOW_LIFETIME,
@@ -357,6 +386,25 @@ impl SetupService {
             },
         );
         Ok(started)
+    }
+
+    pub async fn companion_auth_request(&self, handle: &str) -> CompanionAuthRequestResult {
+        let Some(handle_hash) = companion_handle_hash(handle) else {
+            return CompanionAuthRequestResult::Unavailable;
+        };
+        let mut state = self.inner.state.lock().await;
+        cleanup_expired(&mut state, self.inner.clock.now());
+        state
+            .flows
+            .values()
+            .find(|flow| {
+                flow.companion_handle_hash == handle_hash
+                    && matches!(flow.status, FlowStatus::Pending | FlowStatus::Completing)
+            })
+            .map(|flow| CompanionAuthRequestResult::Ready {
+                authorization_url: flow.authorization_url.clone(),
+            })
+            .unwrap_or(CompanionAuthRequestResult::Unavailable)
     }
 
     /// Runs real completion for precisely this flow. A completion attempt is
@@ -441,15 +489,10 @@ impl SetupService {
         }
     }
 
-    pub async fn flow(&self, flow_id: &str) -> Option<StartedFlow> {
+    pub async fn flow_exists(&self, flow_id: &str) -> bool {
         let mut guard = self.inner.state.lock().await;
         cleanup_expired(&mut guard, self.inner.clock.now());
-        guard.flows.get(flow_id).map(|flow| StartedFlow {
-            flow_id: flow_id.to_owned(),
-            state: flow.state.clone(),
-            origin: flow.origin.clone(),
-            authorization_url: flow.authorization_url.clone(),
-        })
+        guard.flows.contains_key(flow_id)
     }
 
     async fn status(&self, flow_id: &str) -> PollResult {
@@ -518,6 +561,23 @@ fn reserve_poll(counter: &AtomicUsize, maximum: usize) -> bool {
             (current < maximum).then_some(current + 1)
         })
         .is_ok()
+}
+
+fn random_token() -> Result<String, ()> {
+    let mut bytes = [0_u8; 32];
+    SysRng.try_fill_bytes(&mut bytes).map_err(|_| ())?;
+    Ok(URL_SAFE_NO_PAD.encode(bytes))
+}
+
+fn companion_handle_hash(value: &str) -> Option<[u8; 32]> {
+    let decoded: [u8; 32] = URL_SAFE_NO_PAD.decode(value).ok()?.try_into().ok()?;
+    if URL_SAFE_NO_PAD.encode(decoded) != value {
+        return None;
+    }
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"paykit-companion-handle-v1\0");
+    hasher.update(&decoded);
+    Some(*hasher.finalize().as_bytes())
 }
 
 fn cleanup_expired(state: &mut State, now: Duration) {
