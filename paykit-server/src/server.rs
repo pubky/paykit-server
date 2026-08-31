@@ -678,7 +678,8 @@ fn classify_pubky_session_error(error: &pubky::Error) -> SessionValidationError 
         pubky::Error::Request(RequestError::Validation { .. }) => SessionValidationError::Invalid,
         // Pubky 0.11 exposes homeserver failures only as status + message. Even 401 can mean a
         // recoverable PoP audience or timestamp failure, so no server status proves this stored
-        // grant is invalid. Keep these retryable until upstream preserves a typed rejection cause.
+        // grant is invalid. Preserve this distinction for invoice callers; SetupStatusService
+        // deliberately collapses every completed validation failure into re-authentication.
         pubky::Error::Request(_) | pubky::Error::Pkarr(_) | pubky::Error::Build(_) => {
             SessionValidationError::Unavailable
         }

@@ -44,8 +44,13 @@ impl SetupStatusService {
     pub async fn status(&self, creator: &CreatorPubky) -> SetupStatus {
         match tokio::time::timeout(self.timeout, self.sessions.validate(creator)).await {
             Ok(Ok(())) => SetupStatus::Ready,
-            Ok(Err(SessionValidationError::Invalid)) => SetupStatus::SetupRequired,
-            Ok(Err(SessionValidationError::Unavailable)) | Err(_) => SetupStatus::Unavailable,
+            // Setup status is a user-recovery policy boundary: every completed validation
+            // failure asks the Creator to authenticate again. The shared validator retains
+            // Invalid vs Unavailable for invoice callers.
+            Ok(Err(SessionValidationError::Invalid | SessionValidationError::Unavailable)) => {
+                SetupStatus::SetupRequired
+            }
+            Err(_) => SetupStatus::Unavailable,
         }
     }
 }
