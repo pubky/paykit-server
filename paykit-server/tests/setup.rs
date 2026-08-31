@@ -16,7 +16,7 @@ use axum::{
     http::{Method, Request, StatusCode},
     response::Response,
 };
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+
 use bitcoin::{
     Network,
     bip32::{ChildNumber, Xpriv, Xpub},
@@ -29,12 +29,14 @@ use paykit_server::{
     http::setup::setup_router,
     real_setup::validate_xpub,
     setup::{
-        BeginError, CompanionAuthRequestResult, Completion, ManualClock, PollResult, SetupAttempt,
-        SetupCompleter, SetupLimits, SetupService, StartedSetup,
+        BeginError, Completion, ManualClock, PollResult, SetupAttempt, SetupCompleter, SetupLimits,
+        SetupService, StartedSetup,
     },
 };
 use tokio::sync::{Mutex, Notify, Semaphore};
 use tower::ServiceExt;
+use tracing::{Event, Subscriber, instrument::WithSubscriber};
+use tracing_subscriber::{Layer, layer::Context, prelude::*};
 
 fn account_xpub(network: Network, coin_type: u32, account_index: u32) -> Xpub {
     let secp = Secp256k1::new();
@@ -327,195 +329,126 @@ fn peer() -> IpAddr {
     IpAddr::V4(Ipv4Addr::LOCALHOST)
 }
 
-#[tokio::test]
-async fn companion_handle_resolves_the_exact_stored_request_idempotently_until_terminal() {
-    let service = service(
-        Arc::new(MockCompleter::new([Completion::DurableSuccess])),
-        Arc::new(ManualClock::default()),
-    );
-    let flow = service
-        .begin(peer(), "https://app.example/callback", "state-1")
-        .await
-        .unwrap();
+type CapturedEventFields = Vec<Vec<(String, String)>>;
 
-    assert_eq!(
-        URL_SAFE_NO_PAD
-            .decode(&flow.companion_handle)
-            .unwrap()
-            .len(),
-        32
-    );
-    assert!(!format!("{flow:?}").contains(&flow.companion_handle));
-    assert!(!format!("{flow:?}").contains(&flow.authorization_url));
-    let expected = CompanionAuthRequestResult::Ready {
-        authorization_url: flow.authorization_url.clone(),
-    };
-    assert!(!format!("{expected:?}").contains(&flow.authorization_url));
-    assert_eq!(
-        service.companion_auth_request(&flow.companion_handle).await,
-        expected
-    );
-    assert_eq!(
-        service.companion_auth_request(&flow.companion_handle).await,
-        expected
-    );
+#[derive(Clone, Default)]
+struct EventCapture(Arc<std::sync::Mutex<CapturedEventFields>>);
 
-    assert_eq!(
-        service.trigger_completion(&flow.flow_id).await,
-        PollResult::Complete
-    );
-    assert_eq!(
-        service.companion_auth_request(&flow.companion_handle).await,
-        CompanionAuthRequestResult::Unavailable
-    );
+impl<S> Layer<S> for EventCapture
+where
+    S: Subscriber,
+{
+    fn on_event(&self, event: &Event<'_>, _context: Context<'_, S>) {
+        let mut fields = Vec::new();
+        event.record(&mut FieldVisitor(&mut fields));
+        self.0.lock().unwrap().push(fields);
+    }
+}
+
+struct FieldVisitor<'a>(&'a mut Vec<(String, String)>);
+
+impl tracing::field::Visit for FieldVisitor<'_> {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn core::fmt::Debug) {
+        self.0.push((field.name().to_owned(), format!("{value:?}")));
+    }
+}
+
+fn authorization_url_events(capture: &EventCapture) -> Vec<Vec<(String, String)>> {
+    capture
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|fields| {
+            fields.iter().any(|(name, value)| {
+                name == "event" && value.contains("paykit_setup_authorization_url")
+            })
+        })
+        .cloned()
+        .collect()
 }
 
 #[tokio::test]
-async fn companion_handle_remains_available_while_completion_waits_then_closes_on_success() {
-    let entered = Arc::new(Notify::new());
-    let release = Arc::new(Notify::new());
-    let service = service(
-        Arc::new(BlockingCompleter {
-            entered: entered.clone(),
-            release: release.clone(),
-        }),
-        Arc::new(ManualClock::default()),
-    );
-    let flow = service
-        .begin(peer(), "https://app.example/callback", "state-1")
-        .await
-        .unwrap();
-    let completing = {
-        let service = service.clone();
-        let flow_id = flow.flow_id.clone();
-        tokio::spawn(async move { service.trigger_completion(&flow_id).await })
-    };
-    entered.notified().await;
-    assert_eq!(
-        service.companion_auth_request(&flow.companion_handle).await,
-        CompanionAuthRequestResult::Ready {
-            authorization_url: flow.authorization_url.clone(),
+async fn authorization_url_event_is_emitted_once_only_when_enabled() {
+    let authorization_url = "pubkyauth://signin?secret=log-only-when-enabled";
+    for (enabled, expected_count) in [(false, 0), (true, 1)] {
+        let capture = EventCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        let setup = SetupService::with_poll_timeout_and_logging(
+            vec!["https://app.example".to_owned()],
+            Arc::new(UrlCompleter(authorization_url.to_owned())),
+            Arc::new(ManualClock::default()),
+            runtime_limits(2, 4, 100, 100),
+            Duration::ZERO,
+            enabled,
+        );
+
+        async {
+            setup
+                .begin(peer(), "https://app.example/callback", "state")
+                .await
+                .unwrap();
         }
-    );
-    release.notify_one();
-    assert_eq!(completing.await.unwrap(), PollResult::Complete);
-    assert_eq!(
-        service.companion_auth_request(&flow.companion_handle).await,
-        CompanionAuthRequestResult::Unavailable
-    );
-}
-
-#[tokio::test]
-async fn companion_handle_closes_after_failed_completion() {
-    let service = service(
-        Arc::new(MockCompleter::new([Completion::DefinitiveFailure])),
-        Arc::new(ManualClock::default()),
-    );
-    let flow = service
-        .begin(peer(), "https://app.example/callback", "state-1")
-        .await
-        .unwrap();
-    assert_eq!(
-        service.trigger_completion(&flow.flow_id).await,
-        PollResult::Failed
-    );
-    assert_eq!(
-        service.companion_auth_request(&flow.companion_handle).await,
-        CompanionAuthRequestResult::Unavailable
-    );
-}
-
-#[tokio::test]
-async fn companion_handle_rejects_malformed_unknown_and_expired_values() {
-    let clock = Arc::new(ManualClock::default());
-    let service = service(
-        Arc::new(MockCompleter::new([Completion::DurableSuccess])),
-        clock.clone(),
-    );
-    let flow = service
-        .begin(peer(), "https://app.example/callback", "state-1")
-        .await
-        .unwrap();
-
-    for handle in ["not-base64", &URL_SAFE_NO_PAD.encode([9_u8; 32])] {
-        assert_eq!(
-            service.companion_auth_request(handle).await,
-            CompanionAuthRequestResult::Unavailable
-        );
-    }
-    clock.advance(Duration::from_secs(5 * 60));
-    assert_eq!(
-        service.companion_auth_request(&flow.companion_handle).await,
-        CompanionAuthRequestResult::Unavailable
-    );
-}
-
-#[tokio::test]
-async fn companion_auth_request_route_returns_only_the_exact_stored_url_without_cors_or_caching() {
-    let service = service(
-        Arc::new(MockCompleter::new([Completion::DurableSuccess])),
-        Arc::new(ManualClock::default()),
-    );
-    let flow = service
-        .begin(peer(), "https://app.example/callback", "state-1")
-        .await
-        .unwrap();
-    let payload = serde_json::json!({"version": 1, "handle": flow.companion_handle});
-
-    for _ in 0..2 {
-        let response = request_json(
-            setup_router(service.clone()),
-            "/setup/companion-auth-request",
-            payload.clone(),
-        )
+        .with_subscriber(subscriber)
         .await;
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response.headers()["cache-control"], "no-store");
-        assert!(
-            !response
-                .headers()
-                .contains_key("access-control-allow-origin")
-        );
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&body(response).await).unwrap(),
-            serde_json::json!({"version": 1, "auth_url": flow.authorization_url})
-        );
+
+        let events = authorization_url_events(&capture);
+        assert_eq!(events.len(), expected_count);
+        if enabled {
+            assert!(events[0].iter().any(|(name, value)| {
+                name == "authorization_url" && value.contains(authorization_url)
+            }));
+        } else {
+            assert!(
+                !capture
+                    .0
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .flatten()
+                    .any(|(_, value)| value.contains(authorization_url))
+            );
+        }
     }
 }
 
 #[tokio::test]
-async fn companion_auth_request_route_rejects_open_malformed_and_unknown_requests() {
-    let router = setup_router(service(
-        Arc::new(MockCompleter::new([Completion::DurableSuccess])),
+async fn started_flow_has_no_companion_handle_surface() {
+    let flow = service(
+        Arc::new(MockCompleter::new([])),
         Arc::new(ManualClock::default()),
-    ));
-    for (payload, expected_status) in [
-        (
-            serde_json::json!({"version": 1, "handle": URL_SAFE_NO_PAD.encode([9_u8; 32])}),
-            StatusCode::NOT_FOUND,
-        ),
-        (
-            serde_json::json!({"version": 1, "handle": "invalid"}),
-            StatusCode::NOT_FOUND,
-        ),
-        (
-            serde_json::json!({"version": 1, "handle": URL_SAFE_NO_PAD.encode([9_u8; 32]), "extra": true}),
-            StatusCode::BAD_REQUEST,
-        ),
-        (
-            serde_json::json!({"version": 2, "handle": URL_SAFE_NO_PAD.encode([9_u8; 32])}),
-            StatusCode::BAD_REQUEST,
-        ),
-    ] {
-        let response = request_json(router.clone(), "/setup/companion-auth-request", payload).await;
-        assert_eq!(response.status(), expected_status);
-        assert_eq!(response.headers()["cache-control"], "no-store");
-        assert!(
-            !response
-                .headers()
-                .contains_key("access-control-allow-origin")
-        );
-    }
+    )
+    .begin(peer(), "https://app.example/callback", "state")
+    .await
+    .unwrap();
+
+    let paykit_server::setup::StartedFlow {
+        flow_id,
+        state,
+        origin,
+        authorization_url,
+    } = flow;
+    assert!(!flow_id.is_empty());
+    assert_eq!(state, "state");
+    assert_eq!(origin, "https://app.example");
+    assert!(!authorization_url.is_empty());
+}
+
+#[tokio::test]
+async fn companion_auth_request_route_is_not_mounted() {
+    let response = request_json(
+        setup_router(service(
+            Arc::new(MockCompleter::new([])),
+            Arc::new(ManualClock::default()),
+        )),
+        "/setup/companion-auth-request",
+        serde_json::json!({"version": 1}),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert!(!response.headers().contains_key("cache-control"));
+    assert!(body(response).await.is_empty());
 }
 
 async fn request(router: axum::Router, method: Method, uri: &str) -> Response {
@@ -1251,10 +1184,8 @@ async fn valid_setup_preserves_polling_and_secret_free_callback_shell() {
     assert!(!shell.contains("</script><img"));
     assert!(shell.contains("\\u003c/script\\u003e\\u003cimg\\u003e"));
     assert!(shell.contains(r#"data-testid="paykit-auth-qr""#));
-    assert!(shell.contains(r#"data-testid="paykit-companion-handle""#));
-    assert!(shell.contains(
-        "npm --prefix examples/js-sdk run authenticate-paykit -- --role content-creator"
-    ));
+    assert!(!shell.contains("companion"));
+    assert!(!shell.contains("authenticate-paykit"));
     assert!(!shell.contains("docker compose exec"));
     assert!(shell.contains(r#"<svg aria-label="Bitkit authorization QR code""#));
     // The SVG is inlined into HTML, so the standalone-document prolog must be gone.
@@ -1264,13 +1195,6 @@ async fn valid_setup_preserves_polling_and_secret_free_callback_shell() {
         .split_once("<script>")
         .expect("setup shell contains polling script")
         .1;
-    let companion_handle = shell
-        .split_once(r#"data-testid="paykit-companion-handle">"#)
-        .and_then(|(_, rest)| rest.split_once("</code>"))
-        .map(|(handle, _)| handle)
-        .expect("setup shell contains companion handle text");
-    assert_eq!(URL_SAFE_NO_PAD.decode(companion_handle).unwrap().len(), 32);
-    assert!(!script.contains(companion_handle));
     for forbidden in ["pubkyauth://", "response.json", "response.text", "console."] {
         assert!(
             !script.contains(forbidden),
@@ -1289,6 +1213,45 @@ async fn valid_setup_preserves_polling_and_secret_free_callback_shell() {
             "setup shell contained forbidden value {forbidden}"
         );
     }
+}
+
+#[tokio::test]
+async fn setup_shell_matches_the_bitkit_qr_and_touch_deep_link_shape() {
+    let authorization_url = "pubkyauth://signin?secret=mock&label=<approve>";
+    let response = request(
+        setup_router(service_with_authorization_url(authorization_url)),
+        Method::GET,
+        "/setup?return_to=https://app.example/callback&state=opaque",
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    assert_eq!(
+        response.headers()["content-security-policy"],
+        "frame-ancestors https://app.example"
+    );
+    let shell = body(response).await;
+    assert!(shell.contains("<main><span class=\"qr\" data-testid=\"paykit-auth-qr\">"));
+    assert!(shell.contains(
+        "<a class=\"bitkit-btn\" href=\"pubkyauth://signin?secret=mock&amp;label=&lt;approve&gt;\">Continue with Bitkit</a></main>"
+    ));
+    assert!(
+        shell.contains("main{width:100%;display:flex;align-items:center;justify-content:center}")
+    );
+    assert!(shell.contains("@media (hover:none) and (pointer:coarse)"));
+    assert!(!shell.contains("companion"));
+    assert!(!shell.contains("authenticate-paykit"));
+    assert!(!shell.contains("xpub"));
+    assert_eq!(shell.matches("pubkyauth://signin?").count(), 1);
+    assert!(shell.contains("new Set([408,425,429,502,503,504])"));
+    assert!(shell.contains("delay=500"));
+    assert!(shell.contains("Math.min(delay*2,5000)"));
+    assert!(shell.contains("const state=\"opaque\";const targetOrigin=\"https://app.example\""));
+    assert!(shell.contains("postMessage({type:'paykit-setup-callback',state},targetOrigin)"));
+    assert!(shell.contains(
+        "postMessage({type:'paykit-setup-callback',state,error:'setup-failed'},targetOrigin)"
+    ));
 }
 
 #[tokio::test]

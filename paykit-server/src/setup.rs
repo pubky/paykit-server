@@ -109,6 +109,7 @@ pub struct SetupService {
 
 struct Inner {
     allowed_origins: Vec<String>,
+    log_authorization_url: bool,
     completer: Arc<dyn SetupCompleter>,
     clock: Arc<dyn Clock>,
     poll_timeout: Duration,
@@ -130,8 +131,6 @@ struct State {
 }
 
 struct Flow {
-    authorization_url: String,
-    companion_handle_hash: [u8; 32],
     attempt: Option<Box<dyn SetupAttempt>>,
     reservation: Option<OwnedSemaphorePermit>,
     expires_at: Duration,
@@ -236,7 +235,6 @@ impl SetupRateLimiter {
 #[derive(PartialEq, Eq)]
 pub struct StartedFlow {
     pub flow_id: String,
-    pub companion_handle: String,
     pub state: String,
     pub origin: String,
     pub authorization_url: String,
@@ -246,29 +244,10 @@ impl core::fmt::Debug for StartedFlow {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("StartedFlow")
             .field("flow_id", &self.flow_id)
-            .field("companion_handle", &"<redacted>")
             .field("state", &self.state)
             .field("origin", &self.origin)
             .field("authorization_url", &"<redacted>")
             .finish()
-    }
-}
-
-#[derive(Clone, PartialEq, Eq)]
-pub enum CompanionAuthRequestResult {
-    Ready { authorization_url: String },
-    Unavailable,
-}
-
-impl core::fmt::Debug for CompanionAuthRequestResult {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Ready { .. } => f
-                .debug_struct("Ready")
-                .field("authorization_url", &"<redacted>")
-                .finish(),
-            Self::Unavailable => f.write_str("Unavailable"),
-        }
     }
 }
 
@@ -299,6 +278,23 @@ impl SetupService {
         )
     }
 
+    pub fn new_with_authorization_url_logging(
+        allowed_origins: Vec<String>,
+        completer: Arc<dyn SetupCompleter>,
+        clock: Arc<dyn Clock>,
+        limits: SetupLimits,
+        log_authorization_url: bool,
+    ) -> Self {
+        Self::with_poll_timeout_and_logging(
+            allowed_origins,
+            completer,
+            clock,
+            limits,
+            DEFAULT_POLL_TIMEOUT,
+            log_authorization_url,
+        )
+    }
+
     pub fn with_poll_timeout(
         allowed_origins: Vec<String>,
         completer: Arc<dyn SetupCompleter>,
@@ -306,9 +302,28 @@ impl SetupService {
         limits: SetupLimits,
         poll_timeout: Duration,
     ) -> Self {
+        Self::with_poll_timeout_and_logging(
+            allowed_origins,
+            completer,
+            clock,
+            limits,
+            poll_timeout,
+            false,
+        )
+    }
+
+    pub fn with_poll_timeout_and_logging(
+        allowed_origins: Vec<String>,
+        completer: Arc<dyn SetupCompleter>,
+        clock: Arc<dyn Clock>,
+        limits: SetupLimits,
+        poll_timeout: Duration,
+        log_authorization_url: bool,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 allowed_origins,
+                log_authorization_url,
                 completer,
                 clock,
                 poll_timeout,
@@ -361,12 +376,8 @@ impl SetupService {
             .await
             .map_err(|_| BeginError::Unavailable)?;
         let flow_id = random_token().map_err(|_| BeginError::Unavailable)?;
-        let companion_handle = random_token().map_err(|_| BeginError::Unavailable)?;
-        let companion_handle_hash =
-            companion_handle_hash(&companion_handle).expect("generated companion handle is valid");
         let started = StartedFlow {
             flow_id: flow_id.clone(),
-            companion_handle: companion_handle.clone(),
             state: state.to_owned(),
             origin,
             authorization_url: started_setup.authorization_url.clone(),
@@ -376,8 +387,6 @@ impl SetupService {
         guard.flows.insert(
             flow_id,
             Flow {
-                authorization_url: started_setup.authorization_url,
-                companion_handle_hash,
                 attempt: Some(started_setup.attempt),
                 reservation: Some(reservation),
                 expires_at: self.inner.clock.now() + FLOW_LIFETIME,
@@ -385,26 +394,15 @@ impl SetupService {
                 active_polls: Arc::new(AtomicUsize::new(0)),
             },
         );
+        drop(guard);
+        if self.inner.log_authorization_url {
+            tracing::info!(
+                event = "paykit_setup_authorization_url",
+                authorization_url = %started.authorization_url,
+                "setup authorization URL"
+            );
+        }
         Ok(started)
-    }
-
-    pub async fn companion_auth_request(&self, handle: &str) -> CompanionAuthRequestResult {
-        let Some(handle_hash) = companion_handle_hash(handle) else {
-            return CompanionAuthRequestResult::Unavailable;
-        };
-        let mut state = self.inner.state.lock().await;
-        cleanup_expired(&mut state, self.inner.clock.now());
-        state
-            .flows
-            .values()
-            .find(|flow| {
-                flow.companion_handle_hash == handle_hash
-                    && matches!(flow.status, FlowStatus::Pending | FlowStatus::Completing)
-            })
-            .map(|flow| CompanionAuthRequestResult::Ready {
-                authorization_url: flow.authorization_url.clone(),
-            })
-            .unwrap_or(CompanionAuthRequestResult::Unavailable)
     }
 
     /// Runs real completion for precisely this flow. A completion attempt is
@@ -569,17 +567,6 @@ fn random_token() -> Result<String, ()> {
     Ok(URL_SAFE_NO_PAD.encode(bytes))
 }
 
-fn companion_handle_hash(value: &str) -> Option<[u8; 32]> {
-    let decoded: [u8; 32] = URL_SAFE_NO_PAD.decode(value).ok()?.try_into().ok()?;
-    if URL_SAFE_NO_PAD.encode(decoded) != value {
-        return None;
-    }
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"paykit-companion-handle-v1\0");
-    hasher.update(&decoded);
-    Some(*hasher.finalize().as_bytes())
-}
-
 fn cleanup_expired(state: &mut State, now: Duration) {
     state.expired.retain(|_, until| now < *until);
     let expired_ids = state
@@ -589,8 +576,8 @@ fn cleanup_expired(state: &mut State, now: Duration) {
         .map(|(flow_id, _)| flow_id.clone())
         .collect::<Vec<_>>();
     for flow_id in expired_ids {
-        // Removing the flow drops its attempt and authorization URL before the
-        // tombstone is recorded. Tombstones contain no flow secrets.
+        // Removing the flow drops its secret-bearing setup attempt before the
+        // tombstone is recorded. Tombstones retain no flow secrets.
         state.flows.remove(&flow_id);
         state.expired.insert(flow_id, now + FLOW_LIFETIME);
     }

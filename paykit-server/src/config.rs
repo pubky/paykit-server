@@ -71,7 +71,10 @@ impl Config {
                 listen_addr: raw.http.listen_addr,
             },
             locks: LocksConfig { trusted_public_key },
-            setup: SetupConfig { allowed_origins },
+            setup: SetupConfig {
+                allowed_origins,
+                log_authorization_url: raw.setup.log_authorization_url,
+            },
             paykit: PaykitConfig {
                 client_id: client_id.clone(),
                 receiver_path: receiver_path.clone(),
@@ -309,6 +312,7 @@ pub struct LocksConfig {
 #[derive(Debug)]
 pub struct SetupConfig {
     pub allowed_origins: Vec<String>,
+    pub log_authorization_url: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -542,6 +546,8 @@ struct RawLocksConfig {
 #[serde(deny_unknown_fields)]
 struct RawSetupConfig {
     allowed_origins: Vec<String>,
+    #[serde(default)]
+    log_authorization_url: bool,
 }
 
 #[derive(Deserialize)]

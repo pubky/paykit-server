@@ -21,7 +21,7 @@
 - Production setup UI must match Paykit commit `06d227444f186a24d82b1f15d8c8b83d4e535ce2`: desktop Bitkit QR, touch-device `Continue with Bitkit` deep link, parent-owned modal chrome, no handle, no URL text, and no helper command inside the iframe.
 - The local helper must remain protocol-real and use canonical `paykit-sdk`; no manual server claim route or database bypass is allowed.
 - The demo accepts requester-key (`cpk`), relay, and encryption-secret substitution risk from the pasted URL.
-- The helper still validates URL parseability, exact Paykit client ID, exact expected capabilities, and exact `watch-only-account-v1` companion-claim type.
+- The helper still validates URL parseability, exact Paykit client ID, exact capabilities `/pub/paykit/v0/bitkit/server/:rw,/pub/paykit/v0/private/bitkit/server/:rw`, and exact `watch-only-account-v1` companion-claim type.
 - The helper remains prompt/strict-stdin driven; auth URL, Creator secret, and xpub do not enter argv or `postMessage`, and helper output remains coarse.
 - Paykit config adds `[setup].log_authorization_url`, default `false`; local Compose sets it to `true`.
 - When URL logging is enabled, emit one stable URL-bearing line when a setup flow starts; the local operator owns log retention.
@@ -70,6 +70,12 @@ None.
 | URL never logs | one local-demo-only log line behind default-false config |
 | handle-specific HTTP/adversarial tests | URL validation and demo-scope tests |
 
+Implementation audit (current uncommitted tree): Tasks 2–4 are implemented and
+were accepted for this branch checkpoint. Task 5 documentation/config-example
+alignment is implemented pending manual review. Task 6 full Paykit,
+cross-repository, image, and live Compose verification remains pending; this
+audit is not self-approval.
+
 ---
 
 ### Task 1: Paired plan-only correction checkpoint
@@ -99,8 +105,10 @@ None.
 - Modify: `paykit-server/src/setup.rs`
 - Modify: `paykit-server/src/http/setup.rs`
 - Modify: `paykit-server/src/config.rs`
+- Modify: `paykit-server/src/server.rs`
 - Modify: `paykit-server/tests/setup.rs`
 - Modify: `paykit-server/tests/config.rs`
+- Modify: `paykit-server/tests/runtime.rs` or the nearest production-constructor test that proves config-to-service plumbing
 
 **RED sequence:**
 1. Add route regression asserting `/setup/companion-auth-request` is not mounted.
@@ -108,13 +116,14 @@ None.
 3. Add exact shell regression for the `06d2274` shape: desktop QR, touch deep link, no handle, no auth URL text, no helper command, no xpub, unchanged polling/callback, exact CSP, and `no-store`.
 4. Add config regressions: absent `log_authorization_url` defaults false; explicit true is accepted; unknown setup keys still fail.
 5. Add logging seam regression proving URL-bearing event is emitted once only when enabled and never when disabled. Use an injected/testable event sink or narrowly scoped tracing capture; do not assert raw URL through general logs.
-6. Run focused tests and observe expected RED failures caused by current handle route/state/UI and missing config field.
+6. Add a production-constructor regression proving parsed `setup.log_authorization_url` reaches the `SetupService` used by the mounted setup router; a workspace compile alone is not sufficient evidence of value propagation.
+7. Run focused tests and observe expected RED failures caused by current handle route/state/UI and missing config field.
 
 **GREEN sequence:**
 1. Remove handle generation, hashing, lookup result types, fields, terminal invalidation code, route DTOs, and route mount.
 2. Restore the visual shell structure/CSS from `06d2274` while preserving current `no-store`, exact `frame-ancestors`, polling retry set, target origin, state, and coarse callback.
 3. Add `SetupConfig::log_authorization_url: bool` with serde default false.
-4. Pass the flag to setup construction and emit one explicitly labeled local-demo URL log event at flow start only when enabled.
+4. Thread the flag through `paykit-server/src/server.rs` into setup construction and emit one explicitly labeled local-demo URL log event at flow start only when enabled.
 5. Run focused setup/config tests to GREEN.
 6. Run `cargo check --locked --workspace --all-targets` to catch constructor/config fallout.
 
@@ -141,12 +150,15 @@ None.
 ```
 
 **RED sequence:**
-1. Add Cargo-example tests (`cargo test -p paykit-server --example paykit-companion-auth`) for exact closed schema, unknown/missing fields, version, bounded canonical auth URL, Creator secret, tpub/network/depth/account index, and exact success/failure output.
-2. Add URL contract tests requiring canonical SDK parse, exact `app.paykit.server`, exact `LOCAL_DEMO_CAPABILITIES`, and exact `watch-only-account-v1` query/type.
-3. Add tests documenting accepted provenance gap: helper does not compare `cpk`, relay, or secret against server state.
-4. Retain protocol-ordering evidence that encrypted companion delivery is attempted before grant approval.
-5. Verify URL/secret/xpub never appear in helper output or `Debug` paths and argv remains empty.
-6. Observe RED against current handle schema and HTTP exchange.
+1. Structure the Cargo example around an example-local callable runner that accepts injected args, stdin reader, stdout/stderr writers, and the canonical async approval dependency; keep this seam inside `examples/paykit-companion-auth.rs`, not the production library.
+2. Add Cargo-example unit tests (`cargo test -p paykit-server --example paykit-companion-auth`) for exact closed schema, unknown/missing fields, version, bounded canonical auth URL, Creator secret, tpub/network/depth/account index, empty/extra argv rejection, and exact success/failure output through injected I/O.
+3. Add URL contract tests requiring canonical SDK parse, exact `app.paykit.server`, exact literal capabilities `/pub/paykit/v0/bitkit/server/:rw,/pub/paykit/v0/private/bitkit/server/:rw`, and exact `watch-only-account-v1` query/type.
+4. Add tests documenting accepted provenance gap: helper does not compare `cpk`, relay, or secret against server state.
+5. Move canonical relay/approval ordering evidence into example-local async tests around the callable runner; prove companion delivery is attempted before grant approval.
+6. Keep process deadline/kill/reap/stdout-stderr-cap assertions in the Locks Node wrapper tests, where the bounded child-process owner remains. Do not duplicate those process-supervision tests in the Rust example.
+7. Reserve packaged-process checks for `Dockerfile.local`: empty stdin, extra argv, exact coarse errors, and executable presence. Full Compose E2E proves the built example performs the real protocol flow.
+8. Verify URL/secret/xpub never appear in helper output or `Debug` paths.
+9. Observe RED against current handle schema and HTTP exchange.
 
 **GREEN sequence:**
 1. Move helper to Cargo examples and replace `companion_handle` with `auth_url`.
@@ -174,8 +186,11 @@ None.
 2. Install the example artifact from `target/release/examples/paykit-companion-auth` into the local-demo runtime image for the Locks creator image to copy.
 3. Keep image labels explicitly local/demo-only.
 4. Keep build-time empty-stdin helper rejection smoke and server startup-contract smoke.
-5. Prove ordinary `cargo build -p paykit-server --bins` does not produce a companion helper binary.
-6. Build exact public/local contexts with Paykit Rust `v0.1.0-rc48` and Locks `v0.1.0-rc1`.
+5. Use `cargo metadata --no-deps --format-version 1` to assert `paykit-companion-auth` target kind is `example`, never `bin`.
+6. Use a fresh isolated `CARGO_TARGET_DIR` to run `cargo build -p paykit-server --bins`; assert no helper artifact exists there so stale artifacts cannot create false evidence.
+7. In a separate isolated target directory, build `--example paykit-companion-auth` and assert the artifact is under `target/release/examples/` (or the selected profile-equivalent path).
+8. Verify ordinary server routes/package binaries contain no helper or handle surface, while `Dockerfile.local` explicitly builds and installs `target/release/examples/paykit-companion-auth`.
+9. Build exact public/local contexts with Paykit Rust `v0.1.0-rc48` and Locks `v0.1.0-rc1`.
 
 **Suggested commit:** `build(demo): package companion helper example`
 
@@ -188,15 +203,19 @@ None.
 **Files:**
 - Modify: `README.md`
 - Modify: `docs/local-locks-demo.md`
+- Modify: `config/paykit-server.example.toml`
+- Modify: `docs/plans/0001-receiver-only-prototype-design.md`
 - Modify: `docs/plans/0004-local-locks-compose-integration.md` implementation audit/status
 
 **Steps:**
 1. Document production Bitkit QR/deep-link flow and no helper/handle production surface.
 2. Document `[setup].log_authorization_url = true` as local-demo-only, bearer-secret logging with operator-owned retention.
-3. Document strict helper stdin and accepted `cpk`/relay/secret substitution risk.
-4. Remove `companion_handle`, handle exchange endpoint, helper `PAYKIT_SERVER_URL`, and server-provenance claims from active docs.
-5. Search current docs/tests/source for stale terms; historical commit messages need not be rewritten.
-6. Run Markdown/stale-term checks and `git diff --check`.
+3. Add `log_authorization_url = false` to `config/paykit-server.example.toml`; state that Locks-generated local config is the sole planned `true` setting.
+4. Reconcile the active plan 0001 claim that setup URLs never enter logs: default/production remains no-log, while explicit local-demo config is an accepted exception with operator-owned retention.
+5. Document strict helper stdin and accepted `cpk`/relay/secret substitution risk.
+6. Remove `companion_handle`, handle exchange endpoint, helper `PAYKIT_SERVER_URL`, and server-provenance claims from active docs.
+7. Search current docs/tests/source for stale terms; historical commit messages need not be rewritten.
+8. Run Markdown/stale-term checks and `git diff --check`.
 
 **Suggested commit:** fold into the correction commit unless repository policy requires docs-only separation.
 

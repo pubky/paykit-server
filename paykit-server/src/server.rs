@@ -151,7 +151,7 @@ impl Server {
             config.deployment_invariants().bitcoin_network.clone(),
             config.paykit.receiver_path.clone(),
         ));
-        let setup = SetupService::new(
+        let setup = SetupService::new_with_authorization_url_logging(
             config.setup.allowed_origins.clone(),
             setup_completer,
             Arc::new(SystemClock::default()),
@@ -171,6 +171,7 @@ impl Server {
                 )
                 .expect("validated pending setup limit fits usize"),
             },
+            config.setup.log_authorization_url,
         );
 
         let session_validator = Arc::new(CreatorSessionValidator {

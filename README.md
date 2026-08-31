@@ -51,15 +51,28 @@ Business-route signatures use the configured trusted Locks Ed25519 key. Setup us
 
 ### Setup iframe
 
-`GET /setup` renders the Bitkit QR/deep link plus a short-lived opaque companion handle and this local approval command; the helper never accepts the auth URL from the operator:
+`GET /setup` is the production Bitkit setup surface. On desktop it renders the
+normal secret-bearing Pubky Auth request as a QR code; on touch devices it
+offers the same request through a `Continue with Bitkit` deep link. Production
+has no companion handle, helper endpoint or state, helper UI, or helper in the
+production package/runtime surface.
 
-```bash
-npm --prefix examples/js-sdk run authenticate-paykit -- --role content-creator
-```
+The iframe continues polling `POST /setup/{flow_id}/complete`. It never sends
+the auth URL, Creator secret, xpub, or companion payload through `postMessage`.
+There is no manual claim route. Completion posts only
+`{ type: "paykit-setup-callback", state }` or the same callback with a coarse
+error to the exact caller origin.
 
-The iframe continues polling `POST /setup/{flow_id}/complete`. It does not receive, store, post, or log an xpub, and there is no manual claim route. Completion posts only `{ type: "paykit-setup-callback", state }` or the same callback with a coarse error to the exact caller origin.
-
-`paykit-companion-auth` accepts one closed version-1 JSON object on stdin with a base64url 32-byte `companion_handle`, a base64url 32-byte `creator_secret`, `account_xpub`, and `account_index`. The trusted Paykit Server origin comes from `PAYKIT_SERVER_URL`, never stdin. The helper exchanges the handle at `POST /setup/companion-auth-request`, requires a no-store closed response, and approves only the exact server-retained grant URL. It rejects missing or unknown fields, unsupported versions, caller-supplied auth URLs, unsafe server origins, redirects, oversized responses, and grant URLs whose client ID is not the trusted `app.paykit.server`. Success stdout is exactly `{"version":1,"status":"approved"}\n`; failures remain coarse and do not echo input.
+The local Locks demo substitutes a Paykit-owned Cargo example for Bitkit. That
+example is built and installed only by `Dockerfile.local`; it is not a normal
+package binary or production server surface. It accepts exactly one closed
+version-1 JSON object on stdin containing `auth_url`, `creator_secret`,
+`account_xpub`, and `account_index`, invokes the canonical `paykit-sdk`
+companion-approval operation, and returns only a coarse result. It accepts no
+URL, secret, or xpub through argv or `postMessage` and never writes those values
+to output. It does not accept a Paykit Server URL or perform a helper-to-server
+exchange. See [`docs/local-locks-demo.md`](docs/local-locks-demo.md) for the
+local-only logging and trust boundary.
 
 The composed PostgreSQL workflow is tested with two independent Creators across restart. Live adapter evidence covers a separate local Pubky relay/homeserver process and one public mainnet Fulcrum endpoint; see [`docs/live-adapter-smoke.md`](docs/live-adapter-smoke.md). Those checks bound interoperability to the recorded versions and environments rather than claiming compatibility with every provider.
 
@@ -112,6 +125,13 @@ Required environment variables:
 
 Do not put database credentials or the master key in TOML, logs, shell history, or source control. Effective-config debug output redacts secret values.
 
+`setup.log_authorization_url` defaults to `false` and must remain false for
+production. The paired Locks correction will make its generated local-demo
+config the sole `true` setting; once that sibling change lands, each new setup
+flow emits one explicitly labeled authorization URL log line for operator
+retrieval. The URL is a bearer secret; the local operator owns access to and
+retention of those logs.
+
 The parser rejects the retired `[inbox]` section. The executable exposes no payer
 inbox API or worker, and the baseline schema contains no payer inbox tables.
 
@@ -134,7 +154,8 @@ Startup fails before bind if configuration, secrets, PostgreSQL, migrations, aut
 `Dockerfile.local` packages this repository for the Locks Compose stack. It
 accepts pinned public Git sources or deliberate local-worktree overrides through
 named BuildKit contexts, then produces an unprivileged local image containing
-the server and helper binaries.
+the server, the existing reader-demo binary, and the local companion Cargo
+example installed as `paykit-companion-auth`.
 
 Build command, image contract, source-rewrite behavior, and generated config contract live in [`docs/local-locks-demo.md`](docs/local-locks-demo.md).
 
@@ -145,7 +166,11 @@ Build command, image contract, source-rewrite behavior, and generated config con
 - PostgreSQL loss is `not_ready`. Electrum or Paykit delivery trouble is `degraded`.
 - `GET /metrics` exports identifier-free Prometheus/OpenMetrics data.
 
-Health, metrics, and logs do not expose Creator/reader identities, addresses, URLs, payloads, signatures, credentials, or protocol correlations. Policy rate limiting returns `429`; exhausted runtime admission returns `503` with `Retry-After: 1`.
+Health and metrics do not expose Creator/reader identities, addresses, URLs,
+payloads, signatures, credentials, or protocol correlations. Normal production
+logs have the same boundary. The sole exception is the explicitly enabled local
+demo authorization-URL event described above. Policy rate limiting returns
+`429`; exhausted runtime admission returns `503` with `Retry-After: 1`.
 
 On SIGTERM or SIGINT, readiness changes first, normal admission and new worker claims stop, and admitted work drains for at most `shutdown.drain_timeout`. Remaining work is cancelled at the deadline. Durable leases can be reclaimed after restart; pending memory-only setup flows are lost.
 

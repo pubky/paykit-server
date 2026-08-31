@@ -14,10 +14,15 @@ listen_addr = "127.0.0.1:8080"
 # Configure exact HTTP(S) origins, or use ["*"] alone to accept any valid
 # HTTP(S) parent. Even with "*", CSP and postMessage use the caller's concrete origin.
 allowed_origins = ["https://app.example.invalid"]
+# Keep false outside the controlled local Locks demo. When true, each setup flow
+# writes its bearer-secret authorization URL to one log event. The operator owns
+# log access and retention. The Locks-generated local config is the sole planned
+# true setting.
+log_authorization_url = false
 
 [paykit]
-# Stable grant owner checked by both Paykit Server and its companion helper.
-# Other values are rejected.
+# Stable grant owner checked by Paykit Server and by the local-demo companion
+# Cargo example. Other values are rejected.
 client_id = "app.paykit.server"
 receiver_path = "bitkit/server"
 receiver_path_priority = ["bitkit"]

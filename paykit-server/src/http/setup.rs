@@ -1,38 +1,20 @@
 use axum::{
-    Json, Router,
+    Router,
     body::Body,
-    extract::{ConnectInfo, Path, RawQuery, State, rejection::JsonRejection},
+    extract::{ConnectInfo, Path, RawQuery, State},
     http::{HeaderValue, StatusCode, header},
     response::Response,
     routing::{get, post},
 };
 use qrcode::{QrCode, render::svg};
-use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::net::SocketAddr;
 
-use crate::setup::{BeginError, CompanionAuthRequestResult, PollResult, SetupService, StartedFlow};
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CompanionAuthRequestBody {
-    version: u8,
-    handle: String,
-}
-
-#[derive(Serialize)]
-struct CompanionAuthRequestResponse {
-    version: u8,
-    auth_url: String,
-}
+use crate::setup::{BeginError, PollResult, SetupService, StartedFlow};
 
 pub fn setup_router(service: SetupService) -> Router {
     Router::new()
         .route("/setup", get(begin))
-        .route(
-            "/setup/companion-auth-request",
-            post(companion_auth_request),
-        )
         .route("/setup/{flow_id}/complete", post(complete))
         .with_state(service)
 }
@@ -61,31 +43,6 @@ async fn begin(
     }
 }
 
-async fn companion_auth_request(
-    State(service): State<SetupService>,
-    request: Result<Json<CompanionAuthRequestBody>, JsonRejection>,
-) -> Response<Body> {
-    let Ok(Json(request)) = request else {
-        return invalid_request();
-    };
-    if request.version != 1 {
-        return invalid_request();
-    }
-    match service.companion_auth_request(&request.handle).await {
-        CompanionAuthRequestResult::Ready { authorization_url } => safe_response(
-            StatusCode::OK,
-            serde_json::to_value(CompanionAuthRequestResponse {
-                version: 1,
-                auth_url: authorization_url,
-            })
-            .expect("companion auth response serializes"),
-        ),
-        CompanionAuthRequestResult::Unavailable => {
-            safe_response(StatusCode::NOT_FOUND, json!({"error":"not_found"}))
-        }
-    }
-}
-
 async fn complete(
     State(service): State<SetupService>,
     Path(flow_id): Path<String>,
@@ -111,13 +68,10 @@ fn iframe_response(flow: StartedFlow) -> Response<Body> {
     let state = json_for_script(&flow.state);
     let origin = json_for_script(&flow.origin);
     let authorization_url = html_for_text(&flow.authorization_url);
-    let companion_handle = html_for_text(&flow.companion_handle);
     let qr_svg = render_authorization_qr_svg(&flow.authorization_url);
-    let companion_command =
-        "npm --prefix examples/js-sdk run authenticate-paykit -- --role content-creator";
     let css = SETUP_CSS;
     let shell = format!(
-        "<!doctype html><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><style>{css}</style><main><span class=\"qr\" data-testid=\"paykit-auth-qr\">{qr_svg}</span><a class=\"bitkit-btn\" href=\"{authorization_url}\">Continue with Bitkit</a><section class=\"companion\"><span>Local demo companion handle</span><code data-testid=\"paykit-companion-handle\">{companion_handle}</code><span>Run from the Locks repository host</span><code data-testid=\"paykit-companion-command\">{companion_command}</code></section></main><script>\nconst flowId={flow_id};const state={state};const targetOrigin={origin};\nconst retryable=new Set([408,425,429,502,503,504]);let delay=500;\nasync function poll(){{try{{const response=await fetch('/setup/'+flowId+'/complete',{{method:'POST'}});if(response.status===200){{window.parent.postMessage({{type:'paykit-setup-callback',state}},targetOrigin);return;}}if(!retryable.has(response.status)){{window.parent.postMessage({{type:'paykit-setup-callback',state,error:'setup-failed'}},targetOrigin);return;}}}}catch(_error){{}}setTimeout(poll,delay);delay=Math.min(delay*2,5000);}}setTimeout(poll,delay);\n</script>"
+        "<!doctype html><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><style>{css}</style><main><span class=\"qr\" data-testid=\"paykit-auth-qr\">{qr_svg}</span><a class=\"bitkit-btn\" href=\"{authorization_url}\">Continue with Bitkit</a></main><script>\nconst flowId={flow_id};const state={state};const targetOrigin={origin};\nconst retryable=new Set([408,425,429,502,503,504]);let delay=500;\nasync function poll(){{try{{const response=await fetch('/setup/'+flowId+'/complete',{{method:'POST'}});if(response.status===200){{window.parent.postMessage({{type:'paykit-setup-callback',state}},targetOrigin);return;}}if(!retryable.has(response.status)){{window.parent.postMessage({{type:'paykit-setup-callback',state,error:'setup-failed'}},targetOrigin);return;}}}}catch(_error){{}}setTimeout(poll,delay);delay=Math.min(delay*2,5000);}}setTimeout(poll,delay);\n</script>"
     );
     let mut response = Response::new(Body::from(shell));
     *response.status_mut() = StatusCode::OK;
@@ -142,11 +96,11 @@ const SETUP_CSS: &str = r#"html,body{margin:0;height:100%}
 body{display:flex;align-items:center;justify-content:center;background:transparent;font:700 14px/20px system-ui,-apple-system,sans-serif;color:#d4d4db}
 /* Without this the flex item shrinks to its content, so the touch button's width:100% only
    reaches the QR panel's width instead of the frame's. */
-main{width:100%;display:flex;flex-direction:column;gap:12px;align-items:center;justify-content:center}
+main{width:100%;display:flex;align-items:center;justify-content:center}
 .qr{display:flex;align-items:center;justify-content:center;box-sizing:border-box;width:192px;height:192px;padding:12px;border-radius:8px;background:#fff}
 .qr svg{display:block;width:100%;height:100%}
 .bitkit-btn{display:none}
-.companion{display:flex;max-width:100%;flex-direction:column;gap:4px;text-align:center;font:500 12px/16px system-ui,-apple-system,sans-serif}.companion code{max-width:100%;overflow-wrap:anywhere;user-select:all}
+
 /* Touch devices cannot scan their own screen, so they get the same URL as a deep link. Keyed on the
    pointer type, not viewport width: this page renders inside a small parent iframe, which would
    always read as narrow. */
