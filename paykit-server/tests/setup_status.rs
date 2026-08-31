@@ -126,7 +126,7 @@ async fn signed_status_maps_live_session_outcomes_to_closed_coarse_states() {
         ),
         (
             Err(SessionValidationError::Unavailable),
-            r#"{"status":"setup_required"}"#,
+            r#"{"status":"unavailable"}"#,
         ),
     ] {
         let response = router(&key, result)

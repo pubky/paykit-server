@@ -676,10 +676,14 @@ fn classify_pubky_session_error(error: &pubky::Error) -> SessionValidationError 
     match error {
         pubky::Error::Authentication(_) | pubky::Error::Parse(_) => SessionValidationError::Invalid,
         pubky::Error::Request(RequestError::Validation { .. }) => SessionValidationError::Invalid,
-        // Pubky 0.11 exposes homeserver failures only as status + message. Even 401 can mean a
-        // recoverable PoP audience or timestamp failure, so no server status proves this stored
-        // grant is invalid. Preserve this distinction for invoice callers; SetupStatusService
-        // deliberately collapses every completed validation failure into re-authentication.
+        // Pubky 0.11 reports revoked grants as an untyped 401. Treat that status as terminal so
+        // setup can recover. A recoverable PoP audience or timestamp rejection may also be 401;
+        // this narrow ambiguity remains until upstream preserves a typed rejection cause.
+        pubky::Error::Request(RequestError::Server { status, .. })
+            if *status == pubky::StatusCode::UNAUTHORIZED =>
+        {
+            SessionValidationError::Invalid
+        }
         pubky::Error::Request(_) | pubky::Error::Pkarr(_) | pubky::Error::Build(_) => {
             SessionValidationError::Unavailable
         }
@@ -797,9 +801,27 @@ mod tests {
     }
 
     #[test]
-    fn pubky_server_errors_without_typed_rejection_are_unavailable() {
+    fn pubky_unauthorized_restore_is_invalid_to_recover_revoked_grants() {
+        let error = PaykitSdkError::Identity {
+            context: "restore Pubky grant session".into(),
+            source: Some(
+                pubky::Error::Request(pubky::errors::RequestError::Server {
+                    status: pubky::StatusCode::UNAUTHORIZED,
+                    message: "grant rejected".into(),
+                })
+                .into(),
+            ),
+        };
+
+        assert_eq!(
+            map_session_validation_error(error),
+            SessionValidationError::Invalid
+        );
+    }
+
+    #[test]
+    fn transient_pubky_server_errors_remain_unavailable() {
         for status in [
-            pubky::StatusCode::UNAUTHORIZED,
             pubky::StatusCode::MISDIRECTED_REQUEST,
             pubky::StatusCode::SERVICE_UNAVAILABLE,
             pubky::StatusCode::TOO_MANY_REQUESTS,

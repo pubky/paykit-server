@@ -47,7 +47,7 @@ Business routes:
 
 Business-route signatures use the configured trusted Locks Ed25519 key. Setup uses the Bitkit Pubky Auth companion-claim flow and an exact configured browser origin.
 
-`POST /setup/status` is the Locks-only readiness check for an authenticated Creator. Its closed canonical body is `{"creator":"pubky..."}`; the signature covers the exact compact canonical JSON bytes. It returns exactly one coarse state: `ready` when the persisted Creator session imports and matches that Creator, `setup_required` for any completed session-validation failure so the user can authenticate again, and `unavailable` only when validation exceeds the bounded status deadline. Callers must not convert `unavailable` into a new authorization flow.
+`POST /setup/status` is the Locks-only readiness check for an authenticated Creator. Its closed canonical body is `{"creator":"pubky..."}`; the signature covers the exact compact canonical JSON bytes. It returns exactly one coarse state: `ready` when the persisted Creator session imports and matches that Creator, `setup_required` when authority is absent, invalid, expired, or rejected with the Pubky 0.11 status used for revoked grants, and `unavailable` for validation timeouts and transient storage, rate-limit, server, DNS, or transport failures. Callers must not convert `unavailable` into a new authorization flow.
 
 ### Setup iframe
 
