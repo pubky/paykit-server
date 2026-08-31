@@ -223,12 +223,16 @@ mod tests {
         secp256k1::Secp256k1,
     };
     use paykit_server::bitkit_claim::{
-        CLAIM_TYPE, LOCAL_DEMO_CAPABILITIES, QUERY_PARAMETER, derive_channel_id,
-        parse_unsigned_payload,
+        CLAIM_TYPE, LOCAL_DEMO_CAPABILITIES, QUERY_PARAMETER, decrypt_and_verify,
+        derive_channel_id, parse_unsigned_payload,
+    };
+    use pubky::{
+        Capabilities, EncryptedHttpRelayInboxChannel, GrantClaims, HttpRelayInboxChannel, Keypair,
+        PubkyHttpClient,
     };
     use serde_json::{Value, json};
 
-    use super::{Approval, ApprovalRequest, SdkApproval, run_with};
+    use super::{Approval, ApprovalRequest, PAYKIT_CLIENT_ID, SdkApproval, run_with};
 
     const FIXTURE_DEADLINE: Duration = Duration::from_secs(5);
 
@@ -535,6 +539,58 @@ mod tests {
         .await;
         assert!(!success);
         assert_eq!(stderr, b"companion authentication failed\n");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn canonical_sdk_delivers_companion_claim_and_grant_on_success() {
+        let relay = http_relay::HttpRelay::builder()
+            .http_port(0)
+            .run()
+            .await
+            .unwrap();
+        let inbox = relay.local_url().join("inbox").unwrap();
+        let auth_secret = [9; 32];
+        let mut input = valid_input();
+        input["auth_url"] = json!(auth_url(inbox.as_str(), &auth_secret));
+
+        let (success, stdout, stderr) = run(&input, vec!["helper".into()], &SdkApproval).await;
+
+        assert!(success, "{}", String::from_utf8_lossy(&stderr));
+        assert_eq!(stdout, b"{\"version\":1,\"status\":\"approved\"}\n");
+        assert!(stderr.is_empty());
+
+        let client = PubkyHttpClient::new().unwrap();
+        let claim_channel =
+            HttpRelayInboxChannel::new(inbox.clone(), derive_channel_id(&auth_secret)).unwrap();
+        let encrypted_claim = claim_channel
+            .poll(&client, Some(Duration::from_secs(1)))
+            .await
+            .unwrap()
+            .unwrap();
+        let creator = Keypair::from_secret(&[7; 32]);
+        let verifying_key =
+            ed25519_dalek::VerifyingKey::from_bytes(creator.public_key().as_bytes()).unwrap();
+        let claim = decrypt_and_verify(&encrypted_claim, &auth_secret, &verifying_key).unwrap();
+        assert_eq!(claim.account_index, 0);
+        assert_eq!(
+            claim.serialized_xpub,
+            account_xpub(Network::Testnet, 0).encode()
+        );
+
+        let auth_channel = EncryptedHttpRelayInboxChannel::new(inbox, auth_secret).unwrap();
+        let grant_bytes = auth_channel
+            .poll(&client, Some(Duration::from_secs(1)))
+            .await
+            .unwrap()
+            .unwrap();
+        let grant = GrantClaims::decode(std::str::from_utf8(&grant_bytes).unwrap()).unwrap();
+        assert_eq!(grant.iss, creator.public_key());
+        assert_eq!(grant.client_id.as_str(), PAYKIT_CLIENT_ID);
+        assert_eq!(
+            Capabilities::from(grant.caps).to_string(),
+            LOCAL_DEMO_CAPABILITIES
+        );
+        assert_eq!(grant.cnf, Keypair::from_secret(&[8; 32]).public_key());
     }
 
     #[tokio::test(flavor = "multi_thread")]
