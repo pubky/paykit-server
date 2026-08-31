@@ -73,6 +73,34 @@ poll_interval = "500ms"
 }
 
 #[test]
+fn setup_authorization_url_logging_defaults_to_disabled() {
+    let config = Config::from_toml_and_environment(&valid_toml(), environment()).unwrap();
+
+    assert!(!config.setup.log_authorization_url);
+}
+
+#[test]
+fn setup_authorization_url_logging_accepts_explicit_true() {
+    let input = valid_toml().replace(
+        "allowed_origins = [\"https://app.example\"]",
+        "allowed_origins = [\"https://app.example\"]\nlog_authorization_url = true",
+    );
+    let config = Config::from_toml_and_environment(&input, environment()).unwrap();
+
+    assert!(config.setup.log_authorization_url);
+}
+
+#[test]
+fn setup_still_rejects_unknown_keys() {
+    let input = valid_toml().replace(
+        "allowed_origins = [\"https://app.example\"]",
+        "allowed_origins = [\"https://app.example\"]\nlog_authorisation_url = true",
+    );
+
+    assert!(Config::from_toml_and_environment(&input, environment()).is_err());
+}
+
+#[test]
 fn parses_exact_local_compose_config_contract() {
     let config = Config::from_toml_and_environment(&local_compose_toml(), environment())
         .expect("local Compose configuration");

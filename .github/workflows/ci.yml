@@ -72,6 +72,9 @@ jobs:
       - name: Run server tests
         run: cargo test --locked -p paykit-server -- --test-threads=1
 
+      - name: Run companion helper example tests
+        run: cargo test --locked -p paykit-server --example paykit-companion-auth -- --test-threads=1
+
   postgres-e2e:
     name: PostgreSQL E2E
     runs-on: ubuntu-24.04

@@ -440,7 +440,7 @@ Rules:
 - TOML sections are `http`, `locks`, `setup`, `paykit`, `bitcoin`, `electrum`, `outbox`, `limits`, `rate_limits`, and `shutdown`; retired `[inbox]` is rejected.
 - `http` configures listen address.
 - TOML keys use `snake_case`; duration values use strings such as `"5s"`, `"30s"`, and `"90d"`.
-- Initial key names are `http.listen_addr`, `locks.trusted_public_key`, `setup.allowed_origins`, `paykit.receiver_path`, `paykit.receiver_path_priority`, `paykit.network`, `bitcoin.network`, `electrum.endpoint`, `electrum.poll_interval`, `electrum.request_timeout`, and `electrum.connect_retries`; `paykit.receiver_path` is validated as `paykit_lib::PaykitReceiverPath` (for example `paykit/server`) and `paykit.network` is the closed enum `mainnet | testnet` supported by the pinned Pubky constructors. `testnet` is the pinned Pubky client's fixed localhost testnet, not a hosted service. Electrum request timeout and connect retries default to `"10s"` and `1`.
+- Initial key names are `http.listen_addr`, `locks.trusted_public_key`, `setup.allowed_origins`, `setup.log_authorization_url`, `paykit.receiver_path`, `paykit.receiver_path_priority`, `paykit.network`, `bitcoin.network`, `electrum.endpoint`, `electrum.poll_interval`, `electrum.request_timeout`, and `electrum.connect_retries`; `setup.log_authorization_url` defaults to `false` and production leaves it disabled. The sole planned `true` setting is the Locks-generated local-demo config, where one bearer-secret authorization URL event is emitted per new setup flow and the local operator owns log access and retention. `paykit.receiver_path` is validated as `paykit_lib::PaykitReceiverPath` (for example `paykit/server`) and `paykit.network` is the closed enum `mainnet | testnet` supported by the pinned Pubky constructors. `testnet` is the pinned Pubky client's fixed localhost testnet, not a hosted service. Electrum request timeout and connect retries default to `"10s"` and `1`.
 - Remaining key names are `outbox.poll_interval`, `outbox.batch_size`, `outbox.lease_duration`, `outbox.retry_initial`, `outbox.retry_max`, `limits.request_body_bytes`, `limits.lock_resource_bytes`, `limits.lock_fetch_timeout`, `rate_limits.signed_requests_per_second`, `rate_limits.signed_burst`, `rate_limits.setup_per_ip_per_minute`, `rate_limits.max_pending_setup_flows`, `rate_limits.max_completion_polls_per_flow`, `rate_limits.max_completion_polls`, and `shutdown.drain_timeout`; `outbox.batch_size` defaults to `16`.
 - `locks` configures one canonical Pubky-prefixed trusted Lock Server public key
   in the same `pubky<pubky-key>` form as Locks
@@ -481,7 +481,13 @@ Rules:
 
 - Logs are structured JSON.
 - Logs may include timestamp, level, target, generated request ID, route, method, status, latency, internal row UUID, worker/action/result, and safe error class.
-- Logs never include request/response bodies, signature header, `return_to`, setup state/auth URL, credentials/keys/xpub, creator/reader Pubky, bundle/lock identifiers, Bitcoin address, Payment Reference/Request ID, `txid:vout`, decrypted payload/state, or database URL.
+- By default, and for production, logs never include request/response bodies,
+  signature header, `return_to`, setup state/auth URL, credentials/keys/xpub,
+  creator/reader Pubky, bundle/lock identifiers, Bitcoin address, Payment
+  Reference/Request ID, `txid:vout`, decrypted payload/state, or database URL.
+  The explicit local-demo-only exception is `setup.log_authorization_url = true`,
+  which emits one bearer-secret authorization URL event when a setup flow starts;
+  the local operator owns access to and retention of that log.
 - Prometheus metrics are exposed at `GET /metrics`.
 - Metrics have no labels and cover HTTP count/latency, outbox
   depth/retry/permanent failure, Electrum availability/last-success age,

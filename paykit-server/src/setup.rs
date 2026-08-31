@@ -109,6 +109,7 @@ pub struct SetupService {
 
 struct Inner {
     allowed_origins: Vec<String>,
+    log_authorization_url: bool,
     completer: Arc<dyn SetupCompleter>,
     clock: Arc<dyn Clock>,
     poll_timeout: Duration,
@@ -130,9 +131,6 @@ struct State {
 }
 
 struct Flow {
-    state: String,
-    origin: String,
-    authorization_url: String,
     attempt: Option<Box<dyn SetupAttempt>>,
     reservation: Option<OwnedSemaphorePermit>,
     expires_at: Duration,
@@ -234,12 +232,23 @@ impl SetupRateLimiter {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub struct StartedFlow {
     pub flow_id: String,
     pub state: String,
     pub origin: String,
     pub authorization_url: String,
+}
+
+impl core::fmt::Debug for StartedFlow {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("StartedFlow")
+            .field("flow_id", &self.flow_id)
+            .field("state", &self.state)
+            .field("origin", &self.origin)
+            .field("authorization_url", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -269,6 +278,23 @@ impl SetupService {
         )
     }
 
+    pub fn new_with_authorization_url_logging(
+        allowed_origins: Vec<String>,
+        completer: Arc<dyn SetupCompleter>,
+        clock: Arc<dyn Clock>,
+        limits: SetupLimits,
+        log_authorization_url: bool,
+    ) -> Self {
+        Self::with_poll_timeout_and_logging(
+            allowed_origins,
+            completer,
+            clock,
+            limits,
+            DEFAULT_POLL_TIMEOUT,
+            log_authorization_url,
+        )
+    }
+
     pub fn with_poll_timeout(
         allowed_origins: Vec<String>,
         completer: Arc<dyn SetupCompleter>,
@@ -276,9 +302,28 @@ impl SetupService {
         limits: SetupLimits,
         poll_timeout: Duration,
     ) -> Self {
+        Self::with_poll_timeout_and_logging(
+            allowed_origins,
+            completer,
+            clock,
+            limits,
+            poll_timeout,
+            false,
+        )
+    }
+
+    pub fn with_poll_timeout_and_logging(
+        allowed_origins: Vec<String>,
+        completer: Arc<dyn SetupCompleter>,
+        clock: Arc<dyn Clock>,
+        limits: SetupLimits,
+        poll_timeout: Duration,
+        log_authorization_url: bool,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 allowed_origins,
+                log_authorization_url,
                 completer,
                 clock,
                 poll_timeout,
@@ -330,11 +375,7 @@ impl SetupService {
             .start()
             .await
             .map_err(|_| BeginError::Unavailable)?;
-        let mut bytes = [0_u8; 32];
-        SysRng
-            .try_fill_bytes(&mut bytes)
-            .map_err(|_| BeginError::Unavailable)?;
-        let flow_id = URL_SAFE_NO_PAD.encode(bytes);
+        let flow_id = random_token().map_err(|_| BeginError::Unavailable)?;
         let started = StartedFlow {
             flow_id: flow_id.clone(),
             state: state.to_owned(),
@@ -346,9 +387,6 @@ impl SetupService {
         guard.flows.insert(
             flow_id,
             Flow {
-                state: state.to_owned(),
-                origin: started.origin.clone(),
-                authorization_url: started_setup.authorization_url,
                 attempt: Some(started_setup.attempt),
                 reservation: Some(reservation),
                 expires_at: self.inner.clock.now() + FLOW_LIFETIME,
@@ -356,6 +394,14 @@ impl SetupService {
                 active_polls: Arc::new(AtomicUsize::new(0)),
             },
         );
+        drop(guard);
+        if self.inner.log_authorization_url {
+            tracing::info!(
+                event = "paykit_setup_authorization_url",
+                authorization_url = %started.authorization_url,
+                "setup authorization URL"
+            );
+        }
         Ok(started)
     }
 
@@ -441,15 +487,10 @@ impl SetupService {
         }
     }
 
-    pub async fn flow(&self, flow_id: &str) -> Option<StartedFlow> {
+    pub async fn flow_exists(&self, flow_id: &str) -> bool {
         let mut guard = self.inner.state.lock().await;
         cleanup_expired(&mut guard, self.inner.clock.now());
-        guard.flows.get(flow_id).map(|flow| StartedFlow {
-            flow_id: flow_id.to_owned(),
-            state: flow.state.clone(),
-            origin: flow.origin.clone(),
-            authorization_url: flow.authorization_url.clone(),
-        })
+        guard.flows.contains_key(flow_id)
     }
 
     async fn status(&self, flow_id: &str) -> PollResult {
@@ -520,6 +561,12 @@ fn reserve_poll(counter: &AtomicUsize, maximum: usize) -> bool {
         .is_ok()
 }
 
+fn random_token() -> Result<String, ()> {
+    let mut bytes = [0_u8; 32];
+    SysRng.try_fill_bytes(&mut bytes).map_err(|_| ())?;
+    Ok(URL_SAFE_NO_PAD.encode(bytes))
+}
+
 fn cleanup_expired(state: &mut State, now: Duration) {
     state.expired.retain(|_, until| now < *until);
     let expired_ids = state
@@ -529,8 +576,8 @@ fn cleanup_expired(state: &mut State, now: Duration) {
         .map(|(flow_id, _)| flow_id.clone())
         .collect::<Vec<_>>();
     for flow_id in expired_ids {
-        // Removing the flow drops its attempt and authorization URL before the
-        // tombstone is recorded. Tombstones contain no flow secrets.
+        // Removing the flow drops its secret-bearing setup attempt before the
+        // tombstone is recorded. Tombstones retain no flow secrets.
         state.flows.remove(&flow_id);
         state.expired.insert(flow_id, now + FLOW_LIFETIME);
     }

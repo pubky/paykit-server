@@ -16,6 +16,7 @@ use axum::{
     http::{Method, Request, StatusCode},
     response::Response,
 };
+
 use bitcoin::{
     Network,
     bip32::{ChildNumber, Xpriv, Xpub},
@@ -34,6 +35,8 @@ use paykit_server::{
 };
 use tokio::sync::{Mutex, Notify, Semaphore};
 use tower::ServiceExt;
+use tracing::{Event, Subscriber, instrument::WithSubscriber};
+use tracing_subscriber::{Layer, layer::Context, prelude::*};
 
 fn account_xpub(network: Network, coin_type: u32, account_index: u32) -> Xpub {
     let secp = Secp256k1::new();
@@ -326,6 +329,128 @@ fn peer() -> IpAddr {
     IpAddr::V4(Ipv4Addr::LOCALHOST)
 }
 
+type CapturedEventFields = Vec<Vec<(String, String)>>;
+
+#[derive(Clone, Default)]
+struct EventCapture(Arc<std::sync::Mutex<CapturedEventFields>>);
+
+impl<S> Layer<S> for EventCapture
+where
+    S: Subscriber,
+{
+    fn on_event(&self, event: &Event<'_>, _context: Context<'_, S>) {
+        let mut fields = Vec::new();
+        event.record(&mut FieldVisitor(&mut fields));
+        self.0.lock().unwrap().push(fields);
+    }
+}
+
+struct FieldVisitor<'a>(&'a mut Vec<(String, String)>);
+
+impl tracing::field::Visit for FieldVisitor<'_> {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn core::fmt::Debug) {
+        self.0.push((field.name().to_owned(), format!("{value:?}")));
+    }
+}
+
+fn authorization_url_events(capture: &EventCapture) -> Vec<Vec<(String, String)>> {
+    capture
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|fields| {
+            fields.iter().any(|(name, value)| {
+                name == "event" && value.contains("paykit_setup_authorization_url")
+            })
+        })
+        .cloned()
+        .collect()
+}
+
+#[tokio::test]
+async fn authorization_url_event_is_emitted_once_only_when_enabled() {
+    let authorization_url = "pubkyauth://signin?secret=log-only-when-enabled";
+    for (enabled, expected_count) in [(false, 0), (true, 1)] {
+        let capture = EventCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        let setup = SetupService::with_poll_timeout_and_logging(
+            vec!["https://app.example".to_owned()],
+            Arc::new(UrlCompleter(authorization_url.to_owned())),
+            Arc::new(ManualClock::default()),
+            runtime_limits(2, 4, 100, 100),
+            Duration::ZERO,
+            enabled,
+        );
+
+        async {
+            setup
+                .begin(peer(), "https://app.example/callback", "state")
+                .await
+                .unwrap();
+        }
+        .with_subscriber(subscriber)
+        .await;
+
+        let events = authorization_url_events(&capture);
+        assert_eq!(events.len(), expected_count);
+        if enabled {
+            assert!(events[0].iter().any(|(name, value)| {
+                name == "authorization_url" && value.contains(authorization_url)
+            }));
+        } else {
+            assert!(
+                !capture
+                    .0
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .flatten()
+                    .any(|(_, value)| value.contains(authorization_url))
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn started_flow_has_no_companion_handle_surface() {
+    let flow = service(
+        Arc::new(MockCompleter::new([])),
+        Arc::new(ManualClock::default()),
+    )
+    .begin(peer(), "https://app.example/callback", "state")
+    .await
+    .unwrap();
+
+    let paykit_server::setup::StartedFlow {
+        flow_id,
+        state,
+        origin,
+        authorization_url,
+    } = flow;
+    assert!(!flow_id.is_empty());
+    assert_eq!(state, "state");
+    assert_eq!(origin, "https://app.example");
+    assert!(!authorization_url.is_empty());
+}
+
+#[tokio::test]
+async fn companion_auth_request_route_is_not_mounted() {
+    let response = request_json(
+        setup_router(service(
+            Arc::new(MockCompleter::new([])),
+            Arc::new(ManualClock::default()),
+        )),
+        "/setup/companion-auth-request",
+        serde_json::json!({"version": 1}),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert!(!response.headers().contains_key("cache-control"));
+    assert!(body(response).await.is_empty());
+}
+
 async fn request(router: axum::Router, method: Method, uri: &str) -> Response {
     request_with_body(router, method, uri, Body::empty()).await
 }
@@ -340,6 +465,19 @@ async fn request_with_body(
         .method(method)
         .uri(uri)
         .body(request_body)
+        .unwrap();
+    request
+        .extensions_mut()
+        .insert(ConnectInfo(SocketAddr::new(peer(), 12345)));
+    router.oneshot(request).await.unwrap()
+}
+
+async fn request_json(router: axum::Router, uri: &str, payload: serde_json::Value) -> Response {
+    let mut request = Request::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .header("content-type", "application/json")
+        .body(Body::from(payload.to_string()))
         .unwrap();
     request
         .extensions_mut()
@@ -437,7 +575,7 @@ async fn expired_flows_drop_secret_attempts_but_retain_a_bounded_expired_tombsto
     clock.advance(Duration::from_secs(300));
     assert_eq!(setup.poll(&flow.flow_id).await, PollResult::Expired);
     assert_eq!(dropped.load(Ordering::SeqCst), 1);
-    assert!(setup.flow(&flow.flow_id).await.is_none());
+    assert!(!setup.flow_exists(&flow.flow_id).await);
     assert_eq!(
         setup.trigger_completion(&flow.flow_id).await,
         PollResult::Expired
@@ -1033,6 +1171,7 @@ async fn valid_setup_preserves_polling_and_secret_free_callback_shell() {
         response.headers()["content-security-policy"],
         "frame-ancestors https://app.example"
     );
+    assert_eq!(response.headers()["cache-control"], "no-store");
     let shell = body(response).await;
     assert!(shell.contains("new Set([408,425,429,502,503,504])"));
     assert!(shell.contains("delay=500"));
@@ -1045,6 +1184,9 @@ async fn valid_setup_preserves_polling_and_secret_free_callback_shell() {
     assert!(!shell.contains("</script><img"));
     assert!(shell.contains("\\u003c/script\\u003e\\u003cimg\\u003e"));
     assert!(shell.contains(r#"data-testid="paykit-auth-qr""#));
+    assert!(!shell.contains("companion"));
+    assert!(!shell.contains("authenticate-paykit"));
+    assert!(!shell.contains("docker compose exec"));
     assert!(shell.contains(r#"<svg aria-label="Bitkit authorization QR code""#));
     // The SVG is inlined into HTML, so the standalone-document prolog must be gone.
     assert!(!shell.contains("<?xml"));
@@ -1071,6 +1213,45 @@ async fn valid_setup_preserves_polling_and_secret_free_callback_shell() {
             "setup shell contained forbidden value {forbidden}"
         );
     }
+}
+
+#[tokio::test]
+async fn setup_shell_matches_the_bitkit_qr_and_touch_deep_link_shape() {
+    let authorization_url = "pubkyauth://signin?secret=mock&label=<approve>";
+    let response = request(
+        setup_router(service_with_authorization_url(authorization_url)),
+        Method::GET,
+        "/setup?return_to=https://app.example/callback&state=opaque",
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    assert_eq!(
+        response.headers()["content-security-policy"],
+        "frame-ancestors https://app.example"
+    );
+    let shell = body(response).await;
+    assert!(shell.contains("<main><span class=\"qr\" data-testid=\"paykit-auth-qr\">"));
+    assert!(shell.contains(
+        "<a class=\"bitkit-btn\" href=\"pubkyauth://signin?secret=mock&amp;label=&lt;approve&gt;\">Continue with Bitkit</a></main>"
+    ));
+    assert!(
+        shell.contains("main{width:100%;display:flex;align-items:center;justify-content:center}")
+    );
+    assert!(shell.contains("@media (hover:none) and (pointer:coarse)"));
+    assert!(!shell.contains("companion"));
+    assert!(!shell.contains("authenticate-paykit"));
+    assert!(!shell.contains("xpub"));
+    assert_eq!(shell.matches("pubkyauth://signin?").count(), 1);
+    assert!(shell.contains("new Set([408,425,429,502,503,504])"));
+    assert!(shell.contains("delay=500"));
+    assert!(shell.contains("Math.min(delay*2,5000)"));
+    assert!(shell.contains("const state=\"opaque\";const targetOrigin=\"https://app.example\""));
+    assert!(shell.contains("postMessage({type:'paykit-setup-callback',state},targetOrigin)"));
+    assert!(shell.contains(
+        "postMessage({type:'paykit-setup-callback',state,error:'setup-failed'},targetOrigin)"
+    ));
 }
 
 #[tokio::test]
