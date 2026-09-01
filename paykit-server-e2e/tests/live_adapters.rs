@@ -251,6 +251,7 @@ async fn live_electrum_observes_known_output_and_confirmations() {
         "mainnet" => BitcoinNetwork::Mainnet,
         "testnet" => BitcoinNetwork::Testnet,
         "signet" => BitcoinNetwork::Signet,
+        "regtest" => BitcoinNetwork::Regtest,
         other => panic!("unsupported PAYKIT_LIVE_BITCOIN_NETWORK: {other}"),
     };
     let address = env::var("PAYKIT_LIVE_BITCOIN_ADDRESS").unwrap();
