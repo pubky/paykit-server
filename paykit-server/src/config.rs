@@ -450,7 +450,9 @@ pub enum ConfigError {
     InvalidUrl(&'static str),
     #[error("http.listen_addr must be a valid socket address")]
     InvalidListenAddress,
-    #[error("electrum.endpoint must be an exact tcp:// or ssl:// host:port URL")]
+    #[error(
+        "electrum.endpoint must be an exact tcp://host:nonzero-port or ssl://DNS-or-IPv4:nonzero-port URL"
+    )]
     InvalidElectrumEndpoint,
     #[error(
         "setup.allowed_origins must contain exact HTTP(S) origins or the sole wildcard value *"
@@ -502,12 +504,14 @@ pub(crate) fn validate_electrum_endpoint(value: &str) -> Result<(), ConfigError>
     if !matches!(parsed.scheme(), "tcp" | "ssl")
         || parsed.host_str().is_none()
         || parsed.port().is_none()
+        || parsed.port() == Some(0)
         || !parsed.username().is_empty()
         || parsed.password().is_some()
         || !parsed.path().is_empty()
         || parsed.query().is_some()
         || parsed.fragment().is_some()
         || parsed.as_str() != value
+        || (parsed.scheme() == "ssl" && matches!(parsed.host(), Some(url::Host::Ipv6(_))))
     {
         return Err(ConfigError::InvalidElectrumEndpoint);
     }

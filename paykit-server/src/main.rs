@@ -7,15 +7,12 @@ use paykit_server::{
 };
 use tracing_subscriber::EnvFilter;
 
-const AUTH_RELAY_LOG_TARGET: &str = "pubky::actors::auth::relay::auth_relay_listener";
-const HTTP_RELAY_CHANNEL_LOG_TARGET: &str = "pubky::actors::auth::relay::http_relay_inbox_channel";
-const HTTP_RELAY_LINK_LOG_TARGET: &str = "pubky::actors::auth::relay::http_relay_link_channel";
-const PUBKY_GRANT_EXCHANGE_LOG_TARGET: &str = "pubky::actors::auth::grant::grant_exchange";
+const PUBKY_LOG_TARGET: &str = "pubky";
 const PAYKIT_PUBKY_ROUTING_LOG_TARGET: &str = "paykit_lib::pubky_routing";
 
 fn production_log_filter() -> EnvFilter {
     EnvFilter::new(format!(
-        "info,{AUTH_RELAY_LOG_TARGET}=off,{HTTP_RELAY_CHANNEL_LOG_TARGET}=off,{HTTP_RELAY_LINK_LOG_TARGET}=off,{PUBKY_GRANT_EXCHANGE_LOG_TARGET}=off,{PAYKIT_PUBKY_ROUTING_LOG_TARGET}=off"
+        "info,{PUBKY_LOG_TARGET}=off,{PAYKIT_PUBKY_ROUTING_LOG_TARGET}=off"
     ))
 }
 
@@ -101,6 +98,10 @@ mod tests {
             );
             tracing::info!(
                 target: "pubky::actors::auth::grant::grant_exchange",
+                "identity-bearing dependency event"
+            );
+            tracing::info!(
+                target: "pubky::actors::pkdns",
                 "identity-bearing dependency event"
             );
             tracing::error!(
