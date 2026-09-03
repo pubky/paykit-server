@@ -7,13 +7,10 @@ use paykit_server::{
 };
 use tracing_subscriber::EnvFilter;
 
-const PUBKY_LOG_TARGET: &str = "pubky";
-const PAYKIT_PUBKY_ROUTING_LOG_TARGET: &str = "paykit_lib::pubky_routing";
+const APPLICATION_LOG_TARGET: &str = "paykit_server";
 
 fn production_log_filter() -> EnvFilter {
-    EnvFilter::new(format!(
-        "info,{PUBKY_LOG_TARGET}=off,{PAYKIT_PUBKY_ROUTING_LOG_TARGET}=off"
-    ))
+    EnvFilter::new(format!("off,{APPLICATION_LOG_TARGET}=info"))
 }
 
 #[tokio::main]
@@ -45,7 +42,7 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     let pool = initialize_database(&config).await?;
-    let listen_addr = config.http.listen_addr.clone();
+    let listen_addr = config.http.listen_addr();
     let server = Server::build(config, pool).await?;
     let listener = tokio::net::TcpListener::bind(listen_addr).await?;
     server.run(listener).await?;
@@ -74,7 +71,7 @@ mod tests {
     }
 
     #[test]
-    fn production_filter_suppresses_sensitive_dependency_events() {
+    fn production_filter_allows_application_events_only() {
         let capture = CountEvents::default();
         let subscriber = tracing_subscriber::registry()
             .with(production_log_filter())
@@ -104,6 +101,7 @@ mod tests {
                 target: "pubky::actors::pkdns",
                 "identity-bearing dependency event"
             );
+            tracing::warn!(target: "pkarr::client", "identity-bearing dependency event");
             tracing::error!(
                 target: "paykit_lib::pubky_routing",
                 "raw dependency transport error"

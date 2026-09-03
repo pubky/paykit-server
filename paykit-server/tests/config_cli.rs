@@ -129,3 +129,72 @@ fn check_config_rejects_runtime_invalid_bind_and_electrum_values() {
         assert!(combined.contains(expected), "{combined}");
     }
 }
+
+#[test]
+fn check_config_rejects_sqlx_invalid_database_options() {
+    for database_url in [
+        "postgres://paykit@127.0.0.1:5432/paykit?port=bogus",
+        "postgres://paykit@127.0.0.1:5432/paykit?sslmode=bogus",
+    ] {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("paykit-check-config-{nonce}.toml"));
+        fs::write(&path, config(true)).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_paykit-server"))
+            .arg("--check-config")
+            .env("PAYKIT_CONFIG", &path)
+            .env("PAYKIT_DATABASE_URL", database_url)
+            .env("PAYKIT_MASTER_KEY", MASTER_KEY)
+            .output()
+            .unwrap();
+        fs::remove_file(path).unwrap();
+        assert!(!output.status.success());
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(combined.contains("PAYKIT_DATABASE_URL"), "{combined}");
+        assert!(!combined.contains(database_url));
+    }
+}
+
+#[test]
+fn check_config_rejects_pending_setup_capacity_above_tokio_limit() {
+    let source = format!(
+        "{}\n[rate_limits]\nmax_pending_setup_flows = {}\n",
+        config(true),
+        tokio::sync::Semaphore::MAX_PERMITS + 1
+    );
+    let output = run_check(&source, &[]);
+    assert!(!output.status.success());
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("rate_limits.max_pending_setup_flows"),
+        "{combined}"
+    );
+}
+
+#[test]
+fn malformed_toml_error_does_not_echo_endpoint_source() {
+    let sentinel = "tcp://endpoint-secret.example:50001";
+    let source = config(true).replace(
+        "endpoint = \"tcp://127.0.0.1:50001\"",
+        &format!("endpoint = \"{sentinel}"),
+    );
+    let output = run_check(&source, &[]);
+    assert!(!output.status.success());
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(combined.contains("configuration TOML is invalid"));
+    assert!(!combined.contains(sentinel));
+}

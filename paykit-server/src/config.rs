@@ -1,4 +1,4 @@
-use std::{fmt, net::SocketAddr, time::Duration};
+use std::{fmt, net::SocketAddr, str::FromStr, time::Duration};
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use ed25519_dalek::VerifyingKey;
@@ -6,6 +6,7 @@ use paykit_lib::PaykitReceiverPath;
 use pubky::{ClientId, PublicKey};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use sqlx::postgres::PgConnectOptions;
 use thiserror::Error;
 use url::Url;
 
@@ -33,7 +34,7 @@ impl Config {
         toml_source: &str,
         environment: ConfigEnvironment,
     ) -> Result<Self, ConfigError> {
-        let raw: RawConfig = toml::from_str(toml_source).map_err(ConfigError::Toml)?;
+        let raw: RawConfig = toml::from_str(toml_source).map_err(|_| ConfigError::Toml)?;
         let database_url = DatabaseUrl::parse(environment.database_url)?;
         let master_key = MasterKey::parse(environment.master_key)?;
         let trusted_public_key = TrustedLocksPublicKey::parse(raw.locks.trusted_public_key)?;
@@ -67,17 +68,16 @@ impl Config {
         }
         let bitcoin_network = BitcoinNetwork::parse(&raw.bitcoin.network)?;
 
-        raw.http
+        let listen_addr = raw
+            .http
             .listen_addr
             .parse::<SocketAddr>()
             .map_err(|_| ConfigError::InvalidListenAddress)?;
-        validate_electrum_endpoint(&raw.electrum.endpoint)?;
+        let electrum_endpoint = ElectrumEndpoint::parse(raw.electrum.endpoint)?;
         let allowed_origins = validate_allowed_origins(raw.setup.allowed_origins)?;
 
         let config = Self {
-            http: HttpConfig {
-                listen_addr: raw.http.listen_addr,
-            },
+            http: HttpConfig { listen_addr },
             locks: LocksConfig { trusted_public_key },
             setup: SetupConfig {
                 allowed_origins,
@@ -90,7 +90,7 @@ impl Config {
                 network: PaykitNetwork::parse(&raw.paykit.network)?,
             },
             electrum: ElectrumConfig {
-                endpoint: raw.electrum.endpoint,
+                endpoint: electrum_endpoint,
                 poll_interval: raw.electrum.poll_interval,
                 request_timeout: raw.electrum.request_timeout,
                 connect_retries: raw.electrum.connect_retries,
@@ -116,8 +116,8 @@ impl Config {
         &self.master_key
     }
 
-    pub fn database_url(&self) -> &str {
-        self.database_url.as_str()
+    pub(crate) fn database_options(&self) -> &PgConnectOptions {
+        self.database_url.options()
     }
 
     pub fn deployment_invariants(&self) -> &DeploymentInvariants {
@@ -188,14 +188,29 @@ impl Config {
         if self.outbox.retry_initial > self.outbox.retry_max {
             return Err(ConfigError::InconsistentRetries("outbox"));
         }
+        if self.rate_limits.max_pending_setup_flows > tokio::sync::Semaphore::MAX_PERMITS as u64 {
+            return Err(ConfigError::ValueTooLarge(
+                "rate_limits.max_pending_setup_flows",
+            ));
+        }
         Ok(())
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct ConfigEnvironment {
     pub database_url: Option<String>,
     pub master_key: Option<String>,
+}
+
+impl fmt::Debug for ConfigEnvironment {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ConfigEnvironment")
+            .field("database_url", &"<redacted>")
+            .field("master_key", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -309,7 +324,13 @@ impl fmt::Debug for MasterKey {
 
 #[derive(Debug)]
 pub struct HttpConfig {
-    pub listen_addr: String,
+    listen_addr: SocketAddr,
+}
+
+impl HttpConfig {
+    pub fn listen_addr(&self) -> SocketAddr {
+        self.listen_addr
+    }
 }
 
 #[derive(Debug)]
@@ -370,10 +391,16 @@ impl ReceiverPathPriority {
 
 #[derive(Debug)]
 pub struct ElectrumConfig {
-    pub endpoint: String,
+    endpoint: ElectrumEndpoint,
     pub poll_interval: Duration,
     pub request_timeout: Duration,
     pub connect_retries: u8,
+}
+
+impl ElectrumConfig {
+    pub fn endpoint(&self) -> &str {
+        self.endpoint.as_str()
+    }
 }
 
 #[derive(Debug)]
@@ -397,9 +424,16 @@ pub struct RateLimitsConfig {
     pub signed_requests_per_second: u64,
     pub signed_burst: u64,
     pub setup_per_ip_per_minute: u64,
-    pub max_pending_setup_flows: u64,
+    max_pending_setup_flows: u64,
     pub max_completion_polls_per_flow: u64,
     pub max_completion_polls: u64,
+}
+
+impl RateLimitsConfig {
+    pub fn max_pending_setup_flows(&self) -> usize {
+        usize::try_from(self.max_pending_setup_flows)
+            .expect("validated pending setup limit fits usize")
+    }
 }
 
 #[derive(Debug)]
@@ -407,7 +441,7 @@ pub struct ShutdownConfig {
     pub drain_timeout: Duration,
 }
 
-struct DatabaseUrl(String);
+struct DatabaseUrl(PgConnectOptions);
 
 impl DatabaseUrl {
     fn parse(value: Option<String>) -> Result<Self, ConfigError> {
@@ -416,10 +450,12 @@ impl DatabaseUrl {
         if !matches!(parsed.scheme(), "postgres" | "postgresql") {
             return Err(ConfigError::InvalidDatabaseUrlScheme);
         }
-        Ok(Self(value))
+        let options =
+            PgConnectOptions::from_str(&value).map_err(|_| ConfigError::InvalidDatabaseUrl)?;
+        Ok(Self(options))
     }
 
-    fn as_str(&self) -> &str {
+    fn options(&self) -> &PgConnectOptions {
         &self.0
     }
 }
@@ -430,16 +466,37 @@ impl fmt::Debug for DatabaseUrl {
     }
 }
 
+struct ElectrumEndpoint(String);
+
+impl ElectrumEndpoint {
+    fn parse(value: String) -> Result<Self, ConfigError> {
+        validate_electrum_endpoint(&value)?;
+        Ok(Self(value))
+    }
+
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for ElectrumEndpoint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("<redacted>")
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ConfigError {
-    #[error("configuration TOML is invalid: {0}")]
-    Toml(toml::de::Error),
+    #[error("configuration TOML is invalid")]
+    Toml,
     #[error("PAYKIT_DATABASE_URL is required")]
     MissingDatabaseUrl,
     #[error("PAYKIT_MASTER_KEY is required")]
     MissingMasterKey,
     #[error("PAYKIT_DATABASE_URL must use postgres:// or postgresql://")]
     InvalidDatabaseUrlScheme,
+    #[error("PAYKIT_DATABASE_URL is invalid")]
+    InvalidDatabaseUrl,
     #[error("PAYKIT_MASTER_KEY must be unpadded base64url encoding of exactly 32 bytes")]
     InvalidMasterKey,
     #[error("locks.trusted_public_key must be a canonical pubky-prefixed public key")]
@@ -478,6 +535,8 @@ pub enum ConfigError {
     ZeroDuration(&'static str),
     #[error("{0} must be greater than zero")]
     ZeroValue(&'static str),
+    #[error("{0} exceeds the supported maximum")]
+    ValueTooLarge(&'static str),
     #[error("{0} must be at least one second")]
     SubsecondPersistenceDuration(&'static str),
     #[error("{0}.retry_initial must not exceed {0}.retry_max")]

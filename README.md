@@ -125,6 +125,8 @@ Required environment variables:
 
 Do not put database credentials or the master key in TOML, logs, shell history, or source control. Effective-config debug output redacts secret values.
 
+Production logging allowlists only the `paykit_server` target at INFO and above. Dependency targets are disabled because upstream diagnostics may contain identities, URLs, or response text.
+
 `setup.log_authorization_url` defaults to `false` and must remain false for
 production. The paired Locks correction will make its generated local-demo
 config the sole `true` setting; once that sibling change lands, each new setup
