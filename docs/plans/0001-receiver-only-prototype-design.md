@@ -452,7 +452,7 @@ Rules:
 - `outbox` configures executable lease, polling/batch, and backoff values.
 - `limits` configures accepted 16 KiB request limit, 256 KiB lock limit, and 10-second fetch timeout.
 - `PAYKIT_DATABASE_URL` and `PAYKIT_MASTER_KEY` are env-only secrets and cannot appear in TOML.
-- Startup rejects SQLx-invalid database options, invalid URLs/origins/keys/networks, retired Paykit relay/homeserver URL keys, zero durations/batches, unsafe receiver paths, and inconsistent or runtime-unrepresentable limits.
+- Startup rejects SQLx-invalid or unknown database URL options, invalid URLs/origins/keys/networks, Electrum TLS names rejected by the pinned Rustls parser, retired Paykit relay/homeserver URL keys, zero durations/batches, unsafe receiver paths, and inconsistent or runtime-unrepresentable limits.
 - Effective-config logging redacts environment secret values.
 - First initialized database persists Bitcoin network, Paykit client ID, receiver path, and trusted Locks public-key fingerprint as deployment invariants.
 - Later mismatch of any invariant aborts boot; prototype has no rotation/migration procedure for them.

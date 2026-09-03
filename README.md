@@ -155,7 +155,8 @@ cargo run -p paykit-server
 ```
 
 `--check-config` validates the complete TOML, required environment values,
-HTTP bind-address syntax, and exact Electrum endpoint shape,
+SQLx-supported database URL options, HTTP bind-address syntax, and exact
+Electrum endpoint shape including TLS server-name validity,
 prints only `configuration valid`, then exits before PostgreSQL connection,
 migration, network construction, or HTTP bind. Run it against the exact staged
 config and environment before restarting a deployment.

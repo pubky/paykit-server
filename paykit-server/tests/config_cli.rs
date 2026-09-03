@@ -118,6 +118,10 @@ fn check_config_rejects_runtime_invalid_bind_and_electrum_values() {
             config(true).replace("tcp://127.0.0.1:50001", "ssl://[::1]:50002"),
             "electrum.endpoint",
         ),
+        (
+            config(true).replace("tcp://127.0.0.1:50001", "ssl://-bad.example:50002"),
+            "electrum.endpoint",
+        ),
     ] {
         let output = run_check(&source, &[]);
         assert!(!output.status.success());
@@ -135,6 +139,7 @@ fn check_config_rejects_sqlx_invalid_database_options() {
     for database_url in [
         "postgres://paykit@127.0.0.1:5432/paykit?port=bogus",
         "postgres://paykit@127.0.0.1:5432/paykit?sslmode=bogus",
+        "postgres://paykit@127.0.0.1:5432/paykit?sslmod=verify-full",
     ] {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)

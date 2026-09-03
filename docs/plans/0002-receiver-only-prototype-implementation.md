@@ -67,9 +67,9 @@ cargo test --workspace
 
 **RED tests:**
 - Unknown TOML fields fail parsing.
-- Missing or SQLx-invalid `PAYKIT_DATABASE_URL`, or malformed `PAYKIT_MASTER_KEY`, fails startup configuration without echoing secret-bearing input.
+- Missing, SQLx-invalid, or unknown-option `PAYKIT_DATABASE_URL`, or malformed `PAYKIT_MASTER_KEY`, fails startup configuration without echoing secret-bearing input.
 - Master key accepts only base64url-no-pad that decodes to exactly 32 bytes.
-- Invalid network, client ID, receiver path, URL/origin, mixed wildcard/concrete origin policy, retired Paykit URL key, zero duration/batch, inconsistent limit, or runtime-unrepresentable setup capacity fails.
+- Invalid network, client ID, receiver path, URL/origin, Electrum TLS server name, mixed wildcard/concrete origin policy, retired Paykit URL key, zero duration/batch, inconsistent limit, or runtime-unrepresentable setup capacity fails.
 
 **Implementation:**
 - Parse the closed supported sections: `http`, `locks`, `setup`, `paykit`, `bitcoin`, `electrum`, `outbox`, `limits`, `rate_limits`, `shutdown`; reject retired `[inbox]`.

@@ -4,6 +4,7 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use ed25519_dalek::VerifyingKey;
 use paykit_lib::PaykitReceiverPath;
 use pubky::{ClientId, PublicKey};
+use rustls_pki_types::ServerName;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use sqlx::postgres::PgConnectOptions;
@@ -450,6 +451,12 @@ impl DatabaseUrl {
         if !matches!(parsed.scheme(), "postgres" | "postgresql") {
             return Err(ConfigError::InvalidDatabaseUrlScheme);
         }
+        if parsed
+            .query_pairs()
+            .any(|(key, _)| !supported_postgres_query_key(&key))
+        {
+            return Err(ConfigError::InvalidDatabaseUrl);
+        }
         let options =
             PgConnectOptions::from_str(&value).map_err(|_| ConfigError::InvalidDatabaseUrl)?;
         Ok(Self(options))
@@ -458,6 +465,33 @@ impl DatabaseUrl {
     fn options(&self) -> &PgConnectOptions {
         &self.0
     }
+}
+
+fn supported_postgres_query_key(key: &str) -> bool {
+    matches!(
+        key,
+        "sslmode"
+            | "ssl-mode"
+            | "sslrootcert"
+            | "ssl-root-cert"
+            | "ssl-ca"
+            | "sslcert"
+            | "ssl-cert"
+            | "sslkey"
+            | "ssl-key"
+            | "statement-cache-capacity"
+            | "host"
+            | "hostaddr"
+            | "port"
+            | "dbname"
+            | "user"
+            | "password"
+            | "application_name"
+            | "options"
+    ) || key
+        .strip_prefix("options[")
+        .and_then(|key| key.strip_suffix(']'))
+        .is_some_and(|key| !key.is_empty())
 }
 
 impl fmt::Debug for DatabaseUrl {
@@ -571,6 +605,11 @@ pub(crate) fn validate_electrum_endpoint(value: &str) -> Result<(), ConfigError>
         || parsed.fragment().is_some()
         || parsed.as_str() != value
         || (parsed.scheme() == "ssl" && matches!(parsed.host(), Some(url::Host::Ipv6(_))))
+    {
+        return Err(ConfigError::InvalidElectrumEndpoint);
+    }
+    if parsed.scheme() == "ssl"
+        && ServerName::try_from(parsed.host_str().expect("validated host").to_owned()).is_err()
     {
         return Err(ConfigError::InvalidElectrumEndpoint);
     }
