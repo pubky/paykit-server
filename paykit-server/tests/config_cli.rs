@@ -87,3 +87,29 @@ fn unknown_arguments_fail_closed() {
     let output = run_check(&config(true), &["--unexpected"]);
     assert!(!output.status.success());
 }
+
+#[test]
+fn check_config_rejects_runtime_invalid_bind_and_electrum_values() {
+    for (source, expected) in [
+        (
+            config(true).replace("127.0.0.1:3001", "not-a-socket-address"),
+            "http.listen_addr",
+        ),
+        (
+            config(true).replace(
+                "tcp://127.0.0.1:50001",
+                "tcp://127.0.0.1:50001/path?query=yes",
+            ),
+            "electrum.endpoint",
+        ),
+    ] {
+        let output = run_check(&source, &[]);
+        assert!(!output.status.success());
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(combined.contains(expected), "{combined}");
+    }
+}

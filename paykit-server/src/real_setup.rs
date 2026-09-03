@@ -21,7 +21,10 @@ use crate::{
     domain::locks::parse_creator,
     persistence::{CreatorCredentials, CreatorStore},
     setup::{Completion, SetupAttempt, SetupCompleter, StartedSetup},
-    setup_diagnostics::{SetupFailureClass, SetupOutcome, SetupStage, emit_setup_stage},
+    setup_diagnostics::{
+        SetupFailureClass, SetupOutcome, SetupStage, emit_setup_stage, marker_failure_class,
+        persistence_failure_class, sdk_failure_class,
+    },
     setup_orchestration::{CompanionRelay, receive_verify_commit},
 };
 
@@ -76,14 +79,11 @@ impl MarkerPublisher for DirectMarkerPublisher {
             SetupOutcome::Started,
             SetupFailureClass::None,
         );
-        if paykit_lib::publish_paykit_receiver_marker(session, marker)
-            .await
-            .is_err()
-        {
+        if let Err(error) = paykit_lib::publish_paykit_receiver_marker(session, marker).await {
             emit_setup_stage(
                 SetupStage::MarkerPublish,
                 SetupOutcome::Failed,
-                SetupFailureClass::Transport,
+                marker_failure_class(&error),
             );
             return Err(ClaimError::InvalidEnvelope);
         }
@@ -105,11 +105,11 @@ impl MarkerPublisher for DirectMarkerPublisher {
         .await
         {
             Ok(readback) => readback,
-            Err(_) => {
+            Err(error) => {
                 emit_setup_stage(
                     SetupStage::MarkerReadback,
                     SetupOutcome::Failed,
-                    SetupFailureClass::Transport,
+                    marker_failure_class(&error),
                 );
                 return Err(ClaimError::InvalidEnvelope);
             }
@@ -247,8 +247,11 @@ impl SetupCompleter for RealSetupCompleter {
                 );
                 auth
             }
-            Err(_) => {
-                return definitive_setup_failure(SetupStage::AuthComplete, SetupFailureClass::Auth);
+            Err(error) => {
+                return definitive_setup_failure(
+                    SetupStage::AuthComplete,
+                    sdk_failure_class(&error),
+                );
             }
         };
         emit_setup_stage(
@@ -302,10 +305,10 @@ impl SetupCompleter for RealSetupCompleter {
                 );
                 secret.into_inner()
             }
-            Err(_) => {
+            Err(error) => {
                 return definitive_setup_failure(
                     SetupStage::SessionExport,
-                    SetupFailureClass::SessionExport,
+                    sdk_failure_class(&error),
                 );
             }
         };
@@ -400,11 +403,11 @@ impl crate::setup_orchestration::VerifiedSetupCommit for CreatorSetupCommit {
                 );
                 lock
             }
-            Err(_) => {
+            Err(error) => {
                 emit_setup_stage(
                     SetupStage::LockAcquire,
                     SetupOutcome::Failed,
-                    SetupFailureClass::Storage,
+                    persistence_failure_class(&error),
                 );
                 return Err(ClaimError::InvalidEnvelope);
             }
@@ -424,11 +427,11 @@ impl crate::setup_orchestration::VerifiedSetupCommit for CreatorSetupCommit {
                     );
                     existing
                 }
-                Err(_) => {
+                Err(error) => {
                     emit_setup_stage(
                         SetupStage::CreatorLoad,
                         SetupOutcome::Failed,
-                        SetupFailureClass::Storage,
+                        persistence_failure_class(&error),
                     );
                     return Err(ClaimError::InvalidEnvelope);
                 }
@@ -470,11 +473,11 @@ impl crate::setup_orchestration::VerifiedSetupCommit for CreatorSetupCommit {
                     .await
                     .map(|_| ()),
             };
-            if persistence.is_err() {
+            if let Err(error) = persistence {
                 emit_setup_stage(
                     SetupStage::Persistence,
                     SetupOutcome::Failed,
-                    SetupFailureClass::Storage,
+                    persistence_failure_class(&error),
                 );
                 // Publication and Postgres cannot share a transaction. This
                 // creator-scoped lock covers load, publication, persistence,
@@ -521,19 +524,11 @@ impl crate::setup_orchestration::VerifiedSetupCommit for CreatorSetupCommit {
             SetupFailureClass::None,
         );
         let unlock_result = setup_lock.release().await;
-        emit_setup_stage(
-            SetupStage::LockRelease,
-            if unlock_result.is_ok() {
-                SetupOutcome::Succeeded
-            } else {
-                SetupOutcome::Failed
-            },
-            if unlock_result.is_ok() {
-                SetupFailureClass::None
-            } else {
-                SetupFailureClass::Storage
-            },
-        );
+        let (unlock_outcome, unlock_class) = match &unlock_result {
+            Ok(()) => (SetupOutcome::Succeeded, SetupFailureClass::None),
+            Err(error) => (SetupOutcome::Failed, persistence_failure_class(error)),
+        };
+        emit_setup_stage(SetupStage::LockRelease, unlock_outcome, unlock_class);
         match (commit_result, unlock_result) {
             (Err(error), _) => Err(error),
             (Ok(()), Err(_)) => Err(ClaimError::InvalidEnvelope),

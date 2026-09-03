@@ -319,6 +319,8 @@ mod tests {
             result: Ok(()),
         };
         let other = SigningKey::from_bytes(&[9; 32]);
+        let capture = EventCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
         assert_eq!(
             receive_verify_commit(
                 &relay,
@@ -327,11 +329,24 @@ mod tests {
                 &other.verifying_key(),
                 Duration::from_secs(1)
             )
+            .with_subscriber(subscriber)
             .await,
             Err(ClaimError::AuthenticationFailed)
         );
         assert_eq!(commit.calls.load(Ordering::SeqCst), 0);
         assert_eq!(relay.acks.load(Ordering::SeqCst), 0);
+        let events = capture.0.lock().unwrap();
+        assert!(events.iter().any(|fields| {
+            fields
+                .iter()
+                .any(|(name, value)| name == "stage" && value.contains("claim_verify"))
+                && fields
+                    .iter()
+                    .any(|(name, value)| name == "outcome" && value.contains("failed"))
+                && fields
+                    .iter()
+                    .any(|(name, value)| name == "class" && value.contains("authentication"))
+        }));
     }
 
     #[tokio::test]

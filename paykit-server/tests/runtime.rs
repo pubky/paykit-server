@@ -19,7 +19,7 @@ use paykit_server::runtime::{
 };
 use paykit_server::{
     Server,
-    config::{Config, ConfigEnvironment},
+    config::{Config, ConfigEnvironment, ConfigError},
 };
 use tower::ServiceExt;
 use tracing::{Event, Subscriber, instrument::WithSubscriber};
@@ -36,6 +36,13 @@ fn production_config_with_setup_logging(
     electrum_endpoint: &str,
     log_authorization_url: bool,
 ) -> Config {
+    try_production_config_with_setup_logging(electrum_endpoint, log_authorization_url).unwrap()
+}
+
+fn try_production_config_with_setup_logging(
+    electrum_endpoint: &str,
+    log_authorization_url: bool,
+) -> Result<Config, ConfigError> {
     let source = format!(
         r#"
 [http]
@@ -66,7 +73,6 @@ poll_interval = "1s"
             master_key: Some(CONFIG_MASTER_KEY.into()),
         },
     )
-    .unwrap()
 }
 
 fn lazy_pool() -> sqlx::PgPool {
@@ -417,14 +423,13 @@ async fn production_constructor_allows_electrum_to_be_temporarily_unavailable() 
     );
 }
 
-#[tokio::test]
-async fn production_constructor_rejects_malformed_electrum_adapter_configuration() {
-    assert!(
-        Server::build(
-            production_config("https://electrum.example:50002/path?token=secret"),
-            lazy_pool(),
-        )
-        .await
-        .is_err()
-    );
+#[test]
+fn config_rejects_malformed_electrum_adapter_configuration_before_server_construction() {
+    assert!(matches!(
+        try_production_config_with_setup_logging(
+            "https://electrum.example:50002/path?token=secret",
+            false,
+        ),
+        Err(ConfigError::InvalidElectrumEndpoint)
+    ));
 }

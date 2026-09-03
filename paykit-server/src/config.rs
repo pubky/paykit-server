@@ -1,4 +1,4 @@
-use std::{fmt, time::Duration};
+use std::{fmt, net::SocketAddr, time::Duration};
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use ed25519_dalek::VerifyingKey;
@@ -67,7 +67,11 @@ impl Config {
         }
         let bitcoin_network = BitcoinNetwork::parse(&raw.bitcoin.network)?;
 
-        validate_url("electrum.endpoint", &raw.electrum.endpoint)?;
+        raw.http
+            .listen_addr
+            .parse::<SocketAddr>()
+            .map_err(|_| ConfigError::InvalidListenAddress)?;
+        validate_electrum_endpoint(&raw.electrum.endpoint)?;
         let allowed_origins = validate_allowed_origins(raw.setup.allowed_origins)?;
 
         let config = Self {
@@ -444,6 +448,10 @@ pub enum ConfigError {
     InvalidNetwork,
     #[error("{0} must be a valid absolute URL")]
     InvalidUrl(&'static str),
+    #[error("http.listen_addr must be a valid socket address")]
+    InvalidListenAddress,
+    #[error("electrum.endpoint must be an exact tcp:// or ssl:// host:port URL")]
+    InvalidElectrumEndpoint,
     #[error(
         "setup.allowed_origins must contain exact HTTP(S) origins or the sole wildcard value *"
     )]
@@ -487,6 +495,22 @@ fn validate_url(field: &'static str, value: &str) -> Result<Url, ConfigError> {
         return Err(ConfigError::InvalidUrl(field));
     }
     Ok(parsed)
+}
+
+pub(crate) fn validate_electrum_endpoint(value: &str) -> Result<(), ConfigError> {
+    let parsed = Url::parse(value).map_err(|_| ConfigError::InvalidElectrumEndpoint)?;
+    if !matches!(parsed.scheme(), "tcp" | "ssl")
+        || parsed.host_str().is_none()
+        || parsed.port().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || !matches!(parsed.path(), "" | "/")
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(ConfigError::InvalidElectrumEndpoint);
+    }
+    Ok(())
 }
 
 fn validate_origin(value: &str) -> Result<Url, ConfigError> {

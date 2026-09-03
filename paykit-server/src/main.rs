@@ -8,9 +8,13 @@ use paykit_server::{
 use tracing_subscriber::EnvFilter;
 
 const AUTH_RELAY_LOG_TARGET: &str = "pubky::actors::auth::relay::auth_relay_listener";
+const HTTP_RELAY_CHANNEL_LOG_TARGET: &str = "pubky::actors::auth::relay::http_relay_inbox_channel";
+const HTTP_RELAY_LINK_LOG_TARGET: &str = "pubky::actors::auth::relay::http_relay_link_channel";
 
 fn production_log_filter() -> EnvFilter {
-    EnvFilter::new(format!("info,{AUTH_RELAY_LOG_TARGET}=warn"))
+    EnvFilter::new(format!(
+        "info,{AUTH_RELAY_LOG_TARGET}=off,{HTTP_RELAY_CHANNEL_LOG_TARGET}=off,{HTTP_RELAY_LINK_LOG_TARGET}=off"
+    ))
 }
 
 #[tokio::main]
@@ -71,16 +75,34 @@ mod tests {
     }
 
     #[test]
-    fn production_filter_suppresses_url_bearing_auth_relay_info() {
+    fn production_filter_suppresses_all_url_bearing_auth_relay_events() {
         let capture = CountEvents::default();
         let subscriber = tracing_subscriber::registry()
             .with(production_log_filter())
             .with(capture.clone());
         tracing::subscriber::with_default(subscriber, || {
-            tracing::info!(target: AUTH_RELAY_LOG_TARGET, "URL-bearing dependency event");
-            tracing::warn!(target: AUTH_RELAY_LOG_TARGET, "coarse dependency warning");
+            tracing::info!(
+                target: "pubky::actors::auth::relay::auth_relay_listener",
+                "URL-bearing dependency event"
+            );
+            tracing::error!(
+                target: "pubky::actors::auth::relay::auth_relay_listener",
+                "URL-bearing dependency error"
+            );
+            tracing::error!(
+                target: "pubky::actors::auth::relay::http_relay_inbox_channel",
+                "URL-bearing dependency error"
+            );
+            tracing::error!(
+                target: "pubky::actors::auth::relay::http_relay_link_channel",
+                "URL-bearing dependency error"
+            );
+            tracing::warn!(
+                target: "pubky::actors::auth::relay::auth_relay_listener",
+                "coarse dependency warning"
+            );
             tracing::info!(target: "paykit_server", "application event");
         });
-        assert_eq!(*capture.0.lock().unwrap(), 2);
+        assert_eq!(*capture.0.lock().unwrap(), 1);
     }
 }

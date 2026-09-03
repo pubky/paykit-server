@@ -152,7 +152,8 @@ cargo run -p paykit-server -- --check-config
 cargo run -p paykit-server
 ```
 
-`--check-config` validates the complete TOML and required environment values,
+`--check-config` validates the complete TOML, required environment values,
+HTTP bind-address syntax, and exact Electrum endpoint shape,
 prints only `configuration valid`, then exits before PostgreSQL connection,
 migration, network construction, or HTTP bind. Run it against the exact staged
 config and environment before restarting a deployment.
@@ -206,7 +207,10 @@ receive, claim verification, xpub validation, setup locking, marker
 publish/readback, persistence/compensation, lock release, and relay ACK. These
 events intentionally omit flow IDs, Creator identities, authorization and relay
 URLs, sessions, xpubs, payloads, and raw error text; correlate them by timestamp
-and request access logs.
+and request access logs. Closed failure classes preserve typed SDK, marker-data,
+and persistence distinctions without formatting their source errors. Pubky's
+URL-bearing AUTH relay targets are disabled at every log level; application-owned
+setup stages provide the safe replacement diagnostics.
 
 On SIGTERM or SIGINT, readiness changes first, normal admission and new worker claims stop, and admitted work drains for at most `shutdown.drain_timeout`. Remaining work is cancelled at the deadline. Durable leases can be reclaimed after restart; pending memory-only setup flows are lost.
 
