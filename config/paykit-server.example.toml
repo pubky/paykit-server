@@ -22,7 +22,7 @@ log_authorization_url = false
 
 [paykit]
 # Stable grant owner checked by Paykit Server and by the local-demo companion
-# Cargo example. Other values are rejected.
+# Cargo example. Required exactly as shown; missing or other values are rejected.
 client_id = "app.paykit.server"
 receiver_path = "bitkit/server"
 receiver_path_priority = ["bitkit"]

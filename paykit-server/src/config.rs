@@ -40,8 +40,12 @@ impl Config {
         let trusted_locks_key_fingerprint = trusted_public_key.fingerprint();
         let receiver_path = PaykitReceiverPath::new(raw.paykit.receiver_path)
             .map_err(|_| ConfigError::InvalidReceiverPath)?;
+        let raw_client_id = raw
+            .paykit
+            .client_id
+            .ok_or(ConfigError::MissingPaykitClientId)?;
         let client_id =
-            ClientId::new(&raw.paykit.client_id).map_err(|_| ConfigError::InvalidPaykitClientId)?;
+            ClientId::new(&raw_client_id).map_err(|_| ConfigError::InvalidPaykitClientId)?;
         if client_id.as_str() != PAYKIT_CLIENT_ID {
             return Err(ConfigError::UnsupportedPaykitClientId);
         }
@@ -448,6 +452,8 @@ pub enum ConfigError {
     InvalidReceiverPath,
     #[error("paykit.client_id must be a valid non-empty Pubky client ID")]
     InvalidPaykitClientId,
+    #[error("paykit.client_id is required")]
+    MissingPaykitClientId,
     #[error("paykit.client_id must be app.paykit.server")]
     UnsupportedPaykitClientId,
     #[error("paykit.network must be mainnet or testnet")]
@@ -553,7 +559,7 @@ struct RawSetupConfig {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawPaykitConfig {
-    client_id: String,
+    client_id: Option<String>,
     receiver_path: String,
     #[serde(default = "default_receiver_path_priority")]
     receiver_path_priority: Vec<String>,

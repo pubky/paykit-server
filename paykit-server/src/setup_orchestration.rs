@@ -13,6 +13,9 @@ use pubky::{HttpRelayInboxChannel, PubkyHttpClient};
 use crate::bitkit_claim::{
     AuthRequest, ClaimError, WatchOnlyAccountClaim, decrypt_and_verify, derive_channel_id,
 };
+use crate::setup_diagnostics::{
+    SetupFailureClass, SetupOutcome, SetupStage, claim_failure_class, emit_setup_stage,
+};
 
 #[async_trait]
 pub trait CompanionRelay: Send + Sync {
@@ -87,12 +90,79 @@ where
     R: CompanionRelay + ?Sized,
     C: VerifiedSetupCommit + ?Sized,
 {
-    let Some(body) = relay.receive(request, deadline).await? else {
-        return Ok(false);
+    emit_setup_stage(
+        SetupStage::RelayReceive,
+        SetupOutcome::Started,
+        SetupFailureClass::None,
+    );
+    let body = match relay.receive(request, deadline).await {
+        Ok(Some(body)) => {
+            emit_setup_stage(
+                SetupStage::RelayReceive,
+                SetupOutcome::Succeeded,
+                SetupFailureClass::None,
+            );
+            body
+        }
+        Ok(None) => {
+            emit_setup_stage(
+                SetupStage::RelayReceive,
+                SetupOutcome::Absent,
+                SetupFailureClass::BodyAbsent,
+            );
+            return Ok(false);
+        }
+        Err(error) => {
+            emit_setup_stage(
+                SetupStage::RelayReceive,
+                SetupOutcome::Failed,
+                SetupFailureClass::Transport,
+            );
+            return Err(error);
+        }
     };
-    let claim = decrypt_and_verify(&body, request.secret(), creator)?;
+    emit_setup_stage(
+        SetupStage::ClaimVerify,
+        SetupOutcome::Started,
+        SetupFailureClass::None,
+    );
+    let claim = match decrypt_and_verify(&body, request.secret(), creator) {
+        Ok(claim) => {
+            emit_setup_stage(
+                SetupStage::ClaimVerify,
+                SetupOutcome::Succeeded,
+                SetupFailureClass::None,
+            );
+            claim
+        }
+        Err(error) => {
+            emit_setup_stage(
+                SetupStage::ClaimVerify,
+                SetupOutcome::Failed,
+                claim_failure_class(&error),
+            );
+            return Err(error);
+        }
+    };
     commit.publish_readback_and_commit(claim).await?;
-    relay.acknowledge(request).await?;
+    emit_setup_stage(
+        SetupStage::RelayAck,
+        SetupOutcome::Started,
+        SetupFailureClass::None,
+    );
+    if let Err(error) = relay.acknowledge(request).await {
+        emit_setup_stage(
+            SetupStage::RelayAck,
+            SetupOutcome::Failed,
+            SetupFailureClass::Transport,
+        );
+        return Err(error);
+    }
+    emit_setup_stage(
+        SetupStage::RelayAck,
+        SetupOutcome::Succeeded,
+        SetupFailureClass::None,
+    );
     Ok(true)
 }
 
@@ -106,7 +176,36 @@ mod tests {
     };
     use ed25519_dalek::{Signer, SigningKey};
     use sha2::{Digest, Sha256};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tracing::{Event, Subscriber, instrument::WithSubscriber};
+    use tracing_subscriber::{Layer, layer::Context, prelude::*};
+
+    type CapturedEventFields = Vec<Vec<(String, String)>>;
+
+    #[derive(Clone, Default)]
+    struct EventCapture(Arc<Mutex<CapturedEventFields>>);
+
+    impl<S> Layer<S> for EventCapture
+    where
+        S: Subscriber,
+    {
+        fn on_event(&self, event: &Event<'_>, _context: Context<'_, S>) {
+            let mut fields = Vec::new();
+            event.record(&mut FieldVisitor(&mut fields));
+            self.0.lock().unwrap().push(fields);
+        }
+    }
+
+    struct FieldVisitor<'a>(&'a mut Vec<(String, String)>);
+
+    impl tracing::field::Visit for FieldVisitor<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn core::fmt::Debug) {
+            self.0.push((field.name().to_owned(), format!("{value:?}")));
+        }
+    }
 
     struct Relay {
         body: Vec<u8>,
@@ -233,5 +332,72 @@ mod tests {
         );
         assert_eq!(commit.calls.load(Ordering::SeqCst), 0);
         assert_eq!(relay.acks.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn successful_orchestration_emits_ordered_secret_free_stage_events() {
+        let request = request();
+        let key = SigningKey::from_bytes(&[8; 32]);
+        let relay = Relay {
+            body: body(request.secret(), &key),
+            acks: AtomicUsize::new(0),
+        };
+        let commit = Commit {
+            calls: AtomicUsize::new(0),
+            result: Ok(()),
+        };
+        let capture = EventCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+
+        assert!(
+            receive_verify_commit(
+                &relay,
+                &commit,
+                &request,
+                &key.verifying_key(),
+                Duration::from_secs(1),
+            )
+            .with_subscriber(subscriber)
+            .await
+            .unwrap()
+        );
+
+        let events = capture.0.lock().unwrap();
+        let stages = events
+            .iter()
+            .filter_map(|fields| {
+                let event = fields.iter().find(|(name, _)| name == "event")?.1.as_str();
+                event.contains("paykit_setup_completion").then(|| {
+                    let stage = fields
+                        .iter()
+                        .find(|(name, _)| name == "stage")
+                        .unwrap()
+                        .1
+                        .clone();
+                    let outcome = fields
+                        .iter()
+                        .find(|(name, _)| name == "outcome")
+                        .unwrap()
+                        .1
+                        .clone();
+                    (stage, outcome)
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(stages.len(), 6);
+        for (index, (stage, outcome)) in [
+            ("relay_receive", "started"),
+            ("relay_receive", "succeeded"),
+            ("claim_verify", "started"),
+            ("claim_verify", "succeeded"),
+            ("relay_ack", "started"),
+            ("relay_ack", "succeeded"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(stages[index].0.contains(stage));
+            assert!(stages[index].1.contains(outcome));
+        }
     }
 }

@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use paykit_server::config::{Config, ConfigEnvironment, PaykitNetwork};
+use paykit_server::config::{Config, ConfigEnvironment, ConfigError, PaykitNetwork};
 
 const KEY: &str = "pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo";
 const MASTER_KEY: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE";
@@ -175,7 +175,10 @@ fn requires_a_nonempty_paykit_client_id() {
         "client_id = \"other.paykit.server\"",
     );
 
-    assert!(Config::from_toml_and_environment(&missing, environment()).is_err());
+    assert!(matches!(
+        Config::from_toml_and_environment(&missing, environment()),
+        Err(ConfigError::MissingPaykitClientId)
+    ));
     assert!(Config::from_toml_and_environment(&empty, environment()).is_err());
     assert!(Config::from_toml_and_environment(&other, environment()).is_err());
 }
