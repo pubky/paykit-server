@@ -125,6 +125,8 @@ Required environment variables:
 
 Do not put database credentials or the master key in TOML, logs, shell history, or source control. Effective-config debug output redacts secret values.
 
+Production logging allowlists only the `paykit_server` target at INFO and above. Dependency targets are disabled because upstream diagnostics may contain identities, URLs, or response text.
+
 `setup.log_authorization_url` defaults to `false` and must remain false for
 production. The paired Locks correction will make its generated local-demo
 config the sole `true` setting; once that sibling change lands, each new setup
@@ -139,13 +141,42 @@ inbox API or worker, and the baseline schema contains no payer inbox tables.
 
 The executable consumes only keys shown in the example. Arbitrary Paykit relay/homeserver URLs are not accepted.
 
+`paykit.client_id` is required and must be exactly `"app.paykit.server"`. It is an
+immutable deployment invariant, not an optional label. Missing configuration now
+fails with the direct error `paykit.client_id is required`.
+
 ## Running
 
 With configuration and secrets supplied by an operator-controlled secret manager:
 
 ```bash
+cargo run -p paykit-server -- --check-config
 cargo run -p paykit-server
 ```
+
+`--check-config` validates the complete TOML, required environment values,
+SQLx-supported database URL options, HTTP bind-address syntax, and exact
+Electrum endpoint shape including TLS server-name validity,
+prints only `configuration valid`, then exits before PostgreSQL connection,
+migration, network construction, or HTTP bind. Run it against the exact staged
+config and environment before restarting a deployment.
+
+For systemd deployments, gate startup and bound invalid-config restart storms:
+
+```ini
+[Unit]
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+ExecStartPre=/usr/local/bin/paykit-server --check-config
+ExecStart=/usr/local/bin/paykit-server
+Restart=on-failure
+RestartSec=5s
+```
+
+Both commands must receive the same `PAYKIT_CONFIG`, `PAYKIT_DATABASE_URL`, and
+`PAYKIT_MASTER_KEY` environment. Adjust executable path to deployment layout.
 
 Startup fails before bind if configuration, secrets, PostgreSQL, migrations, authenticated persisted state, or immutable deployment values are invalid. Electrum need not be reachable at construction time; its worker reports degraded health and retries.
 
@@ -171,6 +202,18 @@ payloads, signatures, credentials, or protocol correlations. Normal production
 logs have the same boundary. The sole exception is the explicitly enabled local
 demo authorization-URL event described above. Policy rate limiting returns
 `429`; exhausted runtime admission returns `503` with `Retry-After: 1`.
+
+Setup completion emits secret-free structured events with
+`event="paykit_setup_completion"` and closed `stage`, `outcome`, and `class`
+fields. Stages cover AUTH completion, identity/session handling, companion relay
+receive, claim verification, xpub validation, setup locking, marker
+publish/readback, persistence/compensation, lock release, and relay ACK. These
+events intentionally omit flow IDs, Creator identities, authorization and relay
+URLs, sessions, xpubs, payloads, and raw error text; correlate them by timestamp
+and request access logs. Closed failure classes preserve typed SDK, marker-data,
+and persistence distinctions without formatting their source errors. Pubky's
+URL-bearing AUTH relay targets are disabled at every log level; application-owned
+setup stages provide the safe replacement diagnostics.
 
 On SIGTERM or SIGINT, readiness changes first, normal admission and new worker claims stop, and admitted work drains for at most `shutdown.drain_timeout`. Remaining work is cancelled at the deadline. Durable leases can be reclaimed after restart; pending memory-only setup flows are lost.
 

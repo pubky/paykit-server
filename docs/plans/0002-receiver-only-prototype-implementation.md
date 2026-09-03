@@ -67,18 +67,18 @@ cargo test --workspace
 
 **RED tests:**
 - Unknown TOML fields fail parsing.
-- Missing `PAYKIT_DATABASE_URL` or malformed `PAYKIT_MASTER_KEY` fails startup configuration.
+- Missing, SQLx-invalid, or unknown-option `PAYKIT_DATABASE_URL`, or malformed `PAYKIT_MASTER_KEY`, fails startup configuration without echoing secret-bearing input.
 - Master key accepts only base64url-no-pad that decodes to exactly 32 bytes.
-- Invalid network, receiver path, URL/origin, mixed wildcard/concrete origin policy, retired Paykit URL key, zero duration/batch, or inconsistent limit fails.
+- Invalid network, client ID, receiver path, URL/origin, Electrum TLS server name, mixed wildcard/concrete origin policy, retired Paykit URL key, zero duration/batch, inconsistent limit, or runtime-unrepresentable setup capacity fails.
 
 **Implementation:**
 - Parse the closed supported sections: `http`, `locks`, `setup`, `paykit`, `bitcoin`, `electrum`, `outbox`, `limits`, `rate_limits`, `shutdown`; reject retired `[inbox]`.
 - Require `locks.trusted_public_key` in canonical `pubky<pubky-key>` form,
   matching Locks `credentials.lock_server_public_key`.
-- Use accepted `snake_case` TOML keys and duration strings (`"5s"`, `"30s"`, `"90d"`); initial names are `http.listen_addr`, `locks.trusted_public_key`, `setup.allowed_origins`, `paykit.receiver_path`, `paykit.network`, `bitcoin.network`, `electrum.endpoint`, `electrum.poll_interval`, `electrum.request_timeout`, and `electrum.connect_retries`; accept exact HTTP(S) setup origins or `"*"` only as the sole origin policy, validate `paykit.receiver_path` with `paykit_lib::PaykitReceiverPath` (for example `paykit/server`), and treat `paykit.network` as the closed enum `mainnet | testnet` supported by the pinned SDK/Pubky constructors. `testnet` is the pinned Pubky client's fixed localhost testnet, not a hosted service.
+- Use accepted `snake_case` TOML keys and duration strings (`"5s"`, `"30s"`, `"90d"`); initial names are `http.listen_addr`, `locks.trusted_public_key`, `setup.allowed_origins`, `setup.log_authorization_url`, `paykit.client_id`, `paykit.receiver_path`, `paykit.receiver_path_priority`, `paykit.network`, `bitcoin.network`, `electrum.endpoint`, `electrum.poll_interval`, `electrum.request_timeout`, and `electrum.connect_retries`; accept exact HTTP(S) setup origins or `"*"` only as the sole origin policy, require `paykit.client_id = "app.paykit.server"`, validate `paykit.receiver_path` with `paykit_lib::PaykitReceiverPath` (for example `paykit/server`), and treat `paykit.network` as the closed enum `mainnet | testnet` supported by the pinned SDK/Pubky constructors. `testnet` is the pinned Pubky client's fixed localhost testnet, not a hosted service.
 - Remaining names are `outbox.poll_interval`, `outbox.batch_size`, `outbox.lease_duration`, `outbox.retry_initial`, `outbox.retry_max`, `limits.request_body_bytes`, `limits.lock_resource_bytes`, `limits.lock_fetch_timeout`, `rate_limits.signed_requests_per_second`, `rate_limits.signed_burst`, `rate_limits.setup_per_ip_per_minute`, `rate_limits.max_pending_setup_flows`, `rate_limits.max_completion_polls_per_flow`, `rate_limits.max_completion_polls`, and `shutdown.drain_timeout`; default `outbox.batch_size` to `16`.
 - Keep `PAYKIT_DATABASE_URL` and `PAYKIT_MASTER_KEY` environment-only.
-- Define typed immutable deployment values: Bitcoin network, receiver path, and trusted Locks-key fingerprint.
+- Define typed immutable deployment values: Bitcoin network, Paykit client ID, receiver path, and trusted Locks-key fingerprint.
 - Log only redacted effective configuration.
 
 **Verification:**

@@ -21,6 +21,10 @@ use crate::{
     domain::locks::parse_creator,
     persistence::{CreatorCredentials, CreatorStore},
     setup::{Completion, SetupAttempt, SetupCompleter, StartedSetup},
+    setup_diagnostics::{
+        SetupFailureClass, SetupOutcome, SetupStage, emit_setup_stage, marker_failure_class,
+        persistence_failure_class, sdk_failure_class,
+    },
     setup_orchestration::{CompanionRelay, receive_verify_commit},
 };
 
@@ -31,6 +35,11 @@ fn default_marker_capabilities() -> PaykitReceiverCapabilities {
         receipts: false,
         outgoing_payments: false,
     }
+}
+
+fn definitive_setup_failure(stage: SetupStage, class: SetupFailureClass) -> Completion {
+    emit_setup_stage(stage, SetupOutcome::Failed, class);
+    Completion::DefinitiveFailure
 }
 
 /// Marker I/O is a narrow test seam. Production uses [`DirectMarkerPublisher`],
@@ -65,19 +74,60 @@ impl MarkerPublisher for DirectMarkerPublisher {
         owner: &paykit_lib::PublicKey,
         marker: &PaykitReceiverMarker,
     ) -> Result<(), ClaimError> {
-        paykit_lib::publish_paykit_receiver_marker(session, marker)
-            .await
-            .map_err(|_| ClaimError::InvalidEnvelope)?;
-        let readback = paykit_lib::get_paykit_receiver_marker(
+        emit_setup_stage(
+            SetupStage::MarkerPublish,
+            SetupOutcome::Started,
+            SetupFailureClass::None,
+        );
+        if let Err(error) = paykit_lib::publish_paykit_receiver_marker(session, marker).await {
+            emit_setup_stage(
+                SetupStage::MarkerPublish,
+                SetupOutcome::Failed,
+                marker_failure_class(&error),
+            );
+            return Err(ClaimError::InvalidEnvelope);
+        }
+        emit_setup_stage(
+            SetupStage::MarkerPublish,
+            SetupOutcome::Succeeded,
+            SetupFailureClass::None,
+        );
+        emit_setup_stage(
+            SetupStage::MarkerReadback,
+            SetupOutcome::Started,
+            SetupFailureClass::None,
+        );
+        let readback = match paykit_lib::get_paykit_receiver_marker(
             &public_storage_client.public_storage(),
             owner,
             &marker.receiver_path,
         )
         .await
-        .map_err(|_| ClaimError::InvalidEnvelope)?;
-        (readback == Some(marker.clone()))
-            .then_some(())
-            .ok_or(ClaimError::InvalidEnvelope)
+        {
+            Ok(readback) => readback,
+            Err(error) => {
+                emit_setup_stage(
+                    SetupStage::MarkerReadback,
+                    SetupOutcome::Failed,
+                    marker_failure_class(&error),
+                );
+                return Err(ClaimError::InvalidEnvelope);
+            }
+        };
+        if readback != Some(marker.clone()) {
+            emit_setup_stage(
+                SetupStage::MarkerReadback,
+                SetupOutcome::Failed,
+                SetupFailureClass::ReadbackMismatch,
+            );
+            return Err(ClaimError::InvalidEnvelope);
+        }
+        emit_setup_stage(
+            SetupStage::MarkerReadback,
+            SetupOutcome::Succeeded,
+            SetupFailureClass::None,
+        );
+        Ok(())
     }
 
     async fn remove(
@@ -168,7 +218,10 @@ impl SetupCompleter for RealSetupCompleter {
 
     async fn complete(&self, attempt: Box<dyn SetupAttempt>) -> Completion {
         let Ok(attempt) = attempt.into_any().downcast::<BitkitSetupAttempt>() else {
-            return Completion::DefinitiveFailure;
+            return definitive_setup_failure(
+                SetupStage::AuthComplete,
+                SetupFailureClass::InvalidRequest,
+            );
         };
         let attempt = attempt.0;
         let capabilities = attempt.capabilities().to_owned();
@@ -176,29 +229,88 @@ impl SetupCompleter for RealSetupCompleter {
         // The authenticated identity is not available until the normal auth
         // flow completes. Start with a fresh Noise key, then replace it with
         // the persisted key before any marker/persistence work on reauth.
+        emit_setup_stage(
+            SetupStage::AuthComplete,
+            SetupOutcome::Started,
+            SetupFailureClass::None,
+        );
         let auth = match attempt
             .auth_request
             .complete(None, ReceiverNoiseSecretKey::random(), &capabilities)
             .await
         {
-            Ok(auth) => auth,
-            Err(_) => return Completion::DefinitiveFailure,
+            Ok(auth) => {
+                emit_setup_stage(
+                    SetupStage::AuthComplete,
+                    SetupOutcome::Succeeded,
+                    SetupFailureClass::None,
+                );
+                auth
+            }
+            Err(error) => {
+                return definitive_setup_failure(
+                    SetupStage::AuthComplete,
+                    sdk_failure_class(&error),
+                );
+            }
         };
+        emit_setup_stage(
+            SetupStage::IdentityValidate,
+            SetupOutcome::Started,
+            SetupFailureClass::None,
+        );
         let owner = match auth.public_key.to_public_key() {
             Ok(owner) => owner,
-            Err(_) => return Completion::DefinitiveFailure,
+            Err(_) => {
+                return definitive_setup_failure(
+                    SetupStage::IdentityValidate,
+                    SetupFailureClass::InvalidIdentity,
+                );
+            }
         };
         let creator = match parse_creator(&auth.public_key.to_app_key()) {
             Ok(creator) => creator,
-            Err(_) => return Completion::DefinitiveFailure,
+            Err(_) => {
+                return definitive_setup_failure(
+                    SetupStage::IdentityValidate,
+                    SetupFailureClass::InvalidIdentity,
+                );
+            }
         };
         let verifying_key = match VerifyingKey::from_bytes(owner.as_bytes()) {
             Ok(key) => key,
-            Err(_) => return Completion::DefinitiveFailure,
+            Err(_) => {
+                return definitive_setup_failure(
+                    SetupStage::IdentityValidate,
+                    SetupFailureClass::InvalidIdentity,
+                );
+            }
         };
+        emit_setup_stage(
+            SetupStage::IdentityValidate,
+            SetupOutcome::Succeeded,
+            SetupFailureClass::None,
+        );
+        emit_setup_stage(
+            SetupStage::SessionExport,
+            SetupOutcome::Started,
+            SetupFailureClass::None,
+        );
         let session_secret = match auth.export_session_secret().await {
-            Ok(secret) => secret.into_inner(),
-            Err(_) => return Completion::DefinitiveFailure,
+            Ok(secret) => {
+                emit_setup_stage(
+                    SetupStage::SessionExport,
+                    SetupOutcome::Succeeded,
+                    SetupFailureClass::None,
+                );
+                secret.into_inner()
+            }
+            Err(error) => {
+                return definitive_setup_failure(
+                    SetupStage::SessionExport,
+                    sdk_failure_class(&error),
+                );
+            }
         };
         let commit = CreatorSetupCommit {
             session: auth.access.session,
@@ -250,22 +362,80 @@ impl crate::setup_orchestration::VerifiedSetupCommit for CreatorSetupCommit {
         &self,
         claim: WatchOnlyAccountClaim,
     ) -> Result<(), ClaimError> {
-        let xpub = validate_xpub(
+        emit_setup_stage(
+            SetupStage::XpubValidate,
+            SetupOutcome::Started,
+            SetupFailureClass::None,
+        );
+        let xpub = match validate_xpub(
             &claim.serialized_xpub,
             claim.account_index,
             &self.bitcoin_network,
-        )?;
-        let setup_lock = self
-            .creators
-            .acquire_setup_lock(&self.creator)
-            .await
-            .map_err(|_| ClaimError::InvalidEnvelope)?;
+        ) {
+            Ok(xpub) => {
+                emit_setup_stage(
+                    SetupStage::XpubValidate,
+                    SetupOutcome::Succeeded,
+                    SetupFailureClass::None,
+                );
+                xpub
+            }
+            Err(error) => {
+                emit_setup_stage(
+                    SetupStage::XpubValidate,
+                    SetupOutcome::Failed,
+                    SetupFailureClass::InvalidPayload,
+                );
+                return Err(error);
+            }
+        };
+        emit_setup_stage(
+            SetupStage::LockAcquire,
+            SetupOutcome::Started,
+            SetupFailureClass::None,
+        );
+        let setup_lock = match self.creators.acquire_setup_lock(&self.creator).await {
+            Ok(lock) => {
+                emit_setup_stage(
+                    SetupStage::LockAcquire,
+                    SetupOutcome::Succeeded,
+                    SetupFailureClass::None,
+                );
+                lock
+            }
+            Err(error) => {
+                emit_setup_stage(
+                    SetupStage::LockAcquire,
+                    SetupOutcome::Failed,
+                    persistence_failure_class(&error),
+                );
+                return Err(ClaimError::InvalidEnvelope);
+            }
+        };
         let commit_result = async {
-            let existing = self
-                .creators
-                .load_optional(&self.creator)
-                .await
-                .map_err(|_| ClaimError::InvalidEnvelope)?;
+            emit_setup_stage(
+                SetupStage::CreatorLoad,
+                SetupOutcome::Started,
+                SetupFailureClass::None,
+            );
+            let existing = match self.creators.load_optional(&self.creator).await {
+                Ok(existing) => {
+                    emit_setup_stage(
+                        SetupStage::CreatorLoad,
+                        SetupOutcome::Succeeded,
+                        SetupFailureClass::None,
+                    );
+                    existing
+                }
+                Err(error) => {
+                    emit_setup_stage(
+                        SetupStage::CreatorLoad,
+                        SetupOutcome::Failed,
+                        persistence_failure_class(&error),
+                    );
+                    return Err(ClaimError::InvalidEnvelope);
+                }
+            };
             let noise_secret = existing
                 .as_ref()
                 .map(|credentials| credentials.receiver_noise_secret().clone())
@@ -290,6 +460,11 @@ impl crate::setup_orchestration::VerifiedSetupCommit for CreatorSetupCommit {
                 xpub,
                 claim.account_index,
             );
+            emit_setup_stage(
+                SetupStage::Persistence,
+                SetupOutcome::Started,
+                SetupFailureClass::None,
+            );
             let persistence = match existing {
                 Some(_) => self.creators.reauthenticate(&credentials).await,
                 None => self
@@ -298,24 +473,62 @@ impl crate::setup_orchestration::VerifiedSetupCommit for CreatorSetupCommit {
                     .await
                     .map(|_| ()),
             };
-            if persistence.is_err() {
+            if let Err(error) = persistence {
+                emit_setup_stage(
+                    SetupStage::Persistence,
+                    SetupOutcome::Failed,
+                    persistence_failure_class(&error),
+                );
                 // Publication and Postgres cannot share a transaction. This
                 // creator-scoped lock covers load, publication, persistence,
                 // and compensation, so a failed first creator cannot remove a
                 // concurrent winner's receiver marker. Reauth never removes
                 // its existing marker.
                 if existing.is_none() {
-                    let _ = self
+                    emit_setup_stage(
+                        SetupStage::Compensation,
+                        SetupOutcome::Started,
+                        SetupFailureClass::None,
+                    );
+                    let compensation = self
                         .marker_publisher
                         .remove(&self.session, &self.receiver_path)
                         .await;
+                    emit_setup_stage(
+                        SetupStage::Compensation,
+                        if compensation.is_ok() {
+                            SetupOutcome::Succeeded
+                        } else {
+                            SetupOutcome::Failed
+                        },
+                        if compensation.is_ok() {
+                            SetupFailureClass::None
+                        } else {
+                            SetupFailureClass::Transport
+                        },
+                    );
                 }
                 return Err(ClaimError::InvalidEnvelope);
             }
+            emit_setup_stage(
+                SetupStage::Persistence,
+                SetupOutcome::Succeeded,
+                SetupFailureClass::None,
+            );
             Ok(())
         }
         .await;
+        emit_setup_stage(
+            SetupStage::LockRelease,
+            SetupOutcome::Started,
+            SetupFailureClass::None,
+        );
         let unlock_result = setup_lock.release().await;
+        let (unlock_outcome, unlock_class) = match &unlock_result {
+            Ok(()) => (SetupOutcome::Succeeded, SetupFailureClass::None),
+            Err(error) => (SetupOutcome::Failed, persistence_failure_class(error)),
+        };
+        emit_setup_stage(SetupStage::LockRelease, unlock_outcome, unlock_class);
         match (commit_result, unlock_result) {
             (Err(error), _) => Err(error),
             (Ok(()), Err(_)) => Err(ClaimError::InvalidEnvelope),

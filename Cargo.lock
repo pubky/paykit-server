@@ -3041,6 +3041,7 @@ dependencies = [
  "pubky",
  "qrcode",
  "rand 0.10.2",
+ "rustls-pki-types",
  "serde",
  "serde_ignored",
  "serde_json",

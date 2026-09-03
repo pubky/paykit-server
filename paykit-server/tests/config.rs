@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use paykit_server::config::{Config, ConfigEnvironment, PaykitNetwork};
+use paykit_server::config::{Config, ConfigEnvironment, ConfigError, PaykitNetwork};
 
 const KEY: &str = "pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo";
 const MASTER_KEY: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE";
@@ -105,7 +105,7 @@ fn parses_exact_local_compose_config_contract() {
     let config = Config::from_toml_and_environment(&local_compose_toml(), environment())
         .expect("local Compose configuration");
 
-    assert_eq!(config.http.listen_addr, "0.0.0.0:3001");
+    assert_eq!(config.http.listen_addr().to_string(), "0.0.0.0:3001");
     assert_eq!(config.setup.allowed_origins, vec!["http://localhost:8080"]);
     assert_eq!(config.paykit.network, PaykitNetwork::Testnet);
     assert_eq!(config.paykit.client_id.as_str(), "app.paykit.server");
@@ -130,7 +130,7 @@ fn parses_exact_local_compose_config_contract() {
             120, 70, 178, 165, 123, 137, 126, 113, 9, 25, 183, 103, 9,
         ]
     );
-    assert_eq!(config.electrum.endpoint, "tcp://fulcrum:50001");
+    assert_eq!(config.electrum.endpoint(), "tcp://fulcrum:50001");
     assert_eq!(config.electrum.poll_interval, Duration::from_secs(1));
     assert_eq!(config.outbox.poll_interval, Duration::from_millis(500));
 }
@@ -175,7 +175,10 @@ fn requires_a_nonempty_paykit_client_id() {
         "client_id = \"other.paykit.server\"",
     );
 
-    assert!(Config::from_toml_and_environment(&missing, environment()).is_err());
+    assert!(matches!(
+        Config::from_toml_and_environment(&missing, environment()),
+        Err(ConfigError::MissingPaykitClientId)
+    ));
     assert!(Config::from_toml_and_environment(&empty, environment()).is_err());
     assert!(Config::from_toml_and_environment(&other, environment()).is_err());
 }
@@ -226,6 +229,19 @@ fn rejects_non_postgresql_database_url() {
     };
 
     assert!(Config::from_toml_and_environment(&valid_toml(), non_postgresql).is_err());
+}
+
+#[test]
+fn config_environment_debug_redacts_both_secrets() {
+    let environment = ConfigEnvironment {
+        database_url: Some("postgres://debug-user:debug-password@example.test/paykit".into()),
+        master_key: Some("debug-master-key".into()),
+    };
+
+    let rendered = format!("{environment:?}");
+    assert!(!rendered.contains("debug-password"));
+    assert!(!rendered.contains("debug-master-key"));
+    assert!(rendered.contains("<redacted>"));
 }
 
 #[test]
@@ -355,7 +371,7 @@ fn parses_accepted_durations_and_uses_ledger_defaults() {
     assert_eq!(config.rate_limits.signed_requests_per_second, 100);
     assert_eq!(config.rate_limits.signed_burst, 200);
     assert_eq!(config.rate_limits.setup_per_ip_per_minute, 10);
-    assert_eq!(config.rate_limits.max_pending_setup_flows, 100);
+    assert_eq!(config.rate_limits.max_pending_setup_flows(), 100);
     assert_eq!(config.rate_limits.max_completion_polls_per_flow, 2);
     assert_eq!(config.rate_limits.max_completion_polls, 200);
     assert_eq!(config.shutdown.drain_timeout, Duration::from_secs(30));

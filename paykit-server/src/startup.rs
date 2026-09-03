@@ -38,7 +38,7 @@ pub enum StartupError {
 /// persisted Creator credential and SDK state before returning a ready database.
 pub async fn initialize_database(config: &Config) -> Result<PgPool, StartupError> {
     let pool = PgPoolOptions::new()
-        .connect(config.database_url())
+        .connect_with(config.database_options().clone())
         .await
         .map_err(|_| StartupError::Connection)?;
     run_migrations(&pool)

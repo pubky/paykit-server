@@ -26,6 +26,7 @@ pub mod real_setup;
 pub mod runtime;
 pub mod server;
 pub mod setup;
+mod setup_diagnostics;
 /// Relay receive/ack boundary and durable-before-ack setup orchestration.
 pub mod setup_orchestration;
 /// Fail-closed database and Creator-state initialization before HTTP bind.

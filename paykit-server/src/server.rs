@@ -117,7 +117,7 @@ impl Server {
         pubky: Pubky,
     ) -> Result<Self, ServerBuildError> {
         let electrum = ElectrumAdapter::configured(
-            config.electrum.endpoint.clone(),
+            config.electrum.endpoint(),
             config.deployment_invariants().bitcoin_network.clone(),
             config.electrum.request_timeout,
             config.electrum.connect_retries,
@@ -166,10 +166,7 @@ impl Server {
                     config.rate_limits.setup_per_ip_per_minute,
                 )
                 .expect("validated setup rate limit fits usize"),
-                max_pending_setup_flows: usize::try_from(
-                    config.rate_limits.max_pending_setup_flows,
-                )
-                .expect("validated pending setup limit fits usize"),
+                max_pending_setup_flows: config.rate_limits.max_pending_setup_flows(),
             },
             config.setup.log_authorization_url,
         );

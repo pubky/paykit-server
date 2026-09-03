@@ -13,6 +13,31 @@ use pubky::{HttpRelayInboxChannel, PubkyHttpClient};
 use crate::bitkit_claim::{
     AuthRequest, ClaimError, WatchOnlyAccountClaim, decrypt_and_verify, derive_channel_id,
 };
+use crate::setup_diagnostics::{
+    SetupFailureClass, SetupOutcome, SetupStage, claim_failure_class, emit_setup_stage,
+};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompanionRelayError {
+    InvalidRequest,
+    Transport,
+}
+
+impl CompanionRelayError {
+    fn failure_class(self) -> SetupFailureClass {
+        match self {
+            Self::InvalidRequest => SetupFailureClass::InvalidRequest,
+            Self::Transport => SetupFailureClass::Transport,
+        }
+    }
+
+    fn into_claim_error(self) -> ClaimError {
+        match self {
+            Self::InvalidRequest => ClaimError::InvalidAuthRequest,
+            Self::Transport => ClaimError::InvalidEnvelope,
+        }
+    }
+}
 
 #[async_trait]
 pub trait CompanionRelay: Send + Sync {
@@ -20,9 +45,9 @@ pub trait CompanionRelay: Send + Sync {
         &self,
         request: &AuthRequest,
         deadline: Duration,
-    ) -> Result<Option<Vec<u8>>, ClaimError>;
+    ) -> Result<Option<Vec<u8>>, CompanionRelayError>;
     /// Called only after marker publication/read-back and durable state commit.
-    async fn acknowledge(&self, request: &AuthRequest) -> Result<(), ClaimError>;
+    async fn acknowledge(&self, request: &AuthRequest) -> Result<(), CompanionRelayError>;
 }
 
 /// The production relay boundary uses Pubky's public raw inbox channel, not
@@ -37,9 +62,9 @@ impl PubkyCompanionRelay {
     pub fn new(client: PubkyHttpClient) -> Self {
         Self { client }
     }
-    fn channel(&self, request: &AuthRequest) -> Result<HttpRelayInboxChannel, ClaimError> {
+    fn channel(&self, request: &AuthRequest) -> Result<HttpRelayInboxChannel, CompanionRelayError> {
         HttpRelayInboxChannel::new(request.relay().clone(), derive_channel_id(request.secret()))
-            .map_err(|_| ClaimError::InvalidAuthRequest)
+            .map_err(|_| CompanionRelayError::InvalidRequest)
     }
 }
 
@@ -49,18 +74,18 @@ impl CompanionRelay for PubkyCompanionRelay {
         &self,
         request: &AuthRequest,
         deadline: Duration,
-    ) -> Result<Option<Vec<u8>>, ClaimError> {
+    ) -> Result<Option<Vec<u8>>, CompanionRelayError> {
         self.channel(request)?
             .poll(&self.client, Some(deadline))
             .await
-            .map_err(|_| ClaimError::InvalidEnvelope)
+            .map_err(|_| CompanionRelayError::Transport)
     }
-    async fn acknowledge(&self, request: &AuthRequest) -> Result<(), ClaimError> {
+    async fn acknowledge(&self, request: &AuthRequest) -> Result<(), CompanionRelayError> {
         self.channel(request)?
             .ack(&self.client)
             .await
             .map(|_| ())
-            .map_err(|_| ClaimError::InvalidEnvelope)
+            .map_err(|_| CompanionRelayError::Transport)
     }
 }
 
@@ -87,12 +112,79 @@ where
     R: CompanionRelay + ?Sized,
     C: VerifiedSetupCommit + ?Sized,
 {
-    let Some(body) = relay.receive(request, deadline).await? else {
-        return Ok(false);
+    emit_setup_stage(
+        SetupStage::RelayReceive,
+        SetupOutcome::Started,
+        SetupFailureClass::None,
+    );
+    let body = match relay.receive(request, deadline).await {
+        Ok(Some(body)) => {
+            emit_setup_stage(
+                SetupStage::RelayReceive,
+                SetupOutcome::Succeeded,
+                SetupFailureClass::None,
+            );
+            body
+        }
+        Ok(None) => {
+            emit_setup_stage(
+                SetupStage::RelayReceive,
+                SetupOutcome::Absent,
+                SetupFailureClass::BodyAbsent,
+            );
+            return Ok(false);
+        }
+        Err(error) => {
+            emit_setup_stage(
+                SetupStage::RelayReceive,
+                SetupOutcome::Failed,
+                error.failure_class(),
+            );
+            return Err(error.into_claim_error());
+        }
     };
-    let claim = decrypt_and_verify(&body, request.secret(), creator)?;
+    emit_setup_stage(
+        SetupStage::ClaimVerify,
+        SetupOutcome::Started,
+        SetupFailureClass::None,
+    );
+    let claim = match decrypt_and_verify(&body, request.secret(), creator) {
+        Ok(claim) => {
+            emit_setup_stage(
+                SetupStage::ClaimVerify,
+                SetupOutcome::Succeeded,
+                SetupFailureClass::None,
+            );
+            claim
+        }
+        Err(error) => {
+            emit_setup_stage(
+                SetupStage::ClaimVerify,
+                SetupOutcome::Failed,
+                claim_failure_class(&error),
+            );
+            return Err(error);
+        }
+    };
     commit.publish_readback_and_commit(claim).await?;
-    relay.acknowledge(request).await?;
+    emit_setup_stage(
+        SetupStage::RelayAck,
+        SetupOutcome::Started,
+        SetupFailureClass::None,
+    );
+    if let Err(error) = relay.acknowledge(request).await {
+        emit_setup_stage(
+            SetupStage::RelayAck,
+            SetupOutcome::Failed,
+            error.failure_class(),
+        );
+        return Err(error.into_claim_error());
+    }
+    emit_setup_stage(
+        SetupStage::RelayAck,
+        SetupOutcome::Succeeded,
+        SetupFailureClass::None,
+    );
     Ok(true)
 }
 
@@ -106,7 +198,36 @@ mod tests {
     };
     use ed25519_dalek::{Signer, SigningKey};
     use sha2::{Digest, Sha256};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tracing::{Event, Subscriber, instrument::WithSubscriber};
+    use tracing_subscriber::{Layer, layer::Context, prelude::*};
+
+    type CapturedEventFields = Vec<Vec<(String, String)>>;
+
+    #[derive(Clone, Default)]
+    struct EventCapture(Arc<Mutex<CapturedEventFields>>);
+
+    impl<S> Layer<S> for EventCapture
+    where
+        S: Subscriber,
+    {
+        fn on_event(&self, event: &Event<'_>, _context: Context<'_, S>) {
+            let mut fields = Vec::new();
+            event.record(&mut FieldVisitor(&mut fields));
+            self.0.lock().unwrap().push(fields);
+        }
+    }
+
+    struct FieldVisitor<'a>(&'a mut Vec<(String, String)>);
+
+    impl tracing::field::Visit for FieldVisitor<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn core::fmt::Debug) {
+            self.0.push((field.name().to_owned(), format!("{value:?}")));
+        }
+    }
 
     struct Relay {
         body: Vec<u8>,
@@ -118,12 +239,42 @@ mod tests {
             &self,
             _: &AuthRequest,
             _: Duration,
-        ) -> Result<Option<Vec<u8>>, ClaimError> {
+        ) -> Result<Option<Vec<u8>>, CompanionRelayError> {
             Ok(Some(self.body.clone()))
         }
-        async fn acknowledge(&self, _: &AuthRequest) -> Result<(), ClaimError> {
+        async fn acknowledge(&self, _: &AuthRequest) -> Result<(), CompanionRelayError> {
             self.acks.fetch_add(1, Ordering::SeqCst);
             Ok(())
+        }
+    }
+    struct FailingRelay(CompanionRelayError);
+    #[async_trait]
+    impl CompanionRelay for FailingRelay {
+        async fn receive(
+            &self,
+            _: &AuthRequest,
+            _: Duration,
+        ) -> Result<Option<Vec<u8>>, CompanionRelayError> {
+            Err(self.0)
+        }
+        async fn acknowledge(&self, _: &AuthRequest) -> Result<(), CompanionRelayError> {
+            Err(self.0)
+        }
+    }
+    struct FailingAckRelay {
+        body: Vec<u8>,
+    }
+    #[async_trait]
+    impl CompanionRelay for FailingAckRelay {
+        async fn receive(
+            &self,
+            _: &AuthRequest,
+            _: Duration,
+        ) -> Result<Option<Vec<u8>>, CompanionRelayError> {
+            Ok(Some(self.body.clone()))
+        }
+        async fn acknowledge(&self, _: &AuthRequest) -> Result<(), CompanionRelayError> {
+            Err(CompanionRelayError::Transport)
         }
     }
     struct Commit {
@@ -220,6 +371,8 @@ mod tests {
             result: Ok(()),
         };
         let other = SigningKey::from_bytes(&[9; 32]);
+        let capture = EventCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
         assert_eq!(
             receive_verify_commit(
                 &relay,
@@ -228,10 +381,161 @@ mod tests {
                 &other.verifying_key(),
                 Duration::from_secs(1)
             )
+            .with_subscriber(subscriber)
             .await,
             Err(ClaimError::AuthenticationFailed)
         );
         assert_eq!(commit.calls.load(Ordering::SeqCst), 0);
         assert_eq!(relay.acks.load(Ordering::SeqCst), 0);
+        let events = capture.0.lock().unwrap();
+        assert!(events.iter().any(|fields| {
+            fields
+                .iter()
+                .any(|(name, value)| name == "stage" && value.contains("claim_verify"))
+                && fields
+                    .iter()
+                    .any(|(name, value)| name == "outcome" && value.contains("failed"))
+                && fields
+                    .iter()
+                    .any(|(name, value)| name == "class" && value.contains("authentication"))
+        }));
+    }
+
+    #[tokio::test]
+    async fn relay_receive_transport_failure_is_classified_before_coarse_mapping() {
+        let request = request();
+        let key = SigningKey::from_bytes(&[8; 32]);
+        let relay = FailingRelay(CompanionRelayError::Transport);
+        let commit = Commit {
+            calls: AtomicUsize::new(0),
+            result: Ok(()),
+        };
+        let capture = EventCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+
+        assert_eq!(
+            receive_verify_commit(
+                &relay,
+                &commit,
+                &request,
+                &key.verifying_key(),
+                Duration::from_secs(1),
+            )
+            .with_subscriber(subscriber)
+            .await,
+            Err(ClaimError::InvalidEnvelope)
+        );
+        assert!(capture.0.lock().unwrap().iter().any(|fields| {
+            fields
+                .iter()
+                .any(|(name, value)| name == "class" && value.contains("transport"))
+        }));
+    }
+
+    #[tokio::test]
+    async fn relay_ack_transport_failure_is_classified_after_commit() {
+        let request = request();
+        let key = SigningKey::from_bytes(&[8; 32]);
+        let relay = FailingAckRelay {
+            body: body(request.secret(), &key),
+        };
+        let commit = Commit {
+            calls: AtomicUsize::new(0),
+            result: Ok(()),
+        };
+        let capture = EventCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+
+        assert_eq!(
+            receive_verify_commit(
+                &relay,
+                &commit,
+                &request,
+                &key.verifying_key(),
+                Duration::from_secs(1),
+            )
+            .with_subscriber(subscriber)
+            .await,
+            Err(ClaimError::InvalidEnvelope)
+        );
+        assert_eq!(commit.calls.load(Ordering::SeqCst), 1);
+        assert!(capture.0.lock().unwrap().iter().any(|fields| {
+            fields
+                .iter()
+                .any(|(name, value)| name == "stage" && value.contains("relay_ack"))
+                && fields
+                    .iter()
+                    .any(|(name, value)| name == "outcome" && value.contains("failed"))
+                && fields
+                    .iter()
+                    .any(|(name, value)| name == "class" && value.contains("transport"))
+        }));
+    }
+
+    #[tokio::test]
+    async fn successful_orchestration_emits_ordered_secret_free_stage_events() {
+        let request = request();
+        let key = SigningKey::from_bytes(&[8; 32]);
+        let relay = Relay {
+            body: body(request.secret(), &key),
+            acks: AtomicUsize::new(0),
+        };
+        let commit = Commit {
+            calls: AtomicUsize::new(0),
+            result: Ok(()),
+        };
+        let capture = EventCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+
+        assert!(
+            receive_verify_commit(
+                &relay,
+                &commit,
+                &request,
+                &key.verifying_key(),
+                Duration::from_secs(1),
+            )
+            .with_subscriber(subscriber)
+            .await
+            .unwrap()
+        );
+
+        let events = capture.0.lock().unwrap();
+        let stages = events
+            .iter()
+            .filter_map(|fields| {
+                let event = fields.iter().find(|(name, _)| name == "event")?.1.as_str();
+                event.contains("paykit_setup_completion").then(|| {
+                    let stage = fields
+                        .iter()
+                        .find(|(name, _)| name == "stage")
+                        .unwrap()
+                        .1
+                        .clone();
+                    let outcome = fields
+                        .iter()
+                        .find(|(name, _)| name == "outcome")
+                        .unwrap()
+                        .1
+                        .clone();
+                    (stage, outcome)
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(stages.len(), 6);
+        for (index, (stage, outcome)) in [
+            ("relay_receive", "started"),
+            ("relay_receive", "succeeded"),
+            ("claim_verify", "started"),
+            ("claim_verify", "succeeded"),
+            ("relay_ack", "started"),
+            ("relay_ack", "succeeded"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(stages[index].0.contains(stage));
+            assert!(stages[index].1.contains(outcome));
+        }
     }
 }
