@@ -504,9 +504,10 @@ pub(crate) fn validate_electrum_endpoint(value: &str) -> Result<(), ConfigError>
         || parsed.port().is_none()
         || !parsed.username().is_empty()
         || parsed.password().is_some()
-        || !matches!(parsed.path(), "" | "/")
+        || !parsed.path().is_empty()
         || parsed.query().is_some()
         || parsed.fragment().is_some()
+        || parsed.as_str() != value
     {
         return Err(ConfigError::InvalidElectrumEndpoint);
     }
