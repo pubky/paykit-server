@@ -956,7 +956,7 @@ git status --short
 **Implementation record (2026-07-22):**
 - Added ignored, explicit live tests in `paykit-server-e2e/tests/live_adapters.rs`;
   normal workspace runs compile them but do not depend on external services.
-- Against Pubky Core static testnet `0.9.3` at revision
+- Against Pubky static testnet `0.9.3` at revision
   `51db89744f97e33486a5e5aedf442b7e2f9b51c2`, two temporary identities published
   and discovered markers through the separate localhost relay/homeserver process,
   established an Encrypted Link, and sent/received one Payment Request.

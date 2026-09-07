@@ -12,7 +12,7 @@ Pinned/runtime versions:
 - Docker `29.6.2`
 - `paykit-lib` and `paykit-sdk` `0.1.0-rc37`, Git revision `81fd0e5124aac1fd782811fd968109a5972cd323`
 - Paykit dependency `pubky` `0.8.0`
-- local Pubky Core static testnet `0.9.3`, Git revision `51db89744f97e33486a5e5aedf442b7e2f9b51c2`
+- local Pubky static testnet `0.9.3`, Git revision `51db89744f97e33486a5e5aedf442b7e2f9b51c2`
 - `bdk_electrum` `0.24.0`
 - `electrum-client` `0.25.0`
 - public Electrum server reported `Fulcrum 1.11.1`, protocol `1.4`
@@ -23,12 +23,12 @@ The snapshot proves interoperability only for these versions and environments. I
 
 This test signs up two temporary identities, publishes both receiver markers, discovers the payee marker through public storage, establishes an Encrypted Link, proposes and sends one Payment Request, receives it on the peer, and verifies the SDK-derived request identity.
 
-The static testnet uses fixed localhost ports and homeserver identity documented by Pubky Core. It needs the sibling Pubky Core checkout at the exact recorded revision and a PostgreSQL server. From the Paykit Server repository:
+The static testnet uses fixed localhost ports and homeserver identity documented by the Pubky Homeserver repository. It needs a sibling `pubky-homeserver` checkout at the exact recorded revision and a PostgreSQL server. From the Paykit Server repository:
 
 ```bash
 set -euo pipefail
 
-pubky_dir=../../Pubky/pubky-core
+pubky_dir=../../Pubky/pubky-homeserver
 required_pubky_revision=51db89744f97e33486a5e5aedf442b7e2f9b51c2
 test "$(git -C "$pubky_dir" rev-parse HEAD)" = "$required_pubky_revision"
 test -z "$(git -C "$pubky_dir" status --porcelain)"

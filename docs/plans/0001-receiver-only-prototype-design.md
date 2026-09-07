@@ -504,7 +504,7 @@ Rules:
 - The composed application is PostgreSQL-verified with two independent Creators,
   concurrent invoice creation, SDK handoff/reconciliation, direct Bitcoin
   observation, status reads, shutdown, startup reauthentication, and restart.
-- Live Paykit evidence uses Pubky Core static testnet `0.9.3` at revision
+- Live Paykit evidence uses Pubky static testnet `0.9.3` at revision
   `51db89744f97e33486a5e5aedf442b7e2f9b51c2`: two temporary identities publish
   and discover receiver markers through the separate relay/homeserver process,
   establish an Encrypted Link, and send/receive one Payment Request.

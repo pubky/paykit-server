@@ -23,7 +23,7 @@ TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres \
   cargo test --locked -p paykit-server-e2e -- --test-threads=1
 ```
 
-The two live-adapter tests remain ignored by default because they require either a local Pubky Core static testnet or a recorded public Electrum fixture. See [`docs/live-adapter-smoke.md`](docs/live-adapter-smoke.md) before running them explicitly.
+The two live-adapter tests remain ignored by default because they require either a local Pubky static testnet or a recorded public Electrum fixture. See [`docs/live-adapter-smoke.md`](docs/live-adapter-smoke.md) before running them explicitly.
 
 Before submitting changes, read [`CONTRIBUTING.md`](CONTRIBUTING.md). Report security problems through the private process in [`SECURITY.md`](SECURITY.md), not a public issue.
 
@@ -115,7 +115,7 @@ Do not put database credentials or the master key in TOML, logs, shell history, 
 The parser rejects the retired `[inbox]` section. The executable exposes no payer
 inbox API or worker, and the baseline schema contains no payer inbox tables.
 
-`paykit.network = "testnet"` selects the pinned Pubky client’s fixed **local** testnet configuration. It requires the Pubky Core static testnet on localhost; it is not a hosted public testnet. `paykit.network = "mainnet"` uses normal Pkarr/homeserver resolution. Bitcoin network and Electrum endpoint are configured separately and must agree.
+`paykit.network = "testnet"` selects the pinned Pubky client’s fixed **local** testnet configuration. It requires the Pubky static testnet on localhost; it is not a hosted public testnet. `paykit.network = "mainnet"` uses normal Pkarr/homeserver resolution. Bitcoin network and Electrum endpoint are configured separately and must agree.
 
 The executable consumes only keys shown in the example. Arbitrary Paykit relay/homeserver URLs are not accepted.
 

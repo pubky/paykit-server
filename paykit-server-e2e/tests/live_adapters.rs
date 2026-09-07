@@ -166,7 +166,7 @@ async fn establish_link(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires the Pubky Core static testnet on localhost"]
+#[ignore = "requires the Pubky static testnet on localhost"]
 async fn live_pubky_marker_discovery_and_payment_request_delivery() {
     let pubky = Pubky::testnet().unwrap();
     let bootstrap = PubkySessionBootstrap::with_pubky(pubky, "app.paykit.server").unwrap();
