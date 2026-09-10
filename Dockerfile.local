@@ -7,6 +7,10 @@ FROM ${RUST_IMAGE} AS builder
 ENV RUSTUP_TOOLCHAIN=1.91.1
 WORKDIR /build
 
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
+
 # These named contexts are supplied by the calling build or Compose project.
 # The Paykit contexts are crate directories, so the paykit-rs repository needs
 # no Docker-owned files and its workspace target directory is never transferred.
@@ -27,7 +31,8 @@ WORKDIR /build/paykit-server
 
 # Override only the copied manifest's Docker build source resolution. Exact
 # matches make dependency-pin drift fail closed; committed files stay unchanged.
-RUN sh scripts/prepare-local-docker-sources.sh
+RUN sh scripts/prepare-local-docker-sources.sh \
+    && cargo update --package locks-core
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
