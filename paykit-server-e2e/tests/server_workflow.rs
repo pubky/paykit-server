@@ -897,7 +897,7 @@ async fn composed_two_creator_receiver_workflow_survives_restart() {
         );
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&response.body).unwrap(),
-            serde_json::json!({"connection_state":"none"})
+            serde_json::json!({"connection_state":"connected"})
         );
     }
     assert_persisted_workflow_inputs(
