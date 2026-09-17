@@ -326,7 +326,7 @@ cargo clippy -p paykit-server --all-targets -- -D warnings
 - The canonical Creator selects only its own persisted credentials, xpub/account index, derivation counter, and SDK state; missing state has no default or cross-Creator fallback.
 - Validate exactly one referenced `paykit-payment` criterion with recipient equal to canonical creator, `BTC`, and positive sats.
 - Session invalid/unavailable returns approved 409/503 without allocation/commit.
-- Exact replay is 204 without refetch/revalidation; changed binding is 409.
+- Exact replay is 200 with current Noise connection state, without lock refetch/revalidation; changed binding is 409.
 - New reader transaction creates assignment, endpoint-publication intent, then dependent Payment Request intent.
 - Concurrent invoices for different Creators use independent derivation counters and may share a numeric child index without sharing an address or SDK transaction.
 - Handler returns before link establishment/delivery. Cancel-safe dependency work

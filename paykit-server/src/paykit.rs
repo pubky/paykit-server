@@ -20,9 +20,12 @@ use tokio::sync::Mutex as TokioMutex;
 use uuid::Uuid;
 
 use crate::{
-    application::semantic_intent::{DeliveryIntentV1, PaymentTermsV1, ReceivingDetailV1},
+    application::{
+        create_invoice::{CreateInvoiceError, NoiseConnectionState},
+        semantic_intent::{DeliveryIntentV1, PaymentTermsV1, ReceivingDetailV1},
+    },
     config::PaykitConfig,
-    domain::locks::CreatorPubky,
+    domain::locks::{CreatorPubky, ReaderPubky},
     persistence::{CreatorStore, PostgresStorageAdapter},
     workers::outbox::{
         Adapter, HandoffError, HandoffFailure, HandoffResult, RetryableHandoffCause, handoff_steps,
@@ -171,6 +174,42 @@ impl PaykitAdapter {
             mutation_lock: creator_mutation_lock(storage.creator_id()),
             storage,
         })
+    }
+
+    pub async fn invoice_connection_state(
+        &self,
+        reader: &ReaderPubky,
+        reader_path: &PaykitReceiverPath,
+    ) -> Result<NoiseConnectionState, CreateInvoiceError> {
+        let _guard = self.mutation_lock.lock().await;
+        let reader = PubkyPublicKey::from_raw_or_app_key(reader.to_string())
+            .map_err(|_| CreateInvoiceError::Unavailable)?;
+        let peers = self
+            .sdk
+            .linked_peers()
+            .await
+            .map_err(|_| CreateInvoiceError::Unavailable)?;
+        let state = peers
+            .iter()
+            .find(|peer| {
+                peer.counterparty == reader
+                    && peer.counterparty_receiver_path.as_str() == reader_path.as_str()
+            })
+            .map(|peer| &peer.state);
+        invoice_connection_state(state)
+    }
+}
+
+fn invoice_connection_state(
+    state: Option<&LinkedPeerState>,
+) -> Result<NoiseConnectionState, CreateInvoiceError> {
+    match state {
+        None | Some(LinkedPeerState::NotLinked) => Ok(NoiseConnectionState::None),
+        Some(LinkedPeerState::Linking) => Ok(NoiseConnectionState::Handshake),
+        Some(LinkedPeerState::Linked) => Ok(NoiseConnectionState::Connected),
+        Some(LinkedPeerState::RecoveryRequired | LinkedPeerState::Blocked) | Some(_) => {
+            Err(CreateInvoiceError::Unavailable)
+        }
     }
 }
 
@@ -407,6 +446,36 @@ mod tests {
 
         assert!(Arc::ptr_eq(&same_creator_first, &same_creator_second));
         assert!(!Arc::ptr_eq(&same_creator_first, &other_creator));
+    }
+
+    #[test]
+    fn invoice_connection_state_maps_exact_sdk_states_and_fails_closed() {
+        use crate::application::create_invoice::{CreateInvoiceError, NoiseConnectionState};
+
+        assert_eq!(
+            invoice_connection_state(None),
+            Ok(NoiseConnectionState::None)
+        );
+        assert_eq!(
+            invoice_connection_state(Some(&LinkedPeerState::NotLinked)),
+            Ok(NoiseConnectionState::None)
+        );
+        assert_eq!(
+            invoice_connection_state(Some(&LinkedPeerState::Linking)),
+            Ok(NoiseConnectionState::Handshake)
+        );
+        assert_eq!(
+            invoice_connection_state(Some(&LinkedPeerState::Linked)),
+            Ok(NoiseConnectionState::Connected)
+        );
+        assert_eq!(
+            invoice_connection_state(Some(&LinkedPeerState::RecoveryRequired)),
+            Err(CreateInvoiceError::Unavailable)
+        );
+        assert_eq!(
+            invoice_connection_state(Some(&LinkedPeerState::Blocked)),
+            Err(CreateInvoiceError::Unavailable)
+        );
     }
 
     #[test]

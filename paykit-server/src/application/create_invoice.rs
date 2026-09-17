@@ -20,6 +20,7 @@ use paykit_lib::{
     PaykitReceiverMarker, PaykitReceiverPath, PaymentAmount, PaymentEndpointIdentifier,
     PaymentEndpointPayload, PaymentReference, PaymentRequestTerms,
 };
+use serde::Serialize;
 use serde_json::{Map, Value};
 
 use crate::{
@@ -65,6 +66,29 @@ pub enum CreateInvoiceError {
     Conflict,
     DeadlineExceeded,
     Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NoiseConnectionState {
+    Connected,
+    Handshake,
+    None,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct CreateInvoiceResult {
+    pub connection_state: NoiseConnectionState,
+}
+
+#[async_trait]
+pub trait NoiseStateProvider: Send + Sync {
+    async fn connection_state(
+        &self,
+        creator: &CreatorPubky,
+        reader: &ReaderPubky,
+        reader_path: &PaykitReceiverPath,
+    ) -> Result<NoiseConnectionState, CreateInvoiceError>;
 }
 
 #[async_trait]
@@ -312,6 +336,7 @@ pub struct CreateInvoiceService {
     bitcoin_network: crate::config::BitcoinNetwork,
     store: Arc<dyn InvoicePersistence>,
     intents: Arc<dyn IntentBuilder>,
+    noise: Arc<dyn NoiseStateProvider>,
     clock: Arc<dyn DeadlineClock>,
 }
 impl CreateInvoiceService {
@@ -326,6 +351,7 @@ impl CreateInvoiceService {
         bitcoin_network: crate::config::BitcoinNetwork,
         store: Arc<dyn InvoicePersistence>,
         intents: Arc<dyn IntentBuilder>,
+        noise: Arc<dyn NoiseStateProvider>,
     ) -> Self {
         Self::with_clock(
             sessions,
@@ -337,6 +363,7 @@ impl CreateInvoiceService {
             bitcoin_network,
             store,
             intents,
+            noise,
             Arc::new(SystemDeadlineClock),
         )
     }
@@ -352,6 +379,7 @@ impl CreateInvoiceService {
         bitcoin_network: crate::config::BitcoinNetwork,
         store: Arc<dyn InvoicePersistence>,
         intents: Arc<dyn IntentBuilder>,
+        noise: Arc<dyn NoiseStateProvider>,
         clock: Arc<dyn DeadlineClock>,
     ) -> Self {
         Self {
@@ -364,6 +392,7 @@ impl CreateInvoiceService {
             bitcoin_network,
             store,
             intents,
+            noise,
             clock,
         }
     }
@@ -379,6 +408,7 @@ impl CreateInvoiceService {
         bitcoin_network: crate::config::BitcoinNetwork,
         store: Arc<dyn InvoicePersistence>,
         intents: Arc<dyn IntentBuilder>,
+        noise: Arc<dyn NoiseStateProvider>,
     ) -> Self {
         Self::new(
             sessions,
@@ -390,13 +420,14 @@ impl CreateInvoiceService {
             bitcoin_network,
             store,
             intents,
+            noise,
         )
     }
 
     pub async fn create(
         &self,
         request: CreateInvoiceRequest,
-    ) -> Result<AtomicInvoiceResult, CreateInvoiceError> {
+    ) -> Result<CreateInvoiceResult, CreateInvoiceError> {
         let started = self.clock.now();
         let creator = request.lock_resource.creator().clone();
         let bundle_binding = request.bundle_id.to_string().into_bytes();
@@ -413,7 +444,7 @@ impl CreateInvoiceService {
         {
             InvoicePreflight::ExactReplay => {
                 let replay_remaining = remaining(started, self.clock.now())?;
-                return tokio::time::timeout(
+                let persisted = tokio::time::timeout(
                     replay_remaining,
                     self.store.exact_replay(
                         &creator,
@@ -424,7 +455,10 @@ impl CreateInvoiceService {
                 )
                 .await
                 .map_err(|_| CreateInvoiceError::DeadlineExceeded)?
-                .map_err(map_store);
+                .map_err(map_store)?;
+                return self
+                    .result_with_noise_state(&creator, &request.reader, persisted)
+                    .await;
             }
             InvoicePreflight::Conflict => return Err(CreateInvoiceError::Conflict),
             InvoicePreflight::New => {}
@@ -483,7 +517,8 @@ impl CreateInvoiceService {
         // Once PostgreSQL mutation starts it must be awaited to a factual
         // commit/rollback result. Canceling this future at the HTTP deadline
         // could otherwise return failure while COMMIT succeeds concurrently.
-        self.store
+        let persisted = self
+            .store
             .create_atomic(AtomicInvoiceInput {
                 creator: &creator,
                 reader: &request.reader,
@@ -494,7 +529,22 @@ impl CreateInvoiceService {
                 required_sats: extract_terms(&lock)?.as_sats(),
             })
             .await
-            .map_err(map_store)
+            .map_err(map_store)?;
+        self.result_with_noise_state(&creator, &request.reader, persisted)
+            .await
+    }
+
+    async fn result_with_noise_state(
+        &self,
+        creator: &CreatorPubky,
+        reader: &ReaderPubky,
+        persisted: AtomicInvoiceResult,
+    ) -> Result<CreateInvoiceResult, CreateInvoiceError> {
+        let connection_state = self
+            .noise
+            .connection_state(creator, reader, persisted.selected_reader_path())
+            .await?;
+        Ok(CreateInvoiceResult { connection_state })
     }
 }
 

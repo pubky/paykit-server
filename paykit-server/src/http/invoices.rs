@@ -37,7 +37,7 @@ async fn create(
         Err(error) => return error.into_response(),
     };
     match service.create(request).await {
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Ok(result) => (StatusCode::OK, axum::Json(result)).into_response(),
         Err(error) => invoice_error(error),
     }
 }

@@ -271,7 +271,7 @@ Rules:
 - Criterion asset must equal `BTC`.
 - Paykit Server snapshots validated invoice terms; later status does not refetch lock.
 - Generate UUID-v4 Payment Reference once per new invoice; persist and reuse it.
-- Exact replay returns `204 No Content` without refetching lock, reallocating address, recreating delivery, or revalidating creator session.
+- Exact replay returns `200 OK` with current Noise connection state without refetching lock, reallocating address, recreating delivery, or revalidating creator session.
 - Same `(creator, bundle_id)` with changed request binding returns `409 Conflict`.
 - New invoice requires active network validation of creator Pubky session on every request:
   - revoked/expired → `409 creator_session_invalid`;
@@ -323,6 +323,7 @@ Rules:
 - `POST /invoices` returns success after the invoice and encrypted, versioned
   server semantic intent containing all `PaymentRequestTerms` inputs are durably
   committed. This is not the final SDK Payment Request event or wire JSON.
+- Success body is `{ "connection_state": "none" | "handshake" | "connected" }`, observed for the persisted reader identity and receiver path without advancing the handshake. SDK recovery-required or blocked states return dependency unavailable rather than being collapsed into those three states.
 - API does not wait for Encrypted Link establishment or sender delivery.
 - Invoice/allocation/outbox repository writes are one all-or-nothing PostgreSQL
   transaction. Invoice success is impossible without both complete intents and

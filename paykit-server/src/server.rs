@@ -6,7 +6,8 @@ use crate::{
     application::{
         create_invoice::{
             CreateInvoiceError, CreateInvoiceService, LockFetchError, LockFetcher, MarkerDiscovery,
-            PaykitIntentBuilder, SessionValidationError, SessionValidator,
+            NoiseConnectionState, NoiseStateProvider, PaykitIntentBuilder, SessionValidationError,
+            SessionValidator,
         },
         payment_status::PaymentStatusService,
         setup_status::SetupStatusService,
@@ -36,7 +37,10 @@ use crate::{
 use async_trait::async_trait;
 use axum::{Extension, Router};
 use locks_core::lock_policy::ContentLock;
-use paykit_lib::{PaykitReceiverMarker, get_paykit_receiver_marker, list_paykit_receiver_paths};
+use paykit_lib::{
+    PaykitReceiverMarker, PaykitReceiverPath, get_paykit_receiver_marker,
+    list_paykit_receiver_paths,
+};
 use paykit_sdk::{PaykitSdkError, PubkyPublicKey, PubkySessionBootstrap, PubkySessionProvider};
 use pubky::{Pubky, errors::RequestError};
 use sqlx::PgPool;
@@ -79,6 +83,40 @@ struct WorkerComponents {
     outbox_retry_initial: Duration,
     outbox_retry_max: Duration,
     electrum_poll_interval: Duration,
+}
+
+struct InvoiceNoiseStateProvider {
+    pool: PgPool,
+    crypto: Arc<Crypto>,
+    creators: CreatorStore,
+    pubky: Pubky,
+    paykit: PaykitConfig,
+}
+
+#[async_trait]
+impl NoiseStateProvider for InvoiceNoiseStateProvider {
+    async fn connection_state(
+        &self,
+        creator: &CreatorPubky,
+        reader: &ReaderPubky,
+        reader_path: &PaykitReceiverPath,
+    ) -> Result<NoiseConnectionState, CreateInvoiceError> {
+        let creator_id = self
+            .creators
+            .creator_id(creator)
+            .await
+            .map_err(|_| CreateInvoiceError::Unavailable)?;
+        let storage = PostgresStorageAdapter::new(&self.pool, self.crypto.clone(), creator_id);
+        let sessions = CreatorSessionProvider::with_pubky(
+            self.creators.clone(),
+            creator.clone(),
+            self.pubky.clone(),
+            &self.paykit,
+        );
+        let adapter = PaykitAdapter::new(storage, sessions, &self.paykit)
+            .map_err(|_| CreateInvoiceError::Unavailable)?;
+        adapter.invoice_connection_state(reader, reader_path).await
+    }
 }
 
 impl Server {
@@ -194,6 +232,13 @@ impl Server {
             Arc::new(PaykitIntentBuilder::new(
                 config.deployment_invariants().bitcoin_network.clone(),
             )),
+            Arc::new(InvoiceNoiseStateProvider {
+                pool: pool.clone(),
+                crypto: crypto.clone(),
+                creators: creators.clone(),
+                pubky: pubky.clone(),
+                paykit: config.paykit.clone(),
+            }),
         ));
         let status_service = Arc::new(PaymentStatusService::new(Arc::new(invoices.clone())));
         let setup_status_service = Arc::new(SetupStatusService::new(session_validator));
