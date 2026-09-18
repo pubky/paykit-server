@@ -52,6 +52,7 @@ struct Input {
 enum Operation {
     Prepare,
     Receive,
+    Inspect,
 }
 
 struct Config {
@@ -176,10 +177,18 @@ struct ReceiveOutput {
 }
 
 #[derive(Serialize)]
+struct InspectOutput {
+    version: u8,
+    status: &'static str,
+    connection_state: &'static str,
+}
+
+#[derive(Serialize)]
 #[serde(untagged)]
 enum SuccessOutput {
     Prepare(PrepareOutput),
     Receive(ReceiveOutput),
+    Inspect(InspectOutput),
 }
 
 #[tokio::main]
@@ -246,6 +255,7 @@ async fn execute(
             Zeroizing::new(*ReceiverNoiseSecretKey::random().as_bytes()),
         ),
         (Operation::Receive, None) => return Err(Failure::InvalidState),
+        (Operation::Inspect, None) => return Err(Failure::InvalidState),
     };
 
     let pubky = configured_testnet_pubky(&config.testnet_host)?;
@@ -286,7 +296,9 @@ async fn execute(
             .map_err(|_| Failure::InvalidState)?;
     }
 
-    checkpoint(&sdk, &state_store, &receiver_noise_secret, &invariants).await?;
+    if !matches!(operation, Operation::Inspect) {
+        checkpoint(&sdk, &state_store, &receiver_noise_secret, &invariants).await?;
+    }
 
     match operation {
         Operation::Prepare => {
@@ -309,6 +321,37 @@ async fn execute(
             checkpoint(&sdk, &state_store, &receiver_noise_secret, &invariants).await?;
             result.map(SuccessOutput::Receive)
         }
+        Operation::Inspect => inspect(&sdk, &config).await.map(SuccessOutput::Inspect),
+    }
+}
+
+async fn inspect(sdk: &DemoSdk, config: &Config) -> Result<InspectOutput, Failure> {
+    let peers = sdk
+        .linked_peers()
+        .await
+        .map_err(|_| Failure::InvalidState)?;
+    let state = peers
+        .iter()
+        .find(|peer| {
+            peer.counterparty == config.server_pubky
+                && peer.counterparty_receiver_path == config.server_receiver_path
+        })
+        .map(|peer| &peer.state);
+    Ok(InspectOutput {
+        version: 1,
+        status: "inspected",
+        connection_state: diagnostic_peer_state(state),
+    })
+}
+
+fn diagnostic_peer_state(state: Option<&LinkedPeerState>) -> &'static str {
+    match state {
+        None | Some(LinkedPeerState::NotLinked) => "none",
+        Some(LinkedPeerState::Linking) => "handshake",
+        Some(LinkedPeerState::Linked) => "connected",
+        Some(LinkedPeerState::RecoveryRequired) => "recovery_required",
+        Some(LinkedPeerState::Blocked) => "blocked",
+        Some(_) => "unknown",
     }
 }
 
@@ -571,8 +614,34 @@ mod tests {
     use tokio::time::Instant;
 
     use super::{
-        DemoStorage, Failure, has_persisted_malformed_payment_request, within_receive_deadline,
+        DemoStorage, Failure, diagnostic_peer_state, has_persisted_malformed_payment_request,
+        within_receive_deadline,
     };
+
+    #[test]
+    fn peer_state_diagnostics_use_closed_secret_free_labels() {
+        assert_eq!(diagnostic_peer_state(None), "none");
+        assert_eq!(
+            diagnostic_peer_state(Some(&paykit_sdk::LinkedPeerState::NotLinked)),
+            "none"
+        );
+        assert_eq!(
+            diagnostic_peer_state(Some(&paykit_sdk::LinkedPeerState::Linking)),
+            "handshake"
+        );
+        assert_eq!(
+            diagnostic_peer_state(Some(&paykit_sdk::LinkedPeerState::Linked)),
+            "connected"
+        );
+        assert_eq!(
+            diagnostic_peer_state(Some(&paykit_sdk::LinkedPeerState::RecoveryRequired)),
+            "recovery_required"
+        );
+        assert_eq!(
+            diagnostic_peer_state(Some(&paykit_sdk::LinkedPeerState::Blocked)),
+            "blocked"
+        );
+    }
 
     #[tokio::test]
     async fn receive_deadline_bounds_awaits_before_the_poll_loop() {

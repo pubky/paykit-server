@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod connection_status;
 pub mod error;
 pub mod health;
 pub mod invoices;

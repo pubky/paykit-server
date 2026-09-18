@@ -888,18 +888,15 @@ async fn composed_two_creator_receiver_workflow_survives_restart() {
             invoice_request(&signing_key, &creator_b, &reader, BUNDLE_B)
         ),
     );
-    assert_eq!(
-        invoice_a.status,
-        StatusCode::NO_CONTENT,
-        "Creator A invoice body: {}",
-        String::from_utf8_lossy(&invoice_a.body)
-    );
-    assert_eq!(
-        invoice_b.status,
-        StatusCode::NO_CONTENT,
-        "Creator B invoice body: {}",
-        String::from_utf8_lossy(&invoice_b.body)
-    );
+    for (label, response) in [("Creator A", &invoice_a), ("Creator B", &invoice_b)] {
+        assert_eq!(
+            response.status,
+            StatusCode::NO_CONTENT,
+            "{label} invoice body: {}",
+            String::from_utf8_lossy(&response.body)
+        );
+        assert!(response.body.is_empty());
+    }
     assert_persisted_workflow_inputs(
         &first_pool,
         &crypto,
