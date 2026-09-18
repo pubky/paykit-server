@@ -23,6 +23,15 @@ pub enum HandoffError {
     Permanent,
 }
 
+impl HandoffError {
+    pub const fn diagnostic_label(self) -> &'static str {
+        match self {
+            Self::Retryable(cause) => cause.diagnostic_label(),
+            Self::Permanent => "permanent",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RetryableHandoffCause {
     Storage,
@@ -31,7 +40,25 @@ pub enum RetryableHandoffCause {
     NotFound,
     PaymentAdapter,
     RecoveryRequired,
+    Policy,
+    LinkPending,
     Other,
+}
+
+impl RetryableHandoffCause {
+    pub const fn diagnostic_label(self) -> &'static str {
+        match self {
+            Self::Storage => "storage",
+            Self::Identity => "identity",
+            Self::Transport => "transport",
+            Self::NotFound => "not_found",
+            Self::PaymentAdapter => "payment_adapter",
+            Self::RecoveryRequired => "recovery_required",
+            Self::Policy => "policy",
+            Self::LinkPending => "link_pending",
+            Self::Other => "other",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

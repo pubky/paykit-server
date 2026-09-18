@@ -27,8 +27,8 @@ use paykit_server::{
     application::create_invoice::{
         CreateInvoiceError, CreateInvoiceRequest, CreateInvoiceService, CreatorXpubProvider,
         DeadlineClock, IntentBuilder, InvoicePersistence, LockFetchError, LockFetcher,
-        MarkerDiscovery, NoiseConnectionState, NoiseStateProvider, PaykitIntentBuilder,
-        SessionValidationError, SessionValidator, derive_bip84_p2wpkh_address,
+        MarkerDiscovery, PaykitIntentBuilder, SessionValidationError, SessionValidator,
+        derive_bip84_p2wpkh_address,
     },
     application::semantic_intent::{DeliveryIntentV1, DeliveryOperationV1},
     config::{BitcoinNetwork, Config, ConfigEnvironment},
@@ -269,49 +269,6 @@ impl LockFetcher for FakeLocks {
 
 struct FakeCredentials;
 
-struct FakeNoiseState {
-    result: Result<NoiseConnectionState, CreateInvoiceError>,
-    calls: Mutex<Vec<(String, String, String)>>,
-}
-
-struct PendingNoiseState;
-
-#[async_trait]
-impl NoiseStateProvider for PendingNoiseState {
-    async fn connection_state(
-        &self,
-        _creator: &CreatorPubky,
-        _reader: &paykit_server::domain::locks::ReaderPubky,
-        _reader_path: &paykit_lib::PaykitReceiverPath,
-    ) -> Result<NoiseConnectionState, CreateInvoiceError> {
-        std::future::pending().await
-    }
-}
-
-#[async_trait]
-impl NoiseStateProvider for FakeNoiseState {
-    async fn connection_state(
-        &self,
-        creator: &CreatorPubky,
-        reader: &paykit_server::domain::locks::ReaderPubky,
-        reader_path: &paykit_lib::PaykitReceiverPath,
-    ) -> Result<NoiseConnectionState, CreateInvoiceError> {
-        self.calls.lock().unwrap().push((
-            creator.to_string(),
-            reader.to_string(),
-            reader_path.to_string(),
-        ));
-        self.result
-    }
-}
-
-fn no_noise_connection() -> Arc<dyn NoiseStateProvider> {
-    Arc::new(FakeNoiseState {
-        result: Ok(NoiseConnectionState::None),
-        calls: Mutex::new(vec![]),
-    })
-}
-
 fn account_xpub() -> String {
     use bitcoin::{
         Network,
@@ -370,30 +327,6 @@ fn service(
         BitcoinNetwork::Mainnet,
         store,
         Arc::new(PaykitIntentBuilder::new(BitcoinNetwork::Mainnet)),
-        no_noise_connection(),
-    )
-}
-
-fn service_with_noise(
-    session: Arc<FakeSession>,
-    locks: Arc<FakeLocks>,
-    store: Arc<FakeStore>,
-    noise: Arc<dyn NoiseStateProvider>,
-) -> CreateInvoiceService {
-    CreateInvoiceService::new(
-        session,
-        locks,
-        Arc::new(FakeMarkers {
-            markers: vec![capable_marker()],
-            calls: AtomicUsize::default(),
-        }),
-        vec![paykit_server::config::ReceiverPathPriority::parse("bitkit".into()).unwrap()],
-        paykit_lib::PaykitReceiverPath::new("paykit/server").unwrap(),
-        Arc::new(FakeCredentials),
-        BitcoinNetwork::Mainnet,
-        store,
-        Arc::new(PaykitIntentBuilder::new(BitcoinNetwork::Mainnet)),
-        noise,
     )
 }
 
@@ -462,7 +395,7 @@ async fn invalid_and_unavailable_sessions_return_without_store_mutation() {
 }
 
 #[tokio::test]
-async fn exact_replay_queries_persisted_reader_path_without_validator_or_lock_fetch() {
+async fn exact_replay_returns_persisted_result_without_validator_or_lock_fetch() {
     let session = Arc::new(FakeSession {
         result: Ok(()),
         calls: AtomicUsize::default(),
@@ -473,88 +406,17 @@ async fn exact_replay_queries_persisted_reader_path_without_validator_or_lock_fe
         calls: AtomicUsize::default(),
     });
     let store = Arc::new(FakeStore::with_preflight(InvoicePreflight::ExactReplay));
-    let noise = Arc::new(FakeNoiseState {
-        result: Ok(NoiseConnectionState::Connected),
-        calls: Mutex::new(vec![]),
-    });
-
-    let result = service_with_noise(session.clone(), locks.clone(), store.clone(), noise.clone())
+    let result = service(session.clone(), locks.clone(), store.clone())
         .create(request())
         .await
         .unwrap();
-    assert_eq!(result.connection_state, NoiseConnectionState::Connected);
     assert_eq!(
-        noise.calls.lock().unwrap().as_slice(),
-        [(CREATOR.into(), reader(), "bitkit/wallet".into())]
+        result.selected_reader_path(),
+        &paykit_lib::PaykitReceiverPath::new("bitkit/wallet").unwrap()
     );
     assert_eq!(session.calls.load(Ordering::SeqCst), 0);
     assert_eq!(locks.calls.load(Ordering::SeqCst), 0);
     assert_eq!(store.create_calls.load(Ordering::SeqCst), 1);
-}
-
-#[tokio::test]
-async fn exact_replay_noise_query_failure_is_unavailable_without_external_checks() {
-    let session = Arc::new(FakeSession {
-        result: Ok(()),
-        calls: AtomicUsize::default(),
-        creators: Mutex::new(vec![]),
-    });
-    let locks = Arc::new(FakeLocks {
-        result: Ok(valid_lock()),
-        calls: AtomicUsize::default(),
-    });
-    let store = Arc::new(FakeStore::with_preflight(InvoicePreflight::ExactReplay));
-    let noise = Arc::new(FakeNoiseState {
-        result: Err(CreateInvoiceError::Unavailable),
-        calls: Mutex::new(vec![]),
-    });
-
-    assert_eq!(
-        service_with_noise(session.clone(), locks.clone(), store, noise)
-            .create(request())
-            .await,
-        Err(CreateInvoiceError::Unavailable)
-    );
-    assert_eq!(session.calls.load(Ordering::SeqCst), 0);
-    assert_eq!(locks.calls.load(Ordering::SeqCst), 0);
-}
-
-#[tokio::test]
-async fn exact_replay_noise_query_observes_remaining_request_deadline() {
-    let start = Instant::now();
-    let service = CreateInvoiceService::with_clock(
-        Arc::new(FakeSession {
-            result: Ok(()),
-            calls: AtomicUsize::default(),
-            creators: Mutex::new(vec![]),
-        }),
-        Arc::new(FakeLocks {
-            result: Ok(valid_lock()),
-            calls: AtomicUsize::default(),
-        }),
-        Arc::new(FakeMarkers {
-            markers: vec![capable_marker()],
-            calls: AtomicUsize::default(),
-        }),
-        vec![paykit_server::config::ReceiverPathPriority::parse("bitkit".into()).unwrap()],
-        paykit_lib::PaykitReceiverPath::new("paykit/server").unwrap(),
-        Arc::new(FakeCredentials),
-        BitcoinNetwork::Mainnet,
-        Arc::new(FakeStore::with_preflight(InvoicePreflight::ExactReplay)),
-        Arc::new(PaykitIntentBuilder::new(BitcoinNetwork::Mainnet)),
-        Arc::new(PendingNoiseState),
-        Arc::new(FixedClock::new([
-            start,
-            start,
-            start,
-            start + Duration::from_secs(15) - Duration::from_nanos(1),
-        ])),
-    );
-
-    assert_eq!(
-        service.create(request()).await,
-        Err(CreateInvoiceError::DeadlineExceeded)
-    );
 }
 
 #[tokio::test]
@@ -607,7 +469,6 @@ async fn fifteen_second_deadline_is_safe_and_does_not_commit() {
         BitcoinNetwork::Mainnet,
         store.clone(),
         Arc::new(PaykitIntentBuilder::new(BitcoinNetwork::Mainnet)),
-        no_noise_connection(),
         Arc::new(FixedClock::new([start, start + Duration::from_secs(15)])),
     );
 
@@ -646,7 +507,6 @@ async fn marker_discovery_cannot_start_after_the_whole_request_deadline() {
         BitcoinNetwork::Mainnet,
         store.clone(),
         Arc::new(PaykitIntentBuilder::new(BitcoinNetwork::Mainnet)),
-        no_noise_connection(),
         Arc::new(FixedClock::new([
             start,
             start,
@@ -691,7 +551,6 @@ async fn signed_router_maps_deadline_exhaustion_to_dependency_timeout() {
         BitcoinNetwork::Mainnet,
         store,
         Arc::new(PaykitIntentBuilder::new(BitcoinNetwork::Mainnet)),
-        no_noise_connection(),
         Arc::new(FixedClock::new([start, start + Duration::from_secs(15)])),
     );
     let router = invoices_router(Arc::new(service)).layer(Extension(signed_auth(&key)));
@@ -717,7 +576,7 @@ async fn signed_router_maps_deadline_exhaustion_to_dependency_timeout() {
 }
 
 #[tokio::test]
-async fn signed_router_distinguishes_dependency_and_lock_unavailability() {
+async fn signed_router_distinguishes_session_and_lock_unavailability() {
     let key = SigningKey::from_bytes(&[14; 32]);
     let request_body = || {
         serde_json_canonicalizer::to_vec(&serde_json::json!({
@@ -728,9 +587,9 @@ async fn signed_router_distinguishes_dependency_and_lock_unavailability() {
         .unwrap()
     };
 
-    let dependency_router = invoices_router(Arc::new(service_with_noise(
+    let dependency_router = invoices_router(Arc::new(service(
         Arc::new(FakeSession {
-            result: Ok(()),
+            result: Err(SessionValidationError::Unavailable),
             calls: AtomicUsize::default(),
             creators: Mutex::new(vec![]),
         }),
@@ -738,11 +597,7 @@ async fn signed_router_distinguishes_dependency_and_lock_unavailability() {
             result: Ok(valid_lock()),
             calls: AtomicUsize::default(),
         }),
-        Arc::new(FakeStore::with_preflight(InvoicePreflight::ExactReplay)),
-        Arc::new(FakeNoiseState {
-            result: Err(CreateInvoiceError::Unavailable),
-            calls: Mutex::new(vec![]),
-        }),
+        Arc::new(FakeStore::with_preflight(InvoicePreflight::New)),
     )))
     .layer(Extension(signed_auth(&key)));
     let response = dependency_router
@@ -755,7 +610,7 @@ async fn signed_router_distinguishes_dependency_and_lock_unavailability() {
         .unwrap();
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
-        serde_json::json!({"error":{"code":"dependency_unavailable","message":"dependency is unavailable"}})
+        serde_json::json!({"error":{"code":"creator_session_unavailable","message":"creator session is unavailable"}})
     );
 
     let lock_router = invoices_router(Arc::new(service(
@@ -863,14 +718,11 @@ async fn signed_router_parses_canonical_invoice_and_derives_creator_from_lock_re
         .oneshot(signed_invoice_request(&key, body))
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
     let body = axum::body::to_bytes(response.into_body(), 4096)
         .await
         .unwrap();
-    assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
-        serde_json::json!({"connection_state":"none"})
-    );
+    assert!(body.is_empty());
     assert_eq!(session.creators.lock().unwrap().as_slice(), [CREATOR]);
 }
 
@@ -1043,7 +895,6 @@ async fn new_invoice_discovers_marker_before_atomic_persistence_and_pins_it_in_b
         BitcoinNetwork::Mainnet,
         store.clone(),
         Arc::new(PaykitIntentBuilder::new(BitcoinNetwork::Mainnet)),
-        no_noise_connection(),
     );
 
     service.create(request()).await.unwrap();

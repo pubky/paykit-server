@@ -17,13 +17,11 @@ use paykit_sdk::{
 };
 use pubky::Pubky;
 use tokio::sync::Mutex as TokioMutex;
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
-    application::{
-        create_invoice::{CreateInvoiceError, NoiseConnectionState},
-        semantic_intent::{DeliveryIntentV1, PaymentTermsV1, ReceivingDetailV1},
-    },
+    application::semantic_intent::{DeliveryIntentV1, PaymentTermsV1, ReceivingDetailV1},
     config::PaykitConfig,
     domain::locks::CreatorPubky,
     persistence::{CreatorStore, PostgresStorageAdapter},
@@ -177,21 +175,6 @@ impl PaykitAdapter {
     }
 }
 
-pub(crate) fn invoice_connection_state(
-    state: Option<&LinkedPeerState>,
-) -> Result<NoiseConnectionState, CreateInvoiceError> {
-    match state {
-        None | Some(LinkedPeerState::NotLinked) => Ok(NoiseConnectionState::None),
-        Some(LinkedPeerState::Linking) => Ok(NoiseConnectionState::Handshake),
-        Some(LinkedPeerState::Linked) => Ok(NoiseConnectionState::Connected),
-        Some(LinkedPeerState::RecoveryRequired | LinkedPeerState::Blocked) => {
-            Err(CreateInvoiceError::Unavailable)
-        }
-        // LinkedPeerState is non-exhaustive; unknown future states fail closed.
-        Some(_) => Err(CreateInvoiceError::Unavailable),
-    }
-}
-
 type CreatorMutationLock = TokioMutex<()>;
 
 fn creator_mutation_lock(creator_id: Uuid) -> Arc<CreatorMutationLock> {
@@ -222,7 +205,7 @@ fn parse_peer(
 fn classify(error: PaykitSdkError) -> HandoffError {
     match error {
         PaykitSdkError::Protocol { .. } => HandoffError::Permanent,
-        PaykitSdkError::Policy { .. } => HandoffError::Retryable(RetryableHandoffCause::Other),
+        PaykitSdkError::Policy { .. } => HandoffError::Retryable(RetryableHandoffCause::Policy),
         PaykitSdkError::Storage { .. } => HandoffError::Retryable(RetryableHandoffCause::Storage),
         PaykitSdkError::Identity { .. } => HandoffError::Retryable(RetryableHandoffCause::Identity),
         PaykitSdkError::Transport { .. } => {
@@ -285,11 +268,20 @@ impl Adapter for PaykitAdapter {
 
     async fn ensure_link_with_peer(&self, reader: &str, path: &str) -> Result<(), HandoffError> {
         let (reader, path) = parse_peer(reader, path)?;
-        self.sdk
+        let result = self
+            .sdk
             .ensure_link_with_peer(reader, path, 1)
             .await
             .map_err(classify)
-            .and_then(|report| require_linked(report.state))
+            .and_then(|report| require_linked(report.state));
+        if let Err(error) = result {
+            warn!(
+                stage = "link_establishment",
+                cause = error.diagnostic_label(),
+                "Paykit handoff failed"
+            );
+        }
+        result
     }
 
     async fn enqueue_private_payment_list_with_receiving_details(
@@ -406,7 +398,7 @@ fn require_linked(state: LinkedPeerState) -> Result<(), HandoffError> {
         LinkedPeerState::RecoveryRequired => Err(HandoffError::Retryable(
             RetryableHandoffCause::RecoveryRequired,
         )),
-        _ => Err(HandoffError::Retryable(RetryableHandoffCause::Other)),
+        _ => Err(HandoffError::Retryable(RetryableHandoffCause::LinkPending)),
     }
 }
 
@@ -428,41 +420,11 @@ mod tests {
     }
 
     #[test]
-    fn invoice_connection_state_maps_exact_sdk_states_and_fails_closed() {
-        use crate::application::create_invoice::{CreateInvoiceError, NoiseConnectionState};
-
-        assert_eq!(
-            invoice_connection_state(None),
-            Ok(NoiseConnectionState::None)
-        );
-        assert_eq!(
-            invoice_connection_state(Some(&LinkedPeerState::NotLinked)),
-            Ok(NoiseConnectionState::None)
-        );
-        assert_eq!(
-            invoice_connection_state(Some(&LinkedPeerState::Linking)),
-            Ok(NoiseConnectionState::Handshake)
-        );
-        assert_eq!(
-            invoice_connection_state(Some(&LinkedPeerState::Linked)),
-            Ok(NoiseConnectionState::Connected)
-        );
-        assert_eq!(
-            invoice_connection_state(Some(&LinkedPeerState::RecoveryRequired)),
-            Err(CreateInvoiceError::Unavailable)
-        );
-        assert_eq!(
-            invoice_connection_state(Some(&LinkedPeerState::Blocked)),
-            Err(CreateInvoiceError::Unavailable)
-        );
-    }
-
-    #[test]
     fn incomplete_link_state_is_not_handoff_ready() {
         assert_eq!(require_linked(LinkedPeerState::Linked), Ok(()));
         assert_eq!(
             require_linked(LinkedPeerState::Linking),
-            Err(HandoffError::Retryable(RetryableHandoffCause::Other))
+            Err(HandoffError::Retryable(RetryableHandoffCause::LinkPending))
         );
         assert_eq!(
             require_linked(LinkedPeerState::RecoveryRequired),
@@ -470,6 +432,37 @@ mod tests {
                 RetryableHandoffCause::RecoveryRequired
             ))
         );
+    }
+
+    #[test]
+    fn handoff_diagnostic_causes_use_closed_secret_free_labels() {
+        assert_eq!(RetryableHandoffCause::Storage.diagnostic_label(), "storage");
+        assert_eq!(
+            RetryableHandoffCause::Identity.diagnostic_label(),
+            "identity"
+        );
+        assert_eq!(
+            RetryableHandoffCause::Transport.diagnostic_label(),
+            "transport"
+        );
+        assert_eq!(
+            RetryableHandoffCause::NotFound.diagnostic_label(),
+            "not_found"
+        );
+        assert_eq!(
+            RetryableHandoffCause::PaymentAdapter.diagnostic_label(),
+            "payment_adapter"
+        );
+        assert_eq!(
+            RetryableHandoffCause::RecoveryRequired.diagnostic_label(),
+            "recovery_required"
+        );
+        assert_eq!(RetryableHandoffCause::Policy.diagnostic_label(), "policy");
+        assert_eq!(
+            RetryableHandoffCause::LinkPending.diagnostic_label(),
+            "link_pending"
+        );
+        assert_eq!(RetryableHandoffCause::Other.diagnostic_label(), "other");
     }
 
     #[test]
@@ -481,7 +474,7 @@ mod tests {
 
         assert_eq!(
             classify(error),
-            HandoffError::Retryable(RetryableHandoffCause::Other)
+            HandoffError::Retryable(RetryableHandoffCause::Policy)
         );
     }
 

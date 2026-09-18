@@ -891,14 +891,11 @@ async fn composed_two_creator_receiver_workflow_survives_restart() {
     for (label, response) in [("Creator A", &invoice_a), ("Creator B", &invoice_b)] {
         assert_eq!(
             response.status,
-            StatusCode::OK,
+            StatusCode::NO_CONTENT,
             "{label} invoice body: {}",
             String::from_utf8_lossy(&response.body)
         );
-        assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&response.body).unwrap(),
-            serde_json::json!({"connection_state":"connected"})
-        );
+        assert!(response.body.is_empty());
     }
     assert_persisted_workflow_inputs(
         &first_pool,

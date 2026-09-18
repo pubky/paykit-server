@@ -13,11 +13,14 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::{
-    application::payment_status::PersistedPaymentStatus,
-    application::semantic_intent::{DeliveryIntentV1, DeliveryOperationV1},
+    application::{
+        connection_status::ConnectionBinding,
+        payment_status::PersistedPaymentStatus,
+        semantic_intent::{DeliveryIntentV1, DeliveryOperationV1},
+    },
     bitcoin::{DirectBinding, ObservationAction, ObservationTarget, TrackedOutput},
     crypto::{Crypto, EncryptedEnvelope, EnvelopeContext, LookupHash},
-    domain::locks::{CreatorPubky, ReaderPubky},
+    domain::locks::{BundleId, CreatorPubky, ReaderPubky, parse_reader},
     domain::payment::BitcoinOutpoint,
     persistence::PersistenceError,
 };
@@ -364,6 +367,57 @@ impl InvoiceStore {
             }
             Some(_) => InvoicePreflight::Conflict,
         })
+    }
+
+    /// Loads the accepted reader and receiver path for one persisted invoice.
+    ///
+    /// This is a read-only lookup. It does not lock rows, replay invoice creation,
+    /// or invoke any Paykit SDK operation.
+    pub async fn connection_binding(
+        &self,
+        creator: &CreatorPubky,
+        bundle_id: &BundleId,
+    ) -> Result<Option<ConnectionBinding>, PersistenceError> {
+        let creator_hash = self.crypto.lookup_hash(creator.to_string().as_bytes());
+        let bundle_hash = self.crypto.lookup_hash(bundle_id.to_string().as_bytes());
+        let row = sqlx::query_as::<_, ConnectionBindingRow>(
+            "SELECT invoices.id, creators.creator_lookup_hash, invoices.invoice_envelope \
+             FROM invoices JOIN creators ON creators.id = invoices.creator_id \
+             WHERE creators.creator_lookup_hash = $1 AND invoices.bundle_lookup_hash = $2",
+        )
+        .bind(creator_hash.as_bytes().as_slice())
+        .bind(bundle_hash.as_bytes().as_slice())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+
+        row.map(|row| {
+            if lookup_hash(&row.creator_lookup_hash)? != creator_hash {
+                return Err(PersistenceError::CorruptOrMissing);
+            }
+            let plaintext = self
+                .crypto
+                .decrypt(
+                    &EnvelopeContext::invoice(creator_hash, row.id),
+                    &EncryptedEnvelope::from_bytes(row.invoice_envelope),
+                )
+                .map_err(|_| PersistenceError::CorruptOrMissing)?;
+            let intent = DeliveryIntentV1::decode(&plaintext)
+                .map_err(|_| PersistenceError::CorruptOrMissing)?;
+            if !matches!(
+                intent.operation(),
+                DeliveryOperationV1::PaymentRequestProposal { .. }
+            ) {
+                return Err(PersistenceError::CorruptOrMissing);
+            }
+            let reader = parse_reader(intent.reader_pubky())
+                .map_err(|_| PersistenceError::CorruptOrMissing)?;
+            let reader_path = intent
+                .selected_reader_path()
+                .map_err(|_| PersistenceError::CorruptOrMissing)?;
+            Ok(ConnectionBinding::new(reader, reader_path))
+        })
+        .transpose()
     }
 
     /// Loads an exact replay without rebuilding delivery intent or repeating
@@ -1193,6 +1247,13 @@ struct PaymentStatusRow {
     payment_status: String,
     confirmation_count: i32,
     amount_matched: bool,
+}
+
+#[derive(sqlx::FromRow)]
+struct ConnectionBindingRow {
+    id: Uuid,
+    creator_lookup_hash: Vec<u8>,
+    invoice_envelope: Vec<u8>,
 }
 
 impl TryFrom<PaymentStatusRow> for PersistedPaymentStatus {

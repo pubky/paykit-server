@@ -4,10 +4,10 @@ use std::{future::Future, sync::Arc, time::Duration};
 
 use crate::{
     application::{
+        connection_status::ConnectionStatusService,
         create_invoice::{
             CreateInvoiceError, CreateInvoiceService, LockFetchError, LockFetcher, MarkerDiscovery,
-            NoiseConnectionState, NoiseStateProvider, PaykitIntentBuilder, SessionValidationError,
-            SessionValidator,
+            PaykitIntentBuilder, SessionValidationError, SessionValidator,
         },
         payment_status::PaymentStatusService,
         setup_status::SetupStatusService,
@@ -17,7 +17,7 @@ use crate::{
     crypto::Crypto,
     domain::locks::{CreatorPubky, PubkyLockResource, ReaderPubky},
     http::{self, auth::SignedLocksAuth},
-    paykit::{CreatorSessionProvider, PaykitAdapter, invoice_connection_state},
+    paykit::{CreatorSessionProvider, PaykitAdapter},
     persistence::{
         CreatorStore, InvoiceStore, OutboxRetryClass, OutboxStore, PersistenceError,
         PostgresStorageAdapter, SdkStateStore,
@@ -37,10 +37,7 @@ use crate::{
 use async_trait::async_trait;
 use axum::{Extension, Router};
 use locks_core::lock_policy::ContentLock;
-use paykit_lib::{
-    PaykitReceiverMarker, PaykitReceiverPath, get_paykit_receiver_marker,
-    list_paykit_receiver_paths,
-};
+use paykit_lib::{PaykitReceiverMarker, get_paykit_receiver_marker, list_paykit_receiver_paths};
 use paykit_sdk::{PaykitSdkError, PubkyPublicKey, PubkySessionBootstrap, PubkySessionProvider};
 use pubky::{Pubky, errors::RequestError};
 use sqlx::PgPool;
@@ -83,30 +80,6 @@ struct WorkerComponents {
     outbox_retry_initial: Duration,
     outbox_retry_max: Duration,
     electrum_poll_interval: Duration,
-}
-
-struct InvoiceNoiseStateProvider {
-    states: SdkStateStore,
-}
-
-#[async_trait]
-impl NoiseStateProvider for InvoiceNoiseStateProvider {
-    async fn connection_state(
-        &self,
-        creator: &CreatorPubky,
-        reader: &ReaderPubky,
-        reader_path: &PaykitReceiverPath,
-    ) -> Result<NoiseConnectionState, CreateInvoiceError> {
-        let state = self
-            .states
-            .load(creator)
-            .await
-            .map_err(|_| CreateInvoiceError::Unavailable)?;
-        let reader = PubkyPublicKey::from_raw_or_app_key(reader.to_string())
-            .map_err(|_| CreateInvoiceError::Unavailable)?;
-        let peer = state.linked_peers.get(&(reader, reader_path.clone()));
-        invoice_connection_state(peer.map(|record| &record.state))
-    }
 }
 
 impl Server {
@@ -222,15 +195,19 @@ impl Server {
             Arc::new(PaykitIntentBuilder::new(
                 config.deployment_invariants().bitcoin_network.clone(),
             )),
-            Arc::new(InvoiceNoiseStateProvider {
-                states: SdkStateStore::new(&pool, crypto.clone()),
-            }),
+        ));
+        let connection_status_service = Arc::new(ConnectionStatusService::new(
+            Arc::new(invoices.clone()),
+            Arc::new(SdkStateStore::new(&pool, crypto.clone())),
         ));
         let status_service = Arc::new(PaymentStatusService::new(Arc::new(invoices.clone())));
         let setup_status_service = Arc::new(SetupStatusService::new(session_validator));
         let signed_auth = Arc::new(SignedLocksAuth::from_config(&config));
         let business_routes = http::setup::setup_router(setup).merge(
             http::invoices::invoices_router(invoice_service)
+                .merge(http::connection_status::connection_status_router(
+                    connection_status_service,
+                ))
                 .merge(http::status::status_router(status_service))
                 .merge(http::setup_status::setup_status_router(
                     setup_status_service,
@@ -412,6 +389,7 @@ fn retry_delay(initial: Duration, maximum: Duration, attempt_count: i32) -> Dura
 
 const RAPID_LINK_ESTABLISHMENT_RETRY_ATTEMPTS: i32 = 20;
 const RAPID_LINK_ESTABLISHMENT_RETRY_DELAY: Duration = Duration::from_secs(1);
+const MAX_LINK_ESTABLISHMENT_RETRY_DELAY: Duration = Duration::from_secs(5);
 
 fn outbox_retry_schedule(
     initial: Duration,
@@ -427,6 +405,7 @@ fn outbox_retry_schedule(
             maximum,
             attempt_count - RAPID_LINK_ESTABLISHMENT_RETRY_ATTEMPTS,
         )
+        .min(MAX_LINK_ESTABLISHMENT_RETRY_DELAY)
     };
     RetrySchedule::new(default, link_establishment)
 }
@@ -892,7 +871,7 @@ mod tests {
     }
 
     #[test]
-    fn link_establishment_retries_rapidly_before_restarting_exponential_backoff() {
+    fn link_establishment_retry_delay_is_capped_below_general_backoff() {
         let initial = Duration::from_secs(1);
         let maximum = Duration::from_secs(300);
 
@@ -917,6 +896,10 @@ mod tests {
         assert_eq!(
             outbox_retry_schedule(initial, maximum, 30)
                 .delay_for(OutboxRetryClass::LinkEstablishment),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            outbox_retry_schedule(initial, maximum, 30).default_delay(),
             Duration::from_secs(300)
         );
     }
