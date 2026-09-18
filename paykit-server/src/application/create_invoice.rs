@@ -457,7 +457,7 @@ impl CreateInvoiceService {
                 .map_err(|_| CreateInvoiceError::DeadlineExceeded)?
                 .map_err(map_store)?;
                 return self
-                    .result_with_noise_state(&creator, &request.reader, persisted)
+                    .result_with_noise_state(started, &creator, &request.reader, persisted)
                     .await;
             }
             InvoicePreflight::Conflict => return Err(CreateInvoiceError::Conflict),
@@ -530,20 +530,25 @@ impl CreateInvoiceService {
             })
             .await
             .map_err(map_store)?;
-        self.result_with_noise_state(&creator, &request.reader, persisted)
+        self.result_with_noise_state(started, &creator, &request.reader, persisted)
             .await
     }
 
     async fn result_with_noise_state(
         &self,
+        started: Instant,
         creator: &CreatorPubky,
         reader: &ReaderPubky,
         persisted: AtomicInvoiceResult,
     ) -> Result<CreateInvoiceResult, CreateInvoiceError> {
-        let connection_state = self
-            .noise
-            .connection_state(creator, reader, persisted.selected_reader_path())
-            .await?;
+        let noise_remaining = remaining(started, self.clock.now())?;
+        let connection_state = tokio::time::timeout(
+            noise_remaining,
+            self.noise
+                .connection_state(creator, reader, persisted.selected_reader_path()),
+        )
+        .await
+        .map_err(|_| CreateInvoiceError::DeadlineExceeded)??;
         Ok(CreateInvoiceResult { connection_state })
     }
 }

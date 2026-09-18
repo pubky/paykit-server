@@ -17,7 +17,7 @@ use crate::{
     crypto::Crypto,
     domain::locks::{CreatorPubky, PubkyLockResource, ReaderPubky},
     http::{self, auth::SignedLocksAuth},
-    paykit::{CreatorSessionProvider, PaykitAdapter},
+    paykit::{CreatorSessionProvider, PaykitAdapter, invoice_connection_state},
     persistence::{
         CreatorStore, InvoiceStore, OutboxRetryClass, OutboxStore, PersistenceError,
         PostgresStorageAdapter, SdkStateStore,
@@ -86,11 +86,7 @@ struct WorkerComponents {
 }
 
 struct InvoiceNoiseStateProvider {
-    pool: PgPool,
-    crypto: Arc<Crypto>,
-    creators: CreatorStore,
-    pubky: Pubky,
-    paykit: PaykitConfig,
+    states: SdkStateStore,
 }
 
 #[async_trait]
@@ -101,21 +97,15 @@ impl NoiseStateProvider for InvoiceNoiseStateProvider {
         reader: &ReaderPubky,
         reader_path: &PaykitReceiverPath,
     ) -> Result<NoiseConnectionState, CreateInvoiceError> {
-        let creator_id = self
-            .creators
-            .creator_id(creator)
+        let state = self
+            .states
+            .load(creator)
             .await
             .map_err(|_| CreateInvoiceError::Unavailable)?;
-        let storage = PostgresStorageAdapter::new(&self.pool, self.crypto.clone(), creator_id);
-        let sessions = CreatorSessionProvider::with_pubky(
-            self.creators.clone(),
-            creator.clone(),
-            self.pubky.clone(),
-            &self.paykit,
-        );
-        let adapter = PaykitAdapter::new(storage, sessions, &self.paykit)
+        let reader = PubkyPublicKey::from_raw_or_app_key(reader.to_string())
             .map_err(|_| CreateInvoiceError::Unavailable)?;
-        adapter.invoice_connection_state(reader, reader_path).await
+        let peer = state.linked_peers.get(&(reader, reader_path.clone()));
+        invoice_connection_state(peer.map(|record| &record.state))
     }
 }
 
@@ -233,11 +223,7 @@ impl Server {
                 config.deployment_invariants().bitcoin_network.clone(),
             )),
             Arc::new(InvoiceNoiseStateProvider {
-                pool: pool.clone(),
-                crypto: crypto.clone(),
-                creators: creators.clone(),
-                pubky: pubky.clone(),
-                paykit: config.paykit.clone(),
+                states: SdkStateStore::new(&pool, crypto.clone()),
             }),
         ));
         let status_service = Arc::new(PaymentStatusService::new(Arc::new(invoices.clone())));

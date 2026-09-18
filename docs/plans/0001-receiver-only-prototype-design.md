@@ -89,13 +89,14 @@ Current `../paykit-rs` code/specifications define dependency behavior. They are 
 - Locks API request body limit is 16 KiB, enforced on raw bytes before JSON parsing; excess returns `413 payload_too_large`.
 - Public lock-resource response limit is 256 KiB, enforced while reading; excess returns `422 invalid_lock_resource`.
 - Public lock-resource fetch timeout is 10 seconds; timeout returns `503 lock_resource_unavailable`.
-- Signed Locks endpoints have a shared 15-second dependency budget through the
-  final pre-mutation deadline check; preflight, replay, session validation, lock
-  fetch, marker discovery, and credential loading consume the same budget.
+- Signed Locks endpoints have a shared 15-second dependency budget; preflight,
+  replay, session validation, lock fetch, marker discovery, credential loading,
+  and the final read-only Noise-state observation consume the same budget.
 - Deadline exhaustion before mutation returns `503 dependency_timeout` and
   commits no state. Once atomic PostgreSQL mutation starts, the server awaits a
-  factual commit or rollback result without canceling the transaction, so it
-  never reports timeout while a concurrent `COMMIT` may have succeeded.
+  factual commit or rollback result without canceling the transaction. The
+  subsequent cancel-safe Noise-state read uses the remaining deadline; if it
+  times out, the invoice is already durable and an exact replay is safe.
 - API error envelope is `{ "error": { "code": "<stable_snake_case>", "message": "<safe text>" } }`.
 - Missing, malformed, and invalid `X-Paykit-Signature` all return identical `401 invalid_signature` with message `request authentication failed`.
 - A valid signature over malformed, schema-invalid, or noncanonical JSON returns `400 invalid_request`.
@@ -323,7 +324,7 @@ Rules:
 - `POST /invoices` returns success after the invoice and encrypted, versioned
   server semantic intent containing all `PaymentRequestTerms` inputs are durably
   committed. This is not the final SDK Payment Request event or wire JSON.
-- Success body is `{ "connection_state": "none" | "handshake" | "connected" }`, observed for the persisted reader identity and receiver path without advancing the handshake. SDK recovery-required or blocked states return dependency unavailable rather than being collapsed into those three states.
+- Success body is `{ "connection_state": "none" | "handshake" | "connected" }`, observed for the persisted reader identity and receiver path without advancing the handshake. SDK recovery-required or blocked states return `503 dependency_unavailable` rather than being collapsed into those three states.
 - API does not wait for Encrypted Link establishment or sender delivery.
 - Invoice/allocation/outbox repository writes are one all-or-nothing PostgreSQL
   transaction. Invoice success is impossible without both complete intents and

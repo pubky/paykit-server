@@ -329,14 +329,15 @@ cargo clippy -p paykit-server --all-targets -- -D warnings
 - Exact replay is 200 with current Noise connection state, without lock refetch/revalidation; changed binding is 409.
 - New reader transaction creates assignment, endpoint-publication intent, then dependent Payment Request intent.
 - Concurrent invoices for different Creators use independent derivation counters and may share a numeric child index without sharing an address or SDK transaction.
-- Handler returns before link establishment/delivery. Cancel-safe dependency work
-  respects the shared 15-second budget through the final pre-mutation check; an
-  entered PostgreSQL transaction is awaited to a factual commit/rollback result.
+- Handler returns before link establishment/delivery. Cancel-safe dependency work,
+  including the final read-only Noise-state observation, respects the shared
+  15-second budget. An entered PostgreSQL mutation is awaited to a factual
+  commit/rollback result before the cancel-safe observation begins.
 
 **Implementation:**
-- Use injected ports for session validation and canonical lock fetch; share the
-  15-second pre-mutation dependency budget and map exhaustion to
-  `503 dependency_timeout`.
+- Use injected ports for session validation, canonical lock fetch, and read-only
+  Noise-state observation; share the 15-second request dependency budget and map
+  exhaustion to `503 dependency_timeout`.
 - Snapshot validated terms once; later status never refetches lock.
 - Create immutable one-time Paykit Payment Request through SDK, including protocol-required fields and approved metadata.
 

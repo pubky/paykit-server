@@ -274,6 +274,20 @@ struct FakeNoiseState {
     calls: Mutex<Vec<(String, String, String)>>,
 }
 
+struct PendingNoiseState;
+
+#[async_trait]
+impl NoiseStateProvider for PendingNoiseState {
+    async fn connection_state(
+        &self,
+        _creator: &CreatorPubky,
+        _reader: &paykit_server::domain::locks::ReaderPubky,
+        _reader_path: &paykit_lib::PaykitReceiverPath,
+    ) -> Result<NoiseConnectionState, CreateInvoiceError> {
+        std::future::pending().await
+    }
+}
+
 #[async_trait]
 impl NoiseStateProvider for FakeNoiseState {
     async fn connection_state(
@@ -506,6 +520,44 @@ async fn exact_replay_noise_query_failure_is_unavailable_without_external_checks
 }
 
 #[tokio::test]
+async fn exact_replay_noise_query_observes_remaining_request_deadline() {
+    let start = Instant::now();
+    let service = CreateInvoiceService::with_clock(
+        Arc::new(FakeSession {
+            result: Ok(()),
+            calls: AtomicUsize::default(),
+            creators: Mutex::new(vec![]),
+        }),
+        Arc::new(FakeLocks {
+            result: Ok(valid_lock()),
+            calls: AtomicUsize::default(),
+        }),
+        Arc::new(FakeMarkers {
+            markers: vec![capable_marker()],
+            calls: AtomicUsize::default(),
+        }),
+        vec![paykit_server::config::ReceiverPathPriority::parse("bitkit".into()).unwrap()],
+        paykit_lib::PaykitReceiverPath::new("paykit/server").unwrap(),
+        Arc::new(FakeCredentials),
+        BitcoinNetwork::Mainnet,
+        Arc::new(FakeStore::with_preflight(InvoicePreflight::ExactReplay)),
+        Arc::new(PaykitIntentBuilder::new(BitcoinNetwork::Mainnet)),
+        Arc::new(PendingNoiseState),
+        Arc::new(FixedClock::new([
+            start,
+            start,
+            start,
+            start + Duration::from_secs(15) - Duration::from_nanos(1),
+        ])),
+    );
+
+    assert_eq!(
+        service.create(request()).await,
+        Err(CreateInvoiceError::DeadlineExceeded)
+    );
+}
+
+#[tokio::test]
 async fn changed_binding_returns_conflict_without_validator_or_lock_fetch() {
     let session = Arc::new(FakeSession {
         result: Ok(()),
@@ -661,6 +713,75 @@ async fn signed_router_maps_deadline_exhaustion_to_dependency_timeout() {
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
         serde_json::json!({"error":{"code":"dependency_timeout","message":"request deadline exceeded"}})
+    );
+}
+
+#[tokio::test]
+async fn signed_router_distinguishes_dependency_and_lock_unavailability() {
+    let key = SigningKey::from_bytes(&[14; 32]);
+    let request_body = || {
+        serde_json_canonicalizer::to_vec(&serde_json::json!({
+            "bundle_id": BUNDLE,
+            "lock_resource": LOCK_RESOURCE,
+            "reader": reader()
+        }))
+        .unwrap()
+    };
+
+    let dependency_router = invoices_router(Arc::new(service_with_noise(
+        Arc::new(FakeSession {
+            result: Ok(()),
+            calls: AtomicUsize::default(),
+            creators: Mutex::new(vec![]),
+        }),
+        Arc::new(FakeLocks {
+            result: Ok(valid_lock()),
+            calls: AtomicUsize::default(),
+        }),
+        Arc::new(FakeStore::with_preflight(InvoicePreflight::ExactReplay)),
+        Arc::new(FakeNoiseState {
+            result: Err(CreateInvoiceError::Unavailable),
+            calls: Mutex::new(vec![]),
+        }),
+    )))
+    .layer(Extension(signed_auth(&key)));
+    let response = dependency_router
+        .oneshot(signed_invoice_request(&key, request_body()))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+        serde_json::json!({"error":{"code":"dependency_unavailable","message":"dependency is unavailable"}})
+    );
+
+    let lock_router = invoices_router(Arc::new(service(
+        Arc::new(FakeSession {
+            result: Ok(()),
+            calls: AtomicUsize::default(),
+            creators: Mutex::new(vec![]),
+        }),
+        Arc::new(FakeLocks {
+            result: Err(LockFetchError::Unavailable),
+            calls: AtomicUsize::default(),
+        }),
+        Arc::new(FakeStore::with_preflight(InvoicePreflight::New)),
+    )))
+    .layer(Extension(signed_auth(&key)));
+    let response = lock_router
+        .oneshot(signed_invoice_request(&key, request_body()))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+        serde_json::json!({"error":{"code":"lock_resource_unavailable","message":"lock resource is unavailable"}})
     );
 }
 

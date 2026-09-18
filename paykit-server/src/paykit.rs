@@ -25,7 +25,7 @@ use crate::{
         semantic_intent::{DeliveryIntentV1, PaymentTermsV1, ReceivingDetailV1},
     },
     config::PaykitConfig,
-    domain::locks::{CreatorPubky, ReaderPubky},
+    domain::locks::CreatorPubky,
     persistence::{CreatorStore, PostgresStorageAdapter},
     workers::outbox::{
         Adapter, HandoffError, HandoffFailure, HandoffResult, RetryableHandoffCause, handoff_steps,
@@ -175,41 +175,20 @@ impl PaykitAdapter {
             storage,
         })
     }
-
-    pub async fn invoice_connection_state(
-        &self,
-        reader: &ReaderPubky,
-        reader_path: &PaykitReceiverPath,
-    ) -> Result<NoiseConnectionState, CreateInvoiceError> {
-        let _guard = self.mutation_lock.lock().await;
-        let reader = PubkyPublicKey::from_raw_or_app_key(reader.to_string())
-            .map_err(|_| CreateInvoiceError::Unavailable)?;
-        let peers = self
-            .sdk
-            .linked_peers()
-            .await
-            .map_err(|_| CreateInvoiceError::Unavailable)?;
-        let state = peers
-            .iter()
-            .find(|peer| {
-                peer.counterparty == reader
-                    && peer.counterparty_receiver_path.as_str() == reader_path.as_str()
-            })
-            .map(|peer| &peer.state);
-        invoice_connection_state(state)
-    }
 }
 
-fn invoice_connection_state(
+pub(crate) fn invoice_connection_state(
     state: Option<&LinkedPeerState>,
 ) -> Result<NoiseConnectionState, CreateInvoiceError> {
     match state {
         None | Some(LinkedPeerState::NotLinked) => Ok(NoiseConnectionState::None),
         Some(LinkedPeerState::Linking) => Ok(NoiseConnectionState::Handshake),
         Some(LinkedPeerState::Linked) => Ok(NoiseConnectionState::Connected),
-        Some(LinkedPeerState::RecoveryRequired | LinkedPeerState::Blocked) | Some(_) => {
+        Some(LinkedPeerState::RecoveryRequired | LinkedPeerState::Blocked) => {
             Err(CreateInvoiceError::Unavailable)
         }
+        // LinkedPeerState is non-exhaustive; unknown future states fail closed.
+        Some(_) => Err(CreateInvoiceError::Unavailable),
     }
 }
 

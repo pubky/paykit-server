@@ -266,13 +266,6 @@ impl CreatorStore {
         self.decrypt_credentials(&row)
     }
 
-    /// Resolves the internal row id only after authenticating the exact Creator record.
-    pub async fn creator_id(&self, creator: &CreatorPubky) -> Result<Uuid, PersistenceError> {
-        let row = self.lookup_row(creator).await?;
-        self.decrypt_credentials(&row)?;
-        Ok(row.id)
-    }
-
     /// Loads and authenticates one exact internal Creator row for worker composition.
     pub async fn load_by_id(
         &self,
