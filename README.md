@@ -42,10 +42,20 @@ Business routes:
 - `GET /setup`
 - `POST /setup/{flow_id}/complete`
 - signed `POST /invoices`
+- signed `POST /connections/status`
 - signed `POST /transactions/status`
 - signed `POST /setup/status`
 
 Business-route signatures use the configured trusted Locks Ed25519 key. Setup uses the Bitkit Pubky Auth companion-claim flow and an exact configured browser origin.
+
+Successful invoice creation returns `204 No Content`; it does not expose Noise
+state. `POST /connections/status` is the separate read-only lookup. Its closed
+body is `{"bundle_id":"...","creator":"pubky..."}`. Paykit Server derives
+exact Reader and receiver path from persisted invoice state, then returns
+`{"state":"none|handshake|connected|recovery_required|blocked"}`. Unknown
+invoices return `404`; authentication, storage, malformed-state, and dependency
+failures remain typed errors. `connected` is Paykit Server's local Noise view,
+not payment or verification completion.
 
 `POST /setup/status` is the Locks-only readiness check for an authenticated Creator. Its closed canonical body is `{"creator":"pubky..."}`; the signature covers the exact compact canonical JSON bytes. It returns exactly one coarse state: `ready` when the persisted Creator session imports and matches that Creator, `setup_required` when authority is absent, invalid, expired, or rejected with the Pubky 0.11 status used for revoked grants, and `unavailable` for validation timeouts and transient storage, rate-limit, server, DNS, or transport failures. Callers must not convert `unavailable` into a new authorization flow.
 

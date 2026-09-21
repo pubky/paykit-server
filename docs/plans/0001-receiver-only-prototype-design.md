@@ -80,6 +80,7 @@ Current `../paykit-rs` code/specifications define dependency behavior. They are 
 **AUTHORITATIVE SOURCE + EXPLICIT refinements**:
 
 - `POST /invoices`
+- `POST /connections/status`
 - `POST /transactions/status`
 - Requests carry `X-Paykit-Signature`.
 - Exactly one trusted Lock Server public key is configured statically. No allowlist and no signer-ID header.
@@ -89,13 +90,14 @@ Current `../paykit-rs` code/specifications define dependency behavior. They are 
 - Locks API request body limit is 16 KiB, enforced on raw bytes before JSON parsing; excess returns `413 payload_too_large`.
 - Public lock-resource response limit is 256 KiB, enforced while reading; excess returns `422 invalid_lock_resource`.
 - Public lock-resource fetch timeout is 10 seconds; timeout returns `503 lock_resource_unavailable`.
-- Signed Locks endpoints have a shared 15-second dependency budget through the
-  final pre-mutation deadline check; preflight, replay, session validation, lock
-  fetch, marker discovery, and credential loading consume the same budget.
+- Invoice creation has a shared 15-second dependency budget; preflight, replay,
+  session validation, lock fetch, marker discovery, and credential loading consume
+  that budget. Connection observation is a separate signed read-only request.
 - Deadline exhaustion before mutation returns `503 dependency_timeout` and
   commits no state. Once atomic PostgreSQL mutation starts, the server awaits a
-  factual commit or rollback result without canceling the transaction, so it
-  never reports timeout while a concurrent `COMMIT` may have succeeded.
+  factual commit or rollback result without canceling the transaction. The
+  invoice response reports the factual result without a subsequent Noise-state
+  read.
 - API error envelope is `{ "error": { "code": "<stable_snake_case>", "message": "<safe text>" } }`.
 - Missing, malformed, and invalid `X-Paykit-Signature` all return identical `401 invalid_signature` with message `request authentication failed`.
 - A valid signature over malformed, schema-invalid, or noncanonical JSON returns `400 invalid_request`.
@@ -271,7 +273,9 @@ Rules:
 - Criterion asset must equal `BTC`.
 - Paykit Server snapshots validated invoice terms; later status does not refetch lock.
 - Generate UUID-v4 Payment Reference once per new invoice; persist and reuse it.
-- Exact replay returns `204 No Content` without refetching lock, reallocating address, recreating delivery, or revalidating creator session.
+- Exact replay returns `204 No Content` without refetching lock, reallocating
+  address, recreating delivery, revalidating creator session, or observing Noise
+  state.
 - Same `(creator, bundle_id)` with changed request binding returns `409 Conflict`.
 - New invoice requires active network validation of creator Pubky session on every request:
   - revoked/expired → `409 creator_session_invalid`;
@@ -320,9 +324,19 @@ Rules:
 - Request remains payable until verified Bitcoin settlement.
 - Payment Request metadata contains exact fields `bundle_id`, `lock_resource`, and `reader` copied from accepted invoice request.
 - Metadata does not duplicate amount, asset, Payment Reference, address, or creator identity.
-- `POST /invoices` returns success after the invoice and encrypted, versioned
+- `POST /invoices` returns `204 No Content` after the invoice and encrypted, versioned
   server semantic intent containing all `PaymentRequestTerms` inputs are durably
   committed. This is not the final SDK Payment Request event or wire JSON.
+- Invoice creation does not expose Noise state. `POST /connections/status` accepts
+  the authenticated persisted invoice identity `{ "creator", "bundle_id" }`,
+  derives Reader identity and receiver path from accepted invoice state, and
+  returns `{ "state": "none" | "handshake" | "connected" |
+  "recovery_required" | "blocked" }`.
+- Connection lookup is read-only: no invoice creation, handshake advancement,
+  outbox mutation, or SDK-state rewrite. Unknown invoices return `404`;
+  authentication, storage, malformed-state, and dependency failures remain typed
+  errors rather than synthetic connection states. `connected` is Paykit Server's
+  local Noise view, not payment or verification completion.
 - API does not wait for Encrypted Link establishment or sender delivery.
 - Invoice/allocation/outbox repository writes are one all-or-nothing PostgreSQL
   transaction. Invoice success is impossible without both complete intents and

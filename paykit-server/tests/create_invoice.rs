@@ -214,6 +214,7 @@ impl InvoicePersistence for FakeStore {
             None,
             uuid::Uuid::nil(),
             0,
+            paykit_lib::PaykitReceiverPath::new("bitkit/wallet").unwrap(),
             true,
         ))
     }
@@ -229,6 +230,7 @@ impl InvoicePersistence for FakeStore {
             None,
             uuid::Uuid::nil(),
             0,
+            paykit_lib::PaykitReceiverPath::new("bitkit/wallet").unwrap(),
             true,
         ))
     }
@@ -393,7 +395,7 @@ async fn invalid_and_unavailable_sessions_return_without_store_mutation() {
 }
 
 #[tokio::test]
-async fn exact_replay_returns_without_validator_or_lock_fetch() {
+async fn exact_replay_returns_persisted_result_without_validator_or_lock_fetch() {
     let session = Arc::new(FakeSession {
         result: Ok(()),
         calls: AtomicUsize::default(),
@@ -404,12 +406,14 @@ async fn exact_replay_returns_without_validator_or_lock_fetch() {
         calls: AtomicUsize::default(),
     });
     let store = Arc::new(FakeStore::with_preflight(InvoicePreflight::ExactReplay));
-
     let result = service(session.clone(), locks.clone(), store.clone())
         .create(request())
         .await
         .unwrap();
-    assert!(result.replayed());
+    assert_eq!(
+        result.selected_reader_path(),
+        &paykit_lib::PaykitReceiverPath::new("bitkit/wallet").unwrap()
+    );
     assert_eq!(session.calls.load(Ordering::SeqCst), 0);
     assert_eq!(locks.calls.load(Ordering::SeqCst), 0);
     assert_eq!(store.create_calls.load(Ordering::SeqCst), 1);
@@ -571,6 +575,71 @@ async fn signed_router_maps_deadline_exhaustion_to_dependency_timeout() {
     );
 }
 
+#[tokio::test]
+async fn signed_router_distinguishes_session_and_lock_unavailability() {
+    let key = SigningKey::from_bytes(&[14; 32]);
+    let request_body = || {
+        serde_json_canonicalizer::to_vec(&serde_json::json!({
+            "bundle_id": BUNDLE,
+            "lock_resource": LOCK_RESOURCE,
+            "reader": reader()
+        }))
+        .unwrap()
+    };
+
+    let dependency_router = invoices_router(Arc::new(service(
+        Arc::new(FakeSession {
+            result: Err(SessionValidationError::Unavailable),
+            calls: AtomicUsize::default(),
+            creators: Mutex::new(vec![]),
+        }),
+        Arc::new(FakeLocks {
+            result: Ok(valid_lock()),
+            calls: AtomicUsize::default(),
+        }),
+        Arc::new(FakeStore::with_preflight(InvoicePreflight::New)),
+    )))
+    .layer(Extension(signed_auth(&key)));
+    let response = dependency_router
+        .oneshot(signed_invoice_request(&key, request_body()))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+        serde_json::json!({"error":{"code":"creator_session_unavailable","message":"creator session is unavailable"}})
+    );
+
+    let lock_router = invoices_router(Arc::new(service(
+        Arc::new(FakeSession {
+            result: Ok(()),
+            calls: AtomicUsize::default(),
+            creators: Mutex::new(vec![]),
+        }),
+        Arc::new(FakeLocks {
+            result: Err(LockFetchError::Unavailable),
+            calls: AtomicUsize::default(),
+        }),
+        Arc::new(FakeStore::with_preflight(InvoicePreflight::New)),
+    )))
+    .layer(Extension(signed_auth(&key)));
+    let response = lock_router
+        .oneshot(signed_invoice_request(&key, request_body()))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+        serde_json::json!({"error":{"code":"lock_resource_unavailable","message":"lock resource is unavailable"}})
+    );
+}
+
 fn signed_auth(key: &SigningKey) -> Arc<SignedLocksAuth> {
     let key = pubky::PublicKey::from(
         pubky::pkarr::PublicKey::try_from(key.verifying_key().as_bytes()).unwrap(),
@@ -650,6 +719,10 @@ async fn signed_router_parses_canonical_invoice_and_derives_creator_from_lock_re
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let body = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .unwrap();
+    assert!(body.is_empty());
     assert_eq!(session.creators.lock().unwrap().as_slice(), [CREATOR]);
 }
 
@@ -766,6 +839,7 @@ impl InvoicePersistence for CapturingIntentStore {
         input: AtomicInvoiceInput<'_>,
     ) -> Result<AtomicInvoiceResult, PersistenceError> {
         let endpoint = input.new_reader_payloads.for_child_index(0)?;
+        let selected_reader_path = input.payment_request_intent.selected_reader_path().unwrap();
         self.captured
             .lock()
             .unwrap()
@@ -776,6 +850,7 @@ impl InvoicePersistence for CapturingIntentStore {
             Some(uuid::Uuid::nil()),
             uuid::Uuid::nil(),
             0,
+            selected_reader_path,
             false,
         ))
     }

@@ -6,17 +6,21 @@
 
 use std::sync::Arc;
 
+use paykit_lib::PaykitReceiverPath;
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::{
-    application::payment_status::PersistedPaymentStatus,
-    application::semantic_intent::{DeliveryIntentV1, DeliveryOperationV1},
+    application::{
+        connection_status::ConnectionBinding,
+        payment_status::PersistedPaymentStatus,
+        semantic_intent::{DeliveryIntentV1, DeliveryOperationV1},
+    },
     bitcoin::{DirectBinding, ObservationAction, ObservationTarget, TrackedOutput},
     crypto::{Crypto, EncryptedEnvelope, EnvelopeContext, LookupHash},
-    domain::locks::{CreatorPubky, ReaderPubky},
+    domain::locks::{BundleId, CreatorPubky, ReaderPubky, parse_reader},
     domain::payment::BitcoinOutpoint,
     persistence::PersistenceError,
 };
@@ -87,6 +91,7 @@ pub struct AtomicInvoiceResult {
     endpoint_publication_outbox_id: Option<Uuid>,
     reader_assignment_id: Uuid,
     reader_child_index: i64,
+    selected_reader_path: PaykitReceiverPath,
     replayed: bool,
 }
 
@@ -99,7 +104,7 @@ pub enum InvoicePreflight {
 }
 
 impl AtomicInvoiceResult {
-    /// Builds the secret-free result returned by an invoice persistence adapter.
+    /// Builds the result returned by an invoice persistence adapter.
     ///
     /// This is public because [`crate::application::create_invoice::InvoicePersistence`]
     /// is an injected port; alternate adapters must be able to report a completed
@@ -110,6 +115,7 @@ impl AtomicInvoiceResult {
         endpoint_publication_outbox_id: Option<Uuid>,
         reader_assignment_id: Uuid,
         reader_child_index: i64,
+        selected_reader_path: PaykitReceiverPath,
         replayed: bool,
     ) -> Self {
         Self {
@@ -118,6 +124,7 @@ impl AtomicInvoiceResult {
             endpoint_publication_outbox_id,
             reader_assignment_id,
             reader_child_index,
+            selected_reader_path,
             replayed,
         }
     }
@@ -142,6 +149,10 @@ impl AtomicInvoiceResult {
 
     pub fn reader_child_index(&self) -> i64 {
         self.reader_child_index
+    }
+
+    pub fn selected_reader_path(&self) -> &PaykitReceiverPath {
+        &self.selected_reader_path
     }
 
     pub fn replayed(&self) -> bool {
@@ -340,7 +351,7 @@ impl InvoiceStore {
         let bundle_hash = self.crypto.lookup_hash(bundle_binding);
         let payment_hash = self.crypto.lookup_hash(payment_request_binding);
         let existing = sqlx::query_as::<_, ExistingInvoice>(
-            "SELECT invoices.id, invoices.payment_request_lookup_hash FROM invoices \
+            "SELECT invoices.payment_request_lookup_hash FROM invoices \
              JOIN creators ON creators.id = invoices.creator_id \
              WHERE creators.creator_lookup_hash = $1 AND invoices.bundle_lookup_hash = $2",
         )
@@ -356,6 +367,57 @@ impl InvoiceStore {
             }
             Some(_) => InvoicePreflight::Conflict,
         })
+    }
+
+    /// Loads the accepted reader and receiver path for one persisted invoice.
+    ///
+    /// This is a read-only lookup. It does not lock rows, replay invoice creation,
+    /// or invoke any Paykit SDK operation.
+    pub async fn connection_binding(
+        &self,
+        creator: &CreatorPubky,
+        bundle_id: &BundleId,
+    ) -> Result<Option<ConnectionBinding>, PersistenceError> {
+        let creator_hash = self.crypto.lookup_hash(creator.to_string().as_bytes());
+        let bundle_hash = self.crypto.lookup_hash(bundle_id.to_string().as_bytes());
+        let row = sqlx::query_as::<_, ConnectionBindingRow>(
+            "SELECT invoices.id, creators.creator_lookup_hash, invoices.invoice_envelope \
+             FROM invoices JOIN creators ON creators.id = invoices.creator_id \
+             WHERE creators.creator_lookup_hash = $1 AND invoices.bundle_lookup_hash = $2",
+        )
+        .bind(creator_hash.as_bytes().as_slice())
+        .bind(bundle_hash.as_bytes().as_slice())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+
+        row.map(|row| {
+            if lookup_hash(&row.creator_lookup_hash)? != creator_hash {
+                return Err(PersistenceError::CorruptOrMissing);
+            }
+            let plaintext = self
+                .crypto
+                .decrypt(
+                    &EnvelopeContext::invoice(creator_hash, row.id),
+                    &EncryptedEnvelope::from_bytes(row.invoice_envelope),
+                )
+                .map_err(|_| PersistenceError::CorruptOrMissing)?;
+            let intent = DeliveryIntentV1::decode(&plaintext)
+                .map_err(|_| PersistenceError::CorruptOrMissing)?;
+            if !matches!(
+                intent.operation(),
+                DeliveryOperationV1::PaymentRequestProposal { .. }
+            ) {
+                return Err(PersistenceError::CorruptOrMissing);
+            }
+            let reader = parse_reader(intent.reader_pubky())
+                .map_err(|_| PersistenceError::CorruptOrMissing)?;
+            let reader_path = intent
+                .selected_reader_path()
+                .map_err(|_| PersistenceError::CorruptOrMissing)?;
+            Ok(ConnectionBinding::new(reader, reader_path))
+        })
+        .transpose()
     }
 
     /// Loads an exact replay without rebuilding delivery intent or repeating
@@ -388,8 +450,8 @@ impl InvoiceStore {
         if lookup_hash(&creator.creator_lookup_hash)? != creator_hash {
             return Err(PersistenceError::CorruptOrMissing);
         }
-        let existing = sqlx::query_as::<_, ExistingInvoice>(
-            "SELECT id, payment_request_lookup_hash FROM invoices \
+        let existing = sqlx::query_as::<_, ReplayInvoice>(
+            "SELECT id, payment_request_lookup_hash, invoice_envelope FROM invoices \
              WHERE creator_id = $1 AND bundle_lookup_hash = $2 FOR UPDATE",
         )
         .bind(creator.id)
@@ -401,6 +463,12 @@ impl InvoiceStore {
         if existing.payment_request_lookup_hash != payment_hash.as_bytes() {
             return Err(PersistenceError::Conflict);
         }
+        let selected_reader_path = self.selected_reader_path(
+            creator_hash,
+            existing.id,
+            existing.invoice_envelope,
+            reader,
+        )?;
         let assignment = self
             .load_assignment(&mut tx, creator.id, reader_hash, bundle_hash, creator_hash)
             .await?
@@ -423,6 +491,7 @@ impl InvoiceStore {
             endpoint_publication_outbox_id: payment_outbox.depends_on_id,
             reader_assignment_id: assignment.id,
             reader_child_index: assignment.child_index,
+            selected_reader_path,
             replayed: true,
         })
     }
@@ -743,8 +812,8 @@ impl InvoiceStore {
             return Err(PersistenceError::CorruptOrMissing);
         }
 
-        if let Some(existing) = sqlx::query_as::<_, ExistingInvoice>(
-            "SELECT id, payment_request_lookup_hash FROM invoices \
+        if let Some(existing) = sqlx::query_as::<_, ReplayInvoice>(
+            "SELECT id, payment_request_lookup_hash, invoice_envelope FROM invoices \
              WHERE creator_id = $1 AND bundle_lookup_hash = $2 FOR UPDATE",
         )
         .bind(creator.id)
@@ -756,6 +825,12 @@ impl InvoiceStore {
             if existing.payment_request_lookup_hash != payment_request_hash.as_bytes() {
                 return Err(PersistenceError::Conflict);
             }
+            let selected_reader_path = self.selected_reader_path(
+                creator_hash,
+                existing.id,
+                existing.invoice_envelope,
+                input.reader,
+            )?;
             let assignment = self
                 .load_assignment(&mut tx, creator.id, reader_hash, bundle_hash, creator_hash)
                 .await?
@@ -779,11 +854,16 @@ impl InvoiceStore {
                 endpoint_publication_outbox_id: payment_request_outbox.depends_on_id,
                 reader_assignment_id: assignment.id,
                 reader_child_index: assignment.child_index,
+                selected_reader_path,
                 replayed: true,
             });
         }
 
         validate_intent(&input.payment_request_intent, input.reader, false)?;
+        let selected_reader_path = input
+            .payment_request_intent
+            .selected_reader_path()
+            .map_err(|_| PersistenceError::CorruptOrMissing)?;
         let (assignment, endpoint_publication_outbox_id, bitcoin_address) = match self
             .load_assignment(&mut tx, creator.id, reader_hash, bundle_hash, creator_hash)
             .await?
@@ -946,8 +1026,31 @@ impl InvoiceStore {
             endpoint_publication_outbox_id,
             reader_assignment_id: assignment.id,
             reader_child_index: assignment.child_index,
+            selected_reader_path,
             replayed: false,
         })
+    }
+
+    fn selected_reader_path(
+        &self,
+        creator_hash: LookupHash,
+        invoice_id: Uuid,
+        invoice_envelope: Vec<u8>,
+        reader: &ReaderPubky,
+    ) -> Result<PaykitReceiverPath, PersistenceError> {
+        let plaintext = self
+            .crypto
+            .decrypt(
+                &EnvelopeContext::invoice(creator_hash, invoice_id),
+                &EncryptedEnvelope::from_bytes(invoice_envelope),
+            )
+            .map_err(|_| PersistenceError::CorruptOrMissing)?;
+        let intent =
+            DeliveryIntentV1::decode(&plaintext).map_err(|_| PersistenceError::CorruptOrMissing)?;
+        validate_intent(&intent, reader, false)?;
+        intent
+            .selected_reader_path()
+            .map_err(|_| PersistenceError::CorruptOrMissing)
     }
 
     fn decrypt_observation(
@@ -1123,8 +1226,14 @@ struct ObservationTargetRow {
 
 #[derive(sqlx::FromRow)]
 struct ExistingInvoice {
+    payment_request_lookup_hash: Vec<u8>,
+}
+
+#[derive(sqlx::FromRow)]
+struct ReplayInvoice {
     id: Uuid,
     payment_request_lookup_hash: Vec<u8>,
+    invoice_envelope: Vec<u8>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -1138,6 +1247,13 @@ struct PaymentStatusRow {
     payment_status: String,
     confirmation_count: i32,
     amount_matched: bool,
+}
+
+#[derive(sqlx::FromRow)]
+struct ConnectionBindingRow {
+    id: Uuid,
+    creator_lookup_hash: Vec<u8>,
+    invoice_envelope: Vec<u8>,
 }
 
 impl TryFrom<PaymentStatusRow> for PersistedPaymentStatus {

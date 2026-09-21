@@ -4,6 +4,7 @@ use std::{future::Future, sync::Arc, time::Duration};
 
 use crate::{
     application::{
+        connection_status::ConnectionStatusService,
         create_invoice::{
             CreateInvoiceError, CreateInvoiceService, LockFetchError, LockFetcher, MarkerDiscovery,
             PaykitIntentBuilder, SessionValidationError, SessionValidator,
@@ -195,11 +196,18 @@ impl Server {
                 config.deployment_invariants().bitcoin_network.clone(),
             )),
         ));
+        let connection_status_service = Arc::new(ConnectionStatusService::new(
+            Arc::new(invoices.clone()),
+            Arc::new(SdkStateStore::new(&pool, crypto.clone())),
+        ));
         let status_service = Arc::new(PaymentStatusService::new(Arc::new(invoices.clone())));
         let setup_status_service = Arc::new(SetupStatusService::new(session_validator));
         let signed_auth = Arc::new(SignedLocksAuth::from_config(&config));
         let business_routes = http::setup::setup_router(setup).merge(
             http::invoices::invoices_router(invoice_service)
+                .merge(http::connection_status::connection_status_router(
+                    connection_status_service,
+                ))
                 .merge(http::status::status_router(status_service))
                 .merge(http::setup_status::setup_status_router(
                     setup_status_service,
@@ -381,6 +389,7 @@ fn retry_delay(initial: Duration, maximum: Duration, attempt_count: i32) -> Dura
 
 const RAPID_LINK_ESTABLISHMENT_RETRY_ATTEMPTS: i32 = 20;
 const RAPID_LINK_ESTABLISHMENT_RETRY_DELAY: Duration = Duration::from_secs(1);
+const MAX_LINK_ESTABLISHMENT_RETRY_DELAY: Duration = Duration::from_secs(5);
 
 fn outbox_retry_schedule(
     initial: Duration,
@@ -396,6 +405,7 @@ fn outbox_retry_schedule(
             maximum,
             attempt_count - RAPID_LINK_ESTABLISHMENT_RETRY_ATTEMPTS,
         )
+        .min(MAX_LINK_ESTABLISHMENT_RETRY_DELAY)
     };
     RetrySchedule::new(default, link_establishment)
 }
@@ -861,7 +871,7 @@ mod tests {
     }
 
     #[test]
-    fn link_establishment_retries_rapidly_before_restarting_exponential_backoff() {
+    fn link_establishment_retry_delay_is_capped_below_general_backoff() {
         let initial = Duration::from_secs(1);
         let maximum = Duration::from_secs(300);
 
@@ -886,6 +896,10 @@ mod tests {
         assert_eq!(
             outbox_retry_schedule(initial, maximum, 30)
                 .delay_for(OutboxRetryClass::LinkEstablishment),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            outbox_retry_schedule(initial, maximum, 30).default_delay(),
             Duration::from_secs(300)
         );
     }
