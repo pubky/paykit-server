@@ -20,8 +20,8 @@ Only **EXPLICIT**, **AUTHORITATIVE SOURCE**, and **CONSTRAINT** entries may driv
 
 The user designated these as authoritative for Locks Server ↔ Paykit Server HTTP behavior:
 
-- [Locks ADR 0020](https://github.com/pubky/locks/blob/df5ea1b6d8dcdec3a9b5a915c3f57bca69d75c8a/docs/ADRs/0020-locks-paykit-v1-integration-boundary.md)
-- matching [Locks Paykit HTTP client](https://github.com/pubky/locks/blob/df5ea1b6d8dcdec3a9b5a915c3f57bca69d75c8a/locks-server/src/paykit_http_client.rs)
+- [Locks ADR 0020](https://github.com/pubky/locks/blob/v0.1.0-rc1/docs/ADRs/0020-locks-paykit-v1-integration-boundary.md)
+- matching [Locks Paykit HTTP client](https://github.com/pubky/locks/blob/v0.1.0-rc1/locks-server/src/paykit_http_client.rs)
 
 ### Product flow
 
@@ -40,8 +40,8 @@ Current `../paykit-rs` code/specifications define dependency behavior. They are 
 **EXPLICIT**:
 
 - Canonical Locks creator, reader, bundle, addressed lock-resource identifiers,
-  and Paykit-payment policy validation use `locks-core` pinned at public revision
-  `df5ea1b6d8dcdec3a9b5a915c3f57bca69d75c8a`; Paykit Server does not duplicate
+  and Paykit-payment policy validation use `locks-core` pinned at public release
+  `v0.1.0-rc1`; Paykit Server does not duplicate
   their parsing, canonicalization, or policy grammar.
 
 ## Actors and key boundaries
@@ -80,6 +80,7 @@ Current `../paykit-rs` code/specifications define dependency behavior. They are 
 **AUTHORITATIVE SOURCE + EXPLICIT refinements**:
 
 - `POST /invoices`
+- `POST /connections/status`
 - `POST /transactions/status`
 - Requests carry `X-Paykit-Signature`.
 - Exactly one trusted Lock Server public key is configured statically. No allowlist and no signer-ID header.
@@ -89,13 +90,14 @@ Current `../paykit-rs` code/specifications define dependency behavior. They are 
 - Locks API request body limit is 16 KiB, enforced on raw bytes before JSON parsing; excess returns `413 payload_too_large`.
 - Public lock-resource response limit is 256 KiB, enforced while reading; excess returns `422 invalid_lock_resource`.
 - Public lock-resource fetch timeout is 10 seconds; timeout returns `503 lock_resource_unavailable`.
-- Signed Locks endpoints have a shared 15-second dependency budget through the
-  final pre-mutation deadline check; preflight, replay, session validation, lock
-  fetch, marker discovery, and credential loading consume the same budget.
+- Invoice creation has a shared 15-second dependency budget; preflight, replay,
+  session validation, lock fetch, marker discovery, and credential loading consume
+  that budget. Connection observation is a separate signed read-only request.
 - Deadline exhaustion before mutation returns `503 dependency_timeout` and
   commits no state. Once atomic PostgreSQL mutation starts, the server awaits a
-  factual commit or rollback result without canceling the transaction, so it
-  never reports timeout while a concurrent `COMMIT` may have succeeded.
+  factual commit or rollback result without canceling the transaction. The
+  invoice response reports the factual result without a subsequent Noise-state
+  read.
 - API error envelope is `{ "error": { "code": "<stable_snake_case>", "message": "<safe text>" } }`.
 - Missing, malformed, and invalid `X-Paykit-Signature` all return identical `401 invalid_signature` with message `request authentication failed`.
 - A valid signature over malformed, schema-invalid, or noncanonical JSON returns `400 invalid_request`.
@@ -271,7 +273,9 @@ Rules:
 - Criterion asset must equal `BTC`.
 - Paykit Server snapshots validated invoice terms; later status does not refetch lock.
 - Generate UUID-v4 Payment Reference once per new invoice; persist and reuse it.
-- Exact replay returns `204 No Content` without refetching lock, reallocating address, recreating delivery, or revalidating creator session.
+- Exact replay returns `204 No Content` without refetching lock, reallocating
+  address, recreating delivery, revalidating creator session, or observing Noise
+  state.
 - Same `(creator, bundle_id)` with changed request binding returns `409 Conflict`.
 - New invoice requires active network validation of creator Pubky session on every request:
   - revoked/expired → `409 creator_session_invalid`;
@@ -320,9 +324,19 @@ Rules:
 - Request remains payable until verified Bitcoin settlement.
 - Payment Request metadata contains exact fields `bundle_id`, `lock_resource`, and `reader` copied from accepted invoice request.
 - Metadata does not duplicate amount, asset, Payment Reference, address, or creator identity.
-- `POST /invoices` returns success after the invoice and encrypted, versioned
+- `POST /invoices` returns `204 No Content` after the invoice and encrypted, versioned
   server semantic intent containing all `PaymentRequestTerms` inputs are durably
   committed. This is not the final SDK Payment Request event or wire JSON.
+- Invoice creation does not expose Noise state. `POST /connections/status` accepts
+  the authenticated persisted invoice identity `{ "creator", "bundle_id" }`,
+  derives Reader identity and receiver path from accepted invoice state, and
+  returns `{ "state": "none" | "handshake" | "connected" |
+  "recovery_required" | "blocked" }`.
+- Connection lookup is read-only: no invoice creation, handshake advancement,
+  outbox mutation, or SDK-state rewrite. Unknown invoices return `404`;
+  authentication, storage, malformed-state, and dependency failures remain typed
+  errors rather than synthetic connection states. `connected` is Paykit Server's
+  local Noise view, not payment or verification completion.
 - API does not wait for Encrypted Link establishment or sender delivery.
 - Invoice/allocation/outbox repository writes are one all-or-nothing PostgreSQL
   transaction. Invoice success is impossible without both complete intents and
@@ -440,21 +454,21 @@ Rules:
 - TOML sections are `http`, `locks`, `setup`, `paykit`, `bitcoin`, `electrum`, `outbox`, `limits`, `rate_limits`, and `shutdown`; retired `[inbox]` is rejected.
 - `http` configures listen address.
 - TOML keys use `snake_case`; duration values use strings such as `"5s"`, `"30s"`, and `"90d"`.
-- Initial key names are `http.listen_addr`, `locks.trusted_public_key`, `setup.allowed_origins`, `paykit.receiver_path`, `paykit.receiver_path_priority`, `paykit.network`, `bitcoin.network`, `electrum.endpoint`, `electrum.poll_interval`, `electrum.request_timeout`, and `electrum.connect_retries`; `paykit.receiver_path` is validated as `paykit_lib::PaykitReceiverPath` (for example `paykit/server`) and `paykit.network` is the closed enum `mainnet | testnet` supported by the pinned Pubky constructors. `testnet` is the pinned Pubky client's fixed localhost testnet, not a hosted service. Electrum request timeout and connect retries default to `"10s"` and `1`.
+- Initial key names are `http.listen_addr`, `locks.trusted_public_key`, `setup.allowed_origins`, `setup.log_authorization_url`, `paykit.client_id`, `paykit.receiver_path`, `paykit.receiver_path_priority`, `paykit.network`, `bitcoin.network`, `electrum.endpoint`, `electrum.poll_interval`, `electrum.request_timeout`, and `electrum.connect_retries`; `setup.log_authorization_url` defaults to `false` and production leaves it disabled. The sole planned `true` setting is the Locks-generated local-demo config, where one bearer-secret authorization URL event is emitted per new setup flow and the local operator owns log access and retention. `paykit.client_id` is required and fixed to `app.paykit.server`. `paykit.receiver_path` is validated as `paykit_lib::PaykitReceiverPath` (for example `paykit/server`) and `paykit.network` is the closed enum `mainnet | testnet` supported by the pinned Pubky constructors. `testnet` is the pinned Pubky client's fixed localhost testnet, not a hosted service. Electrum request timeout and connect retries default to `"10s"` and `1`.
 - Remaining key names are `outbox.poll_interval`, `outbox.batch_size`, `outbox.lease_duration`, `outbox.retry_initial`, `outbox.retry_max`, `limits.request_body_bytes`, `limits.lock_resource_bytes`, `limits.lock_fetch_timeout`, `rate_limits.signed_requests_per_second`, `rate_limits.signed_burst`, `rate_limits.setup_per_ip_per_minute`, `rate_limits.max_pending_setup_flows`, `rate_limits.max_completion_polls_per_flow`, `rate_limits.max_completion_polls`, and `shutdown.drain_timeout`; `outbox.batch_size` defaults to `16`.
 - `locks` configures one canonical Pubky-prefixed trusted Lock Server public key
   in the same `pubky<pubky-key>` form as Locks
   `credentials.lock_server_public_key`.
 - `setup.allowed_origins` accepts exact HTTP(S) origins or `"*"` as the sole value. The wildcard admits any otherwise-valid HTTP(S) `return_to`, but the server still derives that request's concrete origin for exact `postMessage` targeting and `frame-ancestors` CSP.
-- `paykit` configures receiver path and the supported SDK/Pubky network. Arbitrary relay and global homeserver URLs are not accepted because the pinned SDK-owned AUTH bootstrap exposes no relay override and Pubky resolves each identity's homeserver through Pkarr.
+- `paykit` configures the fixed application client ID, receiver path, and supported SDK/Pubky network. Arbitrary relay and global homeserver URLs are not accepted because the pinned SDK-owned AUTH bootstrap exposes no relay override and Pubky resolves each identity's homeserver through Pkarr.
 - `bitcoin` configures network.
 - `electrum` configures endpoint, polling interval, finite request timeout, and connect retry count.
 - `outbox` configures executable lease, polling/batch, and backoff values.
 - `limits` configures accepted 16 KiB request limit, 256 KiB lock limit, and 10-second fetch timeout.
 - `PAYKIT_DATABASE_URL` and `PAYKIT_MASTER_KEY` are env-only secrets and cannot appear in TOML.
-- Startup rejects invalid URLs/origins/keys/networks, retired Paykit relay/homeserver URL keys, zero durations/batches, unsafe receiver paths, and inconsistent limits.
+- Startup rejects SQLx-invalid or unknown database URL options, invalid URLs/origins/keys/networks, Electrum TLS names rejected by the pinned Rustls parser, retired Paykit relay/homeserver URL keys, zero durations/batches, unsafe receiver paths, and inconsistent or runtime-unrepresentable limits.
 - Effective-config logging redacts environment secret values.
-- First initialized database persists Bitcoin network, receiver path, and trusted Locks public-key fingerprint as deployment invariants.
+- First initialized database persists Bitcoin network, Paykit client ID, receiver path, and trusted Locks public-key fingerprint as deployment invariants.
 - Later mismatch of any invariant aborts boot; prototype has no rotation/migration procedure for them.
 - HTTP bind, allowed setup origins, Paykit network, same-network Electrum endpoint, and operational polling/retry/lease/rate/size settings may change across restarts.
 - Closed TOML includes `rate_limits` section.
@@ -481,7 +495,14 @@ Rules:
 
 - Logs are structured JSON.
 - Logs may include timestamp, level, target, generated request ID, route, method, status, latency, internal row UUID, worker/action/result, and safe error class.
-- Logs never include request/response bodies, signature header, `return_to`, setup state/auth URL, credentials/keys/xpub, creator/reader Pubky, bundle/lock identifiers, Bitcoin address, Payment Reference/Request ID, `txid:vout`, decrypted payload/state, or database URL.
+- Production tracing allowlists only the `paykit_server` target at INFO and above; dependency targets remain disabled unless separately audited and explicitly enabled.
+- By default, and for production, logs never include request/response bodies,
+  signature header, `return_to`, setup state/auth URL, credentials/keys/xpub,
+  creator/reader Pubky, bundle/lock identifiers, Bitcoin address, Payment
+  Reference/Request ID, `txid:vout`, decrypted payload/state, or database URL.
+  The explicit local-demo-only exception is `setup.log_authorization_url = true`,
+  which emits one bearer-secret authorization URL event when a setup flow starts;
+  the local operator owns access to and retention of that log.
 - Prometheus metrics are exposed at `GET /metrics`.
 - Metrics have no labels and cover HTTP count/latency, outbox
   depth/retry/permanent failure, Electrum availability/last-success age,
@@ -504,7 +525,7 @@ Rules:
 - The composed application is PostgreSQL-verified with two independent Creators,
   concurrent invoice creation, SDK handoff/reconciliation, direct Bitcoin
   observation, status reads, shutdown, startup reauthentication, and restart.
-- Live Paykit evidence uses Pubky Core static testnet `0.9.3` at revision
+- Live Paykit evidence uses Pubky static testnet `0.9.3` at revision
   `51db89744f97e33486a5e5aedf442b7e2f9b51c2`: two temporary identities publish
   and discover receiver markers through the separate relay/homeserver process,
   establish an Encrypted Link, and send/receive one Payment Request.

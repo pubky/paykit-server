@@ -4,6 +4,7 @@ use std::{future::Future, sync::Arc, time::Duration};
 
 use crate::{
     application::{
+        connection_status::ConnectionStatusService,
         create_invoice::{
             CreateInvoiceError, CreateInvoiceService, LockFetchError, LockFetcher, MarkerDiscovery,
             PaykitIntentBuilder, SessionValidationError, SessionValidator,
@@ -14,6 +15,7 @@ use crate::{
         },
         payment_request_status::PaymentRequestStatusOperations,
         payment_status::PaymentStatusService,
+        setup_status::SetupStatusService,
     },
     bitkit_setup::BitkitAuthStarter,
     config::{Config, OutboxConfig, PaykitConfig, PaykitNetwork},
@@ -41,8 +43,8 @@ use async_trait::async_trait;
 use axum::{Extension, Router};
 use locks_core::lock_policy::ContentLock;
 use paykit_lib::{PaykitReceiverMarker, get_paykit_receiver_marker, list_paykit_receiver_paths};
-use paykit_sdk::{PubkyPublicKey, PubkySessionBootstrap};
-use pubky::{Pubky, PubkySession, errors::RequestError};
+use paykit_sdk::{PaykitSdkError, PubkyPublicKey, PubkySessionBootstrap, PubkySessionProvider};
+use pubky::{Pubky, errors::RequestError};
 use sqlx::PgPool;
 use thiserror::Error;
 use tokio::{task::JoinSet, time::MissedTickBehavior};
@@ -122,7 +124,7 @@ impl Server {
         pubky: Pubky,
     ) -> Result<Self, ServerBuildError> {
         let electrum = ElectrumAdapter::configured(
-            config.electrum.endpoint.clone(),
+            config.electrum.endpoint(),
             config.deployment_invariants().bitcoin_network.clone(),
             config.electrum.request_timeout,
             config.electrum.connect_retries,
@@ -147,7 +149,9 @@ impl Server {
         let payment_request_lifecycles = PaymentRequestLifecycleStore::new(&pool, crypto.clone());
         let payment_drains = PaymentDrainStore::new(&pool, crypto.clone());
 
-        let bootstrap = PubkySessionBootstrap::with_pubky(pubky.clone());
+        let bootstrap =
+            PubkySessionBootstrap::with_pubky(pubky.clone(), config.paykit.client_id.as_str())
+                .map_err(|_| ServerBuildError::Pubky)?;
         let relay = Arc::new(PubkyCompanionRelay::new(pubky.client().clone()));
         let setup_completer = Arc::new(RealSetupCompleter::new(
             BitkitAuthStarter::new(bootstrap, &config.paykit.receiver_path),
@@ -156,7 +160,7 @@ impl Server {
             config.deployment_invariants().bitcoin_network.clone(),
             config.paykit.receiver_path.clone(),
         ));
-        let setup = SetupService::new(
+        let setup = SetupService::new_with_authorization_url_logging(
             config.setup.allowed_origins.clone(),
             setup_completer,
             Arc::new(SystemClock::default()),
@@ -171,18 +175,18 @@ impl Server {
                     config.rate_limits.setup_per_ip_per_minute,
                 )
                 .expect("validated setup rate limit fits usize"),
-                max_pending_setup_flows: usize::try_from(
-                    config.rate_limits.max_pending_setup_flows,
-                )
-                .expect("validated pending setup limit fits usize"),
+                max_pending_setup_flows: config.rate_limits.max_pending_setup_flows(),
             },
+            config.setup.log_authorization_url,
         );
 
+        let session_validator = Arc::new(CreatorSessionValidator {
+            creators: creators.clone(),
+            pubky: pubky.clone(),
+            paykit: config.paykit.clone(),
+        });
         let invoice_service = Arc::new(CreateInvoiceService::new(
-            Arc::new(CreatorSessionValidator {
-                creators: creators.clone(),
-                pubky: pubky.clone(),
-            }),
+            session_validator.clone(),
             Arc::new(PubkyLockFetcher {
                 storage: pubky.public_storage(),
                 max_bytes: config.limits.lock_resource_bytes,
@@ -200,6 +204,10 @@ impl Server {
                 config.deployment_invariants().bitcoin_network.clone(),
             )),
         ));
+        let connection_status_service = Arc::new(ConnectionStatusService::new(
+            Arc::new(invoices.clone()),
+            Arc::new(SdkStateStore::new(&pool, crypto.clone())),
+        ));
         let status_service = Arc::new(PaymentStatusService::new(Arc::new(invoices.clone())));
         let payment_drain_operations: Arc<dyn PaymentDrainOperations> =
             Arc::new(ProductionPaymentDrainOperations {
@@ -213,15 +221,22 @@ impl Server {
             });
         let payment_request_status_operations: Arc<dyn PaymentRequestStatusOperations> =
             Arc::new(invoices.clone());
+        let setup_status_service = Arc::new(SetupStatusService::new(session_validator));
         let signed_auth = Arc::new(SignedLocksAuth::from_config(&config));
         let business_routes = http::setup::setup_router(setup).merge(
             http::invoices::invoices_router(invoice_service)
+                .merge(http::connection_status::connection_status_router(
+                    connection_status_service,
+                ))
                 .merge(http::status::status_router(status_service))
                 .merge(http::payment_drains::payment_drains_router(
                     payment_drain_operations,
                 ))
                 .merge(http::payment_requests::payment_requests_router(
                     payment_request_status_operations,
+                ))
+                .merge(http::setup_status::setup_status_router(
+                    setup_status_service,
                 ))
                 .layer(Extension(signed_auth)),
         );
@@ -403,6 +418,7 @@ impl PaymentDrainOperations for ProductionPaymentDrainOperations {
             self.creators.clone(),
             lock_resource.creator().clone(),
             self.pubky.clone(),
+            &self.paykit,
         );
         let adapter = PaykitAdapter::new(storage, sessions, &self.paykit)
             .map_err(|_| PaymentDrainError::Unavailable)?;
@@ -474,6 +490,7 @@ async fn creator_adapter(
         workers.creators.clone(),
         creator,
         workers.pubky.clone(),
+        &workers.paykit,
     );
     PaykitAdapter::new(storage, sessions, &workers.paykit).map_err(|_| AdapterBuildError::Permanent)
 }
@@ -487,6 +504,7 @@ fn retry_delay(initial: Duration, maximum: Duration, attempt_count: i32) -> Dura
 
 const RAPID_LINK_ESTABLISHMENT_RETRY_ATTEMPTS: i32 = 20;
 const RAPID_LINK_ESTABLISHMENT_RETRY_DELAY: Duration = Duration::from_secs(1);
+const MAX_LINK_ESTABLISHMENT_RETRY_DELAY: Duration = Duration::from_secs(5);
 
 fn outbox_retry_schedule(
     initial: Duration,
@@ -502,6 +520,7 @@ fn outbox_retry_schedule(
             maximum,
             attempt_count - RAPID_LINK_ESTABLISHMENT_RETRY_ATTEMPTS,
         )
+        .min(MAX_LINK_ESTABLISHMENT_RETRY_DELAY)
     };
     RetrySchedule::new(default, link_establishment)
 }
@@ -768,41 +787,56 @@ fn map_electrum_error(_: ObserverError) -> ServerBuildError {
 struct CreatorSessionValidator {
     creators: CreatorStore,
     pubky: Pubky,
+    paykit: PaykitConfig,
 }
 
 #[async_trait]
 impl SessionValidator for CreatorSessionValidator {
     async fn validate(&self, creator: &CreatorPubky) -> Result<(), SessionValidationError> {
-        let credentials = self
-            .creators
-            .load(creator)
-            .await
-            .map_err(|error| match error {
-                crate::persistence::PersistenceError::CorruptOrMissing => {
-                    SessionValidationError::Invalid
-                }
-                _ => SessionValidationError::Unavailable,
-            })?;
-        let session = PubkySession::import_secret(
-            credentials.session_secret(),
-            Some(self.pubky.client().clone()),
+        CreatorSessionProvider::with_pubky(
+            self.creators.clone(),
+            creator.clone(),
+            self.pubky.clone(),
+            &self.paykit,
         )
+        .load_session_access()
         .await
-        .map_err(map_session_import_error)?;
-        let expected = PubkyPublicKey::from_raw_or_app_key(creator.to_string())
-            .map_err(|_| SessionValidationError::Invalid)?;
-        let actual = PubkyPublicKey::from_public_key(session.info().public_key());
-        if actual != expected {
-            return Err(SessionValidationError::Invalid);
-        }
-        Ok(())
+        .map(|_| ())
+        .map_err(map_session_validation_error)
     }
 }
 
-fn map_session_import_error(error: pubky::Error) -> SessionValidationError {
+fn map_session_validation_error(error: PaykitSdkError) -> SessionValidationError {
+    match error {
+        PaykitSdkError::Identity { source, .. } => match source {
+            None => SessionValidationError::Invalid,
+            Some(source) => match source.downcast_ref::<pubky::Error>() {
+                Some(error) => classify_pubky_session_error(error),
+                None => SessionValidationError::Unavailable,
+            },
+        },
+        PaykitSdkError::Protocol { .. } | PaykitSdkError::Policy { .. } => {
+            SessionValidationError::Invalid
+        }
+        _ => SessionValidationError::Unavailable,
+    }
+}
+
+fn classify_pubky_session_error(error: &pubky::Error) -> SessionValidationError {
     match error {
         pubky::Error::Authentication(_) | pubky::Error::Parse(_) => SessionValidationError::Invalid,
-        _ => SessionValidationError::Unavailable,
+        pubky::Error::Request(RequestError::Validation { .. }) => SessionValidationError::Invalid,
+        // Pubky 0.11 reports revoked grants as an untyped 401. Treat that status as terminal so
+        // setup can recover. A recoverable PoP audience or timestamp rejection may also be 401;
+        // this narrow ambiguity remains until upstream preserves a typed rejection cause.
+        pubky::Error::Request(RequestError::Server { status, .. })
+            if *status == pubky::StatusCode::UNAUTHORIZED =>
+        {
+            SessionValidationError::Invalid
+        }
+        pubky::Error::Request(_) | pubky::Error::Pkarr(_) | pubky::Error::Build(_) => {
+            SessionValidationError::Unavailable
+        }
     }
 }
 
@@ -905,16 +939,82 @@ mod tests {
     const CONFIG_MASTER_KEY: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE";
 
     #[test]
-    fn expired_persisted_session_is_invalid_not_dependency_unavailable() {
-        let error = pubky::Error::Authentication(pubky::errors::AuthError::RequestExpired);
+    fn invalid_grant_session_is_invalid_not_dependency_unavailable() {
+        let error = PaykitSdkError::Identity {
+            context: "expired grant".into(),
+            source: None,
+        };
         assert_eq!(
-            map_session_import_error(error),
+            map_session_validation_error(error),
             SessionValidationError::Invalid
         );
     }
 
     #[test]
-    fn link_establishment_retries_rapidly_before_restarting_exponential_backoff() {
+    fn pubky_unauthorized_restore_is_invalid_to_recover_revoked_grants() {
+        let error = PaykitSdkError::Identity {
+            context: "restore Pubky grant session".into(),
+            source: Some(
+                pubky::Error::Request(pubky::errors::RequestError::Server {
+                    status: pubky::StatusCode::UNAUTHORIZED,
+                    message: "grant rejected".into(),
+                })
+                .into(),
+            ),
+        };
+
+        assert_eq!(
+            map_session_validation_error(error),
+            SessionValidationError::Invalid
+        );
+    }
+
+    #[test]
+    fn transient_pubky_server_errors_remain_unavailable() {
+        for status in [
+            pubky::StatusCode::MISDIRECTED_REQUEST,
+            pubky::StatusCode::SERVICE_UNAVAILABLE,
+            pubky::StatusCode::TOO_MANY_REQUESTS,
+        ] {
+            let error = PaykitSdkError::Identity {
+                context: "restore Pubky grant session".into(),
+                source: Some(
+                    pubky::Error::Request(pubky::errors::RequestError::Server {
+                        status,
+                        message: "temporary outage".into(),
+                    })
+                    .into(),
+                ),
+            };
+
+            assert_eq!(
+                map_session_validation_error(error),
+                SessionValidationError::Unavailable
+            );
+        }
+    }
+
+    #[test]
+    fn definitive_pubky_auth_parse_and_validation_errors_are_invalid() {
+        for error in [
+            pubky::Error::Authentication(pubky::errors::AuthError::RequestExpired),
+            pubky::Error::Parse(url::ParseError::EmptyHost),
+            pubky::Error::Request(pubky::errors::RequestError::Validation {
+                message: "malformed stored grant".into(),
+            }),
+        ] {
+            assert_eq!(
+                map_session_validation_error(PaykitSdkError::Identity {
+                    context: "restore Pubky grant session".into(),
+                    source: Some(error.into()),
+                }),
+                SessionValidationError::Invalid
+            );
+        }
+    }
+
+    #[test]
+    fn link_establishment_retry_delay_is_capped_below_general_backoff() {
         let initial = Duration::from_secs(1);
         let maximum = Duration::from_secs(300);
 
@@ -939,6 +1039,10 @@ mod tests {
         assert_eq!(
             outbox_retry_schedule(initial, maximum, 30)
                 .delay_for(OutboxRetryClass::LinkEstablishment),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            outbox_retry_schedule(initial, maximum, 30).default_delay(),
             Duration::from_secs(300)
         );
     }
@@ -955,6 +1059,7 @@ trusted_public_key = "{CONFIG_KEY}"
 [setup]
 allowed_origins = ["https://app.example"]
 [paykit]
+client_id = "app.paykit.server"
 receiver_path = "paykit/server"
 network = "testnet"
 [bitcoin]

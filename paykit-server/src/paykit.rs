@@ -15,10 +15,11 @@ use paykit_sdk::{
     LinkedPeerState, OutboundPrivateMessageStatus, PaykitSdk, PaykitSdkConfig, PaykitSdkError,
     PaymentAdapter, PaymentRequestLifecycleState as SdkPaymentRequestLifecycleState,
     PaymentRequestRecord, PrivateReceivingDetail, PubkyPublicKey, PubkySessionAccess,
-    PubkySessionProvider, StorageAdapter,
+    PubkySessionBootstrap, PubkySessionProvider, StorageAdapter,
 };
-use pubky::{Pubky, PubkySession};
+use pubky::Pubky;
 use tokio::sync::Mutex as TokioMutex;
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
@@ -49,23 +50,37 @@ pub struct CreatorSessionProvider {
     creators: CreatorStore,
     creator: CreatorPubky,
     public_client: Pubky,
+    client_id: String,
+    required_capabilities: String,
 }
 
 impl CreatorSessionProvider {
-    pub fn new(creators: CreatorStore, creator: CreatorPubky) -> Result<Self, PaykitSdkError> {
+    pub fn new(
+        creators: CreatorStore,
+        creator: CreatorPubky,
+        config: &PaykitConfig,
+    ) -> Result<Self, PaykitSdkError> {
         let public_client = Pubky::new().map_err(|error| PaykitSdkError::Identity {
             context: "could not construct Pubky client".into(),
             source: Some(anyhow::anyhow!(error.to_string())),
         })?;
-        Ok(Self::with_pubky(creators, creator, public_client))
+        Ok(Self::with_pubky(creators, creator, public_client, config))
     }
 
     /// Uses the process-selected Pubky network for this Creator's restored session.
-    pub fn with_pubky(creators: CreatorStore, creator: CreatorPubky, public_client: Pubky) -> Self {
+    pub fn with_pubky(
+        creators: CreatorStore,
+        creator: CreatorPubky,
+        public_client: Pubky,
+        config: &PaykitConfig,
+    ) -> Self {
         Self {
             creators,
             creator,
             public_client,
+            client_id: config.client_id.to_string(),
+            required_capabilities: PaykitSdkConfig::new(config.receiver_path.clone())
+                .required_session_capabilities(),
         }
     }
 }
@@ -73,29 +88,33 @@ impl CreatorSessionProvider {
 #[async_trait]
 impl PubkySessionProvider for CreatorSessionProvider {
     async fn load_session_access(&self) -> paykit_sdk::Result<Option<PubkySessionAccess>> {
-        let credentials =
-            self.creators
-                .load(&self.creator)
-                .await
-                .map_err(|_| PaykitSdkError::Storage {
+        let credentials = self
+            .creators
+            .load(&self.creator)
+            .await
+            .map_err(|error| match error {
+                crate::persistence::PersistenceError::CorruptOrMissing => {
+                    PaykitSdkError::Identity {
+                        context: "creator credentials are missing or invalid".into(),
+                        source: None,
+                    }
+                }
+                _ => PaykitSdkError::Storage {
                     context: "creator credentials are unavailable".into(),
                     source: None,
-                })?;
-        let session = PubkySession::import_secret(
-            credentials.session_secret(),
-            Some(self.public_client.client().clone()),
-        )
-        .await
-        .map_err(|error| PaykitSdkError::Identity {
-            context: "creator Pubky session is unavailable".into(),
-            source: Some(anyhow::anyhow!(error.to_string())),
-        })?;
-        let access = PubkySessionAccess {
-            session,
-            outbox_client: self.public_client.clone(),
-            local_secret_key: None,
-            receiver_noise_secret_key: credentials.receiver_noise_secret().clone(),
-        };
+                },
+            })?;
+        let bootstrap =
+            PubkySessionBootstrap::with_pubky(self.public_client.clone(), &self.client_id)?;
+        let access = bootstrap
+            .import_session(
+                credentials.session_secret(),
+                None,
+                credentials.receiver_noise_secret().clone(),
+                &self.required_capabilities,
+            )
+            .await?
+            .access;
         bind_session_to_creator(access.public_key()?, &self.creator)?;
         access.validate()?;
         Ok(Some(access))
@@ -393,7 +412,7 @@ fn parse_peer(
 fn classify(error: PaykitSdkError) -> HandoffError {
     match error {
         PaykitSdkError::Protocol { .. } => HandoffError::Permanent,
-        PaykitSdkError::Policy { .. } => HandoffError::Retryable(RetryableHandoffCause::Other),
+        PaykitSdkError::Policy { .. } => HandoffError::Retryable(RetryableHandoffCause::Policy),
         PaykitSdkError::Storage { .. } => HandoffError::Retryable(RetryableHandoffCause::Storage),
         PaykitSdkError::Identity { .. } => HandoffError::Retryable(RetryableHandoffCause::Identity),
         PaykitSdkError::Transport { .. } => {
@@ -456,11 +475,20 @@ impl Adapter for PaykitAdapter {
 
     async fn ensure_link_with_peer(&self, reader: &str, path: &str) -> Result<(), HandoffError> {
         let (reader, path) = parse_peer(reader, path)?;
-        self.sdk
+        let result = self
+            .sdk
             .ensure_link_with_peer(reader, path, 1)
             .await
             .map_err(classify)
-            .and_then(|report| require_linked(report.state))
+            .and_then(|report| require_linked(report.state));
+        if let Err(error) = result {
+            warn!(
+                stage = "link_establishment",
+                cause = error.diagnostic_label(),
+                "Paykit handoff failed"
+            );
+        }
+        result
     }
 
     async fn enqueue_private_payment_list_with_receiving_details(
@@ -600,7 +628,7 @@ fn require_linked(state: LinkedPeerState) -> Result<(), HandoffError> {
         LinkedPeerState::RecoveryRequired => Err(HandoffError::Retryable(
             RetryableHandoffCause::RecoveryRequired,
         )),
-        _ => Err(HandoffError::Retryable(RetryableHandoffCause::Other)),
+        _ => Err(HandoffError::Retryable(RetryableHandoffCause::LinkPending)),
     }
 }
 
@@ -626,7 +654,7 @@ mod tests {
         assert_eq!(require_linked(LinkedPeerState::Linked), Ok(()));
         assert_eq!(
             require_linked(LinkedPeerState::Linking),
-            Err(HandoffError::Retryable(RetryableHandoffCause::Other))
+            Err(HandoffError::Retryable(RetryableHandoffCause::LinkPending))
         );
         assert_eq!(
             require_linked(LinkedPeerState::RecoveryRequired),
@@ -634,6 +662,37 @@ mod tests {
                 RetryableHandoffCause::RecoveryRequired
             ))
         );
+    }
+
+    #[test]
+    fn handoff_diagnostic_causes_use_closed_secret_free_labels() {
+        assert_eq!(RetryableHandoffCause::Storage.diagnostic_label(), "storage");
+        assert_eq!(
+            RetryableHandoffCause::Identity.diagnostic_label(),
+            "identity"
+        );
+        assert_eq!(
+            RetryableHandoffCause::Transport.diagnostic_label(),
+            "transport"
+        );
+        assert_eq!(
+            RetryableHandoffCause::NotFound.diagnostic_label(),
+            "not_found"
+        );
+        assert_eq!(
+            RetryableHandoffCause::PaymentAdapter.diagnostic_label(),
+            "payment_adapter"
+        );
+        assert_eq!(
+            RetryableHandoffCause::RecoveryRequired.diagnostic_label(),
+            "recovery_required"
+        );
+        assert_eq!(RetryableHandoffCause::Policy.diagnostic_label(), "policy");
+        assert_eq!(
+            RetryableHandoffCause::LinkPending.diagnostic_label(),
+            "link_pending"
+        );
+        assert_eq!(RetryableHandoffCause::Other.diagnostic_label(), "other");
     }
 
     #[test]
@@ -645,7 +704,7 @@ mod tests {
 
         assert_eq!(
             classify(error),
-            HandoffError::Retryable(RetryableHandoffCause::Other)
+            HandoffError::Retryable(RetryableHandoffCause::Policy)
         );
     }
 

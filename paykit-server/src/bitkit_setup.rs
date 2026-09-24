@@ -59,11 +59,6 @@ impl BitkitAuthStarter {
             .map_err(|_| ClaimError::InvalidAuthRequest)?;
         let authorization_url =
             append_bitkit_claim(request.authorization_url(), &self.capabilities)?;
-        let request = self
-            .bootstrap
-            .resume_auth(&authorization_url, &self.capabilities)
-            .await
-            .map_err(|_| ClaimError::InvalidAuthRequest)?;
         let companion = parse_auth_request(&authorization_url, &self.capabilities)?;
         Ok(StartedBitkitAuth {
             authorization_url,
@@ -93,20 +88,40 @@ pub fn append_bitkit_claim(
 mod tests {
     use super::*;
     use crate::bitkit_claim::LOCAL_DEMO_CAPABILITIES;
+    use crate::config::PAYKIT_CLIENT_ID;
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-    #[test]
-    fn appends_one_exact_companion_query_pair_without_exposing_or_replacing_auth_values() {
-        let secret = URL_SAFE_NO_PAD.encode([1; 32]);
-        let url = format!(
-            "pubkyauth://signin?caps={LOCAL_DEMO_CAPABILITIES}&relay=https%3A%2F%2Frelay.example%2Finbox&secret={secret}"
+
+    #[tokio::test]
+    async fn appends_one_exact_companion_query_pair_to_rc48_grant_url() {
+        let request = paykit_sdk::PubkySessionBootstrap::new(PAYKIT_CLIENT_ID)
+            .unwrap()
+            .start_sign_in_auth(LOCAL_DEMO_CAPABILITIES)
+            .await
+            .unwrap();
+        assert!(
+            request
+                .authorization_url()
+                .starts_with("pubkyauth://signin_grant?")
         );
-        let augmented = append_bitkit_claim(&url, LOCAL_DEMO_CAPABILITIES).unwrap();
+        let url = request.authorization_url();
+        let expected_secret: [u8; 32] = URL_SAFE_NO_PAD
+            .decode(
+                Url::parse(url)
+                    .unwrap()
+                    .query_pairs()
+                    .find_map(|(key, value)| (key == "secret").then(|| value.into_owned()))
+                    .unwrap(),
+            )
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let augmented = append_bitkit_claim(url, LOCAL_DEMO_CAPABILITIES).unwrap();
         assert!(augmented.contains("x-bitkit-claim=watch-only-account-v1"));
         assert_eq!(
             parse_auth_request(&augmented, LOCAL_DEMO_CAPABILITIES)
                 .unwrap()
                 .secret(),
-            &[1; 32]
+            &expected_secret
         );
         assert_eq!(
             append_bitkit_claim(&augmented, LOCAL_DEMO_CAPABILITIES),

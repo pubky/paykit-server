@@ -1,13 +1,18 @@
-use std::{fmt, time::Duration};
+use std::{fmt, net::SocketAddr, str::FromStr, time::Duration};
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use ed25519_dalek::VerifyingKey;
 use paykit_lib::PaykitReceiverPath;
-use pubky::PublicKey;
+use pubky::{ClientId, PublicKey};
+use rustls_pki_types::ServerName;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use sqlx::postgres::PgConnectOptions;
 use thiserror::Error;
 use url::Url;
+
+/// Stable Pubky grant client ID owned by this Paykit Server application.
+pub const PAYKIT_CLIENT_ID: &str = "app.paykit.server";
 
 #[derive(Debug)]
 pub struct Config {
@@ -30,13 +35,22 @@ impl Config {
         toml_source: &str,
         environment: ConfigEnvironment,
     ) -> Result<Self, ConfigError> {
-        let raw: RawConfig = toml::from_str(toml_source).map_err(ConfigError::Toml)?;
+        let raw: RawConfig = toml::from_str(toml_source).map_err(|_| ConfigError::Toml)?;
         let database_url = DatabaseUrl::parse(environment.database_url)?;
         let master_key = MasterKey::parse(environment.master_key)?;
         let trusted_public_key = TrustedLocksPublicKey::parse(raw.locks.trusted_public_key)?;
         let trusted_locks_key_fingerprint = trusted_public_key.fingerprint();
         let receiver_path = PaykitReceiverPath::new(raw.paykit.receiver_path)
             .map_err(|_| ConfigError::InvalidReceiverPath)?;
+        let raw_client_id = raw
+            .paykit
+            .client_id
+            .ok_or(ConfigError::MissingPaykitClientId)?;
+        let client_id =
+            ClientId::new(&raw_client_id).map_err(|_| ConfigError::InvalidPaykitClientId)?;
+        if client_id.as_str() != PAYKIT_CLIENT_ID {
+            return Err(ConfigError::UnsupportedPaykitClientId);
+        }
         let receiver_path_priority = raw
             .paykit
             .receiver_path_priority
@@ -55,22 +69,29 @@ impl Config {
         }
         let bitcoin_network = BitcoinNetwork::parse(&raw.bitcoin.network)?;
 
-        validate_url("electrum.endpoint", &raw.electrum.endpoint)?;
+        let listen_addr = raw
+            .http
+            .listen_addr
+            .parse::<SocketAddr>()
+            .map_err(|_| ConfigError::InvalidListenAddress)?;
+        let electrum_endpoint = ElectrumEndpoint::parse(raw.electrum.endpoint)?;
         let allowed_origins = validate_allowed_origins(raw.setup.allowed_origins)?;
 
         let config = Self {
-            http: HttpConfig {
-                listen_addr: raw.http.listen_addr,
-            },
+            http: HttpConfig { listen_addr },
             locks: LocksConfig { trusted_public_key },
-            setup: SetupConfig { allowed_origins },
+            setup: SetupConfig {
+                allowed_origins,
+                log_authorization_url: raw.setup.log_authorization_url,
+            },
             paykit: PaykitConfig {
+                client_id: client_id.clone(),
                 receiver_path: receiver_path.clone(),
                 receiver_path_priority,
                 network: PaykitNetwork::parse(&raw.paykit.network)?,
             },
             electrum: ElectrumConfig {
-                endpoint: raw.electrum.endpoint,
+                endpoint: electrum_endpoint,
                 poll_interval: raw.electrum.poll_interval,
                 request_timeout: raw.electrum.request_timeout,
                 connect_retries: raw.electrum.connect_retries,
@@ -83,6 +104,7 @@ impl Config {
             master_key,
             deployment_invariants: DeploymentInvariants {
                 bitcoin_network,
+                paykit_client_id: client_id,
                 receiver_path,
                 trusted_locks_key_fingerprint,
             },
@@ -95,8 +117,8 @@ impl Config {
         &self.master_key
     }
 
-    pub fn database_url(&self) -> &str {
-        self.database_url.as_str()
+    pub(crate) fn database_options(&self) -> &PgConnectOptions {
+        self.database_url.options()
     }
 
     pub fn deployment_invariants(&self) -> &DeploymentInvariants {
@@ -167,19 +189,35 @@ impl Config {
         if self.outbox.retry_initial > self.outbox.retry_max {
             return Err(ConfigError::InconsistentRetries("outbox"));
         }
+        if self.rate_limits.max_pending_setup_flows > tokio::sync::Semaphore::MAX_PERMITS as u64 {
+            return Err(ConfigError::ValueTooLarge(
+                "rate_limits.max_pending_setup_flows",
+            ));
+        }
         Ok(())
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct ConfigEnvironment {
     pub database_url: Option<String>,
     pub master_key: Option<String>,
 }
 
+impl fmt::Debug for ConfigEnvironment {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ConfigEnvironment")
+            .field("database_url", &"<redacted>")
+            .field("master_key", &"<redacted>")
+            .finish()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeploymentInvariants {
     pub bitcoin_network: BitcoinNetwork,
+    pub paykit_client_id: ClientId,
     pub receiver_path: PaykitReceiverPath,
     pub trusted_locks_key_fingerprint: TrustedLocksKeyFingerprint,
 }
@@ -287,7 +325,13 @@ impl fmt::Debug for MasterKey {
 
 #[derive(Debug)]
 pub struct HttpConfig {
-    pub listen_addr: String,
+    listen_addr: SocketAddr,
+}
+
+impl HttpConfig {
+    pub fn listen_addr(&self) -> SocketAddr {
+        self.listen_addr
+    }
 }
 
 #[derive(Debug)]
@@ -298,10 +342,12 @@ pub struct LocksConfig {
 #[derive(Debug)]
 pub struct SetupConfig {
     pub allowed_origins: Vec<String>,
+    pub log_authorization_url: bool,
 }
 
 #[derive(Clone, Debug)]
 pub struct PaykitConfig {
+    pub client_id: ClientId,
     pub receiver_path: PaykitReceiverPath,
     /// Ordered first-segment preference for discovered reader receiver paths.
     pub receiver_path_priority: Vec<ReceiverPathPriority>,
@@ -346,10 +392,16 @@ impl ReceiverPathPriority {
 
 #[derive(Debug)]
 pub struct ElectrumConfig {
-    pub endpoint: String,
+    endpoint: ElectrumEndpoint,
     pub poll_interval: Duration,
     pub request_timeout: Duration,
     pub connect_retries: u8,
+}
+
+impl ElectrumConfig {
+    pub fn endpoint(&self) -> &str {
+        self.endpoint.as_str()
+    }
 }
 
 #[derive(Debug)]
@@ -373,9 +425,16 @@ pub struct RateLimitsConfig {
     pub signed_requests_per_second: u64,
     pub signed_burst: u64,
     pub setup_per_ip_per_minute: u64,
-    pub max_pending_setup_flows: u64,
+    max_pending_setup_flows: u64,
     pub max_completion_polls_per_flow: u64,
     pub max_completion_polls: u64,
+}
+
+impl RateLimitsConfig {
+    pub fn max_pending_setup_flows(&self) -> usize {
+        usize::try_from(self.max_pending_setup_flows)
+            .expect("validated pending setup limit fits usize")
+    }
 }
 
 #[derive(Debug)]
@@ -383,7 +442,7 @@ pub struct ShutdownConfig {
     pub drain_timeout: Duration,
 }
 
-struct DatabaseUrl(String);
+struct DatabaseUrl(PgConnectOptions);
 
 impl DatabaseUrl {
     fn parse(value: Option<String>) -> Result<Self, ConfigError> {
@@ -392,12 +451,47 @@ impl DatabaseUrl {
         if !matches!(parsed.scheme(), "postgres" | "postgresql") {
             return Err(ConfigError::InvalidDatabaseUrlScheme);
         }
-        Ok(Self(value))
+        if parsed
+            .query_pairs()
+            .any(|(key, _)| !supported_postgres_query_key(&key))
+        {
+            return Err(ConfigError::InvalidDatabaseUrl);
+        }
+        let options =
+            PgConnectOptions::from_str(&value).map_err(|_| ConfigError::InvalidDatabaseUrl)?;
+        Ok(Self(options))
     }
 
-    fn as_str(&self) -> &str {
+    fn options(&self) -> &PgConnectOptions {
         &self.0
     }
+}
+
+fn supported_postgres_query_key(key: &str) -> bool {
+    matches!(
+        key,
+        "sslmode"
+            | "ssl-mode"
+            | "sslrootcert"
+            | "ssl-root-cert"
+            | "ssl-ca"
+            | "sslcert"
+            | "ssl-cert"
+            | "sslkey"
+            | "ssl-key"
+            | "statement-cache-capacity"
+            | "host"
+            | "hostaddr"
+            | "port"
+            | "dbname"
+            | "user"
+            | "password"
+            | "application_name"
+            | "options"
+    ) || key
+        .strip_prefix("options[")
+        .and_then(|key| key.strip_suffix(']'))
+        .is_some_and(|key| !key.is_empty())
 }
 
 impl fmt::Debug for DatabaseUrl {
@@ -406,16 +500,37 @@ impl fmt::Debug for DatabaseUrl {
     }
 }
 
+struct ElectrumEndpoint(String);
+
+impl ElectrumEndpoint {
+    fn parse(value: String) -> Result<Self, ConfigError> {
+        validate_electrum_endpoint(&value)?;
+        Ok(Self(value))
+    }
+
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for ElectrumEndpoint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("<redacted>")
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ConfigError {
-    #[error("configuration TOML is invalid: {0}")]
-    Toml(toml::de::Error),
+    #[error("configuration TOML is invalid")]
+    Toml,
     #[error("PAYKIT_DATABASE_URL is required")]
     MissingDatabaseUrl,
     #[error("PAYKIT_MASTER_KEY is required")]
     MissingMasterKey,
     #[error("PAYKIT_DATABASE_URL must use postgres:// or postgresql://")]
     InvalidDatabaseUrlScheme,
+    #[error("PAYKIT_DATABASE_URL is invalid")]
+    InvalidDatabaseUrl,
     #[error("PAYKIT_MASTER_KEY must be unpadded base64url encoding of exactly 32 bytes")]
     InvalidMasterKey,
     #[error("locks.trusted_public_key must be a canonical pubky-prefixed public key")]
@@ -424,12 +539,24 @@ pub enum ConfigError {
     InvalidNetwork,
     #[error("{0} must be a valid absolute URL")]
     InvalidUrl(&'static str),
+    #[error("http.listen_addr must be a valid socket address")]
+    InvalidListenAddress,
+    #[error(
+        "electrum.endpoint must be an exact tcp://host:nonzero-port or ssl://DNS-or-IPv4:nonzero-port URL"
+    )]
+    InvalidElectrumEndpoint,
     #[error(
         "setup.allowed_origins must contain exact HTTP(S) origins or the sole wildcard value *"
     )]
     InvalidOrigin,
     #[error("paykit.receiver_path must be a valid Paykit receiver path")]
     InvalidReceiverPath,
+    #[error("paykit.client_id must be a valid non-empty Pubky client ID")]
+    InvalidPaykitClientId,
+    #[error("paykit.client_id is required")]
+    MissingPaykitClientId,
+    #[error("paykit.client_id must be app.paykit.server")]
+    UnsupportedPaykitClientId,
     #[error("paykit.network must be mainnet or testnet")]
     InvalidPaykitNetwork,
     #[error("paykit.receiver_path_priority entries must be canonical Paykit receiver app segments")]
@@ -442,6 +569,8 @@ pub enum ConfigError {
     ZeroDuration(&'static str),
     #[error("{0} must be greater than zero")]
     ZeroValue(&'static str),
+    #[error("{0} exceeds the supported maximum")]
+    ValueTooLarge(&'static str),
     #[error("{0} must be at least one second")]
     SubsecondPersistenceDuration(&'static str),
     #[error("{0}.retry_initial must not exceed {0}.retry_max")]
@@ -461,6 +590,30 @@ fn validate_url(field: &'static str, value: &str) -> Result<Url, ConfigError> {
         return Err(ConfigError::InvalidUrl(field));
     }
     Ok(parsed)
+}
+
+pub(crate) fn validate_electrum_endpoint(value: &str) -> Result<(), ConfigError> {
+    let parsed = Url::parse(value).map_err(|_| ConfigError::InvalidElectrumEndpoint)?;
+    if !matches!(parsed.scheme(), "tcp" | "ssl")
+        || parsed.host_str().is_none()
+        || parsed.port().is_none()
+        || parsed.port() == Some(0)
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || !parsed.path().is_empty()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || parsed.as_str() != value
+        || (parsed.scheme() == "ssl" && matches!(parsed.host(), Some(url::Host::Ipv6(_))))
+    {
+        return Err(ConfigError::InvalidElectrumEndpoint);
+    }
+    if parsed.scheme() == "ssl"
+        && ServerName::try_from(parsed.host_str().expect("validated host").to_owned()).is_err()
+    {
+        return Err(ConfigError::InvalidElectrumEndpoint);
+    }
+    Ok(())
 }
 
 fn validate_origin(value: &str) -> Result<Url, ConfigError> {
@@ -526,11 +679,14 @@ struct RawLocksConfig {
 #[serde(deny_unknown_fields)]
 struct RawSetupConfig {
     allowed_origins: Vec<String>,
+    #[serde(default)]
+    log_authorization_url: bool,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawPaykitConfig {
+    client_id: Option<String>,
     receiver_path: String,
     #[serde(default = "default_receiver_path_priority")]
     receiver_path_priority: Vec<String>,

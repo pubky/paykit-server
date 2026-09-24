@@ -5,14 +5,23 @@ use paykit_lib::{
     PaymentEndpointIdentifier, PaymentEndpointPayload, PaymentReference, PaymentRequestTerms,
     PublicKey,
 };
-use paykit_sdk::{ReceiverNoiseSecretKey, storage::StorageState};
+use paykit_sdk::{
+    LinkedPeerState, PubkyPublicKey, ReceiverNoiseSecretKey,
+    storage::{LinkedPeerRecord, StorageState},
+};
 use paykit_server::{
-    application::semantic_intent::{DeliveryIntentV1, DeliveryOperationV1},
+    application::{
+        connection_status::{
+            ConnectionStatusError, ConnectionStatusService, PaykitConnectionState,
+        },
+        semantic_intent::{DeliveryIntentV1, DeliveryOperationV1},
+    },
     crypto::{Crypto, EncryptedEnvelope, EnvelopeContext},
-    domain::locks::{CreatorPubky, ReaderPubky, parse_creator, parse_reader},
+    domain::locks::{CreatorPubky, ReaderPubky, parse_bundle_id, parse_creator, parse_reader},
     persistence::{
         AtomicInvoiceInput, CreatorCredentials, CreatorStore, InvoicePreflight, InvoiceStore,
-        NewReaderPayloadFactory, NewReaderPayloads, PersistenceError, run_migrations,
+        NewReaderPayloadFactory, NewReaderPayloads, PersistenceError, SdkStateStore,
+        run_migrations,
     },
 };
 use paykit_server_e2e::postgres::TestDatabase;
@@ -20,6 +29,7 @@ use sqlx::Row;
 use time::format_description::well_known::Rfc3339;
 
 const CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
+const CONNECTION_BUNDLE: &str = "000G40R40M30E209185GR38E1W";
 
 struct TestPayloads;
 impl NewReaderPayloadFactory for TestPayloads {
@@ -157,6 +167,42 @@ async fn invoice_store(database: &TestDatabase) -> InvoiceStore {
     InvoiceStore::new(database.pool(), crypto)
 }
 
+fn linked_peer_record(
+    reader: &ReaderPubky,
+    path: PaykitReceiverPath,
+    state: LinkedPeerState,
+) -> LinkedPeerRecord {
+    LinkedPeerRecord {
+        counterparty: PubkyPublicKey::from_raw_or_app_key(reader.to_string()).unwrap(),
+        counterparty_receiver_path: path,
+        state,
+        last_sync_at: None,
+        last_private_receive_at: None,
+        failure_count: 0,
+        local_recovery_attempt_id: None,
+        local_recovery_marker_created_at: None,
+        local_recovery_marker_last_error: None,
+        remote_recovery_attempt_id: None,
+        remote_recovery_marker_observed_at: None,
+    }
+}
+
+async fn connection_rows(database: &TestDatabase) -> (String, String, Vec<String>) {
+    let invoice = sqlx::query_scalar("SELECT row_to_json(i)::text FROM invoices i")
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+    let sdk_state = sqlx::query_scalar("SELECT row_to_json(s)::text FROM sdk_states s")
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+    let outbox = sqlx::query_scalar("SELECT row_to_json(o)::text FROM outbox o ORDER BY id")
+        .fetch_all(database.pool())
+        .await
+        .unwrap();
+    (invoice, sdk_state, outbox)
+}
+
 fn input<'a>(
     creator: &'a CreatorPubky,
     reader: &'a ReaderPubky,
@@ -174,6 +220,103 @@ fn input<'a>(
         required_sats: 100,
         payment_in_hours: 24,
     }
+}
+
+#[tokio::test]
+async fn connection_status_uses_exact_persisted_binding_and_does_not_mutate_rows() {
+    let database = TestDatabase::create().await;
+    let invoices = invoice_store(&database).await;
+    let creator = creator();
+    let reader = reader();
+    let bundle_id = parse_bundle_id(CONNECTION_BUNDLE).unwrap();
+    let invoice = invoices
+        .create_atomic(input(
+            &creator,
+            &reader,
+            CONNECTION_BUNDLE.as_bytes(),
+            b"connection-request",
+        ))
+        .await
+        .unwrap();
+    let sdk_states = SdkStateStore::new(database.pool(), crypto());
+    let service =
+        ConnectionStatusService::new(Arc::new(invoices.clone()), Arc::new(sdk_states.clone()));
+    let reader_key = PubkyPublicKey::from_raw_or_app_key(reader.to_string()).unwrap();
+    let exact_path = PaykitReceiverPath::new("bitkit/wallet").unwrap();
+    let wrong_path = PaykitReceiverPath::new("other/wallet").unwrap();
+
+    sdk_states
+        .update(&creator, |state| {
+            state.linked_peers.insert(
+                (reader_key.clone(), wrong_path.clone()),
+                linked_peer_record(&reader, wrong_path.clone(), LinkedPeerState::Linked),
+            );
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        service.status(&creator, &bundle_id).await,
+        Ok(PaykitConnectionState::None),
+        "a different receiver path must not satisfy the persisted invoice binding"
+    );
+    assert_eq!(
+        service
+            .status(
+                &creator,
+                &parse_bundle_id("000G40R40M30E209185GR38E2W").unwrap(),
+            )
+            .await,
+        Err(ConnectionStatusError::NotFound)
+    );
+    assert_eq!(
+        service.status(&second_creator(), &bundle_id).await,
+        Err(ConnectionStatusError::NotFound)
+    );
+
+    for (linked_state, public_state) in [
+        (LinkedPeerState::NotLinked, PaykitConnectionState::None),
+        (LinkedPeerState::Linking, PaykitConnectionState::Handshake),
+        (LinkedPeerState::Linked, PaykitConnectionState::Connected),
+        (
+            LinkedPeerState::RecoveryRequired,
+            PaykitConnectionState::RecoveryRequired,
+        ),
+        (LinkedPeerState::Blocked, PaykitConnectionState::Blocked),
+    ] {
+        sdk_states
+            .update(&creator, |state| {
+                state.linked_peers.insert(
+                    (reader_key.clone(), exact_path.clone()),
+                    linked_peer_record(&reader, exact_path.clone(), linked_state),
+                );
+            })
+            .await
+            .unwrap();
+        let before = connection_rows(&database).await;
+
+        assert_eq!(service.status(&creator, &bundle_id).await, Ok(public_state));
+        assert_eq!(connection_rows(&database).await, before);
+    }
+
+    sqlx::query("UPDATE sdk_states SET state_envelope = $1")
+        .bind(vec![0_u8; 8])
+        .execute(database.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        service.status(&creator, &bundle_id).await,
+        Err(ConnectionStatusError::Unavailable)
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM outbox WHERE invoice_id = $1")
+            .bind(invoice.invoice_id())
+            .fetch_one(database.pool())
+            .await
+            .unwrap(),
+        2
+    );
+
+    database.cleanup().await;
 }
 
 #[tokio::test]

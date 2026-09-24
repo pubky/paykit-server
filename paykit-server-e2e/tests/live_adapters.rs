@@ -166,10 +166,10 @@ async fn establish_link(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires the Pubky Core static testnet on localhost"]
+#[ignore = "requires the Pubky static testnet on localhost"]
 async fn live_pubky_marker_discovery_and_payment_request_delivery() {
     let pubky = Pubky::testnet().unwrap();
-    let bootstrap = PubkySessionBootstrap::with_pubky(pubky);
+    let bootstrap = PubkySessionBootstrap::with_pubky(pubky, "app.paykit.server").unwrap();
     let homeserver = PubkyPublicKey::from_raw_or_app_key(STATIC_HOMESERVER).unwrap();
     let payee_path = PaykitReceiverPath::new("paykit/server").unwrap();
     let payer_path = PaykitReceiverPath::new("bitkit/server").unwrap();

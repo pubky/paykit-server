@@ -2,6 +2,14 @@
 
 `POST /invoices` atomically persists the invoice, its reader allocation, the endpoint-publication intent, the dependent Payment Request intent, and both encrypted semantic envelopes. Exact replay preserves those durable identities and payloads.
 
+After persistence or exact replay, `POST /invoices` returns `204 No Content`; it
+does not observe Noise state. `POST /connections/status` separately loads the
+persisted Reader/path binding and returns `none`, `handshake`, `connected`,
+`recovery_required`, or `blocked`. This lookup does not advance handshake,
+rewrite SDK state, acquire the worker mutation lock, mutate outbox state, or wait
+for delivery. Missing invoices and storage, authentication, malformed-state, or
+dependency failures remain typed errors rather than synthetic connection states.
+
 At request time the server discovers capable reader markers and deterministically selects by `paykit.receiver_path_priority` (default `bitkit`), then first path segment and canonical lexical full path. It persists the selected reader path and fingerprint inside the encrypted, Creator- and row-bound delivery intent. Exact replay may bypass discovery because it returns the already authenticated intent.
 
 Workers claim fenced rows, decrypt and revalidate the complete intent, refetch the exact selected marker, and retry if its fingerprint changed. They never reselect another path. Production handoff uses only public Paykit SDK APIs with one encrypted PostgreSQL SDK state per Creator.

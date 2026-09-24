@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use paykit_sdk::{
-    PaykitSdkError,
+    LinkedPeerState, PaykitSdkError, PubkyPublicKey,
     storage::{
         StorageAdapter, StorageState, StorageTransactionCallback, run_storage_state_transaction,
     },
@@ -15,6 +15,7 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::{
+    application::connection_status::{ConnectionBinding, PaykitConnectionState},
     crypto::{Crypto, EncryptedEnvelope, EnvelopeContext, LookupHash},
     domain::locks::CreatorPubky,
     persistence::{PersistenceError, creators::CreatorRow},
@@ -136,6 +137,22 @@ impl SdkStateStore {
         load_state_by_row(&self.pool, &self.crypto, &row).await
     }
 
+    /// Reads the exact persisted peer state without taking a mutation lock or
+    /// rewriting the encrypted SDK snapshot.
+    pub async fn connection_state(
+        &self,
+        creator: &CreatorPubky,
+        binding: &ConnectionBinding,
+    ) -> Result<PaykitConnectionState, PersistenceError> {
+        let state = self.load(creator).await?;
+        let reader = PubkyPublicKey::from_raw_or_app_key(binding.reader().to_string())
+            .map_err(|_| PersistenceError::CorruptOrMissing)?;
+        let peer = state
+            .linked_peers
+            .get(&(reader, binding.reader_path().clone()));
+        map_linked_peer_state(peer.map(|record| &record.state))
+    }
+
     /// Atomically decrypts, synchronously mutates, and replaces one full SDK state snapshot.
     pub async fn update<F>(&self, creator: &CreatorPubky, mutate: F) -> Result<(), PersistenceError>
     where
@@ -169,6 +186,20 @@ impl SdkStateStore {
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
         tx.commit().await.map_err(|_| PersistenceError::Unavailable)
+    }
+}
+
+fn map_linked_peer_state(
+    state: Option<&LinkedPeerState>,
+) -> Result<PaykitConnectionState, PersistenceError> {
+    match state {
+        None | Some(LinkedPeerState::NotLinked) => Ok(PaykitConnectionState::None),
+        Some(LinkedPeerState::Linking) => Ok(PaykitConnectionState::Handshake),
+        Some(LinkedPeerState::Linked) => Ok(PaykitConnectionState::Connected),
+        Some(LinkedPeerState::RecoveryRequired) => Ok(PaykitConnectionState::RecoveryRequired),
+        Some(LinkedPeerState::Blocked) => Ok(PaykitConnectionState::Blocked),
+        // LinkedPeerState is non-exhaustive. Unknown future states fail closed.
+        Some(_) => Err(PersistenceError::CorruptOrMissing),
     }
 }
 
@@ -250,6 +281,37 @@ async fn creator_row(
 mod tests {
     use super::*;
     use sqlx::postgres::PgPoolOptions;
+
+    #[test]
+    fn linked_peer_states_map_to_full_public_vocabulary() {
+        use crate::application::connection_status::PaykitConnectionState;
+
+        for (input, expected) in [
+            (None, PaykitConnectionState::None),
+            (
+                Some(&LinkedPeerState::NotLinked),
+                PaykitConnectionState::None,
+            ),
+            (
+                Some(&LinkedPeerState::Linking),
+                PaykitConnectionState::Handshake,
+            ),
+            (
+                Some(&LinkedPeerState::Linked),
+                PaykitConnectionState::Connected,
+            ),
+            (
+                Some(&LinkedPeerState::RecoveryRequired),
+                PaykitConnectionState::RecoveryRequired,
+            ),
+            (
+                Some(&LinkedPeerState::Blocked),
+                PaykitConnectionState::Blocked,
+            ),
+        ] {
+            assert_eq!(map_linked_peer_state(input), Ok(expected));
+        }
+    }
 
     #[tokio::test]
     async fn postgres_storage_adapter_debug_redacts_creator_identity() {

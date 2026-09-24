@@ -23,7 +23,7 @@ TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres \
   cargo test --locked -p paykit-server-e2e -- --test-threads=1
 ```
 
-The two live-adapter tests remain ignored by default because they require either a local Pubky Core static testnet or a recorded public Electrum fixture. See [`docs/live-adapter-smoke.md`](docs/live-adapter-smoke.md) before running them explicitly.
+The two live-adapter tests remain ignored by default because they require either a local Pubky static testnet or a recorded public Electrum fixture. See [`docs/live-adapter-smoke.md`](docs/live-adapter-smoke.md) before running them explicitly.
 
 Before submitting changes, read [`CONTRIBUTING.md`](CONTRIBUTING.md). Report security problems through the private process in [`SECURITY.md`](SECURITY.md), not a public issue.
 
@@ -42,21 +42,47 @@ Business routes:
 - `GET /setup`
 - `POST /setup/{flow_id}/complete`
 - signed `POST /invoices`
+- signed `POST /connections/status`
 - signed `POST /transactions/status`
+- signed `POST /setup/status`
 
-Invoice/status signatures use the configured trusted Locks Ed25519 key. Setup uses the Bitkit Pubky Auth companion-claim flow and an exact configured browser origin.
+Business-route signatures use the configured trusted Locks Ed25519 key. Setup uses the Bitkit Pubky Auth companion-claim flow and an exact configured browser origin.
+
+Successful invoice creation returns `204 No Content`; it does not expose Noise
+state. `POST /connections/status` is the separate read-only lookup. Its closed
+body is `{"bundle_id":"...","creator":"pubky..."}`. Paykit Server derives
+exact Reader and receiver path from persisted invoice state, then returns
+`{"state":"none|handshake|connected|recovery_required|blocked"}`. Unknown
+invoices return `404`; authentication, storage, malformed-state, and dependency
+failures remain typed errors. `connected` is Paykit Server's local Noise view,
+not payment or verification completion.
+
+`POST /setup/status` is the Locks-only readiness check for an authenticated Creator. Its closed canonical body is `{"creator":"pubky..."}`; the signature covers the exact compact canonical JSON bytes. It returns exactly one coarse state: `ready` when the persisted Creator session imports and matches that Creator, `setup_required` when authority is absent, invalid, expired, or rejected with the Pubky 0.11 status used for revoked grants, and `unavailable` for validation timeouts and transient storage, rate-limit, server, DNS, or transport failures. Callers must not convert `unavailable` into a new authorization flow.
 
 ### Setup iframe
 
-`GET /setup` renders the Paykit auth URL and this local approval command instead of automatically navigating the iframe:
+`GET /setup` is the production Bitkit setup surface. On desktop it renders the
+normal secret-bearing Pubky Auth request as a QR code; on touch devices it
+offers the same request through a `Continue with Bitkit` deep link. Production
+has no companion handle, helper endpoint or state, helper UI, or helper in the
+production package/runtime surface.
 
-```bash
-docker compose exec creator-demo npm --prefix examples/js-sdk run authenticate-paykit -- --role content-creator
-```
+The iframe continues polling `POST /setup/{flow_id}/complete`. It never sends
+the auth URL, Creator secret, xpub, or companion payload through `postMessage`.
+There is no manual claim route. Completion posts only
+`{ type: "paykit-setup-callback", state }` or the same callback with a coarse
+error to the exact caller origin.
 
-The iframe continues polling `POST /setup/{flow_id}/complete`. It does not receive, store, post, or log an xpub, and there is no manual claim route. Completion posts only `{ type: "paykit-setup-callback", state }` or the same callback with a coarse error to the exact caller origin.
-
-`paykit-companion-auth` accepts one closed version-1 JSON object on stdin with `auth_url`, a base64url 32-byte `creator_secret`, `account_xpub`, and `account_index`. It rejects missing or unknown fields and unsupported versions. Success stdout is exactly `{"version":1,"status":"approved"}\n`; failures remain coarse and do not echo input.
+The local Locks demo substitutes a Paykit-owned Cargo example for Bitkit. That
+example is built and installed only by `Dockerfile.local`; it is not a normal
+package binary or production server surface. It accepts exactly one closed
+version-1 JSON object on stdin containing `auth_url`, `creator_secret`,
+`account_xpub`, and `account_index`, invokes the canonical `paykit-sdk`
+companion-approval operation, and returns only a coarse result. It accepts no
+URL, secret, or xpub through argv or `postMessage` and never writes those values
+to output. It does not accept a Paykit Server URL or perform a helper-to-server
+exchange. See [`docs/local-locks-demo.md`](docs/local-locks-demo.md) for the
+local-only logging and trust boundary.
 
 The composed PostgreSQL workflow is tested with two independent Creators across restart. Live adapter evidence covers a separate local Pubky relay/homeserver process and one public mainnet Fulcrum endpoint; see [`docs/live-adapter-smoke.md`](docs/live-adapter-smoke.md). Those checks bound interoperability to the recorded versions and environments rather than claiming compatibility with every provider.
 
@@ -83,6 +109,7 @@ Startup holds a session advisory lock while applying the single schema baseline.
 Immutable deployment values are:
 
 - Bitcoin network;
+- Paykit Pubky client ID;
 - Paykit receiver path;
 - trusted Locks public-key fingerprint.
 
@@ -108,20 +135,58 @@ Required environment variables:
 
 Do not put database credentials or the master key in TOML, logs, shell history, or source control. Effective-config debug output redacts secret values.
 
+Production logging allowlists only the `paykit_server` target at INFO and above. Dependency targets are disabled because upstream diagnostics may contain identities, URLs, or response text.
+
+`setup.log_authorization_url` defaults to `false` and must remain false for
+production. The paired Locks correction will make its generated local-demo
+config the sole `true` setting; once that sibling change lands, each new setup
+flow emits one explicitly labeled authorization URL log line for operator
+retrieval. The URL is a bearer secret; the local operator owns access to and
+retention of those logs.
+
 The parser rejects the retired `[inbox]` section. The executable exposes no payer
 inbox API or worker, and the baseline schema contains no payer inbox tables.
 
-`paykit.network = "testnet"` selects the pinned Pubky client’s fixed **local** testnet configuration. It requires the Pubky Core static testnet on localhost; it is not a hosted public testnet. `paykit.network = "mainnet"` uses normal Pkarr/homeserver resolution. Bitcoin network and Electrum endpoint are configured separately and must agree.
+`paykit.network = "testnet"` selects the pinned Pubky client’s fixed **local** testnet configuration. It requires the Pubky static testnet on localhost; it is not a hosted public testnet. `paykit.network = "mainnet"` uses normal Pkarr/homeserver resolution. Bitcoin network and Electrum endpoint are configured separately and must agree.
 
 The executable consumes only keys shown in the example. Arbitrary Paykit relay/homeserver URLs are not accepted.
+
+`paykit.client_id` is required and must be exactly `"app.paykit.server"`. It is an
+immutable deployment invariant, not an optional label. Missing configuration now
+fails with the direct error `paykit.client_id is required`.
 
 ## Running
 
 With configuration and secrets supplied by an operator-controlled secret manager:
 
 ```bash
+cargo run -p paykit-server -- --check-config
 cargo run -p paykit-server
 ```
+
+`--check-config` validates the complete TOML, required environment values,
+SQLx-supported database URL options, HTTP bind-address syntax, and exact
+Electrum endpoint shape including TLS server-name validity,
+prints only `configuration valid`, then exits before PostgreSQL connection,
+migration, network construction, or HTTP bind. Run it against the exact staged
+config and environment before restarting a deployment.
+
+For systemd deployments, gate startup and bound invalid-config restart storms:
+
+```ini
+[Unit]
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+ExecStartPre=/usr/local/bin/paykit-server --check-config
+ExecStart=/usr/local/bin/paykit-server
+Restart=on-failure
+RestartSec=5s
+```
+
+Both commands must receive the same `PAYKIT_CONFIG`, `PAYKIT_DATABASE_URL`, and
+`PAYKIT_MASTER_KEY` environment. Adjust executable path to deployment layout.
 
 Startup fails before bind if configuration, secrets, PostgreSQL, migrations, authenticated persisted state, or immutable deployment values are invalid. Electrum need not be reachable at construction time; its worker reports degraded health and retries.
 
@@ -130,7 +195,8 @@ Startup fails before bind if configuration, secrets, PostgreSQL, migrations, aut
 `Dockerfile.local` packages this repository for the Locks Compose stack. It
 accepts pinned public Git sources or deliberate local-worktree overrides through
 named BuildKit contexts, then produces an unprivileged local image containing
-the server and helper binaries.
+the server, the existing reader-demo binary, and the local companion Cargo
+example installed as `paykit-companion-auth`.
 
 Build command, image contract, source-rewrite behavior, and generated config contract live in [`docs/local-locks-demo.md`](docs/local-locks-demo.md).
 
@@ -141,7 +207,23 @@ Build command, image contract, source-rewrite behavior, and generated config con
 - PostgreSQL loss is `not_ready`. Electrum or Paykit delivery trouble is `degraded`.
 - `GET /metrics` exports identifier-free Prometheus/OpenMetrics data.
 
-Health, metrics, and logs do not expose Creator/reader identities, addresses, URLs, payloads, signatures, credentials, or protocol correlations. Policy rate limiting returns `429`; exhausted runtime admission returns `503` with `Retry-After: 1`.
+Health and metrics do not expose Creator/reader identities, addresses, URLs,
+payloads, signatures, credentials, or protocol correlations. Normal production
+logs have the same boundary. The sole exception is the explicitly enabled local
+demo authorization-URL event described above. Policy rate limiting returns
+`429`; exhausted runtime admission returns `503` with `Retry-After: 1`.
+
+Setup completion emits secret-free structured events with
+`event="paykit_setup_completion"` and closed `stage`, `outcome`, and `class`
+fields. Stages cover AUTH completion, identity/session handling, companion relay
+receive, claim verification, xpub validation, setup locking, marker
+publish/readback, persistence/compensation, lock release, and relay ACK. These
+events intentionally omit flow IDs, Creator identities, authorization and relay
+URLs, sessions, xpubs, payloads, and raw error text; correlate them by timestamp
+and request access logs. Closed failure classes preserve typed SDK, marker-data,
+and persistence distinctions without formatting their source errors. Pubky's
+URL-bearing AUTH relay targets are disabled at every log level; application-owned
+setup stages provide the safe replacement diagnostics.
 
 On SIGTERM or SIGINT, readiness changes first, normal admission and new worker claims stop, and admitted work drains for at most `shutdown.drain_timeout`. Remaining work is cancelled at the deadline. Durable leases can be reclaimed after restart; pending memory-only setup flows are lost.
 

@@ -79,6 +79,9 @@ fn iframe_response(flow: StartedFlow) -> Response<Body> {
         header::CONTENT_TYPE,
         HeaderValue::from_static("text/html; charset=utf-8"),
     );
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response.headers_mut().insert(
         header::CONTENT_SECURITY_POLICY,
         HeaderValue::from_str(&format!("frame-ancestors {}", flow.origin))
@@ -91,9 +94,13 @@ fn iframe_response(flow: StartedFlow) -> Response<Body> {
 /// the creator acts on.
 const SETUP_CSS: &str = r#"html,body{margin:0;height:100%}
 body{display:flex;align-items:center;justify-content:center;background:transparent;font:700 14px/20px system-ui,-apple-system,sans-serif;color:#d4d4db}
+/* Without this the flex item shrinks to its content, so the touch button's width:100% only
+   reaches the QR panel's width instead of the frame's. */
+main{width:100%;display:flex;align-items:center;justify-content:center}
 .qr{display:flex;align-items:center;justify-content:center;box-sizing:border-box;width:192px;height:192px;padding:12px;border-radius:8px;background:#fff}
 .qr svg{display:block;width:100%;height:100%}
 .bitkit-btn{display:none}
+
 /* Touch devices cannot scan their own screen, so they get the same URL as a deep link. Keyed on the
    pointer type, not viewport width: this page renders inside a small parent iframe, which would
    always read as narrow. */
@@ -181,6 +188,9 @@ fn safe_response(status: StatusCode, payload: serde_json::Value) -> Response<Bod
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/json"),
     );
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
 }
 
