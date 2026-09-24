@@ -203,16 +203,71 @@ fn map_linked_peer_state(
     }
 }
 
+/// Plaintext layout of `StorageState` before Allowance accounting: what
+/// paykit-sdk v0.1.0-rc48 through rc55 write.
+const SDK_STATE_V1: u8 = 1;
+/// Plaintext layout of the current `StorageState`. The Allowances SDK added
+/// `allowance_accounting` as its first field and left every other field and
+/// record type unchanged, so a version 1 body is a version 2 body without the
+/// leading `None` tag.
+const SDK_STATE_V2: u8 = 2;
+/// Postcard encoding of `Option::None`.
+const POSTCARD_NONE: u8 = 0;
+
 #[derive(Serialize)]
-struct SdkStateV1Ref<'a> {
+struct SdkStateRef<'a> {
     version: u8,
     state: &'a StorageState,
 }
 
 #[derive(Deserialize)]
-struct SdkStateV1 {
+struct SdkState {
     version: u8,
     state: StorageState,
+}
+
+/// Encodes one SDK state plaintext.
+///
+/// A state without Allowance accounting is written as version 1, which the
+/// rc48 server can still read, so a deployment can move between the two
+/// server builds on the same database. A Paykit Server is never the payer, so
+/// its accounting stays empty. A state with accounting is written as version 2.
+pub(crate) fn encode_state(state: &StorageState) -> Result<Zeroizing<Vec<u8>>, PersistenceError> {
+    let mut bytes = Zeroizing::new(
+        postcard::to_allocvec(&SdkStateRef {
+            version: SDK_STATE_V2,
+            state,
+        })
+        .map_err(|_| PersistenceError::CorruptOrMissing)?,
+    );
+    if state.allowance_accounting.is_none() {
+        if bytes.get(1) != Some(&POSTCARD_NONE) {
+            return Err(PersistenceError::CorruptOrMissing);
+        }
+        bytes.remove(1);
+        bytes[0] = SDK_STATE_V1;
+    }
+    Ok(bytes)
+}
+
+/// Decodes a version 1 (rc48 to rc55) or version 2 SDK state plaintext.
+pub(crate) fn decode_state(bytes: &[u8]) -> Result<StorageState, PersistenceError> {
+    let current = match bytes.split_first() {
+        Some((&SDK_STATE_V1, body)) => {
+            let mut current = Zeroizing::new(Vec::with_capacity(bytes.len() + 1));
+            current.extend_from_slice(&[SDK_STATE_V2, POSTCARD_NONE]);
+            current.extend_from_slice(body);
+            current
+        }
+        Some((&SDK_STATE_V2, _)) => Zeroizing::new(bytes.to_vec()),
+        _ => return Err(PersistenceError::CorruptOrMissing),
+    };
+    let wire: SdkState =
+        postcard::from_bytes(&current).map_err(|_| PersistenceError::CorruptOrMissing)?;
+    if wire.version != SDK_STATE_V2 {
+        return Err(PersistenceError::CorruptOrMissing);
+    }
+    Ok(wire.state)
 }
 
 pub(crate) fn encrypt_state(
@@ -221,10 +276,7 @@ pub(crate) fn encrypt_state(
     id: Uuid,
     state: &StorageState,
 ) -> Result<EncryptedEnvelope, PersistenceError> {
-    let bytes = Zeroizing::new(
-        postcard::to_allocvec(&SdkStateV1Ref { version: 1, state })
-            .map_err(|_| PersistenceError::CorruptOrMissing)?,
-    );
+    let bytes = encode_state(state)?;
     crypto
         .encrypt(&EnvelopeContext::sdk_state(hash, id), &bytes)
         .map_err(|_| PersistenceError::CorruptOrMissing)
@@ -259,12 +311,7 @@ pub(crate) fn decrypt_state(
             )
             .map_err(|_| PersistenceError::CorruptOrMissing)?,
     );
-    let wire: SdkStateV1 =
-        postcard::from_bytes(&bytes).map_err(|_| PersistenceError::CorruptOrMissing)?;
-    if wire.version != 1 {
-        return Err(PersistenceError::CorruptOrMissing);
-    }
-    Ok(wire.state)
+    decode_state(&bytes)
 }
 
 async fn creator_row(
@@ -310,6 +357,83 @@ mod tests {
             ),
         ] {
             assert_eq!(map_linked_peer_state(input), Ok(expected));
+        }
+    }
+
+    /// State written by paykit-sdk v0.1.0-rc55 in the version 1 envelope: a
+    /// linked server receiver after one Locks handoff, and the reader that
+    /// received and accepted the request. The rc48 server decodes both and
+    /// re-encodes them to the same bytes.
+    const RC55_SERVER_STATE: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/sdk-state/rc55-server-state.postcard"
+    ));
+    const RC55_READER_STATE: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/sdk-state/rc55-reader-state.postcard"
+    ));
+
+    #[test]
+    fn rc55_state_is_not_the_current_layout() {
+        for fixture in [RC55_SERVER_STATE, RC55_READER_STATE] {
+            let mut relabelled = fixture.to_vec();
+            relabelled[0] = SDK_STATE_V2;
+            assert!(postcard::from_bytes::<SdkState>(&relabelled).is_err());
+        }
+    }
+
+    #[test]
+    fn rc55_state_decodes_and_reencodes_to_the_same_bytes() {
+        let server = decode_state(RC55_SERVER_STATE).unwrap();
+        assert!(server.allowance_accounting.is_none());
+        assert!(server.identity_state.is_some());
+        assert_eq!(server.linked_peers.len(), 1);
+        assert!(
+            server
+                .linked_peers
+                .values()
+                .all(|peer| peer.state == LinkedPeerState::Linked)
+        );
+        assert_eq!(server.encrypted_link_states.len(), 1);
+        assert_eq!(server.outbound_private_messages.len(), 2);
+
+        let reader = decode_state(RC55_READER_STATE).unwrap();
+        assert_eq!(reader.private_stream_items.len(), 2);
+        assert_eq!(reader.event_dedup_records.len(), 1);
+        assert_eq!(reader.outbound_private_messages.len(), 1);
+
+        assert_eq!(*encode_state(&server).unwrap(), RC55_SERVER_STATE);
+        assert_eq!(*encode_state(&reader).unwrap(), RC55_READER_STATE);
+    }
+
+    #[test]
+    fn state_with_allowance_accounting_round_trips_as_version_two() {
+        let mut state = decode_state(RC55_READER_STATE).unwrap();
+        state.allowance_accounting = Some(paykit_sdk::AllowanceAccountingState {
+            revision: 3,
+            epoch: "epoch-1".into(),
+            requires_reconciliation: true,
+            history: Default::default(),
+        });
+        let bytes = encode_state(&state).unwrap();
+        assert_eq!(bytes[0], SDK_STATE_V2);
+        assert!(decode_state(&bytes).unwrap() == state);
+    }
+
+    #[test]
+    fn unknown_empty_and_truncated_state_fails_closed() {
+        let mut unknown = RC55_SERVER_STATE.to_vec();
+        unknown[0] = 3;
+        for bytes in [
+            &unknown[..],
+            &[],
+            &RC55_SERVER_STATE[..1],
+            &RC55_SERVER_STATE[..RC55_SERVER_STATE.len() - 1],
+        ] {
+            assert!(matches!(
+                decode_state(bytes),
+                Err(PersistenceError::CorruptOrMissing)
+            ));
         }
     }
 

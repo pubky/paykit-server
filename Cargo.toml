@@ -24,8 +24,8 @@ hkdf = "0.13"
 hmac = "0.13"
 humantime-serde = "1"
 locks-core = { git = "https://github.com/pubky/locks.git", tag = "v0.1.0-rc1" }
-paykit-lib = { git = "https://github.com/pubky/paykit-rs.git", tag = "v0.1.0-rc48" }
-paykit-sdk = { git = "https://github.com/pubky/paykit-rs.git", tag = "v0.1.0-rc48" }
+paykit-lib = { git = "https://github.com/pubky/paykit-rs.git", rev = "656135904bca2f18687dd012570355ffd11e7ae2" }
+paykit-sdk = { git = "https://github.com/pubky/paykit-rs.git", rev = "656135904bca2f18687dd012570355ffd11e7ae2" }
 pubky = "=0.11.0"
 pubky-testnet = "=0.11.0"
 prometheus-client = "0.25"

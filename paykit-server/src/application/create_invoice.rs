@@ -190,22 +190,22 @@ impl IntentBuilder for PaykitIntentBuilder {
             Value::String(request.lock_resource.to_string()),
         );
         metadata.insert("reader".into(), Value::String(request.reader.to_string()));
-        Ok(PaymentRequestTerms {
-            amount: PaymentAmount::new(
+        PaymentRequestTerms::builder(
+            PaymentAmount::new(
                 format!("{}.{:08}", sats / 100_000_000, sats % 100_000_000),
                 "btc",
             )
             .map_err(|_| CreateInvoiceError::InvalidRequest)?,
-            payment_reference: PaymentReference::new(uuid::Uuid::new_v4().hyphenated().to_string())
+            PaymentReference::new(uuid::Uuid::new_v4().hyphenated().to_string())
                 .map_err(|_| CreateInvoiceError::InvalidRequest)?,
-            proposal_expires_at: None,
-            recurrence: None,
-            accepted_payment_endpoint_identifiers: vec![
+            vec![
                 PaymentEndpointIdentifier::new(self.p2wpkh_identifier())
                     .map_err(|_| CreateInvoiceError::InvalidRequest)?,
             ],
-            metadata,
-        })
+        )
+        .metadata(metadata)
+        .build()
+        .map_err(|_| CreateInvoiceError::InvalidRequest)
     }
 
     fn receiving_details(

@@ -129,7 +129,7 @@ impl DeliveryIntentV1 {
         local_receiver_path: PaykitReceiverPath,
         terms: &PaymentRequestTerms,
     ) -> Result<Self, DeliveryIntentError> {
-        if terms.recurrence.is_some() {
+        if terms.recurrence().is_some() {
             return Err(DeliveryIntentError::Invalid);
         }
         let intent = Self {
@@ -140,16 +140,16 @@ impl DeliveryIntentV1 {
             local_receiver_path: local_receiver_path.as_str().into(),
             operation: DeliveryOperationV1::PaymentRequestProposal {
                 terms: PaymentTermsV1 {
-                    amount: terms.amount.value.clone(),
-                    asset: terms.amount.asset.clone(),
-                    payment_reference: terms.payment_reference.to_string(),
-                    proposal_expires_at: terms.proposal_expires_at.clone(),
+                    amount: terms.amount().value().to_owned(),
+                    asset: terms.amount().asset().to_owned(),
+                    payment_reference: terms.payment_reference().to_string(),
+                    proposal_expires_at: terms.proposal_expires_at().clone(),
                     accepted_endpoint_identifiers: terms
-                        .accepted_payment_endpoint_identifiers
+                        .accepted_payment_endpoint_identifiers()
                         .iter()
                         .map(ToString::to_string)
                         .collect(),
-                    metadata: terms.metadata.clone(),
+                    metadata: terms.metadata().clone(),
                 },
             },
         };

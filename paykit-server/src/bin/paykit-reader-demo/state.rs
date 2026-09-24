@@ -236,6 +236,7 @@ mod tests {
 
     fn backup() -> SdkBackupState {
         SdkBackupState {
+            allowance_accounting: None,
             version: SDK_BACKUP_VERSION,
             local_receiver_path: PaykitReceiverPath::new("bitkit/wallet").unwrap(),
             identity_state: None,

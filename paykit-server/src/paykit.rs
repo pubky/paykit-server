@@ -234,14 +234,15 @@ fn payment_terms(terms: &PaymentTermsV1) -> Result<PaymentRequestTerms, HandoffE
         .map(PaymentEndpointIdentifier::new)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| HandoffError::Permanent)?;
-    Ok(PaymentRequestTerms {
+    PaymentRequestTerms::builder(
         amount,
         payment_reference,
-        proposal_expires_at: terms.proposal_expires_at.clone(),
-        recurrence: None,
         accepted_payment_endpoint_identifiers,
-        metadata: terms.metadata.clone(),
-    })
+    )
+    .proposal_expires_at(terms.proposal_expires_at.clone())
+    .metadata(terms.metadata.clone())
+    .build()
+    .map_err(|_| HandoffError::Permanent)
 }
 
 #[async_trait]

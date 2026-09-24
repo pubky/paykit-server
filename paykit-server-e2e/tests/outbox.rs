@@ -712,20 +712,21 @@ async fn public_sdk_payment_request_retry_persists_distinct_ids_and_only_active_
     assert_eq!(first_claim.id(), invoice.payment_request_outbox_id());
     let intent = outbox.delivery_intent(&first_claim).unwrap();
     let terms = match intent.operation() {
-        DeliveryOperationV1::PaymentRequestProposal { terms } => PaymentRequestTerms {
-            amount: PaymentAmount::new(terms.amount.clone(), terms.asset.clone()).unwrap(),
-            payment_reference: PaymentReference::new(terms.payment_reference.clone()).unwrap(),
-            proposal_expires_at: terms.proposal_expires_at.clone(),
-            recurrence: None,
-            accepted_payment_endpoint_identifiers: terms
+        DeliveryOperationV1::PaymentRequestProposal { terms } => PaymentRequestTerms::builder(
+            PaymentAmount::new(terms.amount.clone(), terms.asset.clone()).unwrap(),
+            PaymentReference::new(terms.payment_reference.clone()).unwrap(),
+            terms
                 .accepted_endpoint_identifiers
                 .iter()
                 .cloned()
                 .map(PaymentEndpointIdentifier::new)
                 .collect::<Result<Vec<_>, _>>()
                 .unwrap(),
-            metadata: terms.metadata.clone(),
-        },
+        )
+        .proposal_expires_at(terms.proposal_expires_at.clone())
+        .metadata(terms.metadata.clone())
+        .build()
+        .unwrap(),
         DeliveryOperationV1::EndpointPublication { .. } => panic!("claimed endpoint row"),
     };
 

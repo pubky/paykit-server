@@ -173,16 +173,13 @@ fn payment_intent(reader: &ReaderPubky, marker: &PaykitReceiverMarker) -> Delive
         reader.to_string(),
         marker,
         PaykitReceiverPath::new("paykit/server").unwrap(),
-        &PaymentRequestTerms {
-            amount: PaymentAmount::new("0.00000100", "btc").unwrap(),
-            payment_reference: PaymentReference::new(Uuid::new_v4().to_string()).unwrap(),
-            proposal_expires_at: None,
-            recurrence: None,
-            accepted_payment_endpoint_identifiers: vec![
-                PaymentEndpointIdentifier::new("btc-bitcoin-p2wpkh").unwrap(),
-            ],
-            metadata: Default::default(),
-        },
+        &PaymentRequestTerms::builder(
+            PaymentAmount::new("0.00000100", "btc").unwrap(),
+            PaymentReference::new(Uuid::new_v4().to_string()).unwrap(),
+            vec![PaymentEndpointIdentifier::new("btc-bitcoin-p2wpkh").unwrap()],
+        )
+        .build()
+        .unwrap(),
     )
     .unwrap()
 }

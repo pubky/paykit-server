@@ -85,16 +85,13 @@ fn payment_intent(marker: &PaykitReceiverMarker) -> DeliveryIntentV1 {
         "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy".into(),
         marker,
         PaykitReceiverPath::new("paykit/server").unwrap(),
-        &PaymentRequestTerms {
-            amount: PaymentAmount::new("0.00050000", "btc").unwrap(),
-            payment_reference: PaymentReference::new(uuid::Uuid::new_v4().to_string()).unwrap(),
-            proposal_expires_at: None,
-            recurrence: None,
-            accepted_payment_endpoint_identifiers: vec![
-                PaymentEndpointIdentifier::new("btc-bitcoin-p2wpkh").unwrap(),
-            ],
-            metadata: Default::default(),
-        },
+        &PaymentRequestTerms::builder(
+            PaymentAmount::new("0.00050000", "btc").unwrap(),
+            PaymentReference::new(uuid::Uuid::new_v4().to_string()).unwrap(),
+            vec![PaymentEndpointIdentifier::new("btc-bitcoin-p2wpkh").unwrap()],
+        )
+        .build()
+        .unwrap(),
     )
     .unwrap()
 }
