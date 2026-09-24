@@ -264,6 +264,36 @@ Paykit Receipt issuance, Receipt Access delivery, and receipt storage are unsupp
 
 There is no payload-retention or pruning contract, retention worker, runtime idle eviction, or SDK compaction contract. Operators must treat encrypted Creator, SDK, invoice, assignment, outbox, internal relay, and Bitcoin observation records as retained according to current database/SDK behavior. Any deletion policy requires a separate product and migration decision.
 
+### Backup and recovery
+
+Back up the whole PostgreSQL database as one consistent snapshot, including
+deployment metadata, Creator credentials and address counters, SDK state,
+assignments, invoices, observations, outbox, and internal relay records. Copying
+only SDK state or public homeserver files is not a complete backup.
+
+Keep the matching `PAYKIT_MASTER_KEY` recoverable in the deployment secret store,
+separately from database dumps. The database alone cannot decrypt its records.
+Also retain the deployment configuration and exact server release/commit and
+`Cargo.lock`: SDK state decoding depends on the pinned Paykit version. Restrict
+access to backup files and never include credentials in logs or support bundles.
+
+Test recovery into a separate database with the original release, key, and
+deployment configuration. Block outbound network access and do not direct Locks
+traffic to the test instance: a running server starts delivery workers. Startup
+checks deployment invariants and authenticates Creator credentials, SDK state,
+and encrypted payment records before binding. `--check-config` alone does not
+read or verify stored data. Confirm record counts and address counters as well;
+successful startup does not prove the backup is complete.
+
+For a live recovery, stop the old instance before starting its replacement.
+Do not reset a database or generate a new master key to bypass a decode or
+integrity failure; retain the original data and investigate with its matching
+release. Restoring an older snapshot is not automatically safe to resume:
+addresses may have been allocated, invoices paid, or Noise messages sent since
+the snapshot. Those differences need reconciliation before delivery resumes to
+avoid address reuse, duplicate requests, or stale Encrypted Link state. Backup
+preservation does not implement that reconciliation or a shared-state import.
+
 ## Known limitations
 
 - One process only; no replicas or active-active deployment.
