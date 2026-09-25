@@ -257,7 +257,8 @@ impl InvoiceStore {
              FROM invoices JOIN creators ON creators.id = invoices.creator_id \
              LEFT JOIN bitcoin_observations AS observations \
                ON observations.invoice_id = invoices.id AND observations.active \
-             WHERE NOT (invoices.payment_status = 'confirmed' \
+             WHERE invoices.payment_status NOT IN ('cancelled', 'expired') \
+               AND NOT (invoices.payment_status = 'confirmed' \
                         AND invoices.confirmation_count = 6 AND invoices.amount_matched) \
              ORDER BY invoices.id",
         )
@@ -521,6 +522,83 @@ impl InvoiceStore {
         row.map(PersistedPaymentStatus::try_from).transpose()
     }
 
+    /// Lists Creators with handed-off payment requests that are not lifecycle-terminal.
+    pub async fn pending_payment_request_creator_ids(&self) -> Result<Vec<Uuid>, PersistenceError> {
+        sqlx::query_scalar(
+            "SELECT DISTINCT invoices.creator_id \
+             FROM invoices JOIN outbox ON outbox.invoice_id = invoices.id \
+             WHERE invoices.payment_status NOT IN ('cancelled', 'expired') \
+               AND outbox.sdk_payment_request_id IS NOT NULL \
+             ORDER BY invoices.creator_id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)
+    }
+
+    /// Lists correlated SDK Payment Request IDs still requiring lifecycle intake.
+    pub async fn pending_payment_request_ids(
+        &self,
+        creator_id: Uuid,
+    ) -> Result<Vec<String>, PersistenceError> {
+        sqlx::query_scalar(
+            "SELECT outbox.sdk_payment_request_id \
+             FROM invoices JOIN outbox ON outbox.invoice_id = invoices.id \
+             WHERE invoices.creator_id = $1 \
+               AND invoices.payment_status NOT IN ('cancelled', 'expired') \
+               AND outbox.sdk_payment_request_id IS NOT NULL \
+             ORDER BY outbox.id",
+        )
+        .bind(creator_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)
+    }
+
+    /// Applies canonical terminal Payment Request lifecycle facts to matching invoices.
+    pub async fn apply_terminal_payment_request_states(
+        &self,
+        creator_id: Uuid,
+        cancelled_ids: &[String],
+        expired_ids: &[String],
+    ) -> Result<u64, PersistenceError> {
+        if cancelled_ids.is_empty() && expired_ids.is_empty() {
+            return Ok(0);
+        }
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        let mut rows_affected = 0;
+        for (status, payment_request_ids) in
+            [("cancelled", cancelled_ids), ("expired", expired_ids)]
+        {
+            if payment_request_ids.is_empty() {
+                continue;
+            }
+            rows_affected += sqlx::query(
+                "UPDATE invoices SET payment_status = $3, confirmation_count = 0, \
+                        amount_matched = FALSE, updated_at = NOW() \
+                 WHERE creator_id = $1 \
+                   AND payment_status NOT IN ('cancelled', 'expired') \
+                   AND id IN (SELECT invoice_id FROM outbox \
+                              WHERE creator_id = $1 AND sdk_payment_request_id = ANY($2))",
+            )
+            .bind(creator_id)
+            .bind(payment_request_ids)
+            .bind(status)
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?
+            .rows_affected();
+        }
+        tx.commit()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        Ok(rows_affected)
+    }
+
     /// Records one direct, invoice-address-specific output observation. The
     /// database resolves the address; callers cannot nominate an invoice.
     pub async fn apply_bitcoin_observation(
@@ -635,9 +713,10 @@ impl InvoiceStore {
         let required = payment_record.required_sats;
         // Final matching outputs are no longer monitored. Keep their persisted
         // six-confirmation fact immutable even if a stale observer reports later.
-        if invoice.payment_status == "confirmed"
-            && invoice.confirmation_count == 6
-            && invoice.amount_matched
+        if matches!(invoice.payment_status.as_str(), "cancelled" | "expired")
+            || (invoice.payment_status == "confirmed"
+                && invoice.confirmation_count == 6
+                && invoice.amount_matched)
         {
             return Ok(true);
         }
@@ -1264,6 +1343,8 @@ impl TryFrom<PaymentStatusRow> for PersistedPaymentStatus {
             .map_err(|_| PersistenceError::CorruptOrMissing)?;
         match row.payment_status.as_str() {
             "undetected" => Ok(Self::Undetected),
+            "cancelled" if confirmations == 0 && !row.amount_matched => Ok(Self::Cancelled),
+            "expired" if confirmations == 0 && !row.amount_matched => Ok(Self::Expired),
             "detected" => Ok(Self::Detected {
                 confirmations,
                 amount_matched: row.amount_matched,
@@ -1366,12 +1447,34 @@ mod tests {
                 confirmation_count: -1,
                 amount_matched: true,
             },
+            PaymentStatusRow {
+                payment_status: "expired".into(),
+                confirmation_count: 1,
+                amount_matched: false,
+            },
+            PaymentStatusRow {
+                payment_status: "expired".into(),
+                confirmation_count: 0,
+                amount_matched: true,
+            },
         ] {
             assert_eq!(
                 PersistedPaymentStatus::try_from(row),
                 Err(PersistenceError::CorruptOrMissing)
             );
         }
+    }
+
+    #[test]
+    fn read_status_accepts_only_canonical_expired_facts() {
+        assert_eq!(
+            PersistedPaymentStatus::try_from(PaymentStatusRow {
+                payment_status: "expired".into(),
+                confirmation_count: 0,
+                amount_matched: false,
+            }),
+            Ok(PersistedPaymentStatus::Expired)
+        );
     }
 
     #[test]

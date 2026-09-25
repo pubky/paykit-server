@@ -220,6 +220,97 @@ fn input<'a>(
 }
 
 #[tokio::test]
+async fn terminal_payment_request_states_override_already_detected_invoices() {
+    let database = TestDatabase::create().await;
+    let invoices = invoice_store(&database).await;
+    let creator = creator();
+    let reader = reader();
+    let cancelled_invoice = invoices
+        .create_atomic(input(
+            &creator,
+            &reader,
+            b"detected-cancelled-bundle",
+            b"detected-cancelled-request",
+        ))
+        .await
+        .unwrap();
+    let expired_invoice = invoices
+        .create_atomic(input(
+            &creator,
+            &reader,
+            b"detected-expired-bundle",
+            b"detected-expired-request",
+        ))
+        .await
+        .unwrap();
+
+    for invoice_id in [cancelled_invoice.invoice_id(), expired_invoice.invoice_id()] {
+        sqlx::query(
+            "UPDATE invoices SET payment_status = 'detected', amount_matched = FALSE \
+             WHERE id = $1",
+        )
+        .bind(invoice_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    }
+    for (invoice_id, event_id, request_id) in [
+        (
+            cancelled_invoice.invoice_id(),
+            "event-cancelled",
+            "request-cancelled",
+        ),
+        (
+            expired_invoice.invoice_id(),
+            "event-expired",
+            "request-expired",
+        ),
+    ] {
+        sqlx::query(
+            "UPDATE outbox SET sdk_event_id = $2, sdk_payment_request_id = $3 \
+             WHERE invoice_id = $1 AND depends_on_id IS NOT NULL",
+        )
+        .bind(invoice_id)
+        .bind(event_id)
+        .bind(request_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    }
+
+    let creator_ids = invoices
+        .pending_payment_request_creator_ids()
+        .await
+        .unwrap();
+    assert_eq!(creator_ids.len(), 1);
+    assert_eq!(
+        invoices
+            .apply_terminal_payment_request_states(
+                creator_ids[0],
+                &["request-cancelled".to_owned()],
+                &["request-expired".to_owned()],
+            )
+            .await
+            .unwrap(),
+        2
+    );
+    let cancelled_status: String =
+        sqlx::query_scalar("SELECT payment_status FROM invoices WHERE id = $1")
+            .bind(cancelled_invoice.invoice_id())
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(cancelled_status, "cancelled");
+    let expired_status: String =
+        sqlx::query_scalar("SELECT payment_status FROM invoices WHERE id = $1")
+            .bind(expired_invoice.invoice_id())
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(expired_status, "expired");
+}
+
+#[tokio::test]
 async fn connection_status_uses_exact_persisted_binding_and_does_not_mutate_rows() {
     let database = TestDatabase::create().await;
     let invoices = invoice_store(&database).await;

@@ -13,6 +13,8 @@ use crate::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PersistedPaymentStatus {
     Undetected,
+    Cancelled,
+    Expired,
     Detected {
         confirmations: u32,
         amount_matched: bool,
@@ -56,6 +58,22 @@ impl PaymentStatusResponse {
     fn undetected() -> Self {
         Self {
             status: "undetected",
+            confirmations: 0,
+            amount_matched: false,
+        }
+    }
+
+    fn cancelled() -> Self {
+        Self {
+            status: "cancelled",
+            confirmations: 0,
+            amount_matched: false,
+        }
+    }
+
+    fn expired() -> Self {
+        Self {
+            status: "expired",
             confirmations: 0,
             amount_matched: false,
         }
@@ -112,6 +130,8 @@ impl PaymentStatusService {
             .ok_or(PaymentStatusError::NotFound)?;
         Ok(match persisted {
             PersistedPaymentStatus::Undetected => PaymentStatusResponse::undetected(),
+            PersistedPaymentStatus::Cancelled => PaymentStatusResponse::cancelled(),
+            PersistedPaymentStatus::Expired => PaymentStatusResponse::expired(),
             PersistedPaymentStatus::Detected {
                 confirmations,
                 amount_matched,

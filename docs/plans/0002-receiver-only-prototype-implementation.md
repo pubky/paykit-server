@@ -413,9 +413,9 @@ cargo test --workspace
 
 **Suggested user commit:** `feat: deliver Paykit endpoint and payment intents`
 
-### Task 13: Removed — payer event intake and state transitions
+### Task 13: Superseded — terminal Payment Request lifecycle projection only
 
-Removed by product decision. The server has no payer-facing inbox or proof/event intake; Task 14 observes the invoice-specific address directly.
+The original payer-facing inbox and proof/event processing scope remains removed. A later cross-service requirement added an internal SDK receive/reconciliation loop that projects canonical `Rejected` and `Canceled` states onto correlated invoices as `cancelled`, and `ProposalExpired` as `expired`. Task 14 remains the sole source of payment attribution.
 
 ### Task 14: Implement direct Electrum observation and finality policy
 
@@ -532,7 +532,7 @@ Mitigation Task 12 completed the retired-surface cleanup.
 | 0 | Removed by product decision | No upstream SDK deletion API gate applies. |
 | 1–11 | Implemented | Workspace, config, PostgreSQL/encryption, setup/signed-route, invoice/status seams are present and covered by unit/PostgreSQL tests. |
 | 12 | Implemented, composed, and live-smoke verified | Outbox behavior is composed through the public SDK. A separate local Pubky relay/homeserver delivered one live-smoke Payment Request. Delivery remains at least once, not a strict end-to-end idempotence guarantee. |
-| 13 | Removed by product decision | No payer inbox, proof, acceptance, cancellation, or rejection intake. |
+| 13 | Superseded and implemented | No public payer inbox or proof attribution. Internal SDK receive/reconciliation projects rejected and canceled requests as terminal invoice cancellation, while proposal-expired requests become terminal invoice expiry. |
 | 14 | Implemented, composed, and live-smoke verified | Direct invoice-specific address observation is PostgreSQL-tested and one exact mainnet output/confirmation result passed through the production BDK adapter against Fulcrum. |
 | 15 | Implemented | Operational health, metrics, capacity, and drain behavior are composed by the binary. |
 | 16 | Removed by product decision | No payload-deletion worker or config/API contract. |

@@ -335,6 +335,10 @@ fn spawn_owned_workers(workers: WorkerComponents, runtime: Arc<Runtime>) -> Join
     let workers = Arc::new(workers);
     tasks.spawn(outbox_enqueue_loop(workers.clone(), runtime.clone()));
     tasks.spawn(outbox_reconciliation_loop(workers.clone(), runtime.clone()));
+    tasks.spawn(payment_request_lifecycle_loop(
+        workers.clone(),
+        runtime.clone(),
+    ));
     tasks.spawn(observer_loop(workers, runtime));
     tasks
 }
@@ -590,6 +594,72 @@ async fn outbox_reconciliation_loop(workers: Arc<WorkerComponents>, runtime: Arc
         }
         runtime.set_paykit_reconciliation_available(delivery_available);
         runtime.set_outbox_reconciliation_available(outbox_available);
+    }
+}
+
+async fn payment_request_lifecycle_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtime>) {
+    let mut interval = tokio::time::interval(workers.outbox_poll_interval);
+    interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = runtime.cancelled() => break,
+            _ = interval.tick() => {}
+        }
+        if !runtime.may_start_worker_claim() {
+            break;
+        }
+        let creator_ids = match workers.invoices.pending_payment_request_creator_ids().await {
+            Ok(creator_ids) => creator_ids,
+            Err(_) => {
+                runtime.set_paykit_lifecycle_available(false);
+                continue;
+            }
+        };
+        let mut available = true;
+        for creator_id in creator_ids {
+            let payment_request_ids = match workers
+                .invoices
+                .pending_payment_request_ids(creator_id)
+                .await
+            {
+                Ok(payment_request_ids) => payment_request_ids,
+                Err(_) => {
+                    available = false;
+                    continue;
+                }
+            };
+            let adapter = match creator_adapter(&workers, creator_id).await {
+                Ok(adapter) => adapter,
+                Err(_) => {
+                    available = false;
+                    continue;
+                }
+            };
+            let refresh = match adapter
+                .refresh_payment_request_lifecycles(&payment_request_ids)
+                .await
+            {
+                Ok(refresh) => refresh,
+                Err(_) => {
+                    available = false;
+                    continue;
+                }
+            };
+            available &= refresh.available;
+            if workers
+                .invoices
+                .apply_terminal_payment_request_states(
+                    creator_id,
+                    &refresh.cancelled_ids,
+                    &refresh.expired_ids,
+                )
+                .await
+                .is_err()
+            {
+                available = false;
+            }
+        }
+        runtime.set_paykit_lifecycle_available(available);
     }
 }
 
@@ -905,7 +975,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn production_spawn_path_owns_all_three_workers() {
+    async fn production_spawn_path_owns_all_four_workers() {
         let config = Config::from_toml_and_environment(
             &format!(
                 r#"
@@ -940,7 +1010,7 @@ poll_interval = "1s"
             .unwrap();
         let server = Server::build(config, pool).await.unwrap();
         let mut tasks = spawn_owned_workers(server.workers, server.runtime);
-        assert_eq!(tasks.len(), 3);
+        assert_eq!(tasks.len(), 4);
         tasks.abort_all();
         while tasks.join_next().await.is_some() {}
     }

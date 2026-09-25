@@ -145,7 +145,9 @@ retrieval. The URL is a bearer secret; the local operator owns access to and
 retention of those logs.
 
 The parser rejects the retired `[inbox]` section. The executable exposes no payer
-inbox API or worker, and the baseline schema contains no payer inbox tables.
+inbox API, and the baseline schema contains no payer inbox tables. Internal lifecycle
+reconciliation receives linked-peer events through the SDK and projects only terminal
+Payment Request state onto correlated invoices.
 
 `paykit.network = "testnet"` selects the pinned Pubky client’s fixed **local** testnet configuration. It requires the Pubky static testnet on localhost; it is not a hosted public testnet. `paykit.network = "mainnet"` uses normal Pkarr/homeserver resolution. Bitcoin network and Electrum endpoint are configured separately and must agree.
 
@@ -254,9 +256,9 @@ Each invoice receives a unique BIP84 external-chain address. Observation uses th
 
 The server has no Bitcoin spending keys and cannot spend, refund, or create change.
 
-## Payer, proof, and receipt exclusions
+## Payer, proof, and receipt boundaries
 
-The server does not process payer-originated acceptance, rejection, cancellation, inbox, or payment-proof events. It exposes no payer inbox and no proof-submission API. Direct invoice-address observation is the only payment-attribution input.
+The server receives payer-originated Payment Request lifecycle events from linked peers. Canonical SDK `Rejected` and `Canceled` states terminate the correlated invoice as `cancelled`; `ProposalExpired` terminates it as `expired`. It does not expose a payer inbox or proof-submission API, and it does not use acceptance or payment-proof events for payment attribution. Direct invoice-address observation remains the only payment-attribution input.
 
 Paykit Receipt issuance, Receipt Access delivery, and receipt storage are unsupported.
 
@@ -272,7 +274,7 @@ There is no payload-retention or pruning contract, retention worker, runtime idl
 - No configured Creator-count bound or runtime eviction.
 - One xpub/account index per Creator; no xpub, account, master-key, or immutable-invariant rotation.
 - BTC only; no other assets.
-- No payer inbox/proofs or receipt workflows.
+- No public payer inbox, payment-proof attribution, or receipt workflows.
 - No spending custody, refunds, credits, or change.
 - No output aggregation and no deep-reorg repair after finality.
 - No retention/pruning contract.

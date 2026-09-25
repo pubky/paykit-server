@@ -1016,6 +1016,11 @@ git status --short
 - The literal formatting, workspace check/no-run, full PostgreSQL workspace test,
   Clippy, rustdoc, and diff-hygiene chain passes.
 
+This implementation record describes that checkpoint. A later cross-service lifecycle
+requirement added internal SDK reconciliation with canonical persisted `cancelled`
+for rejected or canceled Payment Requests and `expired` for proposal-expired requests; it did not restore
+the removed payer inbox tables, public inbox API, or proof-based payment attribution.
+
 **Verification:**
 ```bash
 cargo test --workspace --no-run
