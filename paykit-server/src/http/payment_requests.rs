@@ -13,7 +13,10 @@ use crate::{
     application::payment_request_status::{
         PaymentRequestStatusError, PaymentRequestStatusOperations, PaymentRequestStatusSummary,
     },
-    domain::locks::{parse_bundle_id, parse_creator},
+    domain::{
+        locks::{parse_bundle_id, parse_creator},
+        payment_request_lifecycle::PaymentRequestLifecycleState,
+    },
     http::{auth::AuthenticatedJson, error::ApiError},
 };
 
@@ -56,11 +59,16 @@ async fn status(
         Err(_) => return ApiError::InvalidRequest.into_response(),
     };
     match operations.lookup(&creator, &bundle_id).await {
-        Ok(Some(summary)) => match PaymentRequestStatusResponse::try_from(summary) {
-            Ok(response) => axum::Json(response).into_response(),
-            Err(()) => ApiError::Unavailable.into_response(),
+        Ok(Some(summary)) => match summary.request_state() {
+            PaymentRequestLifecycleState::RecoveryRequired => ApiError::Unavailable.into_response(),
+            PaymentRequestLifecycleState::InvalidConflict => ApiError::Conflict.into_response(),
+            _ => match PaymentRequestStatusResponse::try_from(summary) {
+                Ok(response) => axum::Json(response).into_response(),
+                Err(()) => ApiError::Unavailable.into_response(),
+            },
         },
         Ok(None) => ApiError::InvoiceNotFound.into_response(),
+        Err(PaymentRequestStatusError::Conflict) => ApiError::Conflict.into_response(),
         Err(PaymentRequestStatusError::Unavailable) => ApiError::Unavailable.into_response(),
     }
 }

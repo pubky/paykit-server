@@ -1,8 +1,8 @@
 //! Atomic lock-wide Payment Request drain persistence.
 
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -89,6 +89,8 @@ struct ExistingDrainRow {
     accepted_count: i64,
     terminal_count: i64,
     cancellation_enqueued_count: i64,
+    cancellation_set_hash: Vec<u8>,
+    item_set_hash: Vec<u8>,
     status: String,
     created_at: OffsetDateTime,
 }
@@ -98,10 +100,12 @@ struct InvoiceLifecycleRow {
     invoice_id: Uuid,
     request_state: Option<String>,
     sdk_payment_request_id: Option<String>,
+    last_event_at: Option<OffsetDateTime>,
 }
 
 struct PreparedCancellation {
     invoice_id: Uuid,
+    payment_request_id: String,
     outbox_id: Uuid,
     envelope: EncryptedEnvelope,
 }
@@ -133,9 +137,15 @@ impl PaymentDrainStore {
         let existing = sqlx::query_as::<_, ExistingDrainRow>(
             "SELECT drains.id, drains.lock_resource_envelope, drains.accepted_count,
                     drains.terminal_count, drains.cancellation_enqueued_count,
+                    drains.cancellation_set_hash, drains.item_set_hash,
                     drains.status, drains.created_at
              FROM payment_drains AS drains
              JOIN creators ON creators.id = drains.creator_id
+             JOIN lock_payment_generations AS generation
+               ON generation.creator_id = drains.creator_id
+              AND generation.lock_resource_lookup_hash = drains.lock_resource_lookup_hash
+              AND generation.current_generation = drains.lock_resource_generation
+              AND generation.active_drain_id = drains.id
              WHERE creators.creator_lookup_hash = $1
                AND drains.lock_resource_lookup_hash = $2
              FOR UPDATE OF drains",
@@ -158,6 +168,8 @@ impl PaymentDrainStore {
         if plaintext != canonical_lock.as_bytes() {
             return Err(PersistenceError::Conflict);
         }
+        self.validate_frozen_sets(&mut transaction, &existing)
+            .await?;
         let progressed = sqlx::query_as::<_, ExistingDrainRow>(
             "WITH frozen AS (
                  SELECT
@@ -181,7 +193,10 @@ impl PaymentDrainStore {
                                     )
                                 )
                             )
-                     ) AS terminal_count
+                     ) AS terminal_count,
+                     (SELECT COUNT(*)
+                      FROM payment_drain_cancellations cancellation
+                      WHERE cancellation.drain_id = $1) AS cancellation_count
                  FROM payment_drain_items AS item
                  JOIN invoices AS invoice ON invoice.id = item.invoice_id
                  WHERE item.drain_id = $1
@@ -198,12 +213,14 @@ impl PaymentDrainStore {
                  updated_at = transaction_timestamp()
              FROM frozen
              WHERE drain.id = $1
+               AND frozen.cancellation_count = drain.cancellation_enqueued_count
                AND frozen.accepted_count <= drain.accepted_count
                AND frozen.terminal_count >= drain.terminal_count
                AND frozen.terminal_count - drain.terminal_count
                    = drain.accepted_count - frozen.accepted_count
              RETURNING drain.id, drain.lock_resource_envelope, drain.accepted_count,
                        drain.terminal_count, drain.cancellation_enqueued_count,
+                       drain.cancellation_set_hash, drain.item_set_hash,
                        drain.status, drain.created_at",
         )
         .bind(existing.id)
@@ -246,8 +263,8 @@ impl PaymentDrainStore {
             return Err(PersistenceError::Conflict);
         };
 
-        let generation: Option<(Option<Uuid>, Option<Vec<u8>>)> = sqlx::query_as(
-            "SELECT active_drain_id, last_cleanup_token
+        let generation: Option<(i64, Option<Uuid>, Option<Vec<u8>>)> = sqlx::query_as(
+            "SELECT current_generation, active_drain_id, last_cleanup_token
              FROM lock_payment_generations
              WHERE creator_id = $1 AND lock_resource_lookup_hash = $2
              FOR UPDATE",
@@ -257,7 +274,7 @@ impl PaymentDrainStore {
         .fetch_optional(&mut *transaction)
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
-        let Some((active_drain_id, last_cleanup_token)) = generation else {
+        let Some((current_generation, active_drain_id, last_cleanup_token)) = generation else {
             let orphaned: bool = sqlx::query_scalar(
                 "SELECT EXISTS(
                      SELECT 1 FROM payment_drains
@@ -305,14 +322,16 @@ impl PaymentDrainStore {
 
         let drain: ExistingDrainRow = sqlx::query_as(
             "SELECT id, lock_resource_envelope, accepted_count, terminal_count,
-                    cancellation_enqueued_count, status, created_at
+                    cancellation_enqueued_count, cancellation_set_hash, item_set_hash, status, created_at
              FROM payment_drains
              WHERE id = $1 AND creator_id = $2 AND lock_resource_lookup_hash = $3
+               AND lock_resource_generation = $4
              FOR UPDATE",
         )
         .bind(drain_id)
         .bind(creator_id)
         .bind(lock_hash.as_bytes().as_slice())
+        .bind(current_generation)
         .fetch_optional(&mut *transaction)
         .await
         .map_err(|_| PersistenceError::Unavailable)?
@@ -330,6 +349,50 @@ impl PaymentDrainStore {
             .map_err(|_| PersistenceError::CorruptOrMissing)?;
         if plaintext != canonical_lock.as_bytes() {
             return Err(PersistenceError::CorruptOrMissing);
+        }
+        self.validate_frozen_sets(&mut transaction, &drain).await?;
+        let canonical: (i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT
+                 COUNT(*) FILTER (
+                     WHERE item.classification = 'accepted'
+                       AND invoice.payment_expired_at IS NULL
+                       AND NOT (
+                           invoice.first_amount_matched_observed_at IS NOT NULL
+                           AND invoice.first_amount_matched_observed_at <= invoice.payment_deadline
+                       )
+                 ),
+                 COUNT(*) FILTER (
+                     WHERE item.classification IN ('rejected', 'canceled', 'proposal_expired')
+                        OR (item.classification = 'accepted' AND (
+                            invoice.payment_expired_at IS NOT NULL
+                            OR (invoice.first_amount_matched_observed_at IS NOT NULL
+                                AND invoice.first_amount_matched_observed_at <= invoice.payment_deadline)
+                        ))
+                 ),
+                 COUNT(*),
+                 (SELECT COUNT(*) FROM payment_drain_cancellations WHERE drain_id = $1)
+             FROM payment_drain_items item
+             JOIN invoices invoice ON invoice.id = item.invoice_id
+             WHERE item.drain_id = $1",
+        )
+        .bind(drain.id)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        if canonical.0 != drain.accepted_count
+            || canonical.1 != drain.terminal_count
+            || canonical.3 != drain.cancellation_enqueued_count
+            || drain.status
+                != if canonical.0 == 0 {
+                    "completed"
+                } else {
+                    "active"
+                }
+        {
+            return Err(PersistenceError::CorruptOrMissing);
+        }
+        if canonical.0 != 0 {
+            return Err(PersistenceError::Conflict);
         }
         let drain_id = drain.id;
         let validated = snapshot(drain, false)?;
@@ -390,7 +453,7 @@ impl PaymentDrainStore {
 
         if let Some(existing) = sqlx::query_as::<_, ExistingDrainRow>(
             "SELECT id, lock_resource_envelope, accepted_count, terminal_count,
-                    cancellation_enqueued_count, status, created_at
+                    cancellation_enqueued_count, cancellation_set_hash, item_set_hash, status, created_at
              FROM payment_drains
              WHERE creator_id = $1 AND lock_resource_lookup_hash = $2
              FOR UPDATE",
@@ -449,14 +512,14 @@ impl PaymentDrainStore {
 
         let rows = sqlx::query_as::<_, InvoiceLifecycleRow>(
             "SELECT invoices.id AS invoice_id, lifecycle.request_state,
-                    lifecycle.sdk_payment_request_id
+                    lifecycle.sdk_payment_request_id, lifecycle.last_event_at
              FROM invoices
              LEFT JOIN payment_request_lifecycles AS lifecycle
                ON lifecycle.invoice_id = invoices.id
              WHERE invoices.creator_id = $1
                AND invoices.lock_resource_lookup_hash = $2
                AND invoices.lock_resource_generation = $3
-             ORDER BY invoices.id
+             ORDER BY invoices.id, lifecycle.sdk_payment_request_id
              FOR UPDATE OF invoices",
         )
         .bind(creator.id)
@@ -470,64 +533,117 @@ impl PaymentDrainStore {
         let mut accepted_count = 0_i64;
         let mut terminal_count = 0_i64;
         let mut cancellations = Vec::new();
-        let mut classifications = Vec::with_capacity(rows.len());
+        let mut classifications = Vec::new();
+        let mut attempts_by_invoice = BTreeMap::<Uuid, Vec<InvoiceLifecycleRow>>::new();
         for row in rows {
-            let state = row
-                .request_state
-                .as_deref()
-                .and_then(PaymentRequestLifecycleState::parse)
-                .ok_or(PersistenceError::CorruptOrMissing)?;
-            let classification = match state {
-                PaymentRequestLifecycleState::Accepted => {
-                    accepted_count += 1;
-                    "accepted"
-                }
-                PaymentRequestLifecycleState::Rejected => {
-                    terminal_count += 1;
-                    "rejected"
-                }
-                PaymentRequestLifecycleState::Canceled => {
-                    terminal_count += 1;
-                    "canceled"
-                }
-                PaymentRequestLifecycleState::ProposalExpired => {
-                    terminal_count += 1;
-                    "proposal_expired"
-                }
-                PaymentRequestLifecycleState::Proposed => {
-                    let payment_request_id = row
-                        .sdk_payment_request_id
+            attempts_by_invoice
+                .entry(row.invoice_id)
+                .or_default()
+                .push(row);
+        }
+        for (invoice_id, attempts) in attempts_by_invoice {
+            let parsed = attempts
+                .iter()
+                .map(|attempt| {
+                    let state = attempt
+                        .request_state
+                        .as_deref()
+                        .and_then(PaymentRequestLifecycleState::parse)
                         .ok_or(PersistenceError::CorruptOrMissing)?;
-                    let proposal_rows: Vec<(Uuid, Vec<u8>)> = sqlx::query_as(
-                        "SELECT id, intent_envelope FROM outbox
-                         WHERE creator_id = $1 AND invoice_id = $2
-                           AND sdk_payment_request_id = $3
-                         ORDER BY created_at, id",
-                    )
-                    .bind(creator.id)
-                    .bind(row.invoice_id)
-                    .bind(&payment_request_id)
-                    .fetch_all(&mut *transaction)
-                    .await
-                    .map_err(|_| PersistenceError::Unavailable)?;
-                    let [(proposal_outbox_id, proposal_envelope)] = proposal_rows.as_slice() else {
-                        return Err(PersistenceError::CorruptOrMissing);
-                    };
+                    let payment_request_id = attempt
+                        .sdk_payment_request_id
+                        .as_deref()
+                        .ok_or(PersistenceError::CorruptOrMissing)?;
+                    let last_event_at = attempt
+                        .last_event_at
+                        .ok_or(PersistenceError::CorruptOrMissing)?;
+                    Ok((state, payment_request_id, last_event_at))
+                })
+                .collect::<Result<Vec<_>, PersistenceError>>()?;
+
+            if parsed
+                .iter()
+                .any(|(state, _, _)| *state == PaymentRequestLifecycleState::InvalidConflict)
+            {
+                return Err(PersistenceError::Conflict);
+            }
+            if parsed
+                .iter()
+                .any(|(state, _, _)| *state == PaymentRequestLifecycleState::RecoveryRequired)
+            {
+                return Err(PersistenceError::Unavailable);
+            }
+
+            let proposed_attempts = parsed
+                .iter()
+                .filter(|(state, _, _)| *state == PaymentRequestLifecycleState::Proposed)
+                .collect::<Vec<_>>();
+            let has_accepted_attempt = parsed.iter().any(|(state, _, _)| {
+                matches!(
+                    state,
+                    PaymentRequestLifecycleState::Accepted
+                        | PaymentRequestLifecycleState::ProofSubmitted
+                        | PaymentRequestLifecycleState::ActiveRecurring
+                )
+            });
+            let classification = if has_accepted_attempt {
+                accepted_count += 1;
+                "accepted"
+            } else if proposed_attempts.is_empty() {
+                let terminal = parsed
+                    .iter()
+                    .max_by_key(|(_, _, last_event_at)| *last_event_at)
+                    .ok_or(PersistenceError::CorruptOrMissing)?
+                    .0;
+                terminal_count += 1;
+                match terminal {
+                    PaymentRequestLifecycleState::Rejected => "rejected",
+                    PaymentRequestLifecycleState::Canceled => "canceled",
+                    PaymentRequestLifecycleState::ProposalExpired => "proposal_expired",
+                    _ => return Err(PersistenceError::CorruptOrMissing),
+                }
+            } else {
+                "cancellation_enqueued"
+            };
+            if !proposed_attempts.is_empty() {
+                let proposal_rows: Vec<(Uuid, Vec<u8>)> = sqlx::query_as(
+                    "SELECT id, intent_envelope FROM outbox
+                     WHERE creator_id = $1 AND invoice_id = $2
+                     ORDER BY created_at, id",
+                )
+                .bind(creator.id)
+                .bind(invoice_id)
+                .fetch_all(&mut *transaction)
+                .await
+                .map_err(|_| PersistenceError::Unavailable)?;
+                let mut proposals = Vec::new();
+                for (proposal_outbox_id, proposal_envelope) in proposal_rows {
                     let proposal_plaintext = self
                         .crypto
                         .decrypt(
                             &EnvelopeContext::outbox_semantic_intent(
                                 creator_hash,
-                                *proposal_outbox_id,
+                                proposal_outbox_id,
                             ),
-                            &EncryptedEnvelope::from_bytes(proposal_envelope.clone()),
+                            &EncryptedEnvelope::from_bytes(proposal_envelope),
                         )
                         .map_err(|_| PersistenceError::CorruptOrMissing)?;
-                    let proposal = DeliveryIntentV1::decode(&proposal_plaintext)
+                    let intent = DeliveryIntentV1::decode(&proposal_plaintext)
                         .map_err(|_| PersistenceError::CorruptOrMissing)?;
+                    if matches!(
+                        intent.operation(),
+                        crate::application::semantic_intent::DeliveryOperationV1::PaymentRequestProposal { .. }
+                    ) {
+                        proposals.push(intent);
+                    }
+                }
+                let [proposal] = proposals.as_slice() else {
+                    return Err(PersistenceError::CorruptOrMissing);
+                };
+                for (_, payment_request_id, _) in proposed_attempts {
                     let cancellation = DeliveryIntentV1::payment_request_cancellation(
-                        &proposal,
-                        payment_request_id,
+                        proposal,
+                        (*payment_request_id).to_owned(),
                     )
                     .map_err(|_| PersistenceError::CorruptOrMissing)?;
                     let outbox_id = Uuid::new_v4();
@@ -541,23 +657,44 @@ impl PaymentDrainStore {
                         )
                         .map_err(|_| PersistenceError::CorruptOrMissing)?;
                     cancellations.push(PreparedCancellation {
-                        invoice_id: row.invoice_id,
+                        invoice_id,
+                        payment_request_id: (*payment_request_id).to_owned(),
                         outbox_id,
                         envelope,
                     });
-                    "cancellation_enqueued"
                 }
-                PaymentRequestLifecycleState::RecoveryRequired => {
-                    return Err(PersistenceError::Unavailable);
-                }
-                PaymentRequestLifecycleState::InvalidConflict
-                | PaymentRequestLifecycleState::ProofSubmitted
-                | PaymentRequestLifecycleState::ActiveRecurring => {
-                    return Err(PersistenceError::Conflict);
-                }
-            };
-            classifications.push((row.invoice_id, classification));
+            }
+            classifications.push((invoice_id, classification));
         }
+
+        cancellations.sort_by(|left, right| {
+            (
+                left.invoice_id,
+                left.payment_request_id.as_str(),
+                left.outbox_id,
+            )
+                .cmp(&(
+                    right.invoice_id,
+                    right.payment_request_id.as_str(),
+                    right.outbox_id,
+                ))
+        });
+        let cancellation_set_hash = cancellation_set_hash(&self.crypto, &cancellations);
+        let item_set_hash = item_rows_hash(
+            &self.crypto,
+            &classifications
+                .iter()
+                .map(|(invoice_id, classification)| {
+                    (
+                        *invoice_id,
+                        creator.id,
+                        lock_hash.as_bytes().to_vec(),
+                        lock_resource_generation,
+                        *classification,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        );
 
         let lock_envelope = self
             .crypto
@@ -571,10 +708,11 @@ impl PaymentDrainStore {
             "INSERT INTO payment_drains (
                  id, creator_id, lock_resource_lookup_hash, lock_resource_envelope,
                  lock_resource_generation, accepted_count, terminal_count,
-                 cancellation_enqueued_count, status, completed_at
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8,
-                       CASE WHEN $9 THEN 'completed' ELSE 'active' END,
-                       CASE WHEN $9 THEN transaction_timestamp() ELSE NULL END)
+                 cancellation_enqueued_count, cancellation_set_hash, item_set_hash,
+                 status, completed_at
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                       CASE WHEN $11 THEN 'completed' ELSE 'active' END,
+                       CASE WHEN $11 THEN transaction_timestamp() ELSE NULL END)
              RETURNING created_at",
         )
         .bind(drain_id)
@@ -585,6 +723,8 @@ impl PaymentDrainStore {
         .bind(accepted_count)
         .bind(terminal_count)
         .bind(i64::try_from(cancellations.len()).map_err(|_| PersistenceError::InvalidInput)?)
+        .bind(cancellation_set_hash.as_bytes().as_slice())
+        .bind(item_set_hash.as_bytes().as_slice())
         .bind(completed)
         .fetch_one(&mut *transaction)
         .await
@@ -609,31 +749,42 @@ impl PaymentDrainStore {
         for cancellation in &cancellations {
             sqlx::query(
                 "INSERT INTO outbox (
-                     id, creator_id, invoice_id, intent_envelope, status
-                 ) VALUES ($1, $2, $3, $4, 'queued')",
+                     id, creator_id, invoice_id, intent_envelope, intent_kind,
+                     cancellation_target_payment_request_id, status
+                 ) VALUES ($1, $2, $3, $4, 'payment_request_cancellation', $5, 'queued')",
             )
             .bind(cancellation.outbox_id)
             .bind(creator.id)
             .bind(cancellation.invoice_id)
             .bind(cancellation.envelope.as_bytes())
+            .bind(&cancellation.payment_request_id)
             .execute(&mut *transaction)
             .await
             .map_err(|_| PersistenceError::Unavailable)?;
         }
         for (invoice_id, classification) in classifications {
-            let cancellation_outbox_id = cancellations
-                .iter()
-                .find(|cancellation| cancellation.invoice_id == invoice_id)
-                .map(|cancellation| cancellation.outbox_id);
             sqlx::query(
                 "INSERT INTO payment_drain_items (
-                     drain_id, invoice_id, classification, cancellation_outbox_id
-                 ) VALUES ($1, $2, $3, $4)",
+                     drain_id, invoice_id, classification
+                 ) VALUES ($1, $2, $3)",
             )
             .bind(drain_id)
             .bind(invoice_id)
             .bind(classification)
-            .bind(cancellation_outbox_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        }
+        for cancellation in &cancellations {
+            sqlx::query(
+                "INSERT INTO payment_drain_cancellations (
+                     drain_id, invoice_id, sdk_payment_request_id, cancellation_outbox_id
+                 ) VALUES ($1, $2, $3, $4)",
+            )
+            .bind(drain_id)
+            .bind(cancellation.invoice_id)
+            .bind(&cancellation.payment_request_id)
+            .bind(cancellation.outbox_id)
             .execute(&mut *transaction)
             .await
             .map_err(|_| PersistenceError::Unavailable)?;
@@ -654,6 +805,99 @@ impl PaymentDrainStore {
             replayed: false,
         })
     }
+
+    async fn validate_frozen_sets(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        drain: &ExistingDrainRow,
+    ) -> Result<(), PersistenceError> {
+        let rows: Vec<(Uuid, String, Uuid, Vec<u8>)> = sqlx::query_as(
+            "SELECT cancellation.invoice_id, cancellation.sdk_payment_request_id,
+                    cancellation.cancellation_outbox_id, outbox.intent_envelope
+             FROM payment_drain_cancellations AS cancellation
+             JOIN outbox ON outbox.id = cancellation.cancellation_outbox_id
+             WHERE cancellation.drain_id = $1
+             ORDER BY cancellation.invoice_id, cancellation.sdk_payment_request_id,
+                      cancellation.cancellation_outbox_id",
+        )
+        .bind(drain.id)
+        .fetch_all(&mut **transaction)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        let expected_count = usize::try_from(drain.cancellation_enqueued_count)
+            .map_err(|_| PersistenceError::CorruptOrMissing)?;
+        if rows.len() != expected_count
+            || cancellation_rows_hash(&self.crypto, &rows).as_bytes()
+                != drain.cancellation_set_hash.as_slice()
+        {
+            return Err(PersistenceError::CorruptOrMissing);
+        }
+        let item_rows: Vec<(Uuid, Uuid, Vec<u8>, i64, String)> = sqlx::query_as(
+            "SELECT item.invoice_id, invoice.creator_id,
+                    invoice.lock_resource_lookup_hash, invoice.lock_resource_generation,
+                    item.classification
+             FROM payment_drain_items AS item
+             JOIN invoices AS invoice ON invoice.id = item.invoice_id
+             WHERE item.drain_id = $1
+             ORDER BY item.invoice_id, item.classification",
+        )
+        .bind(drain.id)
+        .fetch_all(&mut **transaction)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        if item_rows_hash(&self.crypto, &item_rows).as_bytes() != drain.item_set_hash.as_slice() {
+            return Err(PersistenceError::CorruptOrMissing);
+        }
+        Ok(())
+    }
+}
+
+fn cancellation_set_hash(crypto: &Crypto, cancellations: &[PreparedCancellation]) -> LookupHash {
+    cancellation_rows_hash(
+        crypto,
+        &cancellations
+            .iter()
+            .map(|item| {
+                (
+                    item.invoice_id,
+                    item.payment_request_id.clone(),
+                    item.outbox_id,
+                    item.envelope.as_bytes().to_vec(),
+                )
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn cancellation_rows_hash(crypto: &Crypto, rows: &[(Uuid, String, Uuid, Vec<u8>)]) -> LookupHash {
+    let mut bytes = b"payment-drain-cancellation-set-v1\0".to_vec();
+    for (invoice_id, payment_request_id, outbox_id, intent_envelope) in rows {
+        bytes.extend_from_slice(invoice_id.as_bytes());
+        bytes.extend_from_slice(&(payment_request_id.len() as u64).to_be_bytes());
+        bytes.extend_from_slice(payment_request_id.as_bytes());
+        bytes.extend_from_slice(outbox_id.as_bytes());
+        bytes.extend_from_slice(&(intent_envelope.len() as u64).to_be_bytes());
+        bytes.extend_from_slice(intent_envelope);
+    }
+    crypto.lookup_hash(&bytes)
+}
+
+fn item_rows_hash<S: AsRef<str>>(
+    crypto: &Crypto,
+    rows: &[(Uuid, Uuid, Vec<u8>, i64, S)],
+) -> LookupHash {
+    let mut bytes = b"payment-drain-item-set-v1\0".to_vec();
+    for (invoice_id, creator_id, lock_hash, generation, classification) in rows {
+        let classification = classification.as_ref();
+        bytes.extend_from_slice(invoice_id.as_bytes());
+        bytes.extend_from_slice(creator_id.as_bytes());
+        bytes.extend_from_slice(&(lock_hash.len() as u64).to_be_bytes());
+        bytes.extend_from_slice(lock_hash);
+        bytes.extend_from_slice(&generation.to_be_bytes());
+        bytes.extend_from_slice(&(classification.len() as u64).to_be_bytes());
+        bytes.extend_from_slice(classification.as_bytes());
+    }
+    crypto.lookup_hash(&bytes)
 }
 
 fn snapshot(
@@ -702,6 +946,8 @@ mod tests {
             accepted_count,
             terminal_count: 0,
             cancellation_enqueued_count: 0,
+            cancellation_set_hash: vec![0; 32],
+            item_set_hash: vec![0; 32],
             status: status.to_owned(),
             created_at: OffsetDateTime::UNIX_EPOCH,
         }

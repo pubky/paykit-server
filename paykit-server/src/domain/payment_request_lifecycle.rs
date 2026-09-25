@@ -4,6 +4,8 @@ use std::fmt;
 
 use time::OffsetDateTime;
 
+use crate::application::semantic_intent::PaymentTermsV1;
+
 #[cfg(test)]
 mod tests;
 
@@ -62,18 +64,36 @@ pub(crate) fn cursor_stable_transition_allowed(
             PaymentRequestLifecycleState::Proposed,
             PaymentRequestLifecycleState::ProposalExpired
         )
-    )
+    ) || (existing != PaymentRequestLifecycleState::InvalidConflict
+        && incoming != PaymentRequestLifecycleState::InvalidConflict
+        && (existing == PaymentRequestLifecycleState::RecoveryRequired
+            || incoming == PaymentRequestLifecycleState::RecoveryRequired))
 }
 
 /// One canonical SDK-derived lifecycle snapshot and its independent source cursors.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq)]
 pub struct PaymentRequestLifecycleProjection {
     pub payment_request_id: String,
+    pub proposal: ProposalCorrelation,
     pub request_state: PaymentRequestLifecycleState,
     pub state_event_id: Option<String>,
     pub last_stream_item_id: Option<u64>,
     pub last_outbound_message_id: Option<u64>,
     pub last_event_at: OffsetDateTime,
+}
+
+/// Complete persisted-intent fields available in every SDK proposal record.
+#[derive(Clone, PartialEq)]
+pub struct ProposalCorrelation {
+    pub reader_pubky: String,
+    pub selected_reader_path: String,
+    pub terms: PaymentTermsV1,
+}
+
+impl fmt::Debug for ProposalCorrelation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ProposalCorrelation(<redacted>)")
+    }
 }
 
 impl fmt::Debug for PaymentRequestLifecycleProjection {
@@ -91,4 +111,36 @@ impl fmt::Debug for PaymentRequestLifecycleProjection {
 pub struct PersistedPaymentRequestLifecycle {
     pub request_state: PaymentRequestLifecycleState,
     pub last_event_at: OffsetDateTime,
+}
+
+/// Collapses all SDK proposal attempts for one invoice into its strongest
+/// observable state. Non-terminal attempts always outrank terminal history;
+/// ties use the most recently recorded SDK event, then the stable wire value so
+/// equal database timestamps cannot make row order observable.
+pub fn aggregate_lifecycle(
+    attempts: impl IntoIterator<Item = (PaymentRequestLifecycleState, OffsetDateTime)>,
+) -> Option<PersistedPaymentRequestLifecycle> {
+    attempts
+        .into_iter()
+        .max_by_key(|(state, recorded_at)| (aggregate_rank(*state), *recorded_at, state.as_str()))
+        .map(
+            |(request_state, last_event_at)| PersistedPaymentRequestLifecycle {
+                request_state,
+                last_event_at,
+            },
+        )
+}
+
+const fn aggregate_rank(state: PaymentRequestLifecycleState) -> u8 {
+    match state {
+        PaymentRequestLifecycleState::InvalidConflict => 9,
+        PaymentRequestLifecycleState::RecoveryRequired => 8,
+        PaymentRequestLifecycleState::ProofSubmitted => 7,
+        PaymentRequestLifecycleState::ActiveRecurring => 6,
+        PaymentRequestLifecycleState::Accepted => 5,
+        PaymentRequestLifecycleState::Proposed => 4,
+        PaymentRequestLifecycleState::ProposalExpired
+        | PaymentRequestLifecycleState::Rejected
+        | PaymentRequestLifecycleState::Canceled => 0,
+    }
 }

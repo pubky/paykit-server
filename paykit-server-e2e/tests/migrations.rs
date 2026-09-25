@@ -5,7 +5,7 @@ use paykit_server_e2e::postgres::TestDatabase;
 use sqlx::{Connection, PgConnection, PgPool, Row, migrate::Migrator, postgres::PgConnectOptions};
 use uuid::Uuid;
 
-const REQUIRED_TABLES: [&str; 11] = [
+const REQUIRED_TABLES: [&str; 12] = [
     "deployment_metadata",
     "creators",
     "sdk_states",
@@ -17,6 +17,7 @@ const REQUIRED_TABLES: [&str; 11] = [
     "payment_request_lifecycles",
     "payment_drains",
     "payment_drain_items",
+    "payment_drain_cancellations",
 ];
 
 static ALL_MIGRATIONS: Migrator = sqlx::migrate!("../paykit-server/migrations");
@@ -94,11 +95,37 @@ async fn migrations_create_the_required_schema_and_are_restart_safe() {
     .unwrap();
     assert_eq!(lock_lookup_nullable, "NO");
 
+    let proposal_lookup_nullable: String = sqlx::query_scalar(
+        "SELECT is_nullable FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = 'outbox'
+           AND column_name = 'proposal_lookup_hash'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(proposal_lookup_nullable, "YES");
+    let proposal_lookup_index_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1 FROM pg_indexes
+             WHERE schemaname = 'public'
+               AND tablename = 'outbox'
+               AND indexname = 'outbox_proposal_lookup_index'
+         )",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert!(proposal_lookup_index_exists);
+
     let observation_lifecycle_columns: Vec<(String, String)> = sqlx::query_as(
         "SELECT column_name, is_nullable
          FROM information_schema.columns
          WHERE table_schema = 'public' AND table_name = 'invoices'
-           AND column_name IN ('first_amount_matched_observed_at', 'payment_expired_at')
+           AND column_name IN (
+               'first_amount_matched_observed_at',
+               'first_amount_matched_outpoint_lookup_hash',
+               'payment_expired_at'
+           )
          ORDER BY column_name",
     )
     .fetch_all(pool)
@@ -108,6 +135,10 @@ async fn migrations_create_the_required_schema_and_are_restart_safe() {
         observation_lifecycle_columns,
         vec![
             ("first_amount_matched_observed_at".into(), "YES".into()),
+            (
+                "first_amount_matched_outpoint_lookup_hash".into(),
+                "YES".into()
+            ),
             ("payment_expired_at".into(), "YES".into()),
         ]
     );
@@ -116,8 +147,8 @@ async fn migrations_create_the_required_schema_and_are_restart_safe() {
          WHERE conrelid = 'invoices'::regclass
            AND conname IN (
                'invoices_first_amount_matched_window_check',
-               'invoices_payment_expired_deadline_check',
-               'invoices_payment_lifecycle_terminal_check'
+               'invoices_first_amount_matched_outpoint_pair',
+               'invoices_payment_expired_deadline_check'
            )
          ORDER BY conname",
     )
@@ -127,9 +158,9 @@ async fn migrations_create_the_required_schema_and_are_restart_safe() {
     assert_eq!(
         lifecycle_constraints,
         vec![
+            "invoices_first_amount_matched_outpoint_pair",
             "invoices_first_amount_matched_window_check",
             "invoices_payment_expired_deadline_check",
-            "invoices_payment_lifecycle_terminal_check",
         ]
     );
 
@@ -474,8 +505,8 @@ async fn outbox_sdk_identifier_constraints_reject_unattributable_terminal_rows()
 
     assert_check_violation(
         sqlx::query(
-            "INSERT INTO outbox (creator_id, intent_envelope, status)
-             VALUES ($1, $2, 'handed_off')",
+            "INSERT INTO outbox (creator_id, intent_envelope, intent_kind, status)
+             VALUES ($1, $2, 'endpoint_publication', 'handed_off')",
         )
         .bind(creator_id)
         .bind(b"encrypted-intent".as_slice())
@@ -485,8 +516,8 @@ async fn outbox_sdk_identifier_constraints_reject_unattributable_terminal_rows()
     assert_check_violation(
         sqlx::query(
             "INSERT INTO outbox
-             (creator_id, intent_envelope, status, sdk_outbound_message_id)
-             VALUES ($1, $2, 'delivered', '01')",
+             (creator_id, intent_envelope, intent_kind, status, sdk_outbound_message_id)
+             VALUES ($1, $2, 'endpoint_publication', 'delivered', '01')",
         )
         .bind(creator_id)
         .bind(b"encrypted-intent".as_slice())
@@ -496,8 +527,8 @@ async fn outbox_sdk_identifier_constraints_reject_unattributable_terminal_rows()
     assert_check_violation(
         sqlx::query(
             "INSERT INTO outbox
-             (creator_id, intent_envelope, status, sdk_event_id)
-             VALUES ($1, $2, 'queued', 'event-id')",
+             (creator_id, intent_envelope, intent_kind, status, sdk_event_id)
+             VALUES ($1, $2, 'payment_request_proposal', 'queued', 'event-id')",
         )
         .bind(creator_id)
         .bind(b"encrypted-intent".as_slice())

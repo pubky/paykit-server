@@ -98,12 +98,35 @@ fn router(key: &SigningKey, drains: FakeDrains) -> axum::Router {
 }
 
 fn signed_request(key: &SigningKey, path: &str, body: Vec<u8>) -> Request<Body> {
+    let signed_path = path.split('?').next().expect("request path is non-empty");
+    let preimage = paykit_server::http::auth::signature_preimage("POST", signed_path, &body);
     Request::builder()
         .method(Method::POST)
         .uri(path)
         .header(
             "X-Paykit-Signature",
-            URL_SAFE_NO_PAD.encode(key.sign(&body).to_bytes()),
+            URL_SAFE_NO_PAD.encode(key.sign(&preimage).to_bytes()),
+        )
+        .body(Body::from(body))
+        .unwrap()
+}
+
+fn signed_request_for_route(
+    key: &SigningKey,
+    signed_path: &str,
+    request_path: &str,
+    body: Vec<u8>,
+) -> Request<Body> {
+    let mut preimage = b"paykit-http-signature-v1\0POST\0".to_vec();
+    preimage.extend_from_slice(signed_path.as_bytes());
+    preimage.push(0);
+    preimage.extend_from_slice(&body);
+    Request::builder()
+        .method(Method::POST)
+        .uri(request_path)
+        .header(
+            "X-Paykit-Signature",
+            URL_SAFE_NO_PAD.encode(key.sign(&preimage).to_bytes()),
         )
         .body(Body::from(body))
         .unwrap()
@@ -160,6 +183,39 @@ async fn create_and_lookup_return_the_same_closed_redacted_aggregate() {
         assert!(!body.contains("drain_id"));
         assert!(!body.contains("replayed"));
     }
+}
+
+#[tokio::test]
+async fn create_signature_cannot_be_replayed_against_lookup_route() {
+    let key = SigningKey::from_bytes(&[7; 32]);
+    let drains = FakeDrains {
+        create: Ok(completed()),
+        lookup: Ok(Some(completed())),
+        cleanup: Ok(()),
+    };
+    let request_body = body();
+
+    let create = router(&key, drains.clone())
+        .oneshot(signed_request_for_route(
+            &key,
+            "/payment-request-drains",
+            "/payment-request-drains",
+            request_body.clone(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(create.status(), StatusCode::OK);
+
+    let replay = router(&key, drains)
+        .oneshot(signed_request_for_route(
+            &key,
+            "/payment-request-drains",
+            "/payment-request-drain-lookups",
+            request_body,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(replay.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]

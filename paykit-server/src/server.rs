@@ -13,14 +13,16 @@ use crate::{
             PaymentDrainCleanupToken, PaymentDrainError, PaymentDrainOperations,
             PaymentDrainSummary,
         },
-        payment_request_status::PaymentRequestStatusOperations,
+        payment_request_status::{
+            PaymentRequestStatusError, PaymentRequestStatusOperations, PaymentRequestStatusSummary,
+        },
         payment_status::PaymentStatusService,
         setup_status::SetupStatusService,
     },
     bitkit_setup::BitkitAuthStarter,
     config::{Config, OutboxConfig, PaykitConfig, PaykitNetwork},
     crypto::Crypto,
-    domain::locks::{CreatorPubky, PubkyLockResource, ReaderPubky},
+    domain::locks::{BundleId, CreatorPubky, PubkyLockResource, ReaderPubky},
     http::{self, auth::SignedLocksAuth},
     paykit::{CreatorSessionProvider, PaykitAdapter},
     persistence::{
@@ -220,7 +222,15 @@ impl Server {
                 paykit: config.paykit.clone(),
             });
         let payment_request_status_operations: Arc<dyn PaymentRequestStatusOperations> =
-            Arc::new(invoices.clone());
+            Arc::new(ProductionPaymentRequestStatusOperations {
+                pool: pool.clone(),
+                crypto: crypto.clone(),
+                creators: creators.clone(),
+                lifecycles: payment_request_lifecycles.clone(),
+                statuses: invoices.clone(),
+                pubky: pubky.clone(),
+                paykit: config.paykit.clone(),
+            });
         let setup_status_service = Arc::new(SetupStatusService::new(session_validator));
         let signed_auth = Arc::new(SignedLocksAuth::from_config(&config));
         let business_routes = http::setup::setup_router(setup).merge(
@@ -461,6 +471,63 @@ impl ProductionPaymentDrainOperations {
             snapshot,
             PaymentDrainCleanupToken::from_bytes(*token.as_bytes()),
         )
+    }
+}
+
+#[derive(Clone)]
+struct ProductionPaymentRequestStatusOperations {
+    pool: PgPool,
+    crypto: Arc<Crypto>,
+    creators: CreatorStore,
+    lifecycles: PaymentRequestLifecycleStore,
+    statuses: InvoiceStore,
+    pubky: Pubky,
+    paykit: PaykitConfig,
+}
+
+#[async_trait]
+impl PaymentRequestStatusOperations for ProductionPaymentRequestStatusOperations {
+    async fn lookup(
+        &self,
+        creator: &CreatorPubky,
+        bundle_id: &BundleId,
+    ) -> Result<Option<PaymentRequestStatusSummary>, PaymentRequestStatusError> {
+        if !self
+            .statuses
+            .invoice_exists(creator, bundle_id)
+            .await
+            .map_err(|_| PaymentRequestStatusError::Unavailable)?
+        {
+            return Ok(None);
+        }
+        let (creator_id, credentials) = self
+            .creators
+            .load_with_id(creator)
+            .await
+            .map_err(|_| PaymentRequestStatusError::Unavailable)?;
+        if credentials.creator() != creator {
+            return Err(PaymentRequestStatusError::Unavailable);
+        }
+        SdkStateStore::new(&self.pool, self.crypto.clone())
+            .load(creator)
+            .await
+            .map_err(|_| PaymentRequestStatusError::Unavailable)?;
+        let storage = PostgresStorageAdapter::new(&self.pool, self.crypto.clone(), creator_id);
+        let sessions = CreatorSessionProvider::with_pubky(
+            self.creators.clone(),
+            creator.clone(),
+            self.pubky.clone(),
+            &self.paykit,
+        );
+        let adapter = PaykitAdapter::new(storage, sessions, &self.paykit)
+            .map_err(|_| PaymentRequestStatusError::Unavailable)?;
+        adapter
+            .reconcile_and_lookup_payment_request_status(
+                &self.lifecycles,
+                &self.statuses,
+                bundle_id,
+            )
+            .await
     }
 }
 

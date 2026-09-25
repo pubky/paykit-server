@@ -21,6 +21,7 @@ use paykit_server::{
     config::{Config, ConfigEnvironment},
     crypto::Crypto,
     domain::locks::{CreatorPubky, ReaderPubky, parse_creator, parse_reader},
+    http::auth::signature_preimage,
     persistence::{
         AtomicInvoiceInput, CreatorCredentials, CreatorStore, InvoiceStore,
         NewReaderPayloadFactory, NewReaderPayloads, PersistenceError, PostgresStorageAdapter,
@@ -39,7 +40,6 @@ mod sdk_fixtures;
 use sdk_fixtures::{TestPaymentAdapter, TestSessionProvider};
 
 const MASTER_KEY: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE";
-const TRUSTED_KEY: &str = "pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo";
 
 type CreatorSdk = PaykitSdk<PostgresStorageAdapter, TestSessionProvider, TestPaymentAdapter>;
 type PeerSdk = PaykitSdk<InMemoryStorage, TestSessionProvider, TestPaymentAdapter>;
@@ -195,10 +195,6 @@ fn payment_intent(reader: &ReaderPubky, marker: &PaykitReceiverMarker) -> Delive
     .unwrap()
 }
 
-fn config(database_url: &str, electrum_endpoint: &str) -> Config {
-    config_with_trusted_key(database_url, electrum_endpoint, TRUSTED_KEY)
-}
-
 fn config_with_trusted_key(
     database_url: &str,
     electrum_endpoint: &str,
@@ -299,6 +295,7 @@ async fn production_composition_registers_all_payment_drain_routes_as_signed() {
                 .as_slice(),
         ),
     ] {
+        let preimage = signature_preimage("POST", path, body);
         let response = server
             .router()
             .oneshot(
@@ -307,7 +304,7 @@ async fn production_composition_registers_all_payment_drain_routes_as_signed() {
                     .uri(path)
                     .header(
                         "X-Paykit-Signature",
-                        URL_SAFE_NO_PAD.encode(signing_key.sign(body).to_bytes()),
+                        URL_SAFE_NO_PAD.encode(signing_key.sign(&preimage).to_bytes()),
                     )
                     .body(Body::from(body))
                     .unwrap(),
@@ -318,6 +315,7 @@ async fn production_composition_registers_all_payment_drain_routes_as_signed() {
     }
 
     let body = br#"{"lock_resource":"pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/locks.app/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json"}"#;
+    let preimage = signature_preimage("POST", "/payment-request-drains", body);
     let response = server
         .router()
         .oneshot(
@@ -326,7 +324,7 @@ async fn production_composition_registers_all_payment_drain_routes_as_signed() {
                 .uri("/payment-request-drains")
                 .header(
                     "X-Paykit-Signature",
-                    URL_SAFE_NO_PAD.encode(signing_key.sign(body).to_bytes()),
+                    URL_SAFE_NO_PAD.encode(signing_key.sign(&preimage).to_bytes()),
                 )
                 .body(Body::from(body.as_slice()))
                 .unwrap(),
@@ -340,6 +338,8 @@ async fn production_composition_registers_all_payment_drain_routes_as_signed() {
         r#"{{"cleanup_token":"{cleanup_token}","lock_resource":"pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/locks.app/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json"}}"#
     )
     .into_bytes();
+    let cleanup_preimage =
+        signature_preimage("POST", "/payment-request-drain-cleanups", &cleanup_body);
     let cleanup = server
         .router()
         .oneshot(
@@ -348,7 +348,7 @@ async fn production_composition_registers_all_payment_drain_routes_as_signed() {
                 .uri("/payment-request-drain-cleanups")
                 .header(
                     "X-Paykit-Signature",
-                    URL_SAFE_NO_PAD.encode(signing_key.sign(&cleanup_body).to_bytes()),
+                    URL_SAFE_NO_PAD.encode(signing_key.sign(&cleanup_preimage).to_bytes()),
                 )
                 .body(Body::from(cleanup_body))
                 .unwrap(),
@@ -473,7 +473,7 @@ async fn production_server_workers_process_two_creators_without_sdk_state_fallba
         .create_atomic(AtomicInvoiceInput {
             creator: &creator_a,
             reader: &reader,
-            bundle_binding: b"composition-bundle-a",
+            bundle_binding: b"000G40R40M30E209185GR38E1W",
             lock_resource_binding: lock_resource_a.as_bytes(),
             payment_request_binding: b"composition-request-a",
             new_reader_payloads: &Payloads {
@@ -560,10 +560,8 @@ async fn production_server_workers_process_two_creators_without_sdk_state_fallba
     )
     .await
     .unwrap();
-    let runtime = server.runtime();
-    let router = server.router();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let server_task = tokio::spawn(server.run(listener));
+    let mut server_task = tokio::spawn(server.run(listener));
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     let (outbound_a, outbound_b) = loop {
@@ -607,8 +605,8 @@ async fn production_server_workers_process_two_creators_without_sdk_state_fallba
     let payment_b = invoice_b.payment_request_outbox_id();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     let (request_a, request_b) = loop {
-        let rows: Vec<(Uuid, String, Option<String>)> = sqlx::query_as(
-            "SELECT id, status, sdk_payment_request_id
+        let rows: Vec<(Uuid, String, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT id, status, sdk_payment_request_id, error_class
              FROM outbox
              WHERE id = ANY($1)",
         )
@@ -635,13 +633,70 @@ async fn production_server_workers_process_two_creators_without_sdk_state_fallba
                 break (a, b);
             }
         }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "production workers did not deliver and project both Payment Requests"
-        );
+        if tokio::time::Instant::now() >= deadline {
+            let states: Vec<(Uuid, String, String)> = sqlx::query_as(
+                "SELECT invoice_id, sdk_payment_request_id, request_state
+                 FROM payment_request_lifecycles
+                 WHERE invoice_id = ANY($1)",
+            )
+            .bind(vec![invoice_a.invoice_id(), invoice_b.invoice_id()])
+            .fetch_all(database.pool())
+            .await
+            .unwrap();
+            panic!(
+                "production workers did not deliver and project both Payment Requests: outbox={rows:?}, lifecycles={states:?}"
+            );
+        }
         tokio::time::sleep(Duration::from_millis(25)).await;
     };
     assert_ne!(request_a, request_b);
+
+    server_task.abort();
+    let _ = server_task.await;
+    sqlx::query("DELETE FROM payment_request_lifecycles WHERE invoice_id = $1")
+        .bind(invoice_a.invoice_id())
+        .execute(database.pool())
+        .await
+        .unwrap();
+    let replacement = Server::build_with_pubky(
+        config_with_trusted_key(database.database_url(), &electrum_endpoint, &trusted_key),
+        database.pool().clone(),
+        pubky.clone(),
+    )
+    .await
+    .unwrap();
+    let mut router = replacement.router();
+    let status_body =
+        format!(r#"{{"bundle_id":"000G40R40M30E209185GR38E1W","creator":"{creator_a}"}}"#)
+            .into_bytes();
+    let status_preimage = signature_preimage("POST", "/payment-requests/status", &status_body);
+    let status = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/payment-requests/status")
+                .header(
+                    "X-Paykit-Signature",
+                    URL_SAFE_NO_PAD.encode(signing_key.sign(&status_preimage).to_bytes()),
+                )
+                .body(Body::from(status_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status_code = status.status();
+    let status_body = to_bytes(status.into_body(), 16 * 1024).await.unwrap();
+    assert_eq!(
+        status_code,
+        StatusCode::OK,
+        "status refresh failed: {}",
+        String::from_utf8_lossy(&status_body)
+    );
+    let status_json: serde_json::Value = serde_json::from_slice(&status_body).unwrap();
+    assert_eq!(status_json["request_state"], "proposed");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    server_task = tokio::spawn(replacement.run(listener));
 
     let intake = peer_sdk
         .receive_private_messages_from_linked_peers()
@@ -693,14 +748,54 @@ async fn production_server_workers_process_two_creators_without_sdk_state_fallba
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
 
+    server_task.abort();
+    let _ = server_task.await;
+    sqlx::query("DELETE FROM payment_request_lifecycles WHERE invoice_id = $1")
+        .bind(invoice_a.invoice_id())
+        .execute(database.pool())
+        .await
+        .unwrap();
+    let restarted = Server::build_with_pubky(
+        config_with_trusted_key(database.database_url(), &electrum_endpoint, &trusted_key),
+        database.pool().clone(),
+        pubky.clone(),
+    )
+    .await
+    .unwrap();
+    let runtime = restarted.runtime();
+    router = restarted.router();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    server_task = tokio::spawn(restarted.run(listener));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let state: Option<String> = sqlx::query_scalar(
+            "SELECT request_state
+             FROM payment_request_lifecycles
+             WHERE invoice_id = $1",
+        )
+        .bind(invoice_a.invoice_id())
+        .fetch_optional(database.pool())
+        .await
+        .unwrap();
+        if state.as_deref() == Some("accepted") {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "restart did not rebuild accepted lifecycle from canonical SDK state"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
     let drain_body = format!(r#"{{"lock_resource":"{lock_resource_a}"}}"#).into_bytes();
     let drain_request = || {
+        let preimage = signature_preimage("POST", "/payment-request-drains", &drain_body);
         Request::builder()
             .method(Method::POST)
             .uri("/payment-request-drains")
             .header(
                 "X-Paykit-Signature",
-                URL_SAFE_NO_PAD.encode(signing_key.sign(&drain_body).to_bytes()),
+                URL_SAFE_NO_PAD.encode(signing_key.sign(&preimage).to_bytes()),
             )
             .body(Body::from(drain_body.clone()))
             .unwrap()
@@ -764,12 +859,13 @@ async fn production_server_workers_process_two_creators_without_sdk_state_fallba
 
     let drain_b_body = format!(r#"{{"lock_resource":"{lock_resource_b}"}}"#).into_bytes();
     let request_b = |path: &'static str, body: Vec<u8>| {
+        let preimage = signature_preimage("POST", path, &body);
         Request::builder()
             .method(Method::POST)
             .uri(path)
             .header(
                 "X-Paykit-Signature",
-                URL_SAFE_NO_PAD.encode(signing_key.sign(&body).to_bytes()),
+                URL_SAFE_NO_PAD.encode(signing_key.sign(&preimage).to_bytes()),
             )
             .body(Body::from(body))
             .unwrap()
@@ -825,43 +921,5 @@ async fn production_server_workers_process_two_creators_without_sdk_state_fallba
 
     server_task.abort();
     let _ = server_task.await;
-
-    sqlx::query("DELETE FROM payment_request_lifecycles WHERE invoice_id = $1")
-        .bind(invoice_a.invoice_id())
-        .execute(database.pool())
-        .await
-        .unwrap();
-    let restarted = Server::build_with_pubky(
-        config(database.database_url(), &electrum_endpoint),
-        database.pool().clone(),
-        pubky,
-    )
-    .await
-    .unwrap();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let restarted_task = tokio::spawn(restarted.run(listener));
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-    loop {
-        let state: Option<String> = sqlx::query_scalar(
-            "SELECT request_state
-             FROM payment_request_lifecycles
-             WHERE invoice_id = $1",
-        )
-        .bind(invoice_a.invoice_id())
-        .fetch_optional(database.pool())
-        .await
-        .unwrap();
-        if state.as_deref() == Some("accepted") {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "restart did not rebuild accepted lifecycle from canonical SDK state"
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-
-    restarted_task.abort();
-    let _ = restarted_task.await;
     database.cleanup().await;
 }

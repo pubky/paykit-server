@@ -123,6 +123,14 @@ impl Crypto {
         self.domain_separated_lookup_hash(b"paykit-server:bitcoin-address:v1", address)
     }
 
+    /// Produces a keyed semantic identity for one Payment Request proposal.
+    pub fn payment_request_proposal_lookup_hash(&self, payment_reference: &[u8]) -> LookupHash {
+        self.domain_separated_lookup_hash(
+            b"paykit-server:payment-request-proposal:v1",
+            payment_reference,
+        )
+    }
+
     /// Produces a Creator-scoped keyed hash for a Bitcoin derivation index.
     pub fn bitcoin_derivation_index_lookup_hash(
         &self,

@@ -2,8 +2,9 @@
 
 `POST /invoices` atomically persists the invoice, its reader allocation, the endpoint-publication intent, the dependent Payment Request intent, and both encrypted semantic envelopes. Exact replay preserves those durable identities and payloads.
 
-After persistence or exact replay, `POST /invoices` returns `204 No Content`; it
-does not observe Noise state. `POST /connections/status` separately loads the
+After persistence or exact replay, `POST /invoices` returns `200 OK` with only
+RFC 3339 `invoice_created_at` and `payment_deadline` timestamps; it does not
+observe Noise state. `POST /connections/status` separately loads the
 persisted Reader/path binding and returns `none`, `handshake`, `connected`,
 `recovery_required`, or `blocked`. This lookup does not advance handshake,
 rewrite SDK state, acquire the worker mutation lock, mutate outbox state, or wait

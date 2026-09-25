@@ -1012,14 +1012,16 @@ async fn active_lock_drain_allows_exact_invoice_replay_but_fences_new_bundles() 
         "INSERT INTO payment_drains (
              id, creator_id, lock_resource_lookup_hash, lock_resource_generation,
              lock_resource_envelope, status, accepted_count, terminal_count,
-             cancellation_enqueued_count
-         ) VALUES ($1, $2, $3, $4, $5, 'active', 1, 0, 0)",
+             cancellation_enqueued_count, cancellation_set_hash, item_set_hash
+         ) VALUES ($1, $2, $3, $4, $5, 'active', 1, 0, 0, $6, $7)",
     )
     .bind(drain_id)
     .bind(creator_id)
     .bind(&lock_hash)
     .bind(generation)
     .bind(b"encrypted-lock-resource".as_slice())
+    .bind([0_u8; 32].as_slice())
+    .bind([0_u8; 32].as_slice())
     .execute(database.pool())
     .await
     .unwrap();
@@ -1055,6 +1057,42 @@ async fn active_lock_drain_allows_exact_invoice_replay_but_fences_new_bundles() 
         ))
         .await;
     assert_eq!(blocked.unwrap_err(), PersistenceError::Conflict);
+
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn invoice_creation_samples_database_time_after_creator_lock_wait() {
+    let database = TestDatabase::create().await;
+    let store = invoice_store(&database).await;
+    let creator = creator();
+    let reader = reader();
+    let mut blocker = database.pool().begin().await.unwrap();
+    sqlx::query("SELECT id FROM creators FOR UPDATE")
+        .fetch_all(&mut *blocker)
+        .await
+        .unwrap();
+
+    let task = tokio::spawn(async move {
+        store
+            .create_atomic(input(
+                &creator,
+                &reader,
+                b"post-fence-clock-bundle",
+                b"post-fence-clock-request",
+            ))
+            .await
+            .unwrap()
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let release_time: time::OffsetDateTime = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(&mut *blocker)
+        .await
+        .unwrap();
+    blocker.commit().await.unwrap();
+
+    let created = task.await.unwrap();
+    assert!(created.invoice_created_at() >= release_time);
 
     database.cleanup().await;
 }

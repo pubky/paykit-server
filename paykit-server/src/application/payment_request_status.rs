@@ -81,6 +81,7 @@ impl PaymentRequestStatusSummary {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PaymentRequestStatusError {
+    Conflict,
     Unavailable,
 }
 

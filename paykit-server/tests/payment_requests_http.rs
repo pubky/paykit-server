@@ -95,12 +95,14 @@ fn body() -> Vec<u8> {
 }
 
 fn signed_request(key: &SigningKey, body: Vec<u8>) -> Request<Body> {
+    let preimage =
+        paykit_server::http::auth::signature_preimage("POST", "/payment-requests/status", &body);
     Request::builder()
         .method(Method::POST)
         .uri("/payment-requests/status")
         .header(
             "X-Paykit-Signature",
-            URL_SAFE_NO_PAD.encode(key.sign(&body).to_bytes()),
+            URL_SAFE_NO_PAD.encode(key.sign(&preimage).to_bytes()),
         )
         .body(Body::from(body))
         .unwrap()
@@ -166,8 +168,6 @@ async fn request_and_payment_state_wire_values_are_closed_and_complete() {
         PaymentRequestLifecycleState::Canceled,
         PaymentRequestLifecycleState::ProofSubmitted,
         PaymentRequestLifecycleState::ActiveRecurring,
-        PaymentRequestLifecycleState::RecoveryRequired,
-        PaymentRequestLifecycleState::InvalidConflict,
     ] {
         let response = router(&key, Ok(Some(summary(state, PaymentState::Expired))))
             .oneshot(signed_request(&key, body()))
@@ -215,7 +215,14 @@ async fn per_bundle_status_requires_signature_and_a_closed_body() {
                 .uri("/payment-requests/status?bundle_id=forbidden")
                 .header(
                     "X-Paykit-Signature",
-                    URL_SAFE_NO_PAD.encode(key.sign(&query_body).to_bytes()),
+                    URL_SAFE_NO_PAD.encode(
+                        key.sign(&paykit_server::http::auth::signature_preimage(
+                            "POST",
+                            "/payment-requests/status",
+                            &query_body,
+                        ))
+                        .to_bytes(),
+                    ),
                 )
                 .body(Body::from(query_body))
                 .unwrap(),
@@ -247,4 +254,42 @@ async fn per_bundle_absence_and_unavailability_use_stable_errors() {
         response_body(unavailable).await,
         r#"{"error":{"code":"unavailable","message":"payment request state is unavailable"}}"#
     );
+
+    let conflict = router(&key, Err(PaymentRequestStatusError::Conflict))
+        .oneshot(signed_request(&key, body()))
+        .await
+        .unwrap();
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        response_body(conflict).await,
+        r#"{"error":{"code":"conflict","message":"request conflicts with persisted payment state"}}"#
+    );
+}
+
+#[tokio::test]
+async fn recovery_and_invalid_conflict_are_not_successful_statuses() {
+    let key = SigningKey::from_bytes(&[7; 32]);
+    let recovery = router(
+        &key,
+        Ok(Some(summary(
+            PaymentRequestLifecycleState::RecoveryRequired,
+            PaymentState::Undetected,
+        ))),
+    )
+    .oneshot(signed_request(&key, body()))
+    .await
+    .unwrap();
+    assert_eq!(recovery.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let conflict = router(
+        &key,
+        Ok(Some(summary(
+            PaymentRequestLifecycleState::InvalidConflict,
+            PaymentState::Undetected,
+        ))),
+    )
+    .oneshot(signed_request(&key, body()))
+    .await
+    .unwrap();
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
 }

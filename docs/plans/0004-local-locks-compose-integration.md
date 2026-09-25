@@ -190,7 +190,7 @@ audit is not self-approval.
 6. Use a fresh isolated `CARGO_TARGET_DIR` to run `cargo build -p paykit-server --bins`; assert no helper artifact exists there so stale artifacts cannot create false evidence.
 7. In a separate isolated target directory, build `--example paykit-companion-auth` and assert the artifact is under `target/release/examples/` (or the selected profile-equivalent path).
 8. Verify ordinary server routes/package binaries contain no helper or handle surface, while `Dockerfile.local` explicitly builds and installs `target/release/examples/paykit-companion-auth`.
-9. Build exact public/local contexts with Paykit Rust `v0.1.0-rc48` and Locks `v0.1.0-rc1`.
+9. Build exact public/local contexts with Paykit Rust `v0.1.0-rc48` and Locks `v0.1.0-rc3`.
 
 **Suggested commit:** `build(demo): package companion helper example`
 
@@ -244,7 +244,7 @@ docker buildx build --load \
   --file Dockerfile.local \
   --build-context paykit-lib='https://github.com/pubky/paykit-rs.git#v0.1.0-rc48:paykit-lib' \
   --build-context paykit-sdk='https://github.com/pubky/paykit-rs.git#v0.1.0-rc48:paykit-sdk' \
-  --build-context locks='https://github.com/pubky/locks.git#v0.1.0-rc1' \
+  --build-context locks='https://github.com/pubky/locks.git#v0.1.0-rc3' \
   --tag paykit-server:auth-url-helper-correction .
 ```
 

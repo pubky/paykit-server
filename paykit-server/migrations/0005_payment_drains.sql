@@ -46,15 +46,25 @@ CREATE TABLE payment_drains (
     accepted_count BIGINT NOT NULL CHECK (accepted_count >= 0),
     terminal_count BIGINT NOT NULL CHECK (terminal_count >= 0),
     cancellation_enqueued_count BIGINT NOT NULL CHECK (cancellation_enqueued_count >= 0),
+    cancellation_set_hash BYTEA NOT NULL CHECK (octet_length(cancellation_set_hash) = 32),
+    item_set_hash BYTEA NOT NULL CHECK (octet_length(item_set_hash) = 32),
     created_at TIMESTAMPTZ NOT NULL DEFAULT transaction_timestamp(),
     completed_at TIMESTAMPTZ,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT transaction_timestamp(),
     UNIQUE (creator_id, lock_resource_lookup_hash),
+    UNIQUE (id, creator_id, lock_resource_lookup_hash),
+    UNIQUE (id, creator_id, lock_resource_lookup_hash, lock_resource_generation),
     CONSTRAINT payment_drains_completion_check CHECK (
         (status = 'active' AND completed_at IS NULL)
         OR (status = 'completed' AND completed_at IS NOT NULL)
     )
 );
+
+ALTER TABLE lock_payment_generations
+    ADD CONSTRAINT lock_payment_generations_active_drain_owner_fk
+    FOREIGN KEY (active_drain_id, creator_id, lock_resource_lookup_hash)
+    REFERENCES payment_drains (id, creator_id, lock_resource_lookup_hash)
+    ON DELETE RESTRICT;
 
 CREATE FUNCTION advance_lock_payment_generation_after_drain_delete()
 RETURNS TRIGGER
@@ -99,13 +109,64 @@ CREATE TABLE payment_drain_items (
             'cancellation_enqueued'
         )
     ),
-    cancellation_outbox_id UUID REFERENCES outbox (id) ON DELETE RESTRICT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT transaction_timestamp(),
     PRIMARY KEY (drain_id, invoice_id),
-    UNIQUE (invoice_id),
-    UNIQUE (cancellation_outbox_id),
-    CONSTRAINT payment_drain_item_cancellation_check CHECK (
-        (classification = 'cancellation_enqueued' AND cancellation_outbox_id IS NOT NULL)
-        OR (classification <> 'cancellation_enqueued' AND cancellation_outbox_id IS NULL)
-    )
+    UNIQUE (drain_id, invoice_id, classification),
+    UNIQUE (invoice_id)
+);
+
+CREATE FUNCTION enforce_payment_drain_item_ownership()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM payment_drains AS drain
+        JOIN invoices AS invoice ON invoice.id = NEW.invoice_id
+        WHERE drain.id = NEW.drain_id
+          AND invoice.creator_id = drain.creator_id
+          AND invoice.lock_resource_lookup_hash = drain.lock_resource_lookup_hash
+          AND invoice.lock_resource_generation = drain.lock_resource_generation
+    ) THEN
+        RAISE EXCEPTION 'payment drain item ownership is inconsistent';
+    END IF;
+    RETURN NEW;
+END
+$$;
+
+CREATE TRIGGER payment_drain_items_enforce_ownership
+BEFORE INSERT OR UPDATE ON payment_drain_items
+FOR EACH ROW
+EXECUTE FUNCTION enforce_payment_drain_item_ownership();
+
+-- One invoice can have multiple still-proposed SDK attempts. Each cancellation
+-- is independently durable and replayed through the ordinary outbox.
+CREATE TABLE payment_drain_cancellations (
+    drain_id UUID NOT NULL,
+    invoice_id UUID NOT NULL,
+    sdk_payment_request_id TEXT NOT NULL CHECK (sdk_payment_request_id <> ''),
+    cancellation_outbox_id UUID NOT NULL REFERENCES outbox (id) ON DELETE RESTRICT,
+    outbox_intent_kind TEXT NOT NULL DEFAULT 'payment_request_cancellation'
+        CHECK (outbox_intent_kind = 'payment_request_cancellation'),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT transaction_timestamp(),
+    PRIMARY KEY (drain_id, sdk_payment_request_id),
+    FOREIGN KEY (drain_id, invoice_id)
+        REFERENCES payment_drain_items (drain_id, invoice_id) ON DELETE CASCADE,
+    FOREIGN KEY (invoice_id, sdk_payment_request_id)
+        REFERENCES payment_request_lifecycles (invoice_id, sdk_payment_request_id)
+        ON DELETE RESTRICT,
+
+    FOREIGN KEY (
+        cancellation_outbox_id,
+        invoice_id,
+        sdk_payment_request_id,
+        outbox_intent_kind
+    ) REFERENCES outbox (
+        id,
+        invoice_id,
+        cancellation_target_payment_request_id,
+        intent_kind
+    ) ON DELETE RESTRICT,
+    UNIQUE (cancellation_outbox_id)
 );

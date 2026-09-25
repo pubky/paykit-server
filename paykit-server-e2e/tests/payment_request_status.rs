@@ -64,6 +64,7 @@ async fn per_bundle_status_joins_canonical_lifecycle_and_payment_facts() {
     .unwrap();
 
     let store = InvoiceStore::new(database.pool(), crypto.clone());
+    assert!(store.invoice_exists(&creator, &bundle).await.unwrap());
     let missing_lifecycle = PaymentRequestStatusOperations::lookup(&store, &creator, &bundle).await;
     assert_eq!(
         missing_lifecycle,
@@ -98,6 +99,40 @@ async fn per_bundle_status_joins_canonical_lifecycle_and_payment_facts() {
     assert_eq!(status.confirmations(), 3);
     assert!(status.amount_matched());
 
+    let tied_at = created_at + time::Duration::seconds(1);
+    for (state, payment_request_id) in [
+        ("canceled", "ffffffff-ffff-ffff-ffff-ffffffffffff"),
+        ("rejected", "00000000-0000-0000-0000-000000000001"),
+    ] {
+        sqlx::query(
+            "INSERT INTO payment_request_lifecycles (
+                 invoice_id, sdk_payment_request_id, request_state, state_event_id,
+                 last_stream_item_id, last_outbound_message_id, last_event_at
+             ) VALUES ($1, $2, $3, $4, 2, 2, $5)",
+        )
+        .bind(invoice_id)
+        .bind(payment_request_id)
+        .bind(state)
+        .bind(Uuid::new_v4().to_string())
+        .bind(tied_at)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    }
+    sqlx::query(
+        "DELETE FROM payment_request_lifecycles
+         WHERE invoice_id = $1 AND request_state = 'accepted'",
+    )
+    .bind(invoice_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    let tied = PaymentRequestStatusOperations::lookup(&store, &creator, &bundle)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(tied.request_state(), PaymentRequestLifecycleState::Rejected);
+
     let corrupt_lifecycle = sqlx::query(
         "UPDATE payment_request_lifecycles SET request_state = 'unexpected' WHERE invoice_id = $1",
     )
@@ -127,6 +162,15 @@ async fn per_bundle_status_joins_canonical_lifecycle_and_payment_facts() {
     .await
     .unwrap();
     assert!(absent.is_none());
+    assert!(
+        !store
+            .invoice_exists(
+                &creator,
+                &parse_bundle_id("000G40R40M30E209185GR38E2W").unwrap(),
+            )
+            .await
+            .unwrap()
+    );
 
     database.cleanup().await;
 }

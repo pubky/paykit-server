@@ -1,11 +1,16 @@
 use std::sync::Arc;
 
+use paykit_lib::{
+    PaykitReceiverCapabilities, PaykitReceiverMarker, PaykitReceiverPath, PaymentAmount,
+    PaymentEndpointIdentifier, PaymentReference, PaymentRequestTerms, PublicKey,
+};
 use paykit_server::{
-    crypto::Crypto,
+    application::semantic_intent::{DeliveryIntentV1, PaymentTermsV1},
+    crypto::{Crypto, EnvelopeContext},
     domain::{
         locks::{CreatorPubky, parse_creator},
         payment_request_lifecycle::{
-            PaymentRequestLifecycleProjection, PaymentRequestLifecycleState,
+            PaymentRequestLifecycleProjection, PaymentRequestLifecycleState, ProposalCorrelation,
         },
     },
     persistence::{
@@ -21,6 +26,35 @@ const CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy
 
 fn creator() -> CreatorPubky {
     parse_creator(CREATOR).unwrap()
+}
+
+fn proposal_intent(payment_reference: &str) -> DeliveryIntentV1 {
+    let marker = PaykitReceiverMarker::new(
+        PaykitReceiverPath::new("bitkit/wallet").unwrap(),
+        PaykitReceiverCapabilities {
+            private_payments: true,
+            payment_requests: true,
+            receipts: false,
+            outgoing_payments: false,
+        },
+        PublicKey::try_from_z32("tkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy").unwrap(),
+    );
+    DeliveryIntentV1::payment_request(
+        CREATOR.into(),
+        &marker,
+        PaykitReceiverPath::new("paykit/server").unwrap(),
+        &PaymentRequestTerms {
+            amount: PaymentAmount::new("1", "btc").unwrap(),
+            payment_reference: PaymentReference::new(payment_reference.to_owned()).unwrap(),
+            proposal_expires_at: None,
+            recurrence: None,
+            accepted_payment_endpoint_identifiers: vec![
+                PaymentEndpointIdentifier::new("btc-bitcoin-p2wpkh").unwrap(),
+            ],
+            metadata: serde_json::Map::new(),
+        },
+    )
+    .unwrap()
 }
 
 async fn setup() -> (
@@ -53,6 +87,16 @@ async fn attributable_invoice(
     let bundle_id = Uuid::from_u128(u128::from(ordinal) + 1);
     let invoice_id = Uuid::new_v4();
     let payment_request_id = Uuid::new_v4().to_string();
+    let outbox_id = Uuid::new_v4();
+    let intent_envelope = crypto
+        .encrypt(
+            &EnvelopeContext::outbox_semantic_intent(
+                crypto.lookup_hash(CREATOR.as_bytes()),
+                outbox_id,
+            ),
+            &postcard::to_allocvec(&proposal_intent(&payment_request_id)).unwrap(),
+        )
+        .unwrap();
     let created_at = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
     let deadline = created_at + Duration::hours(24);
     let hash = |label: &str| {
@@ -61,6 +105,7 @@ async fn attributable_invoice(
             .as_bytes()
             .to_vec()
     };
+    let lock_resource_lookup_hash = hash("lock-resource");
 
     sqlx::query(
         "INSERT INTO invoices (
@@ -82,8 +127,13 @@ async fn attributable_invoice(
             .as_bytes()
             .as_slice(),
     )
-    .bind(hash("lock-resource"))
-    .bind(hash("request"))
+    .bind(&lock_resource_lookup_hash)
+    .bind(
+        crypto
+            .lookup_hash(payment_request_id.as_bytes())
+            .as_bytes()
+            .as_slice(),
+    )
     .bind(b"encrypted-invoice".as_slice())
     .bind(b"encrypted-payment".as_slice())
     .bind(hash("address"))
@@ -95,16 +145,36 @@ async fn attributable_invoice(
     .unwrap();
 
     sqlx::query(
-        "INSERT INTO outbox (
-             creator_id, invoice_id, intent_envelope, status,
-             sdk_outbound_message_id, sdk_event_id, sdk_payment_request_id
-         ) VALUES ($1, $2, $3, 'delivered', '1', $4, $5)",
+        "INSERT INTO lock_payment_generations (creator_id, lock_resource_lookup_hash)
+         VALUES ($1, $2)",
     )
     .bind(creator_id)
+    .bind(&lock_resource_lookup_hash)
+    .execute(database.pool())
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO outbox (
+             id, creator_id, invoice_id, intent_envelope, intent_kind, status,
+             sdk_outbound_message_id, sdk_event_id, sdk_payment_request_id,
+             proposal_lookup_hash
+         ) VALUES (
+             $1, $2, $3, $4, 'payment_request_proposal', 'delivered', '1', $5, $6, $7
+         )",
+    )
+    .bind(outbox_id)
+    .bind(creator_id)
     .bind(invoice_id)
-    .bind(b"encrypted-intent".as_slice())
+    .bind(intent_envelope.as_bytes())
     .bind(Uuid::new_v4().to_string())
     .bind(&payment_request_id)
+    .bind(
+        crypto
+            .payment_request_proposal_lookup_hash(payment_request_id.as_bytes())
+            .as_bytes()
+            .as_slice(),
+    )
     .execute(database.pool())
     .await
     .unwrap();
@@ -119,6 +189,18 @@ fn projection(
     recorded_at: OffsetDateTime,
 ) -> PaymentRequestLifecycleProjection {
     PaymentRequestLifecycleProjection {
+        proposal: ProposalCorrelation {
+            reader_pubky: CREATOR.into(),
+            selected_reader_path: "bitkit/wallet".into(),
+            terms: PaymentTermsV1 {
+                amount: "1".into(),
+                asset: "btc".into(),
+                payment_reference: payment_request_id.clone(),
+                proposal_expires_at: None,
+                accepted_endpoint_identifiers: vec!["btc-bitcoin-p2wpkh".into()],
+                metadata: serde_json::Map::new(),
+            },
+        },
         payment_request_id,
         request_state,
         state_event_id: Some(Uuid::new_v4().to_string()),
@@ -278,6 +360,76 @@ async fn exact_replay_is_idempotent_but_stale_or_equal_cursor_divergence_conflic
 }
 
 #[tokio::test]
+async fn recovery_overlay_is_reversible_at_equal_cursors_with_exact_event_identity() {
+    let (database, crypto, store, creator_id) = setup().await;
+    let (_, bundle_id, payment_request_id) =
+        attributable_invoice(&database, &crypto, creator_id, 23).await;
+    let base = OffsetDateTime::from_unix_timestamp(1_800_000_275).unwrap();
+    let accepted = projection(
+        payment_request_id,
+        PaymentRequestLifecycleState::Accepted,
+        2,
+        base,
+    );
+    let event_id = accepted.state_event_id.clone();
+    store.apply(creator_id, &accepted).await.unwrap();
+
+    let mut recovery = accepted.clone();
+    recovery.request_state = PaymentRequestLifecycleState::RecoveryRequired;
+    recovery.last_event_at += Duration::seconds(1);
+    assert_eq!(
+        store.apply(creator_id, &recovery).await.unwrap(),
+        PaymentRequestLifecycleApply::Applied
+    );
+    assert_eq!(
+        PaymentRequestLifecycleStore::new(database.pool(), crypto.clone())
+            .load(&creator(), bundle_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .request_state,
+        PaymentRequestLifecycleState::RecoveryRequired
+    );
+
+    let mut recovered = recovery.clone();
+    recovered.request_state = PaymentRequestLifecycleState::Accepted;
+    recovered.last_event_at += Duration::seconds(1);
+    assert_eq!(recovered.state_event_id, event_id);
+    assert_eq!(
+        store.apply(creator_id, &recovered).await.unwrap(),
+        PaymentRequestLifecycleApply::Applied
+    );
+
+    let mut different_event = recovered.clone();
+    different_event.request_state = PaymentRequestLifecycleState::RecoveryRequired;
+    different_event.state_event_id = Some(Uuid::new_v4().to_string());
+    different_event.last_event_at += Duration::seconds(1);
+    assert_eq!(
+        store.apply(creator_id, &different_event).await,
+        Err(PersistenceError::Conflict)
+    );
+    assert_eq!(
+        store
+            .load(&creator(), bundle_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .request_state,
+        PaymentRequestLifecycleState::Accepted
+    );
+
+    let mut invalid = recovered;
+    invalid.request_state = PaymentRequestLifecycleState::InvalidConflict;
+    invalid.last_event_at += Duration::seconds(1);
+    assert_eq!(
+        store.apply(creator_id, &invalid).await,
+        Err(PersistenceError::Conflict)
+    );
+
+    database.cleanup().await;
+}
+
+#[tokio::test]
 async fn lifecycle_projection_skips_unattributable_and_rejects_multiple_attribution() {
     let (database, crypto, store, creator_id) = setup().await;
     let recorded_at = OffsetDateTime::from_unix_timestamp(1_800_000_250).unwrap();
@@ -329,6 +481,60 @@ async fn lifecycle_projection_skips_unattributable_and_rejects_multiple_attribut
         .await
         .unwrap();
     assert_eq!(projected, 0);
+
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn ambiguous_retry_attempt_is_attributed_by_stable_proposal_semantics() {
+    let (database, crypto, store, creator_id) = setup().await;
+    let (_, bundle_id, associated_request_id) =
+        attributable_invoice(&database, &crypto, creator_id, 24).await;
+    let recorded_at = OffsetDateTime::from_unix_timestamp(1_800_000_280).unwrap();
+
+    let associated = projection(
+        associated_request_id.clone(),
+        PaymentRequestLifecycleState::Proposed,
+        2,
+        recorded_at,
+    );
+    store.apply(creator_id, &associated).await.unwrap();
+
+    let mut ambiguous_attempt = projection(
+        Uuid::new_v4().to_string(),
+        PaymentRequestLifecycleState::Accepted,
+        3,
+        recorded_at + Duration::seconds(1),
+    );
+    ambiguous_attempt.proposal.terms.payment_reference = associated_request_id;
+    assert_eq!(
+        store.apply(creator_id, &ambiguous_attempt).await.unwrap(),
+        PaymentRequestLifecycleApply::Applied
+    );
+
+    let attempts: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM payment_request_lifecycles
+         WHERE invoice_id = (SELECT id FROM invoices WHERE bundle_lookup_hash = $1)",
+    )
+    .bind(
+        crypto
+            .lookup_hash(bundle_id.as_bytes())
+            .as_bytes()
+            .as_slice(),
+    )
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(attempts, 2);
+    assert_eq!(
+        store
+            .load(&creator(), bundle_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .request_state,
+        PaymentRequestLifecycleState::Accepted
+    );
 
     database.cleanup().await;
 }
@@ -395,6 +601,106 @@ async fn concurrent_monotonic_updates_converge_and_delayed_acceptance_after_canc
             .unwrap()
             .request_state,
         PaymentRequestLifecycleState::InvalidConflict
+    );
+
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn active_drain_rejects_new_attempts_but_allows_existing_attempt_progress() {
+    let (database, crypto, store, creator_id) = setup().await;
+    let (invoice_id, _, payment_request_id) =
+        attributable_invoice(&database, &crypto, creator_id, 31).await;
+    let recorded_at = OffsetDateTime::from_unix_timestamp(1_800_000_400).unwrap();
+    let proposed = projection(
+        payment_request_id,
+        PaymentRequestLifecycleState::Proposed,
+        1,
+        recorded_at,
+    );
+    assert_eq!(
+        store.apply(creator_id, &proposed).await.unwrap(),
+        PaymentRequestLifecycleApply::Applied
+    );
+
+    let (lock_hash, generation): (Vec<u8>, i64) = sqlx::query_as(
+        "SELECT lock_resource_lookup_hash, lock_resource_generation FROM invoices WHERE id = $1",
+    )
+    .bind(invoice_id)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    let drain_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO payment_drains (
+             id, creator_id, lock_resource_lookup_hash,
+             lock_resource_generation, lock_resource_envelope, status,
+             accepted_count, terminal_count, cancellation_enqueued_count,
+             cancellation_set_hash, item_set_hash
+         )
+         SELECT $2, creator_id, lock_resource_lookup_hash,
+                lock_resource_generation, $3, 'active',
+                0, 0, 0, decode(repeat('00', 32), 'hex'),
+                decode(repeat('00', 32), 'hex')
+         FROM invoices
+         WHERE id = $1",
+    )
+    .bind(invoice_id)
+    .bind(drain_id)
+    .bind(vec![0_u8])
+    .execute(database.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE lock_payment_generations
+         SET current_generation = $3, active_drain_id = $4
+         WHERE creator_id = $1 AND lock_resource_lookup_hash = $2",
+    )
+    .bind(creator_id)
+    .bind(lock_hash)
+    .bind(generation)
+    .bind(drain_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+
+    let mut retry = proposed.clone();
+    retry.payment_request_id = Uuid::new_v4().to_string();
+    retry.state_event_id = Some(Uuid::new_v4().to_string());
+    retry.last_stream_item_id = Some(2);
+    assert_eq!(
+        store.apply(creator_id, &retry).await,
+        Err(PersistenceError::Conflict)
+    );
+
+    sqlx::query(
+        "UPDATE lock_payment_generations
+         SET current_generation = current_generation + 1, active_drain_id = NULL
+         WHERE creator_id = $1 AND lock_resource_lookup_hash = (
+             SELECT lock_resource_lookup_hash FROM invoices WHERE id = $2
+         )",
+    )
+    .bind(creator_id)
+    .bind(invoice_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    let mut post_cleanup_retry = retry.clone();
+    post_cleanup_retry.payment_request_id = Uuid::new_v4().to_string();
+    post_cleanup_retry.state_event_id = Some(Uuid::new_v4().to_string());
+    post_cleanup_retry.last_stream_item_id = Some(3);
+    assert_eq!(
+        store.apply(creator_id, &post_cleanup_retry).await,
+        Err(PersistenceError::Conflict)
+    );
+
+    let mut accepted = proposed;
+    accepted.request_state = PaymentRequestLifecycleState::Accepted;
+    accepted.last_stream_item_id = Some(2);
+    accepted.last_event_at = recorded_at + Duration::seconds(1);
+    assert_eq!(
+        store.apply(creator_id, &accepted).await.unwrap(),
+        PaymentRequestLifecycleApply::Applied
     );
 
     database.cleanup().await;

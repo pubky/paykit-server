@@ -39,6 +39,7 @@ use paykit_server::{
     config::{BitcoinNetwork, Config, ConfigEnvironment},
     crypto::{Crypto, EncryptedEnvelope, EnvelopeContext},
     domain::locks::{CreatorPubky, ReaderPubky, parse_bundle_id, parse_creator, parse_reader},
+    http::auth::signature_preimage,
     persistence::{CreatorCredentials, CreatorStore, PostgresStorageAdapter, SdkStateStore},
     startup::initialize_database,
     workers::observer::{ElectrumPort, ObserverError},
@@ -400,12 +401,14 @@ fn signed_request(
     uri: &str,
     body: String,
 ) -> Request<Body> {
+    let path = uri.split('?').next().expect("request URI has a path");
+    let preimage = signature_preimage(method.as_str(), path, body.as_bytes());
     Request::builder()
         .method(method)
         .uri(uri)
         .header(
             "X-Paykit-Signature",
-            URL_SAFE_NO_PAD.encode(signing_key.sign(body.as_bytes()).to_bytes()),
+            URL_SAFE_NO_PAD.encode(signing_key.sign(&preimage).to_bytes()),
         )
         .body(Body::from(body))
         .unwrap()

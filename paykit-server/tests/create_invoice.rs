@@ -826,12 +826,13 @@ signed_burst = 100
 }
 
 fn signed_invoice_request(key: &SigningKey, body: Vec<u8>) -> Request<Body> {
+    let preimage = paykit_server::http::auth::signature_preimage("POST", "/invoices", &body);
     Request::builder()
         .method(Method::POST)
         .uri("/invoices")
         .header(
             "X-Paykit-Signature",
-            URL_SAFE_NO_PAD.encode(key.sign(&body).to_bytes()),
+            URL_SAFE_NO_PAD.encode(key.sign(&preimage).to_bytes()),
         )
         .body(Body::from(body))
         .unwrap()

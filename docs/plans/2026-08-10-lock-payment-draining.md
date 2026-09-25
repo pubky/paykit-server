@@ -6,7 +6,7 @@
 
 **Architecture:** Paykit Server derives payment terms from the canonical content lock, compares Locks’ signed `payment_in`, commits invoice timestamps and Payment Request intent atomically, and observes Bitcoin through existing BDK Electrum abstractions. A new persisted lock-wide drain snapshots local Payment Request lifecycle, enqueues cancellations for unanswered requests, and exposes aggregate status. Locks polls separate per-Bundle factual status and applies its own `minimum_confirmations` policy.
 
-**Tech Stack:** Rust 2024, Axum, Tokio, SQLx/PostgreSQL, `paykit-lib`/`paykit-sdk`, BDK Electrum, encrypted semantic intents, existing Ed25519 canonical-JSON authentication.
+**Tech Stack:** Rust 2024, Axum, Tokio, SQLx/PostgreSQL, `paykit-lib`/`paykit-sdk`, BDK Electrum, encrypted semantic intents, Ed25519 method/path/body authentication.
 
 **Sibling plan:** Locks `docs/plans/2026-08-10-graceful-content-lock-deletion.md`. Both plans repeat the shared wire contract deliberately.
 
@@ -14,7 +14,7 @@
 
 ## Status and provenance
 
-- Plan status: **accepted product design; implementation not started**.
+- Plan status: **implemented and verified against an isolated PostgreSQL 16 test database**.
 - Repository inspected: `/home/u/Projects/Synonym/Paykit/paykit-server`.
 - Planning base when written: clean `master` at `f38c791`.
 - Current Locks Core dependency is pinned to `df5ea1b...`; implementation must update it to the reviewed Locks revision containing required `payment_in`.
@@ -32,6 +32,8 @@ invoice_created_at = authoritative database creation timestamp
 payment_deadline = checked(invoice_created_at + payment_in hours)
 ```
 
+Production samples `clock_timestamp()` only after acquiring the decisive Creator or invoice row fence. This prevents lock wait from making a transaction-start timestamp stale across a deadline. Deterministic caller-time seams remain test-only.
+
 4. Integer-to-duration and timestamp addition are checked. Unrepresentable deadlines reject before side effects.
 5. Exact invoice replay resolves persisted state before mutable lock fetch and returns original timestamps without recomputation.
 6. Payment Request `proposal_expires_at` is set to the same absolute deadline, while retaining its existing proposal-only Paykit meaning.
@@ -46,21 +48,22 @@ payment_deadline = checked(invoice_created_at + payment_in hours)
 11. Underpayment may be replaced by a qualifying output only through the deadline. It does not extend monitoring.
 12. Timely amount-matched payment has no second timeout and may keep graceful deletion blocked during unresolved confirmations/reorg behavior.
 13. Paykit reports factual confirmations/amount match only. Locks owns `minimum_confirmations`; drain requests do not carry it.
-14. A durable lock-wide drain atomically snapshots currently persisted Payment Request lifecycle:
+14. Before a new drain or per-Bundle status result, Paykit receives linked-peer messages and projects the canonical SDK reducer under the same Creator mutation fence. Partial receive or projection failure returns unavailable instead of using stale lifecycle state. A durable lock-wide drain then atomically snapshots lifecycle:
    - acceptance committed before snapshot: accepted and monitored;
    - rejection committed before snapshot: terminal rejected;
    - unanswered before snapshot: durably enqueue cancellation;
    - acceptance arriving after cancellation commit loses, even if emitted earlier.
-15. Exact drain replay returns the same frozen per-item classification and never reclassifies delayed lifecycle events. Aggregate progress is monotonic: each frozen accepted item becomes aggregate-terminal when its invoice is application-expired or has a timely durable first amount-matched observation; `accepted_count` decreases by that number, `terminal_count` increases by the same number, `cancellation_enqueued_count` remains fixed, and `completed` is irreversible once `accepted_count == 0`. Locks still polls each Bundle and applies its own confirmation/reorg rule, so Paykit aggregate completion is not sufficient for deletion advancement.
-16. Durable cancellation enqueue is sufficient; no SDK Sent state or payer acknowledgment blocks cleanup.
-17. Rejected and canceled requests do not block Locks cleanup. Accepted requests block until application expiry or factual payment progress permits Locks to satisfy its frozen criterion.
-18. Paykit owns the durable drain and aggregate factual status. Locks owns the overall content-deletion job.
-19. Locks polls per-Bundle status separately. Bundle IDs stay in signed POST bodies, never URLs or logs.
-20. Creator-facing Locks status receives no Paykit identifiers. Internal drain lookup returns aggregates only.
-21. After graceful completion, Locks asks Paykit to remove the operational drain record. Invoice/payment records remain terminal financial history.
-22. Old delayed lifecycle messages cannot reopen canceled/expired state or contaminate a later fresh publication of the same canonical Lock ID.
-23. Reader/payment UI must stop presenting payment at the application deadline. Late payment yields no Locks access or automatic refund; that risk is explicitly accepted.
-24. Deployment from the migration-`0001` prototype automatically clears Paykit application rows inside migration `0002`. The migration is transactional and SQLx applies it once. It does not drop the schema or migration history, does not touch the Locks database, and must not be modified into a recurring startup reset.
+15. Ambiguous proposal retries reuse one Payment Reference but can create several SDK Payment Request IDs. Paykit persists every semantically matched attempt per invoice. Any accepted/proof-submitted/active-recurring attempt makes that invoice accepted, while every still-proposed sibling attempt still receives its own cancellation intent. Drain activation durably rejects new lifecycle-attempt insertion and prevents queued, retryable, or already-leased proposal handoff after the snapshot. `cancellation_enqueued_count` counts cancellation attempts, while accepted and terminal counts count invoices; a keyed commitment binds the exact frozen cancellation membership, and both exact replay and cleanup fail closed if cancellation ownership, membership, or cardinality diverges.
+16. Exact drain replay returns the same frozen per-item classification and never reclassifies delayed lifecycle events. Aggregate progress is monotonic: each frozen accepted item becomes aggregate-terminal when its invoice is application-expired or has a timely durable first amount-matched observation; `accepted_count` decreases by that number, `terminal_count` increases by the same number, `cancellation_enqueued_count` remains fixed, and `completed` is irreversible once `accepted_count == 0`.
+17. Durable cancellation enqueue is sufficient; no SDK Sent state or payer acknowledgment blocks cleanup.
+18. Rejected and canceled requests do not block Locks cleanup. Accepted requests block until application expiry or factual payment progress permits Locks to satisfy its frozen criterion.
+19. Paykit owns the durable drain and aggregate factual status. Locks owns the overall content-deletion job.
+20. Locks polls per-Bundle status separately. Bundle IDs stay in signed POST bodies, never URLs or logs.
+21. Creator-facing Locks status receives no Paykit identifiers. Internal drain lookup returns aggregates only.
+22. After graceful completion, Locks asks Paykit to remove the operational drain record. Invoice/payment records remain terminal financial history.
+23. Old delayed lifecycle messages cannot reopen canceled/expired state or contaminate a later fresh publication of the same canonical Lock ID.
+24. Reader/payment UI must stop presenting payment at the application deadline. Late payment yields no Locks access or automatic refund; that risk is explicitly accepted.
+25. Deployment from the migration-`0001` prototype automatically clears Paykit application rows inside migration `0002`. The migration is transactional and SQLx applies it once. It does not drop the schema or migration history, does not touch the Locks database, and must not be modified into a recurring startup reset.
 
 ## Source-derived constraints
 
@@ -100,7 +103,7 @@ payment_deadline = checked(invoice_created_at + payment_in hours)
 
 ## Shared service-to-service contract
 
-All bodies are closed canonical JSON authenticated by existing `X-Paykit-Signature`. Do not log bodies, signatures, Bundle IDs, readers, addresses, Payment Request IDs, payment references, or internal drain IDs.
+All bodies are closed canonical JSON authenticated by `X-Paykit-Signature` over `b"paykit-http-signature-v1\0" + uppercase_method + b"\0" + exact_query_free_path + b"\0" + exact_raw_body`. Body-only signatures are rejected. Do not log bodies, signatures, Bundle IDs, readers, addresses, Payment Request IDs, payment references, or internal drain IDs.
 
 ### Invoice creation
 
@@ -199,12 +202,12 @@ Locks maps `rejected`, `canceled`, and `proposal_expired` requests to `Verificat
 
 Drain classification uses the persisted state without inference from invoice delivery or Bitcoin observation:
 
-- `accepted` is accepted and blocking;
+- `accepted`, `proof_submitted`, and `active_recurring` are accepted and blocking;
 - `rejected`, `canceled`, and `proposal_expired` are terminal and non-blocking;
 - `proposed` is unanswered and requires durable cancellation enqueue;
-- `recovery_required`, `invalid_conflict`, `proof_submitted`, and `active_recurring` fail drain classification rather than being collapsed into another lifecycle.
+- `recovery_required` returns unavailable and `invalid_conflict` returns conflict.
 
-For the later HTTP slice, `recovery_required` maps to `503 unavailable`; `invalid_conflict`, `proof_submitted`, and `active_recurring` map to `409 conflict`. These mappings do not alter the canonical lifecycle persisted by this projection.
+`recovery_required` maps to `503 unavailable`; `invalid_conflict` maps to `409 conflict`. These mappings do not alter the canonical lifecycle persisted by this projection.
 
 The stable drain-classification error envelopes are:
 
@@ -245,7 +248,7 @@ Persist:
 - drain creation/cutoff timestamp;
 - immutable snapshot membership/classification or equivalent durable per-invoice relation;
 - current aggregate/reconciliation status;
-- cancellation intent relationship/outbox identity;
+- one cancellation intent relationship/outbox identity per still-proposed SDK attempt;
 - cleanup/completion state;
 - exact-replay binding.
 
