@@ -1077,3 +1077,181 @@ async fn composed_two_creator_receiver_workflow_survives_restart() {
     second_pool.close().await;
     database.cleanup().await;
 }
+
+/// `(status, attempt_count)` of every outbox row, oldest first.
+async fn outbox_rows(pool: &PgPool) -> Vec<(String, i32)> {
+    sqlx::query_as("SELECT status, attempt_count FROM outbox ORDER BY created_at, id")
+        .fetch_all(pool)
+        .await
+        .unwrap()
+}
+
+/// Waits until every outbox row is `delivered`, and reports whether they got
+/// there within `timeout`.
+async fn outbox_settles_within(pool: &PgPool, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if outbox_rows(pool)
+            .await
+            .iter()
+            .all(|(status, _)| status == "delivered")
+        {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Opens one Locks invoice (single phase), which queues its handoff.
+async fn open_invoice(
+    address: SocketAddr,
+    signing_key: &SigningKey,
+    fixture: &CreatorFixture,
+    reader: &ReaderPubky,
+    bundle: &str,
+) {
+    let response = send_http(
+        address,
+        invoice_request(signing_key, fixture, reader, bundle),
+    )
+    .await;
+    assert_eq!(
+        response.status,
+        StatusCode::NO_CONTENT,
+        "invoice body: {}",
+        String::from_utf8_lossy(&response.body)
+    );
+}
+
+/// The reader's wallet: keeps its side of the handshake moving, reads the
+/// link and returns once the request for `bundle` has arrived.
+async fn wait_for_request(
+    peer: &PeerSdk,
+    creator_key: &PubkyPublicKey,
+    bundle: &str,
+    pool: &PgPool,
+) {
+    let creator_path = PaykitReceiverPath::new("paykit/server").unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let state = peer
+            .ensure_link_with_peer(creator_key.clone(), creator_path.clone(), 1)
+            .await
+            .map(|report| report.state);
+        if matches!(state, Ok(LinkedPeerState::Linked)) {
+            peer.receive_private_messages(creator_key.clone(), creator_path.clone())
+                .await
+                .unwrap();
+            if peer
+                .payment_requests_with(creator_key, &creator_path)
+                .await
+                .unwrap()
+                .iter()
+                .any(|request| {
+                    request.terms.as_ref().is_some_and(|terms| {
+                        terms.metadata.get("bundle_id") == Some(&serde_json::json!(bundle))
+                    })
+                })
+            {
+                return;
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!(
+                "request for {bundle} never arrived: link={state:?} outbox={:?}",
+                outbox_rows(pool).await
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// A wallet that dropped its side of the server link publishes a recovery
+/// marker and waits for a new handshake. The server must not hand the next
+/// request to the abandoned link (and mark it `delivered`); it relinks, and
+/// the request arrives once the wallet is back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn server_relinks_when_the_reader_publishes_a_recovery_marker() {
+    let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
+    let database = TestDatabase::create().await;
+    let signing_key = SigningKey::from_bytes(&[72; 32]);
+    let server_config = config(database.database_url(), &signing_key, "100ms");
+    let pool = initialize_database(&server_config).await.unwrap();
+    let testnet = build_pubky_testnet().await;
+    let pubky = testnet.sdk().unwrap();
+    let bootstrap = PubkySessionBootstrap::with_pubky(pubky.clone(), "app.paykit.server").unwrap();
+    let homeserver = PubkyPublicKey::from_public_key(&testnet.homeserver_app().public_key());
+    let crypto = Arc::new(Crypto::from_master_key(&[1; 32]).unwrap());
+    let creators = CreatorStore::new(&pool, crypto.clone());
+    let (reader, _peer_key, peer_sdk) = create_peer(&bootstrap, &homeserver).await;
+    let creator = create_creator(
+        &bootstrap,
+        &homeserver,
+        &creators,
+        &pool,
+        crypto.clone(),
+        CreatorSpec {
+            seed: 72,
+            account_index: 0,
+            amount_sats: 2_000,
+            counter_seed: 100,
+        },
+    )
+    .await;
+    let creator_key = PubkyPublicKey::from_raw_or_app_key(creator.creator.to_string()).unwrap();
+
+    let observer = Arc::new(DeterministicElectrum::new(&[&creator]));
+    let server = Server::build_with_transports(server_config, pool.clone(), pubky, observer)
+        .await
+        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let running = tokio::spawn(server.run_until(listener, async move {
+        let _ = shutdown_rx.await;
+    }));
+    wait_until_listening(address).await;
+    wait_until_ready(address).await;
+
+    // The first unlock links the reader's wallet to the creator's server link.
+    open_invoice(address, &signing_key, &creator, &reader, BUNDLE_A).await;
+    wait_for_request(&peer_sdk, &creator_key, BUNDLE_A, &pool).await;
+    assert!(
+        outbox_settles_within(&pool, Duration::from_secs(10)).await,
+        "first unlock never settled: {:?}",
+        outbox_rows(&pool).await
+    );
+
+    // The wallet drops its side of the link and asks for a new handshake, as
+    // Bitkit does after a failed link restore. Marker times have second
+    // precision; one from the second of the server's last link checkpoint
+    // counts as stale.
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    peer_sdk
+        .publish_encrypted_link_recovery_marker(
+            creator_key.clone(),
+            PaykitReceiverPath::new("paykit/server").unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // The next unlock, while the wallet is away: the server must not hand
+    // the request to the link the wallet abandoned.
+    open_invoice(address, &signing_key, &creator, &reader, BUNDLE_B).await;
+    assert!(
+        !outbox_settles_within(&pool, Duration::from_secs(5)).await,
+        "the request was handed to the abandoned link: {:?}",
+        outbox_rows(&pool).await
+    );
+
+    // Once the wallet is back, the new link carries the request.
+    wait_for_request(&peer_sdk, &creator_key, BUNDLE_B, &pool).await;
+
+    let _ = shutdown_tx.send(());
+    running.await.unwrap().unwrap();
+    pool.close().await;
+    database.cleanup().await;
+}
