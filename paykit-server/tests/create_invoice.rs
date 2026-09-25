@@ -90,7 +90,7 @@ fn capable_marker() -> paykit_lib::PaykitReceiverMarker {
             private_payments: true,
             payment_requests: true,
             receipts: false,
-            outgoing_payments: false,
+            outgoing_payments: true,
         },
         paykit_lib::PublicKey::try_from_z32("tkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy")
             .unwrap(),
@@ -867,7 +867,7 @@ async fn new_invoice_discovers_marker_before_atomic_persistence_and_pins_it_in_b
             private_payments: true,
             payment_requests: true,
             receipts: false,
-            outgoing_payments: false,
+            outgoing_payments: true,
         },
         PublicKey::try_from_z32("tkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy").unwrap(),
     );
