@@ -1,11 +1,12 @@
--- There has been no production deployment and historical prototype rows are
--- intentionally unsupported. Existing non-empty prototype databases must reset:
--- lock-resource membership cannot be reconstructed safely from keyed hashes.
+-- Migration 0002 performs the approved one-time prototype reset before adding
+-- authoritative invoice deadlines. Keep this assertion fail-closed: reaching
+-- this migration with invoice rows means migration ordering was violated or an
+-- unsupported partial deployment admitted data between migrations.
 DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM invoices) THEN
         RAISE EXCEPTION
-            'non-empty prototype database must reset before applying payment drain persistence';
+            'prototype reset invariant violated before payment drain persistence';
     END IF;
 END
 $$;

@@ -19,7 +19,7 @@
 - Planning base when written: clean `master` at `f38c791`.
 - Current Locks Core dependency is pinned to `df5ea1b...`; implementation must update it to the reviewed Locks revision containing required `payment_in`.
 - Current Paykit Rust dependency remains pinned to `52a8529...` unless ordinary compatibility work proves a reviewed update necessary. No new Paykit protocol field/event is planned.
-- There has been no production deployment. Forward-only pre-production migrations need no historical backfill.
+- There has been no production deployment. Migration `0002` performs the approved one-time destructive reset of migration-`0001` prototype data before adding non-backfillable invoice facts; SQLx records it once, so later starts do not repeat the reset.
 
 ## Explicit requirements and confirmed decisions
 
@@ -60,6 +60,7 @@ payment_deadline = checked(invoice_created_at + payment_in hours)
 21. After graceful completion, Locks asks Paykit to remove the operational drain record. Invoice/payment records remain terminal financial history.
 22. Old delayed lifecycle messages cannot reopen canceled/expired state or contaminate a later fresh publication of the same canonical Lock ID.
 23. Reader/payment UI must stop presenting payment at the application deadline. Late payment yields no Locks access or automatic refund; that risk is explicitly accepted.
+24. Deployment from the migration-`0001` prototype automatically clears Paykit application rows inside migration `0002`. The migration is transactional and SQLx applies it once. It does not drop the schema or migration history, does not touch the Locks database, and must not be modified into a recurring startup reset.
 
 ## Source-derived constraints
 
@@ -293,9 +294,9 @@ cargo test --workspace --no-run
 - Test: invoice persistence/application/HTTP tests
 - Test: relevant `paykit-server-e2e` invoice tests
 
-**RED:** Test checked duration/timestamp overflow, one timestamp assignment per new invoice, exact replay after clock advance, conflict on changed `payment_in`, strict JSON response, and rollback of invoice/allocation/outbox on failure.
+**RED:** Test the one-time migration-`0001` prototype reset and restart preservation, checked duration/timestamp overflow, one timestamp assignment per new invoice, exact replay after clock advance, conflict on changed `payment_in`, strict JSON response, and rollback of invoice/allocation/outbox on failure.
 
-**GREEN:** Generate the authoritative timestamp in the atomic persistence boundary, set `proposal_expires_at` to `payment_deadline`, persist both, and return a typed result. Preserve replay-first behavior.
+**GREEN:** Clear migration-`0001` application rows transactionally in migration `0002`, generate the authoritative timestamp in the atomic persistence boundary, set `proposal_expires_at` to `payment_deadline`, persist both, and return a typed result. Preserve replay-first behavior; SQLx migration history prevents a second reset.
 
 **Verify:**
 

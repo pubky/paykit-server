@@ -657,17 +657,27 @@ async fn acquire_and_release_advisory_lock(connection: &mut PgConnection) {
 }
 
 #[tokio::test]
-async fn payment_drain_migration_rejects_unattributable_historical_invoices() {
+async fn reset_only_upgrade_clears_prototype_state_once() {
     let _migration_test_guard = migration_test_lock().lock().await;
     let database = TestDatabase::create().await;
     let pool = database.pool();
     let migrator = Migrator {
-        migrations: Cow::Owned(ALL_MIGRATIONS.iter().take(4).cloned().collect()),
+        migrations: Cow::Owned(ALL_MIGRATIONS.iter().take(1).cloned().collect()),
         ignore_missing: false,
         locking: false,
         no_tx: false,
     };
     migrator.run(pool).await.unwrap();
+
+    sqlx::query(
+        "INSERT INTO deployment_metadata (
+             bitcoin_network, paykit_client_id, receiver_path, locks_key_fingerprint
+         ) VALUES ('regtest', 'app.paykit.server', 'paykit/server', $1)",
+    )
+    .bind(b"prototype-locks-key".as_slice())
+    .execute(pool)
+    .await
+    .unwrap();
 
     let creator_id: Uuid = sqlx::query_scalar(
         "INSERT INTO creators (creator_lookup_hash, credential_envelope)
@@ -678,14 +688,34 @@ async fn payment_drain_migration_rejects_unattributable_historical_invoices() {
     .fetch_one(pool)
     .await
     .unwrap();
-    sqlx::query(
+
+    sqlx::query("INSERT INTO sdk_states (creator_id, state_envelope) VALUES ($1, $2)")
+        .bind(creator_id)
+        .bind(b"prototype-sdk-state".as_slice())
+        .execute(pool)
+        .await
+        .unwrap();
+
+    let reader_assignment_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO reader_assignments (
+             creator_id, reader_lookup_hash, bundle_lookup_hash, assignment_envelope
+         ) VALUES ($1, $2, $3, $4) RETURNING id",
+    )
+    .bind(creator_id)
+    .bind(b"prototype-assignment-reader".as_slice())
+    .bind(b"prototype-assignment-bundle".as_slice())
+    .bind(b"prototype-assignment-envelope".as_slice())
+    .fetch_one(pool)
+    .await
+    .unwrap();
+
+    let invoice_id: Uuid = sqlx::query_scalar(
         "INSERT INTO invoices (
              creator_id, reader_lookup_hash, bundle_lookup_hash,
              payment_request_lookup_hash, invoice_envelope, payment_record_envelope,
              bitcoin_address_lookup_hash, derivation_index_lookup_hash,
-             payment_status, invoice_created_at, payment_deadline, payment_in_hours
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8,
-                   'undetected', NOW(), NOW() + INTERVAL '1 hour', 1)",
+             payment_status
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'undetected') RETURNING id",
     )
     .bind(creator_id)
     .bind(b"historical-reader".as_slice())
@@ -695,36 +725,75 @@ async fn payment_drain_migration_rejects_unattributable_historical_invoices() {
     .bind(b"encrypted-payment".as_slice())
     .bind(b"historical-address".as_slice())
     .bind(b"historical-index".as_slice())
+    .fetch_one(pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO outbox (
+             creator_id, invoice_id, reader_assignment_id, intent_envelope, status
+         ) VALUES ($1, $2, $3, $4, 'pending')",
+    )
+    .bind(creator_id)
+    .bind(invoice_id)
+    .bind(reader_assignment_id)
+    .bind(b"prototype-intent".as_slice())
     .execute(pool)
     .await
     .unwrap();
 
-    let error = run_migrations(pool)
-        .await
-        .expect_err("historical lock attribution must not be guessed");
-    assert!(
-        error
-            .to_string()
-            .contains("reset before applying payment drain persistence"),
-        "unexpected migration failure: {error}"
-    );
+    sqlx::query(
+        "INSERT INTO bitcoin_observations (
+             invoice_id, observation_envelope, outpoint_lookup_hash, confirmations
+         ) VALUES ($1, $2, $3, 0)",
+    )
+    .bind(invoice_id)
+    .bind(b"prototype-observation".as_slice())
+    .bind(b"prototype-outpoint".as_slice())
+    .execute(pool)
+    .await
+    .unwrap();
+
+    run_migrations(pool).await.unwrap();
+
+    for table in [
+        "deployment_metadata",
+        "creators",
+        "sdk_states",
+        "reader_assignments",
+        "invoices",
+        "outbox",
+        "bitcoin_observations",
+    ] {
+        let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "prototype rows remain in {table}");
+    }
+
     let applied_versions: Vec<i64> =
         sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
             .fetch_all(pool)
             .await
             .unwrap();
-    assert_eq!(applied_versions, vec![1, 2, 3, 4]);
-    let lock_column_exists: bool = sqlx::query_scalar(
-        "SELECT EXISTS (
-             SELECT 1 FROM information_schema.columns
-             WHERE table_schema = 'public' AND table_name = 'invoices'
-               AND column_name = 'lock_resource_lookup_hash'
-         )",
+    assert_eq!(applied_versions, vec![1, 2, 3, 4, 5, 6]);
+
+    sqlx::query(
+        "INSERT INTO creators (creator_lookup_hash, credential_envelope)
+         VALUES ($1, $2)",
     )
-    .fetch_one(pool)
+    .bind(b"post-upgrade-creator".as_slice())
+    .bind(b"post-upgrade-envelope".as_slice())
+    .execute(pool)
     .await
     .unwrap();
-    assert!(!lock_column_exists);
+    run_migrations(pool).await.unwrap();
+    let creator_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM creators")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(creator_count, 1, "restart repeated the destructive reset");
 
     database.cleanup().await;
 }
