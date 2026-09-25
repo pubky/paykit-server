@@ -1,9 +1,9 @@
 //! Deterministic selection of a reader's publicly discoverable Paykit receiver.
 //!
 //! Discovery deliberately returns every public candidate.  A marker is usable
-//! only when it advertises both private payments and Payment Requests; selection
-//! then applies the operator's first-segment priority and canonical full-path
-//! lexical tie break.
+//! only when it advertises private payments, Payment Requests, and outgoing
+//! payments; selection then applies the operator's first-segment priority and
+//! canonical full-path lexical tie break.
 
 use paykit_lib::{PaykitReceiverMarker, PaykitReceiverPath};
 
@@ -24,7 +24,9 @@ pub fn select_reader_marker(
     let mut capable = candidates
         .into_iter()
         .filter(|marker| {
-            marker.capabilities.private_payments && marker.capabilities.payment_requests
+            marker.capabilities.private_payments
+                && marker.capabilities.payment_requests
+                && marker.capabilities.outgoing_payments
         })
         .collect::<Vec<_>>();
     capable.sort_by_key(|marker| rank(marker, priority));
@@ -60,7 +62,7 @@ mod tests {
                 private_payments: capable,
                 payment_requests: capable,
                 receipts: false,
-                outgoing_payments: false,
+                outgoing_payments: capable,
             },
             PublicKey::try_from_z32("tkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy")
                 .unwrap(),
@@ -94,6 +96,30 @@ mod tests {
         )
         .unwrap();
         assert_eq!(selected.receiver_path.as_str(), "other/server");
+    }
+
+    #[test]
+    fn skips_receiver_that_cannot_make_outgoing_payments() {
+        let selected = select_reader_marker(
+            [
+                PaykitReceiverMarker::new(
+                    PaykitReceiverPath::new("bitkit/server").unwrap(),
+                    PaykitReceiverCapabilities {
+                        private_payments: true,
+                        payment_requests: true,
+                        receipts: false,
+                        outgoing_payments: false,
+                    },
+                    PublicKey::try_from_z32("tkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy")
+                        .unwrap(),
+                ),
+                marker("bitkit/wallet", true),
+            ],
+            &priority(&["bitkit"]),
+        )
+        .unwrap();
+
+        assert_eq!(selected.receiver_path.as_str(), "bitkit/wallet");
     }
 
     #[test]

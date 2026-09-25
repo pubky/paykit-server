@@ -411,7 +411,7 @@ async fn prepare(
             private_payments: true,
             payment_requests: true,
             receipts: false,
-            outgoing_payments: false,
+            outgoing_payments: true,
         })
         .await
         .map_err(|_| Failure::ProtocolFailed)?;
