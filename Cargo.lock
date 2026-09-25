@@ -2566,8 +2566,8 @@ dependencies = [
 
 [[package]]
 name = "locks-core"
-version = "0.1.0-rc1"
-source = "git+https://github.com/pubky/locks.git?tag=v0.1.0-rc1#8502ef79c443c640976a2a901b80c5e717319149"
+version = "0.1.0-rc2"
+source = "git+https://github.com/pubky/locks.git?tag=v0.1.0-rc3#8c22786de477af25aef1c1373f1da80f2080e807"
 dependencies = [
  "base32",
  "blake3",
@@ -3017,7 +3017,7 @@ dependencies = [
 
 [[package]]
 name = "paykit-server"
-version = "0.1.0-rc4"
+version = "0.1.0-rc5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3062,7 +3062,7 @@ dependencies = [
 
 [[package]]
 name = "paykit-server-e2e"
-version = "0.1.0-rc4"
+version = "0.1.0-rc5"
 dependencies = [
  "async-trait",
  "axum",
@@ -4746,6 +4746,7 @@ dependencies = [
  "sha2 0.10.9",
  "smallvec",
  "thiserror 2.0.20",
+ "time",
  "tokio",
  "tokio-stream",
  "tracing",
@@ -4831,6 +4832,7 @@ dependencies = [
  "sqlx-core",
  "stringprep",
  "thiserror 2.0.20",
+ "time",
  "tracing",
  "uuid",
  "whoami",
@@ -4870,6 +4872,7 @@ dependencies = [
  "sqlx-core",
  "stringprep",
  "thiserror 2.0.20",
+ "time",
  "tracing",
  "uuid",
  "whoami",
@@ -4896,6 +4899,7 @@ dependencies = [
  "serde_urlencoded",
  "sqlx-core",
  "thiserror 2.0.20",
+ "time",
  "tracing",
  "url",
  "uuid",

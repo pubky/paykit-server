@@ -112,6 +112,23 @@ impl RetrySchedule {
 /// through the creator SDK-state service; an in-memory runtime is test-only.
 #[async_trait]
 pub trait Adapter: Send + Sync {
+    /// Revalidates a claimed row immediately before its external SDK effect.
+    /// Production overrides hold the same Creator mutation fence as drain creation.
+    async fn execute_claimed_handoff(
+        &self,
+        store: &OutboxStore,
+        claim: &ClaimedOutbox,
+        intent: &DeliveryIntentV1,
+    ) -> Result<HandoffResult, HandoffFailure> {
+        match store.claim_handoff_eligible(claim).await {
+            Ok(true) => self.execute_handoff(intent).await,
+            Ok(false) => Err(HandoffFailure::Permanent),
+            Err(_) => Err(HandoffFailure::Retryable(
+                RetryableHandoffStage::AdapterUnavailable,
+            )),
+        }
+    }
+
     /// Executes one complete semantic handoff. Concrete adapters may override
     /// this to serialize a multi-call SDK operation under one Creator lock.
     async fn execute_handoff(
@@ -138,6 +155,12 @@ pub trait Adapter: Send + Sync {
         reader: &str,
         path: &str,
         terms: &crate::application::semantic_intent::PaymentTermsV1,
+    ) -> Result<HandoffResult, HandoffError>;
+    async fn cancel_payment_request(
+        &self,
+        reader: &str,
+        path: &str,
+        payment_request_id: &str,
     ) -> Result<HandoffResult, HandoffError>;
     async fn outbound_status(
         &self,
@@ -196,6 +219,14 @@ pub(crate) async fn handoff_steps<A: Adapter + ?Sized>(
             .propose_payment_request(intent.reader_pubky(), selected_path.as_str(), terms)
             .await
             .map_err(|error| at_stage(error, RetryableHandoffStage::PaymentRequestProposal)),
+        DeliveryOperationV1::PaymentRequestCancellation { payment_request_id } => adapter
+            .cancel_payment_request(
+                intent.reader_pubky(),
+                selected_path.as_str(),
+                payment_request_id,
+            )
+            .await
+            .map_err(|error| at_stage(error, RetryableHandoffStage::PaymentRequestCancellation)),
     }
 }
 
@@ -234,7 +265,7 @@ pub async fn process_claim_with_health(
                 .map(|transitioned| (transitioned, ProcessingHealth::PermanentFailure));
         }
     };
-    match handoff(adapter, &intent).await {
+    match adapter.execute_claimed_handoff(store, claim, &intent).await {
         Ok(result) => store
             .mark_handed_off(claim, &result)
             .await

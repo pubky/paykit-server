@@ -2,8 +2,9 @@
 
 `POST /invoices` atomically persists the invoice, its reader allocation, the endpoint-publication intent, the dependent Payment Request intent, and both encrypted semantic envelopes. Exact replay preserves those durable identities and payloads.
 
-After persistence or exact replay, `POST /invoices` returns `204 No Content`; it
-does not observe Noise state. `POST /connections/status` separately loads the
+After persistence or exact replay, `POST /invoices` returns `200 OK` with only
+RFC 3339 `invoice_created_at` and `payment_deadline` timestamps; it does not
+observe Noise state. `POST /connections/status` separately loads the
 persisted Reader/path binding and returns `none`, `handshake`, `connected`,
 `recovery_required`, or `blocked`. This lookup does not advance handshake,
 rewrite SDK state, acquire the worker mutation lock, mutate outbox state, or wait
@@ -18,6 +19,6 @@ A successful public enqueue/proposal stores the returned SDK outbound ID under t
 
 `handed_off` means durable local SDK queue association, not remote delivery. A separately fenced reconciliation claim runs the SDK outbound processor and checks the exact stored outbound ID in durable Creator SDK state. Only `OutboundPrivateMessageStatus::Sent` advances the row to `delivered`, which means successful Encrypted-Link send—not payer application read, processing, or acknowledgement. Endpoint dependents remain blocked until this transition. SDK `Pending`, `Sending`, and retry-backoff `Failed` records remain retryable. `RecoveryRequired` also remains retained and retryable while the separate SDK Encrypted-Link recovery flow is unresolved. `Invalid` and `Superseded` exact records cannot become the required exact `Sent` record and are retained as `permanently_failed`. Missing or changed SDK state is retried; permanent reconciliation errors retain only a non-secret error class.
 
-The baseline schema requires new `handed_off` and `delivered` rows to carry a canonical numeric SDK outbound ID. Earlier prototype rows are not migrated; operators must reset the database when adopting this baseline.
+The baseline schema requires new `handed_off` and `delivered` rows to carry a canonical numeric SDK outbound ID. Earlier prototype rows are not migrated. For the approved undeployed prototype rollout, migration `0002` clears Paykit application rows automatically once before applying the new schema.
 
 No part of this design claims exactly-once remote delivery.

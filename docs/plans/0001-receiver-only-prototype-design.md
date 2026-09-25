@@ -20,8 +20,8 @@ Only **EXPLICIT**, **AUTHORITATIVE SOURCE**, and **CONSTRAINT** entries may driv
 
 The user designated these as authoritative for Locks Server ↔ Paykit Server HTTP behavior:
 
-- [Locks ADR 0020](https://github.com/pubky/locks/blob/v0.1.0-rc1/docs/ADRs/0020-locks-paykit-v1-integration-boundary.md)
-- matching [Locks Paykit HTTP client](https://github.com/pubky/locks/blob/v0.1.0-rc1/locks-server/src/paykit_http_client.rs)
+- [Locks ADR 0020](https://github.com/pubky/locks/blob/v0.1.0-rc3/docs/ADRs/0020-locks-paykit-v1-integration-boundary.md)
+- matching [Locks Paykit HTTP client](https://github.com/pubky/locks/blob/v0.1.0-rc3/locks-server/src/paykit_http_client.rs)
 
 ### Product flow
 
@@ -41,7 +41,7 @@ Current `../paykit-rs` code/specifications define dependency behavior. They are 
 
 - Canonical Locks creator, reader, bundle, addressed lock-resource identifiers,
   and Paykit-payment policy validation use `locks-core` pinned at public release
-  `v0.1.0-rc1`; Paykit Server does not duplicate
+  `v0.1.0-rc3`; Paykit Server does not duplicate
   their parsing, canonicalization, or policy grammar.
 
 ## Actors and key boundaries
@@ -84,7 +84,7 @@ Current `../paykit-rs` code/specifications define dependency behavior. They are 
 - `POST /transactions/status`
 - Requests carry `X-Paykit-Signature`.
 - Exactly one trusted Lock Server public key is configured statically. No allowlist and no signer-ID header.
-- Paykit Server verifies Ed25519 signature over exact received body bytes.
+- Paykit Server verifies Ed25519 over the versioned request preimage `b"paykit-http-signature-v1\0" + uppercase_method + b"\0" + exact_query_free_path + b"\0" + exact_received_body`; body-only signatures are rejected.
 - Parsed JSON must RFC 8785-canonicalize to the exact received bytes. Signed noncanonical JSON is rejected.
 - Request schemas are closed according to the authoritative Locks contract.
 - Locks API request body limit is 16 KiB, enforced on raw bytes before JSON parsing; excess returns `413 payload_too_large`.
@@ -273,9 +273,10 @@ Rules:
 - Criterion asset must equal `BTC`.
 - Paykit Server snapshots validated invoice terms; later status does not refetch lock.
 - Generate UUID-v4 Payment Reference once per new invoice; persist and reuse it.
-- Exact replay returns `204 No Content` without refetching lock, reallocating
-  address, recreating delivery, revalidating creator session, or observing Noise
-  state.
+- Exact replay returns `200 OK` with the original RFC 3339
+  `invoice_created_at` and `payment_deadline` timestamps, without refetching lock,
+  reallocating address, recreating delivery, revalidating creator session, or
+  observing Noise state.
 - Same `(creator, bundle_id)` with changed request binding returns `409 Conflict`.
 - New invoice requires active network validation of creator Pubky session on every request:
   - revoked/expired → `409 creator_session_invalid`;
@@ -319,13 +320,16 @@ Rules:
 
 - Paykit v0.2 Payment Request wire message has `version: 1`, `kind: "paykit.payment_request"`, UUID-v4 `event_id`, UUID-v4 `payment_request_id`, and a `request` wrapper containing the accepted one-time request fields.
 - New invoice creates one immutable one-time Payment Request.
-- Payment Request `proposal_expires_at` is `null`; prototype has no proposal-expiry timer.
+- Payment Request `proposal_expires_at` equals the persisted application `payment_deadline`.
 - Payment Request `recurrence` is `null` because request is one-time.
-- Request remains payable until verified Bitcoin settlement.
+- Paykit Server accepts only a qualifying output first observed by the application deadline;
+  late payment can receive no access or refund. A timely matched output remains monitored to
+  factual Bitcoin finality after the deadline.
 - Payment Request metadata contains exact fields `bundle_id`, `lock_resource`, and `reader` copied from accepted invoice request.
 - Metadata does not duplicate amount, asset, Payment Reference, address, or creator identity.
-- `POST /invoices` returns `204 No Content` after the invoice and encrypted, versioned
-  server semantic intent containing all `PaymentRequestTerms` inputs are durably
+- `POST /invoices` returns `200 OK` with only RFC 3339 `invoice_created_at` and
+  `payment_deadline` timestamps after the invoice and encrypted, versioned server
+  semantic intent containing all `PaymentRequestTerms` inputs are durably
   committed. This is not the final SDK Payment Request event or wire JSON.
 - Invoice creation does not expose Noise state. `POST /connections/status` accepts
   the authenticated persisted invoice identity `{ "creator", "bundle_id" }`,

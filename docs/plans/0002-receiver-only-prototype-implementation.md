@@ -10,8 +10,8 @@
 
 **Authoritative requirements:**
 - `docs/plans/0001-receiver-only-prototype-design.md`
-- [Locks ADR 0020](https://github.com/pubky/locks/blob/v0.1.0-rc1/docs/ADRs/0020-locks-paykit-v1-integration-boundary.md)
-- Matching [Locks Paykit HTTP client](https://github.com/pubky/locks/blob/v0.1.0-rc1/locks-server/src/paykit_http_client.rs)
+- [Locks ADR 0020](https://github.com/pubky/locks/blob/v0.1.0-rc3/docs/ADRs/0020-locks-paykit-v1-integration-boundary.md)
+- Matching [Locks Paykit HTTP client](https://github.com/pubky/locks/blob/v0.1.0-rc3/locks-server/src/paykit_http_client.rs)
 
 **Hard boundary:** Do not implement unsupported Paykit wire/Encrypted-Link behavior locally. Delegate it to the pinned `paykit-sdk` dependency.
 
@@ -326,9 +326,10 @@ cargo clippy -p paykit-server --all-targets -- -D warnings
 - The canonical Creator selects only its own persisted credentials, xpub/account index, derivation counter, and SDK state; missing state has no default or cross-Creator fallback.
 - Validate exactly one referenced `paykit-payment` criterion with recipient equal to canonical creator, `BTC`, and positive sats.
 - Session invalid/unavailable returns approved 409/503 without allocation/commit.
-- Exact replay is `204 No Content` without lock refetch, session revalidation, or
-  Noise observation; changed binding is 409. Dedicated `POST /connections/status`
-  returns the closed five-state local Noise view from persisted binding.
+- Exact replay is `200 OK` with the original `invoice_created_at` and `payment_deadline`
+  timestamps, without lock refetch, session revalidation, or Noise observation; changed
+  binding is 409. Dedicated `POST /connections/status` returns the closed five-state
+  local Noise view from persisted binding.
 - New reader transaction creates assignment, endpoint-publication intent, then dependent Payment Request intent.
 - Concurrent invoices for different Creators use independent derivation counters and may share a numeric child index without sharing an address or SDK transaction.
 - Invoice handler returns before link establishment/delivery. Cancel-safe invoice
