@@ -23,8 +23,8 @@
 
 ## Explicit requirements and confirmed decisions
 
-1. Signed invoice creation request gains required `payment_in`, a nonzero JSON `u64` whole-hour value.
-2. Paykit fetches the canonical lock and requires request `payment_in` to equal the lock criterion value. Mismatch rejects before invoice/outbox/allocation side effects.
+1. Signed invoice creation accepts `payment_in` as a nonzero JSON `u64` whole-hour value. For compatibility with current Locks, an omitted request value defaults to `24`; explicit invalid values remain rejected.
+2. Paykit fetches the canonical lock and requires request `payment_in` to equal the lock criterion value. An omitted canonical criterion value also defaults to `24`; explicit mismatch rejects before invoice/outbox/allocation side effects. Omitted and explicit `24` normalize to the same idempotency binding.
 3. Paykit computes and persists:
 
 ```text
@@ -123,7 +123,7 @@ Success is a closed JSON body for new and exact replay:
 }
 ```
 
-Reject unknown fields and invalid `payment_in`. Compare it with the canonical lock before creating new state. For exact replay, verify the persisted request binding includes `payment_in` and return persisted timestamps before mutable lock lookup.
+Reject unknown fields and explicit invalid `payment_in`. Normalize omitted request and canonical-lock values to `24`, then compare them before creating new state. For exact replay, verify the persisted request binding includes normalized `payment_in` and return persisted timestamps before mutable lock lookup.
 
 ### Lock-wide drain
 
@@ -256,7 +256,7 @@ Each task is a separate review/commit checkpoint. Do not commit automatically.
 
 ### Task 1: Consume and validate Locks `payment_in`
 
-**Objective:** Update to the reviewed Locks Core revision and parse the required criterion field without changing other payment terms.
+**Objective:** Update to the reviewed Locks Core revision and parse the criterion field without changing other payment terms, while normalizing omitted current-Locks values to `24`.
 
 **Files:**
 - Modify: root `Cargo.toml`
@@ -267,9 +267,9 @@ Each task is a separate review/commit checkpoint. Do not commit automatically.
 
 **Dependency gate:** Locks Core `payment_in` commit must be reviewed first. Pin an anonymously reachable HTTPS Git revision; do not use a local path.
 
-**RED:** Test missing/zero/string/fraction/out-of-range rejection, exact whole-hour parse, request/canonical-lock mismatch, and no invocation of allocation/outbox persistence on mismatch.
+**RED:** Test omitted request/canonical-lock defaulting, zero/string/fraction/out-of-range rejection, exact whole-hour parse, request/canonical-lock mismatch, normalized idempotency binding, and no invocation of allocation/outbox persistence on mismatch.
 
-**GREEN:** Add a typed criterion duration parser and include `payment_in` in `CreateInvoiceRequest` and exact payment binding.
+**GREEN:** Add a typed criterion duration parser, normalize omitted request/canonical-lock values to `24`, and include normalized `payment_in` in `CreateInvoiceRequest` and exact payment binding.
 
 **Verify:**
 

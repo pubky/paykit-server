@@ -442,14 +442,16 @@ impl CreateInvoiceService {
                 }
             })?;
         let lock_remaining = remaining(started, self.clock.now())?;
-        let lock = tokio::time::timeout(lock_remaining, self.locks.fetch(&request.lock_resource))
-            .await
-            .map_err(|_| CreateInvoiceError::DeadlineExceeded)?
-            .map_err(|error| match error {
-                LockFetchError::NotFound => CreateInvoiceError::LockNotFound,
-                LockFetchError::Unavailable => CreateInvoiceError::LockUnavailable,
-                LockFetchError::Invalid => CreateInvoiceError::InvalidRequest,
-            })?;
+        let mut lock =
+            tokio::time::timeout(lock_remaining, self.locks.fetch(&request.lock_resource))
+                .await
+                .map_err(|_| CreateInvoiceError::DeadlineExceeded)?
+                .map_err(|error| match error {
+                    LockFetchError::NotFound => CreateInvoiceError::LockNotFound,
+                    LockFetchError::Unavailable => CreateInvoiceError::LockUnavailable,
+                    LockFetchError::Invalid => CreateInvoiceError::InvalidRequest,
+                })?;
+        default_missing_payment_window(&mut lock);
         validate_lock(&request, &lock)?;
         let marker_remaining = remaining(started, self.clock.now())?;
         let discovered =
@@ -522,6 +524,21 @@ fn map_store(error: PersistenceError) -> CreateInvoiceError {
         _ => CreateInvoiceError::Unavailable,
     }
 }
+
+fn default_missing_payment_window(lock: &mut ContentLock) {
+    for criterion in &mut lock.criteria {
+        if criterion.verifier_type != VerifierType::PaykitPayment {
+            continue;
+        }
+        let Some(params) = criterion.params.as_object_mut() else {
+            continue;
+        };
+        params.entry("payment_in").or_insert_with(|| {
+            serde_json::Value::from(crate::domain::invoice::DEFAULT_PAYMENT_WINDOW_HOURS)
+        });
+    }
+}
+
 fn validate_lock(
     request: &CreateInvoiceRequest,
     lock: &ContentLock,

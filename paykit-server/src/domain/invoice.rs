@@ -7,6 +7,9 @@ use thiserror::Error;
 
 use super::locks::{BundleId, CreatorPubky, PubkyLockResource};
 
+/// Compatibility payment window used by current Locks callers and locks.
+pub const DEFAULT_PAYMENT_WINDOW_HOURS: u64 = 24;
+
 /// A creator-scoped Locks invoice identity.
 ///
 /// The creator is always derived from the addressed canonical lock resource.

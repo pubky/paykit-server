@@ -380,7 +380,6 @@ async fn malformed_canonical_lock_payment_window_never_persists_an_invoice() {
         serde_json::Number::from_f64(18_446_744_073_709_551_616.0).unwrap(),
     );
     for payment_in in [
-        None,
         Some(serde_json::json!(0)),
         Some(serde_json::json!("24")),
         Some(serde_json::json!(1.5)),
@@ -413,6 +412,35 @@ async fn malformed_canonical_lock_payment_window_never_persists_an_invoice() {
         );
         assert_eq!(store.create_calls.load(Ordering::SeqCst), 0);
     }
+}
+
+#[tokio::test]
+async fn missing_canonical_lock_payment_window_defaults_to_twenty_four_hours() {
+    let mut lock = valid_lock();
+    lock.criteria[0]
+        .params
+        .as_object_mut()
+        .unwrap()
+        .remove("payment_in");
+    let store = Arc::new(FakeStore::with_preflight(InvoicePreflight::New));
+
+    let result = service(
+        Arc::new(FakeSession {
+            result: Ok(()),
+            calls: AtomicUsize::default(),
+            creators: Mutex::new(vec![]),
+        }),
+        Arc::new(FakeLocks {
+            result: Ok(lock),
+            calls: AtomicUsize::default(),
+        }),
+        store.clone(),
+    )
+    .create(request())
+    .await;
+
+    assert!(result.is_ok());
+    assert_eq!(store.create_calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -899,7 +927,7 @@ async fn signed_router_exact_replay_returns_original_timestamps_without_mutable_
 async fn signed_router_rejects_invalid_payment_window_shapes_before_persistence() {
     let key = SigningKey::from_bytes(&[13; 32]);
     for payment_in in [
-        None,
+        Some(serde_json::Value::Null),
         Some(serde_json::json!(0)),
         Some(serde_json::json!("24")),
         Some(serde_json::json!(1.5)),
@@ -966,6 +994,54 @@ async fn signed_router_rejects_invalid_payment_window_shapes_before_persistence(
         StatusCode::BAD_REQUEST
     );
     assert_eq!(store.create_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn omitted_and_explicit_default_payment_windows_share_one_binding() {
+    let key = SigningKey::from_bytes(&[14; 32]);
+    let store = Arc::new(FakeStore::with_preflight(InvoicePreflight::Conflict));
+    let router = invoices_router(Arc::new(service(
+        Arc::new(FakeSession {
+            result: Ok(()),
+            calls: AtomicUsize::default(),
+            creators: Mutex::new(vec![]),
+        }),
+        Arc::new(FakeLocks {
+            result: Ok(valid_lock()),
+            calls: AtomicUsize::default(),
+        }),
+        store.clone(),
+    )))
+    .layer(Extension(signed_auth(&key)));
+
+    for payment_in in [None, Some(serde_json::json!(24))] {
+        let mut value = serde_json::json!({
+            "bundle_id": BUNDLE,
+            "lock_resource": LOCK_RESOURCE,
+            "reader": reader()
+        });
+        if let Some(payment_in) = payment_in {
+            value["payment_in"] = payment_in;
+        }
+        let body = serde_json_canonicalizer::to_vec(&value).unwrap();
+        assert_eq!(
+            router
+                .clone()
+                .oneshot(signed_invoice_request(&key, body))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
+    }
+
+    let bindings = store.payment_bindings.lock().unwrap();
+    assert_eq!(bindings.len(), 2);
+    assert_eq!(bindings[0], bindings[1]);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&bindings[0]).unwrap()["payment_in"],
+        serde_json::json!(24)
+    );
 }
 
 #[tokio::test]

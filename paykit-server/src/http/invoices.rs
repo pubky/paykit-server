@@ -14,7 +14,7 @@ use time::format_description::well_known::Rfc3339;
 use crate::{
     application::create_invoice::{CreateInvoiceError, CreateInvoiceRequest, CreateInvoiceService},
     domain::{
-        invoice::CriterionPaymentWindowHours,
+        invoice::{CriterionPaymentWindowHours, DEFAULT_PAYMENT_WINDOW_HOURS},
         locks::{parse_addressed_lock_resource, parse_bundle_id, parse_reader},
     },
     http::{auth::AuthenticatedJson, error::ApiError},
@@ -25,7 +25,12 @@ struct InvoiceBody {
     bundle_id: String,
     lock_resource: String,
     reader: String,
+    #[serde(default = "default_payment_window")]
     payment_in: Value,
+}
+
+fn default_payment_window() -> Value {
+    Value::from(DEFAULT_PAYMENT_WINDOW_HOURS)
 }
 
 #[derive(Serialize)]
