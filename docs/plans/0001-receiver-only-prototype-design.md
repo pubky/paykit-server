@@ -205,9 +205,10 @@ Current `../paykit-rs` code/specifications define dependency behavior. They are 
   from authenticated persisted state after restart.
 - PostgreSQL SDK adapter locks one creator SDK-state row, decrypts/deserializes full `StorageState`, runs SDK transaction callback, serializes/encrypts updated state, and commits atomically.
 - SDK-state mutation and address allocation are serialized per Creator, while work for different Creators may proceed concurrently.
-- SDK receive-intake and server inbox persistence APIs and tables have been removed.
-  Production composition has no receive/inbox worker, payer-facing behavior,
-  readiness component, or metric.
+- Payer-facing inbox persistence APIs and tables remain removed. A later lifecycle
+  projection requirement added an internal SDK receive/reconciliation worker and
+  an independent readiness component for canonical Payment Request terminal states;
+  it did not add a public payer inbox, proof processing, or payer-facing API.
 
 ## PostgreSQL privacy boundary
 
@@ -321,7 +322,7 @@ Rules:
 - New invoice creates one immutable one-time Payment Request.
 - Payment Request `proposal_expires_at` is `null`; prototype has no proposal-expiry timer.
 - Payment Request `recurrence` is `null` because request is one-time.
-- Request remains payable until verified Bitcoin settlement.
+- Request remains payable until verified Bitcoin settlement or terminal lifecycle projection.
 - Payment Request metadata contains exact fields `bundle_id`, `lock_resource`, and `reader` copied from accepted invoice request.
 - Metadata does not duplicate amount, asset, Payment Reference, address, or creator identity.
 - `POST /invoices` returns `204 No Content` after the invoice and encrypted, versioned
@@ -367,20 +368,24 @@ Rules:
 
 ## Payer-originated events
 
-**EXPLICIT — out of scope for this receiver-only prototype**:
+**SUPERSEDED IN PART — terminal lifecycle projection only**:
 
-- Paykit Server has no payer-facing inbox and does not receive or process payer-originated payment events.
-- The server's Paykit role is limited to establishing the receiver-side link,
-  publishing the invoice-specific endpoint, and sending the Payment Request.
+- Paykit Server has no payer-facing inbox, payment-proof attribution, or public
+  payer event API.
+- A later internal SDK receive/reconciliation worker consumes canonical Payment
+  Request lifecycle states for correlated requests. SDK `Rejected` and `Canceled`
+  terminalize the invoice as `cancelled`; `ProposalExpired` terminalizes it as
+  `expired`.
 - Bitcoin observation of the invoice-specific `(creator, reader, bundle_id)` address
-  is the sole payment-state authority.
+  remains the sole payment-attribution authority. Lifecycle events can terminalize
+  an invoice but never prove payment.
 
 ## Direct Bitcoin observation
 
 **EXPLICIT**:
 
-- The invoice-specific address is the sole attribution key; payer-originated
-  messages are out of scope.
+- The invoice-specific address is the sole payment-attribution key; payer-originated
+  lifecycle messages cannot attribute payment.
 - Output amount matches when `output_sats >= invoice_sats`; overpayment is accepted.
 - No aggregation or top-up semantics: one output must satisfy the full invoice amount.
 - Wrong-address output or no observed output leaves the invoice `undetected`.
@@ -403,7 +408,11 @@ Rules:
 - Status values:
   - `undetected`: no valid referenced output currently observed;
   - `detected`: valid output observed at 0 confirmations;
-  - `confirmed`: valid output observed with at least 1 confirmation.
+  - `confirmed`: valid output observed with at least 1 confirmation;
+  - `cancelled`: correlated SDK Payment Request is `Rejected` or `Canceled`;
+  - `expired`: correlated SDK Payment Request is `ProposalExpired`.
+- `cancelled` and `expired` are terminal lifecycle facts with `confirmations = 0`
+  and `amount_matched = false`; Bitcoin observation cannot overwrite them.
 - Locks applies access threshold from returned confirmation count.
 - Before six confirmations, reorg may regress status and confirmation count.
 - At six confirmations, an amount-matched payment becomes final, monitoring stops, and persisted/reported confirmation count remains `6`.

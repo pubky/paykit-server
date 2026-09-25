@@ -155,6 +155,36 @@ async fn known_unobserved_status_is_exactly_undetected() {
 }
 
 #[tokio::test]
+async fn dismissed_payment_request_is_exactly_cancelled() {
+    let key = SigningKey::from_bytes(&[7; 32]);
+    let response = router(&key, Some(PersistedPaymentStatus::Cancelled))
+        .oneshot(signed_request(&key))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response_body(response).await,
+        r#"{"status":"cancelled","confirmations":0,"amount_matched":false}"#
+    );
+}
+
+#[tokio::test]
+async fn expired_payment_request_is_exactly_expired() {
+    let key = SigningKey::from_bytes(&[7; 32]);
+    let response = router(&key, Some(PersistedPaymentStatus::Expired))
+        .oneshot(signed_request(&key))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response_body(response).await,
+        r#"{"status":"expired","confirmations":0,"amount_matched":false}"#
+    );
+}
+
+#[tokio::test]
 async fn known_observed_statuses_serialize_only_factual_fields() {
     for (status, expected) in [
         (

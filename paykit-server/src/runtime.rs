@@ -118,6 +118,7 @@ pub struct Runtime {
     electrum: AtomicU8,
     paykit_enqueue: AtomicU8,
     paykit_reconciliation: AtomicU8,
+    paykit_lifecycle: AtomicU8,
     outbox_enqueue: AtomicU8,
     outbox_reconciliation: AtomicU8,
     metrics: Arc<Metrics>,
@@ -141,6 +142,7 @@ impl Runtime {
             electrum: AtomicU8::new(NOT_READY),
             paykit_enqueue: AtomicU8::new(NOT_READY),
             paykit_reconciliation: AtomicU8::new(NOT_READY),
+            paykit_lifecycle: AtomicU8::new(NOT_READY),
             outbox_enqueue: AtomicU8::new(NOT_READY),
             outbox_reconciliation: AtomicU8::new(NOT_READY),
             metrics,
@@ -163,6 +165,7 @@ impl Runtime {
     pub fn set_paykit_delivery_available(&self, available: bool) {
         self.set_paykit_enqueue_available(available);
         self.set_paykit_reconciliation_available(available);
+        self.set_paykit_lifecycle_available(available);
     }
     pub fn set_outbox_available(&self, available: bool) {
         self.set_outbox_enqueue_available(available);
@@ -174,6 +177,10 @@ impl Runtime {
     }
     pub(crate) fn set_paykit_reconciliation_available(&self, available: bool) {
         self.paykit_reconciliation
+            .store(if available { READY } else { DEGRADED }, Ordering::Release);
+    }
+    pub(crate) fn set_paykit_lifecycle_available(&self, available: bool) {
+        self.paykit_lifecycle
             .store(if available { READY } else { DEGRADED }, Ordering::Release);
     }
     pub(crate) fn set_outbox_enqueue_available(&self, available: bool) {
@@ -213,8 +220,11 @@ impl Runtime {
         };
         let electrum = ComponentState::from_atomic(self.electrum.load(Ordering::Acquire));
         let paykit_delivery = ComponentState::combine(
-            ComponentState::from_atomic(self.paykit_enqueue.load(Ordering::Acquire)),
-            ComponentState::from_atomic(self.paykit_reconciliation.load(Ordering::Acquire)),
+            ComponentState::combine(
+                ComponentState::from_atomic(self.paykit_enqueue.load(Ordering::Acquire)),
+                ComponentState::from_atomic(self.paykit_reconciliation.load(Ordering::Acquire)),
+            ),
+            ComponentState::from_atomic(self.paykit_lifecycle.load(Ordering::Acquire)),
         );
         let outbox = ComponentState::combine(
             ComponentState::from_atomic(self.outbox_enqueue.load(Ordering::Acquire)),
@@ -386,6 +396,10 @@ mod tests {
 
         runtime.set_outbox_reconciliation_available(true);
         runtime.set_paykit_reconciliation_available(true);
+        let lifecycle_missing = runtime.readiness().await;
+        assert_eq!(lifecycle_missing.paykit_delivery, ComponentState::NotReady);
+
+        runtime.set_paykit_lifecycle_available(true);
         assert_eq!(runtime.readiness().await.status, ComponentState::Ready);
 
         runtime.set_paykit_enqueue_available(false);

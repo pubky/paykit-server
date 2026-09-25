@@ -12,8 +12,8 @@ use paykit_lib::{
 };
 use paykit_sdk::{
     LinkedPeerState, OutboundPrivateMessageStatus, PaykitSdk, PaykitSdkConfig, PaykitSdkError,
-    PaymentAdapter, PrivateReceivingDetail, PubkyPublicKey, PubkySessionAccess,
-    PubkySessionBootstrap, PubkySessionProvider, StorageAdapter,
+    PaymentAdapter, PaymentRequestLifecycleState, PrivateReceivingDetail, PubkyPublicKey,
+    PubkySessionAccess, PubkySessionBootstrap, PubkySessionProvider, StorageAdapter,
 };
 use pubky::Pubky;
 use tokio::sync::Mutex as TokioMutex;
@@ -149,6 +149,18 @@ pub struct PaykitAdapter {
     mutation_lock: Arc<TokioMutex<()>>,
 }
 
+pub(crate) struct PaymentRequestLifecycleRefresh {
+    pub cancelled_ids: Vec<String>,
+    pub expired_ids: Vec<String>,
+    pub available: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TerminalPaymentRequestStatus {
+    Cancelled,
+    Expired,
+}
+
 impl std::fmt::Debug for PaykitAdapter {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("PaykitAdapter { .. }")
@@ -172,6 +184,87 @@ impl PaykitAdapter {
             mutation_lock: creator_mutation_lock(storage.creator_id()),
             storage,
         })
+    }
+
+    /// Receives peer lifecycle events and returns terminal request IDs by cause.
+    pub(crate) async fn refresh_payment_request_lifecycles(
+        &self,
+        expected_payment_request_ids: &[String],
+    ) -> Result<PaymentRequestLifecycleRefresh, HandoffError> {
+        let _guard = self.mutation_lock.lock().await;
+        let existing_records = self.sdk.payment_requests().await.map_err(classify)?;
+        let expected_peers = existing_records
+            .iter()
+            .filter(|record| expected_payment_request_ids.contains(&record.payment_request_id))
+            .map(|record| {
+                (
+                    record.counterparty.clone(),
+                    record.counterparty_receiver_path.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let reports = self
+            .sdk
+            .receive_private_messages_from_linked_peers()
+            .await
+            .map_err(classify)?;
+        let records = self.sdk.payment_requests().await.map_err(classify)?;
+        let report_availability = reports
+            .iter()
+            .map(|report| {
+                (
+                    (
+                        report.counterparty.clone(),
+                        report.counterparty_receiver_path.clone(),
+                    ),
+                    report.error.is_none(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut cancelled_ids = Vec::new();
+        let mut expired_ids = Vec::new();
+        for record in records
+            .into_iter()
+            .filter(|record| expected_payment_request_ids.contains(&record.payment_request_id))
+        {
+            match terminal_payment_request_status(record.state) {
+                Some(TerminalPaymentRequestStatus::Cancelled) => {
+                    cancelled_ids.push(record.payment_request_id);
+                }
+                Some(TerminalPaymentRequestStatus::Expired) => {
+                    expired_ids.push(record.payment_request_id);
+                }
+                None => {}
+            }
+        }
+        Ok(PaymentRequestLifecycleRefresh {
+            cancelled_ids,
+            expired_ids,
+            available: expected_peers.len() == expected_payment_request_ids.len()
+                && lifecycle_peers_available(&expected_peers, &report_availability),
+        })
+    }
+}
+
+fn lifecycle_peers_available<T: PartialEq>(expected: &[T], reports: &[(T, bool)]) -> bool {
+    expected.iter().all(|peer| {
+        reports
+            .iter()
+            .any(|(reported_peer, available)| reported_peer == peer && *available)
+    })
+}
+
+fn terminal_payment_request_status(
+    state: PaymentRequestLifecycleState,
+) -> Option<TerminalPaymentRequestStatus> {
+    match state {
+        PaymentRequestLifecycleState::Rejected | PaymentRequestLifecycleState::Canceled => {
+            Some(TerminalPaymentRequestStatus::Cancelled)
+        }
+        PaymentRequestLifecycleState::ProposalExpired => {
+            Some(TerminalPaymentRequestStatus::Expired)
+        }
+        _ => None,
     }
 }
 
@@ -435,6 +528,33 @@ mod tests {
     }
 
     #[test]
+    fn rejected_and_canceled_requests_are_cancelled_while_expiry_stays_expired() {
+        for state in [
+            PaymentRequestLifecycleState::Rejected,
+            PaymentRequestLifecycleState::Canceled,
+        ] {
+            assert_eq!(
+                terminal_payment_request_status(state),
+                Some(TerminalPaymentRequestStatus::Cancelled)
+            );
+        }
+        assert_eq!(
+            terminal_payment_request_status(PaymentRequestLifecycleState::ProposalExpired),
+            Some(TerminalPaymentRequestStatus::Expired)
+        );
+        for state in [
+            PaymentRequestLifecycleState::Proposed,
+            PaymentRequestLifecycleState::Accepted,
+            PaymentRequestLifecycleState::ProofSubmitted,
+            PaymentRequestLifecycleState::ActiveRecurring,
+            PaymentRequestLifecycleState::RecoveryRequired,
+            PaymentRequestLifecycleState::InvalidConflict,
+        ] {
+            assert_eq!(terminal_payment_request_status(state), None);
+        }
+    }
+
+    #[test]
     fn handoff_diagnostic_causes_use_closed_secret_free_labels() {
         assert_eq!(RetryableHandoffCause::Storage.diagnostic_label(), "storage");
         assert_eq!(
@@ -495,6 +615,16 @@ mod tests {
         ] {
             assert!(!terminal_outbound_status(&status));
         }
+    }
+
+    #[test]
+    fn lifecycle_readiness_requires_a_successful_report_for_every_expected_peer() {
+        assert!(lifecycle_peers_available(&[1, 2], &[(1, true), (2, true)]));
+        assert!(!lifecycle_peers_available(&[1, 2], &[(1, true)]));
+        assert!(!lifecycle_peers_available(
+            &[1, 2],
+            &[(1, true), (2, false)]
+        ));
     }
 
     #[test]
