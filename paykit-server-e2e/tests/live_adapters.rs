@@ -94,6 +94,7 @@ async fn live_sdk(
     bootstrap: &PubkySessionBootstrap,
     homeserver: &PubkyPublicKey,
     receiver_path: PaykitReceiverPath,
+    outgoing_payments: bool,
 ) -> (PubkyPublicKey, LiveSdk) {
     let account = bootstrap
         .sign_up(
@@ -118,7 +119,7 @@ async fn live_sdk(
         private_payments: true,
         payment_requests: true,
         receipts: false,
-        outgoing_payments: false,
+        outgoing_payments,
     })
     .await
     .unwrap();
@@ -172,9 +173,9 @@ async fn live_pubky_marker_discovery_and_payment_request_delivery() {
     let bootstrap = PubkySessionBootstrap::with_pubky(pubky, "app.paykit.server").unwrap();
     let homeserver = PubkyPublicKey::from_raw_or_app_key(STATIC_HOMESERVER).unwrap();
     let payee_path = PaykitReceiverPath::new("paykit/server").unwrap();
-    let payer_path = PaykitReceiverPath::new("bitkit/server").unwrap();
-    let (payee_key, payee) = live_sdk(&bootstrap, &homeserver, payee_path.clone()).await;
-    let (payer_key, payer) = live_sdk(&bootstrap, &homeserver, payer_path.clone()).await;
+    let payer_path = PaykitReceiverPath::new("bitkit/wallet").unwrap();
+    let (payee_key, payee) = live_sdk(&bootstrap, &homeserver, payee_path.clone(), false).await;
+    let (payer_key, payer) = live_sdk(&bootstrap, &homeserver, payer_path.clone(), true).await;
 
     let discovered_paths = payer
         .paykit_receiver_paths(payee_key.clone())

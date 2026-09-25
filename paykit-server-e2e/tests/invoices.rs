@@ -72,7 +72,7 @@ fn marker() -> PaykitReceiverMarker {
             private_payments: true,
             payment_requests: true,
             receipts: false,
-            outgoing_payments: false,
+            outgoing_payments: true,
         },
         PublicKey::try_from_z32("tkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy").unwrap(),
     )
