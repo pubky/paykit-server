@@ -7,12 +7,13 @@ use std::{
 
 use async_trait::async_trait;
 use paykit_lib::{
-    PaykitReceiverPath, PaymentAmount, PaymentEndpointIdentifier, PaymentReference,
+    AllowanceId, PaykitReceiverPath, PaymentAmount, PaymentEndpointIdentifier, PaymentReference,
     PaymentRequestTerms,
 };
 use paykit_sdk::{
-    LinkedPeerState, OutboundPrivateMessageStatus, PaykitSdk, PaykitSdkConfig, PaykitSdkError,
-    PaymentAdapter, PrivateReceivingDetail, PubkyPublicKey, PubkySessionAccess,
+    AllowanceFilter, AllowanceHistoryStatus, AllowanceLifecycleState, AllowanceLocalRole,
+    AllowanceRecord, LinkedPeerState, OutboundPrivateMessageStatus, PaykitSdk, PaykitSdkConfig,
+    PaykitSdkError, PaymentAdapter, PrivateReceivingDetail, PubkyPublicKey, PubkySessionAccess,
     PubkySessionBootstrap, PubkySessionProvider, StorageAdapter,
 };
 use pubky::Pubky;
@@ -222,6 +223,21 @@ fn classify(error: PaykitSdkError) -> HandoffError {
     }
 }
 
+/// Acceptances queued per handoff. Each one is a durable outbound message, so
+/// a reader that floods the link cannot turn one handoff into unbounded work;
+/// later handoffs accept the rest.
+const MAX_ALLOWANCE_ACCEPTANCES_PER_HANDOFF: usize = 4;
+
+/// An Allowance proposal the reader sent, naming this receiver as the Allowee,
+/// with consistent history and no response yet.
+fn awaits_allowee_acceptance(record: &AllowanceRecord) -> bool {
+    record.local_role == Some(AllowanceLocalRole::Allowee)
+        && record.state == AllowanceLifecycleState::Proposed
+        && record.history_status == AllowanceHistoryStatus::Consistent
+        && record.proposal_stream_item_id.is_some()
+        && record.proposal_outbound_message_id.is_none()
+}
+
 fn payment_terms(terms: &PaymentTermsV1) -> Result<PaymentRequestTerms, HandoffError> {
     let amount = PaymentAmount::new(terms.amount.clone(), terms.asset.clone())
         .map_err(|_| HandoffError::Permanent)?;
@@ -283,6 +299,43 @@ impl Adapter for PaykitAdapter {
             );
         }
         result
+    }
+
+    async fn accept_allowance_proposals(
+        &self,
+        reader: &str,
+        path: &str,
+    ) -> Result<usize, HandoffError> {
+        let (reader, path) = parse_peer(reader, path)?;
+        self.sdk
+            .receive_private_messages(reader.clone(), path.clone())
+            .await
+            .map_err(classify)?;
+        let proposals = self
+            .sdk
+            .list_allowances(AllowanceFilter {
+                counterparty: Some(reader.clone()),
+                counterparty_receiver_path: Some(path.clone()),
+                local_role: Some(AllowanceLocalRole::Allowee),
+                states: vec![AllowanceLifecycleState::Proposed],
+            })
+            .await
+            .map_err(classify)?;
+        let mut accepted = 0;
+        for record in proposals
+            .iter()
+            .filter(|record| awaits_allowee_acceptance(record))
+            .take(MAX_ALLOWANCE_ACCEPTANCES_PER_HANDOFF)
+        {
+            let allowance_id = AllowanceId::new(record.allowance_id.clone())
+                .map_err(|_| HandoffError::Permanent)?;
+            self.sdk
+                .accept_allowance(reader.clone(), path.clone(), &allowance_id)
+                .await
+                .map_err(classify)?;
+            accepted += 1;
+        }
+        Ok(accepted)
     }
 
     async fn enqueue_private_payment_list_with_receiving_details(
@@ -517,5 +570,61 @@ mod tests {
             bind_session_to_creator(actual, &expected),
             Err(PaykitSdkError::Identity { .. })
         ));
+    }
+
+    fn received_allowee_proposal() -> AllowanceRecord {
+        AllowanceRecord {
+            counterparty: PubkyPublicKey::from_raw_or_app_key(CREATOR).unwrap(),
+            counterparty_receiver_path: PaykitReceiverPath::new("bitkit/wallet").unwrap(),
+            allowance_id: "b7f9c2a1-6d43-4b0e-a8d4-0fe2c712ab44".into(),
+            local_role: Some(AllowanceLocalRole::Allowee),
+            state: AllowanceLifecycleState::Proposed,
+            history_status: AllowanceHistoryStatus::Consistent,
+            proposal_event_id: Some("8a0d8b4c-913f-4e31-9f2c-2a6f5bb4d201".into()),
+            terms: None,
+            proposal_stream_item_id: Some(7),
+            proposal_outbound_message_id: None,
+            proposal_outbound_status: None,
+            acceptance_event_id: None,
+            acceptance_outbound_status: None,
+            rejection_event_id: None,
+            rejection_outbound_status: None,
+            end_event_id: None,
+            end_outbound_status: None,
+            pending_causal_event_ids: Vec::new(),
+            conflict_event_ids: Vec::new(),
+            last_stream_item_id: Some(7),
+            last_outbound_message_id: None,
+            last_outbound_status: None,
+            last_event_at: None,
+            invalid_reason: None,
+        }
+    }
+
+    #[test]
+    fn only_received_consistent_allowee_proposals_are_accepted() {
+        assert!(awaits_allowee_acceptance(&received_allowee_proposal()));
+
+        let rejected: [fn(&mut AllowanceRecord); 7] = [
+            // The receiver would be the payer.
+            |record| record.local_role = Some(AllowanceLocalRole::Allower),
+            |record| record.local_role = None,
+            // Already answered, ended or colliding.
+            |record| record.state = AllowanceLifecycleState::Accepted,
+            |record| record.state = AllowanceLifecycleState::Conflicted,
+            // Evidence that needs review or recovery first.
+            |record| record.history_status = AllowanceHistoryStatus::Invalid,
+            |record| record.history_status = AllowanceHistoryStatus::UnresolvedReferences,
+            // A proposal this receiver sent is not its to accept.
+            |record| {
+                record.proposal_stream_item_id = None;
+                record.proposal_outbound_message_id = Some(3);
+            },
+        ];
+        for change in rejected {
+            let mut record = received_allowee_proposal();
+            change(&mut record);
+            assert!(!awaits_allowee_acceptance(&record));
+        }
     }
 }

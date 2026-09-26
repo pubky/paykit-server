@@ -14,6 +14,7 @@ use crate::{
     persistence::{ClaimedHandoff, ClaimedOutbox, OutboxStore, PersistenceError},
 };
 use std::time::Duration;
+use tracing::{info, warn};
 
 pub use crate::persistence::{HandoffResult, OutboxRetryClass as RetryableHandoffStage};
 
@@ -127,6 +128,17 @@ pub trait Adapter: Send + Sync {
         path: &str,
     ) -> Result<Option<PaykitReceiverMarker>, HandoffError>;
     async fn ensure_link_with_peer(&self, reader: &str, path: &str) -> Result<(), HandoffError>;
+    /// Reads the reader's private messages on this linked path and accepts
+    /// every Allowance proposal in which this receiver is the Allowee.
+    /// Returns how many were accepted. Test-only adapters keep the default,
+    /// which reads nothing.
+    async fn accept_allowance_proposals(
+        &self,
+        _reader: &str,
+        _path: &str,
+    ) -> Result<usize, HandoffError> {
+        Ok(0)
+    }
     async fn enqueue_private_payment_list_with_receiving_details(
         &self,
         reader: &str,
@@ -183,6 +195,23 @@ pub(crate) async fn handoff_steps<A: Adapter + ?Sized>(
         .ensure_link_with_peer(intent.reader_pubky(), selected_path.as_str())
         .await
         .map_err(|error| at_stage(error, RetryableHandoffStage::LinkEstablishment))?;
+    // An accepted Allowance lets the reader's wallet pay this receiver's
+    // requests on this link without asking. The acceptance is queued before
+    // the endpoint list and the request, so the reader loads it first.
+    // Accepting as the Allowee costs the receiver nothing. Intake is best
+    // effort: when it fails, the request is still proposed for manual payment.
+    match adapter
+        .accept_allowance_proposals(intent.reader_pubky(), selected_path.as_str())
+        .await
+    {
+        Ok(0) => {}
+        Ok(accepted) => info!(accepted, "accepted Paykit Allowance proposals"),
+        Err(error) => warn!(
+            stage = "allowance_intake",
+            cause = error.diagnostic_label(),
+            "Paykit Allowance intake failed; the handoff continues"
+        ),
+    }
     match intent.operation() {
         DeliveryOperationV1::EndpointPublication { receiving_details } => adapter
             .enqueue_private_payment_list_with_receiving_details(
