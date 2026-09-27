@@ -264,6 +264,12 @@ Cancellation takes label precedence over window expiry. `RecoveryRequired` is a
 transport-availability overlay and never changes the payment label. Projected
 `cancelled` and `expired` responses retain persisted `confirmations` and
 `amount_matched`; lifecycle never rewrites or erases Bitcoin evidence.
+Before deriving that label, the route uses the same linked-peer receive,
+required-target freshness proof, Creator-local SDK mutation fence, and
+transactional target revalidation as `POST /payment-requests/status`. Missing,
+partial, unrelated, or failed required-peer intake returns unavailable instead
+of exposing a stale lifecycle projection. Adding the two labels is a closed-enum
+compatibility change for legacy clients.
 
 `POST /payment-requests/status` exposes the request lifecycle and payment state
 as separate fields for callers that need both facts directly.

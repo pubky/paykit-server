@@ -72,7 +72,7 @@ Production samples `clock_timestamp()` only after acquiring the decisive Creator
 - Existing invoice creation persists encrypted Payment Request intent and invoice allocation atomically.
 - Existing exact replay runs before new mutable discovery/creation work and must remain replay-first.
 - Existing observer loads all invoices not factual-final at six amount-matched confirmations. Deadline filtering must be persisted/queryable; do not bolt a worker-local timeout onto this query.
-- Existing `/transactions/status` is factual Bitcoin state only. New Payment Request lifecycle status must not silently change that stable contract.
+- PR #3 preserves `/transactions/status` as factual Bitcoin state at its foundation checkpoint. The reviewed PR #27 follow-up deliberately extends its closed `status` label with `cancelled` and `expired`: it first runs the same linked-peer receive, required-target freshness check, Creator-local mutation fence, and transactional target revalidation as `/payment-requests/status`, then derives the legacy label from the canonical orthogonal lifecycle/payment summary. `Rejected` or `Canceled` takes precedence as `cancelled`; otherwise `ProposalExpired` or application payment expiry projects `expired`; all other lifecycle states retain `undetected`, `detected`, or `confirmed`. Every label preserves factual `confirmations` and `amount_matched`. Missing, partial, unrelated, or failed required-peer intake returns unavailable rather than serving stale lifecycle state. This is a closed-enum compatibility change for clients of the legacy route.
 - Existing Bitcoin integration uses `bdk_electrum`; do not add direct ad hoc `electrum-client` scanning.
 - Outbox handoff is at-least-once and distinct from counterparty delivery.
 - Paykit Server and Locks PostgreSQL cannot transact atomically.
@@ -369,7 +369,7 @@ cargo test -p paykit-server-e2e
 
 ### Task 6: Expose signed drain and lifecycle endpoints
 
-**Objective:** Provide the three closed Locks-facing APIs without changing `/transactions/status`.
+**Objective:** Provide the three closed Locks-facing APIs. At this PR #3 checkpoint, keep `/transactions/status` unchanged; the dependent PR #27 follow-up applies the separately approved legacy-label projection described above.
 
 **Files:**
 - Create: `paykit-server/src/http/payment_drains.rs`
@@ -388,7 +388,7 @@ cargo test -p paykit-server-e2e
 - `POST /payment-request-drain-lookups`
 - `POST /payment-requests/status`
 
-Keep `/transactions/status` factual and backward-compatible.
+At this foundation checkpoint, keep `/transactions/status` factual and backward-compatible. PR #27 later routes it through the canonical fresh status operation and adds only the documented derived labels while preserving Bitcoin evidence.
 
 **Implementation-contract gate:** Exact response enums/fields must first be patched identically into both plans.
 

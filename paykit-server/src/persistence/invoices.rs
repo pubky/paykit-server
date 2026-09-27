@@ -578,41 +578,17 @@ impl InvoiceStore {
         })
     }
 
-    /// Reads only the durable payment facts for one creator-scoped bundle.
-    ///
-    /// Invoice envelopes are deliberately not selected or decrypted. A row with
-    /// an unknown status or invalid confirmation count is a safe persistence
-    /// failure rather than a value exposed to the caller.
+    /// Reads only durable Bitcoin facts for one creator-scoped bundle.
     pub async fn payment_status(
         &self,
         creator: &CreatorPubky,
-        bundle_id: &crate::domain::locks::BundleId,
+        bundle_id: &BundleId,
     ) -> Result<Option<PersistedPaymentStatus>, PersistenceError> {
         let creator_hash = self.crypto.lookup_hash(creator.to_string().as_bytes());
         let bundle_hash = self.crypto.lookup_hash(bundle_id.to_string().as_bytes());
         let row = sqlx::query_as::<_, PaymentStatusRow>(
-            "SELECT lifecycle.request_state, invoices.payment_status, \
-                    invoices.confirmation_count, invoices.amount_matched, \
-                    invoices.payment_expired_at IS NOT NULL AS payment_expired \
+            "SELECT invoices.payment_status, invoices.confirmation_count, invoices.amount_matched \
              FROM invoices JOIN creators ON creators.id = invoices.creator_id \
-             LEFT JOIN LATERAL ( \
-                 SELECT request_state \
-                 FROM payment_request_lifecycles \
-                 WHERE invoice_id = invoices.id \
-                 ORDER BY CASE request_state \
-                     WHEN 'invalid_conflict' THEN 9 \
-                     WHEN 'recovery_required' THEN 8 \
-                     WHEN 'proof_submitted' THEN 7 \
-                     WHEN 'active_recurring' THEN 6 \
-                     WHEN 'accepted' THEN 5 \
-                     WHEN 'proposed' THEN 4 \
-                     WHEN 'proposal_expired' THEN 0 \
-                     WHEN 'rejected' THEN 0 \
-                     WHEN 'canceled' THEN 0 \
-                     ELSE -1 \
-                 END DESC, last_event_at DESC, request_state DESC \
-                 LIMIT 1 \
-             ) AS lifecycle ON TRUE \
              WHERE creators.creator_lookup_hash = $1 AND invoices.bundle_lookup_hash = $2",
         )
         .bind(creator_hash.as_bytes().as_slice())
@@ -718,37 +694,9 @@ impl InvoiceStore {
         if !PaymentRequestLifecycleStore::receive_evidence_covers(&current, evidence) {
             return Err(PersistenceError::Unavailable);
         }
-        let row = sqlx::query_as::<_, PaymentRequestStatusRow>(
-            "SELECT lifecycle.request_state, invoices.payment_status,
-                    invoices.confirmation_count, invoices.amount_matched,
-                    invoices.invoice_created_at, invoices.payment_deadline,
-                    invoices.payment_expired_at
-             FROM invoices
-             LEFT JOIN LATERAL (
-                 SELECT request_state
-                 FROM payment_request_lifecycles
-                 WHERE invoice_id = invoices.id
-                 ORDER BY CASE request_state
-                     WHEN 'invalid_conflict' THEN 9
-                     WHEN 'recovery_required' THEN 8
-                     WHEN 'proof_submitted' THEN 7
-                     WHEN 'active_recurring' THEN 6
-                     WHEN 'accepted' THEN 5
-                     WHEN 'proposed' THEN 4
-                     WHEN 'proposal_expired' THEN 0
-                     WHEN 'rejected' THEN 0
-                     WHEN 'canceled' THEN 0
-                     ELSE -1
-                 END DESC, last_event_at DESC, request_state DESC
-                 LIMIT 1
-             ) AS lifecycle ON TRUE
-             WHERE invoices.id = $1",
-        )
-        .bind(invoice_id)
-        .fetch_optional(&mut *transaction)
-        .await
-        .map_err(|_| PersistenceError::Unavailable)?;
-        let summary = row.map(PaymentRequestStatusSummary::try_from).transpose()?;
+        let summary = self
+            .payment_request_status_by_invoice(&mut transaction, invoice_id)
+            .await?;
         transaction
             .commit()
             .await
@@ -763,6 +711,41 @@ impl InvoiceStore {
     ) -> Result<Option<PaymentRequestStatusSummary>, PersistenceError> {
         let creator_hash = self.crypto.lookup_hash(creator.to_string().as_bytes());
         let bundle_hash = self.crypto.lookup_hash(bundle_id.to_string().as_bytes());
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        let invoice_id: Option<Uuid> = sqlx::query_scalar(
+            "SELECT invoices.id
+             FROM invoices
+             JOIN creators ON creators.id = invoices.creator_id
+             WHERE creators.creator_lookup_hash = $1 AND invoices.bundle_lookup_hash = $2",
+        )
+        .bind(creator_hash.as_bytes().as_slice())
+        .bind(bundle_hash.as_bytes().as_slice())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        let summary = match invoice_id {
+            Some(invoice_id) => {
+                self.payment_request_status_by_invoice(&mut transaction, invoice_id)
+                    .await?
+            }
+            None => None,
+        };
+        transaction
+            .commit()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        Ok(summary)
+    }
+
+    async fn payment_request_status_by_invoice(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        invoice_id: Uuid,
+    ) -> Result<Option<PaymentRequestStatusSummary>, PersistenceError> {
         let row = sqlx::query_as::<_, PaymentRequestStatusRow>(
             "SELECT lifecycle.request_state, invoices.payment_status,
                     invoices.confirmation_count, invoices.amount_matched,
@@ -788,11 +771,10 @@ impl InvoiceStore {
                  END DESC, last_event_at DESC, request_state DESC
                  LIMIT 1
              ) AS lifecycle ON TRUE
-             WHERE creators.creator_lookup_hash = $1 AND invoices.bundle_lookup_hash = $2",
+             WHERE invoices.id = $1",
         )
-        .bind(creator_hash.as_bytes().as_slice())
-        .bind(bundle_hash.as_bytes().as_slice())
-        .fetch_optional(&self.pool)
+        .bind(invoice_id)
+        .fetch_optional(&mut **transaction)
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
         row.map(PaymentRequestStatusSummary::try_from).transpose()
@@ -1807,11 +1789,9 @@ struct ExistingPaymentOutbox {
 
 #[derive(sqlx::FromRow)]
 struct PaymentStatusRow {
-    request_state: Option<String>,
     payment_status: String,
     confirmation_count: i32,
     amount_matched: bool,
-    payment_expired: bool,
 }
 
 #[derive(sqlx::FromRow)]
@@ -1827,7 +1807,7 @@ impl TryFrom<PaymentStatusRow> for PersistedPaymentStatus {
     fn try_from(row: PaymentStatusRow) -> Result<Self, Self::Error> {
         let confirmations = u32::try_from(row.confirmation_count)
             .map_err(|_| PersistenceError::CorruptOrMissing)?;
-        let payment_status = match row.payment_status.as_str() {
+        match row.payment_status.as_str() {
             "undetected" => Ok(Self::Undetected),
             "detected" => Ok(Self::Detected {
                 confirmations,
@@ -1838,33 +1818,6 @@ impl TryFrom<PaymentStatusRow> for PersistedPaymentStatus {
                 amount_matched: row.amount_matched,
             }),
             _ => Err(PersistenceError::CorruptOrMissing),
-        }?;
-        let request_state = row
-            .request_state
-            .as_deref()
-            .map(|value| {
-                PaymentRequestLifecycleState::parse(value).ok_or(PersistenceError::CorruptOrMissing)
-            })
-            .transpose()?;
-        match request_state {
-            Some(
-                PaymentRequestLifecycleState::Rejected | PaymentRequestLifecycleState::Canceled,
-            ) => Ok(Self::Cancelled {
-                confirmations,
-                amount_matched: row.amount_matched,
-            }),
-            Some(PaymentRequestLifecycleState::ProposalExpired) => Ok(Self::Expired {
-                confirmations,
-                amount_matched: row.amount_matched,
-            }),
-            Some(PaymentRequestLifecycleState::InvalidConflict) => {
-                Err(PersistenceError::CorruptOrMissing)
-            }
-            _ if row.payment_expired => Ok(Self::Expired {
-                confirmations,
-                amount_matched: row.amount_matched,
-            }),
-            _ => Ok(payment_status),
         }
     }
 }
@@ -1992,18 +1945,14 @@ mod tests {
     fn read_status_rejects_unknown_text_and_invalid_confirmation_counts() {
         for row in [
             PaymentStatusRow {
-                request_state: None,
                 payment_status: "unexpected".into(),
                 confirmation_count: 0,
                 amount_matched: false,
-                payment_expired: false,
             },
             PaymentStatusRow {
-                request_state: None,
                 payment_status: "confirmed".into(),
                 confirmation_count: -1,
                 amount_matched: true,
-                payment_expired: false,
             },
         ] {
             assert_eq!(
@@ -2011,94 +1960,6 @@ mod tests {
                 Err(PersistenceError::CorruptOrMissing)
             );
         }
-    }
-
-    #[test]
-    fn lifecycle_projection_preserves_bitcoin_evidence() {
-        for (request_state, expected) in [
-            (
-                "rejected",
-                PersistedPaymentStatus::Cancelled {
-                    confirmations: 6,
-                    amount_matched: true,
-                },
-            ),
-            (
-                "canceled",
-                PersistedPaymentStatus::Cancelled {
-                    confirmations: 6,
-                    amount_matched: true,
-                },
-            ),
-            (
-                "proposal_expired",
-                PersistedPaymentStatus::Expired {
-                    confirmations: 6,
-                    amount_matched: true,
-                },
-            ),
-        ] {
-            let actual = PersistedPaymentStatus::try_from(PaymentStatusRow {
-                request_state: Some(request_state.into()),
-                payment_status: "confirmed".into(),
-                confirmation_count: 6,
-                amount_matched: true,
-                payment_expired: false,
-            });
-
-            assert_eq!(actual, Ok(expected));
-        }
-    }
-
-    #[test]
-    fn accepted_expiry_projects_expired_without_erasing_payment_facts() {
-        assert_eq!(
-            PersistedPaymentStatus::try_from(PaymentStatusRow {
-                request_state: Some("accepted".into()),
-                payment_status: "detected".into(),
-                confirmation_count: 0,
-                amount_matched: true,
-                payment_expired: true,
-            }),
-            Ok(PersistedPaymentStatus::Expired {
-                confirmations: 0,
-                amount_matched: true,
-            })
-        );
-    }
-
-    #[test]
-    fn accepted_paid_request_keeps_bitcoin_status() {
-        assert_eq!(
-            PersistedPaymentStatus::try_from(PaymentStatusRow {
-                request_state: Some("accepted".into()),
-                payment_status: "confirmed".into(),
-                confirmation_count: 3,
-                amount_matched: true,
-                payment_expired: false,
-            }),
-            Ok(PersistedPaymentStatus::Confirmed {
-                confirmations: 3,
-                amount_matched: true,
-            })
-        );
-    }
-
-    #[test]
-    fn recovery_required_is_an_availability_overlay_not_payment_lifecycle() {
-        assert_eq!(
-            PersistedPaymentStatus::try_from(PaymentStatusRow {
-                request_state: Some("recovery_required".into()),
-                payment_status: "detected".into(),
-                confirmation_count: 1,
-                amount_matched: true,
-                payment_expired: false,
-            }),
-            Ok(PersistedPaymentStatus::Detected {
-                confirmations: 1,
-                amount_matched: true,
-            })
-        );
     }
 
     #[test]

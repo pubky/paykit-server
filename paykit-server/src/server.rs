@@ -210,7 +210,6 @@ impl Server {
             Arc::new(invoices.clone()),
             Arc::new(SdkStateStore::new(&pool, crypto.clone())),
         ));
-        let status_service = Arc::new(PaymentStatusService::new(Arc::new(invoices.clone())));
         let payment_drain_operations: Arc<dyn PaymentDrainOperations> =
             Arc::new(ProductionPaymentDrainOperations {
                 pool: pool.clone(),
@@ -231,6 +230,9 @@ impl Server {
                 pubky: pubky.clone(),
                 paykit: config.paykit.clone(),
             });
+        let status_service = Arc::new(PaymentStatusService::from_canonical(
+            payment_request_status_operations.clone(),
+        ));
         let setup_status_service = Arc::new(SetupStatusService::new(session_validator));
         let signed_auth = Arc::new(SignedLocksAuth::from_config(&config));
         let business_routes = http::setup::setup_router(setup).merge(

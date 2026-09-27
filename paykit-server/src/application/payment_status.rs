@@ -1,26 +1,25 @@
-//! Read-only payment status lookup backed only by durable invoice facts.
+//! Legacy payment status projection backed by fresh canonical request status.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 
 use crate::{
-    domain::locks::{BundleId, CreatorPubky},
+    application::payment_request_status::{
+        PaymentRequestStatusError, PaymentRequestStatusOperations, PaymentRequestStatusSummary,
+        PaymentState,
+    },
+    domain::{
+        locks::{BundleId, CreatorPubky},
+        payment_request_lifecycle::PaymentRequestLifecycleState,
+    },
     persistence::{InvoiceStore, PersistenceError},
 };
 
-/// Validated payment facts read from one persisted invoice.
+/// Validated factual Bitcoin state read from one persisted invoice.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PersistedPaymentStatus {
     Undetected,
-    Cancelled {
-        confirmations: u32,
-        amount_matched: bool,
-    },
-    Expired {
-        confirmations: u32,
-        amount_matched: bool,
-    },
     Detected {
         confirmations: u32,
         amount_matched: bool,
@@ -31,7 +30,6 @@ pub enum PersistedPaymentStatus {
     },
 }
 
-/// Narrow read-only durable status boundary.
 #[async_trait]
 pub trait StatusRepository: Send + Sync {
     async fn status(
@@ -96,15 +94,30 @@ pub enum PaymentStatusError {
     Unavailable,
 }
 
-/// Looks up factual payment status without session validation, lock fetching,
-/// invoice decryption, observer access, or other external I/O.
+/// Projects the legacy label only after the canonical status operation has
+/// refreshed linked-peer intake and revalidated required evidence.
 pub struct PaymentStatusService {
-    repository: Arc<dyn StatusRepository>,
+    source: PaymentStatusSource,
+}
+
+enum PaymentStatusSource {
+    Factual(Arc<dyn StatusRepository>),
+    Canonical(Arc<dyn PaymentRequestStatusOperations>),
 }
 
 impl PaymentStatusService {
+    /// Retains the factual foundation service for direct repository consumers.
     pub fn new(repository: Arc<dyn StatusRepository>) -> Self {
-        Self { repository }
+        Self {
+            source: PaymentStatusSource::Factual(repository),
+        }
+    }
+
+    /// Builds the composed HTTP service that must refresh lifecycle intake.
+    pub fn from_canonical(operations: Arc<dyn PaymentRequestStatusOperations>) -> Self {
+        Self {
+            source: PaymentStatusSource::Canonical(operations),
+        }
     }
 
     pub async fn status(
@@ -112,30 +125,76 @@ impl PaymentStatusService {
         creator: &CreatorPubky,
         bundle_id: &BundleId,
     ) -> Result<PaymentStatusResponse, PaymentStatusError> {
-        let persisted = self
-            .repository
-            .status(creator, bundle_id)
-            .await
-            .map_err(|_| PaymentStatusError::Unavailable)?
-            .ok_or(PaymentStatusError::NotFound)?;
-        Ok(match persisted {
-            PersistedPaymentStatus::Undetected => PaymentStatusResponse::undetected(),
-            PersistedPaymentStatus::Cancelled {
+        match &self.source {
+            PaymentStatusSource::Factual(repository) => {
+                let persisted = repository
+                    .status(creator, bundle_id)
+                    .await
+                    .map_err(|_| PaymentStatusError::Unavailable)?
+                    .ok_or(PaymentStatusError::NotFound)?;
+                Ok(match persisted {
+                    PersistedPaymentStatus::Undetected => PaymentStatusResponse::undetected(),
+                    PersistedPaymentStatus::Detected {
+                        confirmations,
+                        amount_matched,
+                    } => PaymentStatusResponse::factual("detected", confirmations, amount_matched),
+                    PersistedPaymentStatus::Confirmed {
+                        confirmations,
+                        amount_matched,
+                    } => PaymentStatusResponse::factual("confirmed", confirmations, amount_matched),
+                })
+            }
+            PaymentStatusSource::Canonical(operations) => {
+                let canonical = operations
+                    .lookup(creator, bundle_id)
+                    .await
+                    .map_err(|error| match error {
+                        PaymentRequestStatusError::Conflict
+                        | PaymentRequestStatusError::Unavailable => PaymentStatusError::Unavailable,
+                    })?
+                    .ok_or(PaymentStatusError::NotFound)?;
+                project_legacy_status(canonical)
+            }
+        }
+    }
+}
+
+fn project_legacy_status(
+    canonical: PaymentRequestStatusSummary,
+) -> Result<PaymentStatusResponse, PaymentStatusError> {
+    let confirmations = canonical.confirmations();
+    let amount_matched = canonical.amount_matched();
+    match canonical.request_state() {
+        PaymentRequestLifecycleState::Rejected | PaymentRequestLifecycleState::Canceled => Ok(
+            PaymentStatusResponse::factual("cancelled", confirmations, amount_matched),
+        ),
+        PaymentRequestLifecycleState::ProposalExpired => Ok(PaymentStatusResponse::factual(
+            "expired",
+            confirmations,
+            amount_matched,
+        )),
+        PaymentRequestLifecycleState::RecoveryRequired
+        | PaymentRequestLifecycleState::InvalidConflict => Err(PaymentStatusError::Unavailable),
+        PaymentRequestLifecycleState::Proposed
+        | PaymentRequestLifecycleState::Accepted
+        | PaymentRequestLifecycleState::ProofSubmitted
+        | PaymentRequestLifecycleState::ActiveRecurring => match canonical.payment_state() {
+            PaymentState::Undetected => Ok(PaymentStatusResponse::undetected()),
+            PaymentState::Detected => Ok(PaymentStatusResponse::factual(
+                "detected",
                 confirmations,
                 amount_matched,
-            } => PaymentStatusResponse::factual("cancelled", confirmations, amount_matched),
-            PersistedPaymentStatus::Expired {
+            )),
+            PaymentState::Confirmed => Ok(PaymentStatusResponse::factual(
+                "confirmed",
                 confirmations,
                 amount_matched,
-            } => PaymentStatusResponse::factual("expired", confirmations, amount_matched),
-            PersistedPaymentStatus::Detected {
+            )),
+            PaymentState::Expired => Ok(PaymentStatusResponse::factual(
+                "expired",
                 confirmations,
                 amount_matched,
-            } => PaymentStatusResponse::factual("detected", confirmations, amount_matched),
-            PersistedPaymentStatus::Confirmed {
-                confirmations,
-                amount_matched,
-            } => PaymentStatusResponse::factual("confirmed", confirmations, amount_matched),
-        })
+            )),
+        },
     }
 }

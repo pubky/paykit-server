@@ -101,13 +101,7 @@ async fn per_bundle_status_joins_canonical_lifecycle_and_payment_facts() {
     assert_eq!(status.payment_deadline(), deadline);
     assert_eq!(status.confirmations(), 3);
     assert!(status.amount_matched());
-    assert_eq!(
-        store.payment_status(&creator, &bundle).await.unwrap(),
-        Some(PersistedPaymentStatus::Confirmed {
-            confirmations: 3,
-            amount_matched: true,
-        })
-    );
+    assert_confirmed_payment(&store, &creator, &bundle).await;
 
     let tied_at = created_at + time::Duration::seconds(1);
     for (state, payment_request_id) in [
@@ -129,14 +123,8 @@ async fn per_bundle_status_joins_canonical_lifecycle_and_payment_facts() {
         .await
         .unwrap();
     }
-    assert_eq!(
-        store.payment_status(&creator, &bundle).await.unwrap(),
-        Some(PersistedPaymentStatus::Confirmed {
-            confirmations: 3,
-            amount_matched: true,
-        }),
-        "one accepted attempt keeps terminal duplicate attempts from overriding payment"
-    );
+    assert_confirmed_payment(&store, &creator, &bundle).await;
+
     for state in ["recovery_required", "invalid_conflict"] {
         sqlx::query(
             "INSERT INTO payment_request_lifecycles (
@@ -153,11 +141,16 @@ async fn per_bundle_status_joins_canonical_lifecycle_and_payment_facts() {
         .await
         .unwrap();
     }
+    let conflicted = PaymentRequestStatusOperations::lookup(&store, &creator, &bundle)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(
-        store.payment_status(&creator, &bundle).await,
-        Err(paykit_server::persistence::PersistenceError::CorruptOrMissing),
-        "invalid conflict outranks every attempt and fails closed"
+        conflicted.request_state(),
+        PaymentRequestLifecycleState::InvalidConflict,
+        "invalid conflict outranks every attempt and fails closed at the application boundary"
     );
+    assert_confirmed_payment(&store, &creator, &bundle).await;
     sqlx::query(
         "DELETE FROM payment_request_lifecycles
          WHERE invoice_id = $1 AND request_state = 'invalid_conflict'",
@@ -166,14 +159,16 @@ async fn per_bundle_status_joins_canonical_lifecycle_and_payment_facts() {
     .execute(database.pool())
     .await
     .unwrap();
+    let recovering = PaymentRequestStatusOperations::lookup(&store, &creator, &bundle)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(
-        store.payment_status(&creator, &bundle).await.unwrap(),
-        Some(PersistedPaymentStatus::Confirmed {
-            confirmations: 3,
-            amount_matched: true,
-        }),
-        "recovery overlay does not turn terminal history into payment lifecycle"
+        recovering.request_state(),
+        PaymentRequestLifecycleState::RecoveryRequired,
+        "recovery remains an availability overlay for application projection"
     );
+    assert_confirmed_payment(&store, &creator, &bundle).await;
     sqlx::query(
         "DELETE FROM payment_request_lifecycles
          WHERE invoice_id = $1 AND request_state = 'recovery_required'",
@@ -195,13 +190,9 @@ async fn per_bundle_status_joins_canonical_lifecycle_and_payment_facts() {
         .unwrap()
         .unwrap();
     assert_eq!(tied.request_state(), PaymentRequestLifecycleState::Rejected);
-    assert_eq!(
-        store.payment_status(&creator, &bundle).await.unwrap(),
-        Some(PersistedPaymentStatus::Cancelled {
-            confirmations: 3,
-            amount_matched: true,
-        })
-    );
+    assert_eq!(tied.confirmations(), 3);
+    assert!(tied.amount_matched());
+    assert_confirmed_payment(&store, &creator, &bundle).await;
 
     let corrupt_lifecycle = sqlx::query(
         "UPDATE payment_request_lifecycles SET request_state = 'unexpected' WHERE invoice_id = $1",
@@ -224,13 +215,10 @@ async fn per_bundle_status_joins_canonical_lifecycle_and_payment_facts() {
     assert_eq!(expired.confirmations(), 3);
     assert!(expired.amount_matched());
     assert_eq!(
-        store.payment_status(&creator, &bundle).await.unwrap(),
-        Some(PersistedPaymentStatus::Cancelled {
-            confirmations: 3,
-            amount_matched: true,
-        }),
-        "terminal request lifecycle takes label precedence without erasing payment facts"
+        expired.request_state(),
+        PaymentRequestLifecycleState::Rejected
     );
+    assert_confirmed_payment(&store, &creator, &bundle).await;
 
     sqlx::query("DELETE FROM payment_request_lifecycles WHERE invoice_id = $1")
         .bind(invoice_id)
@@ -250,14 +238,18 @@ async fn per_bundle_status_joins_canonical_lifecycle_and_payment_facts() {
     .execute(database.pool())
     .await
     .unwrap();
+    let accepted_expired = PaymentRequestStatusOperations::lookup(&store, &creator, &bundle)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(
-        store.payment_status(&creator, &bundle).await.unwrap(),
-        Some(PersistedPaymentStatus::Expired {
-            confirmations: 3,
-            amount_matched: true,
-        }),
-        "accepted request with expired payment window projects expired"
+        accepted_expired.request_state(),
+        PaymentRequestLifecycleState::Accepted
     );
+    assert_eq!(accepted_expired.payment_state(), PaymentState::Expired);
+    assert_eq!(accepted_expired.confirmations(), 3);
+    assert!(accepted_expired.amount_matched());
+    assert_confirmed_payment(&store, &creator, &bundle).await;
 
     sqlx::query(
         "UPDATE payment_request_lifecycles
@@ -268,13 +260,18 @@ async fn per_bundle_status_joins_canonical_lifecycle_and_payment_facts() {
     .execute(database.pool())
     .await
     .unwrap();
+    let proposal_expired = PaymentRequestStatusOperations::lookup(&store, &creator, &bundle)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(
-        store.payment_status(&creator, &bundle).await.unwrap(),
-        Some(PersistedPaymentStatus::Expired {
-            confirmations: 3,
-            amount_matched: true,
-        })
+        proposal_expired.request_state(),
+        PaymentRequestLifecycleState::ProposalExpired
     );
+    assert_eq!(proposal_expired.payment_state(), PaymentState::Expired);
+    assert_eq!(proposal_expired.confirmations(), 3);
+    assert!(proposal_expired.amount_matched());
+    assert_confirmed_payment(&store, &creator, &bundle).await;
 
     let absent = PaymentRequestStatusOperations::lookup(
         &store,
@@ -295,4 +292,18 @@ async fn per_bundle_status_joins_canonical_lifecycle_and_payment_facts() {
     );
 
     database.cleanup().await;
+}
+
+async fn assert_confirmed_payment(
+    store: &InvoiceStore,
+    creator: &paykit_server::domain::locks::CreatorPubky,
+    bundle: &paykit_server::domain::locks::BundleId,
+) {
+    assert_eq!(
+        store.payment_status(creator, bundle).await.unwrap(),
+        Some(PersistedPaymentStatus::Confirmed {
+            confirmations: 3,
+            amount_matched: true,
+        })
+    );
 }
