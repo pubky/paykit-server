@@ -13,8 +13,14 @@ use crate::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PersistedPaymentStatus {
     Undetected,
-    Cancelled,
-    Expired,
+    Cancelled {
+        confirmations: u32,
+        amount_matched: bool,
+    },
+    Expired {
+        confirmations: u32,
+        amount_matched: bool,
+    },
     Detected {
         confirmations: u32,
         amount_matched: bool,
@@ -63,23 +69,7 @@ impl PaymentStatusResponse {
         }
     }
 
-    fn cancelled() -> Self {
-        Self {
-            status: "cancelled",
-            confirmations: 0,
-            amount_matched: false,
-        }
-    }
-
-    fn expired() -> Self {
-        Self {
-            status: "expired",
-            confirmations: 0,
-            amount_matched: false,
-        }
-    }
-
-    fn observed(status: &'static str, confirmations: u32, amount_matched: bool) -> Self {
+    fn factual(status: &'static str, confirmations: u32, amount_matched: bool) -> Self {
         Self {
             status,
             confirmations,
@@ -130,16 +120,22 @@ impl PaymentStatusService {
             .ok_or(PaymentStatusError::NotFound)?;
         Ok(match persisted {
             PersistedPaymentStatus::Undetected => PaymentStatusResponse::undetected(),
-            PersistedPaymentStatus::Cancelled => PaymentStatusResponse::cancelled(),
-            PersistedPaymentStatus::Expired => PaymentStatusResponse::expired(),
+            PersistedPaymentStatus::Cancelled {
+                confirmations,
+                amount_matched,
+            } => PaymentStatusResponse::factual("cancelled", confirmations, amount_matched),
+            PersistedPaymentStatus::Expired {
+                confirmations,
+                amount_matched,
+            } => PaymentStatusResponse::factual("expired", confirmations, amount_matched),
             PersistedPaymentStatus::Detected {
                 confirmations,
                 amount_matched,
-            } => PaymentStatusResponse::observed("detected", confirmations, amount_matched),
+            } => PaymentStatusResponse::factual("detected", confirmations, amount_matched),
             PersistedPaymentStatus::Confirmed {
                 confirmations,
                 amount_matched,
-            } => PaymentStatusResponse::observed("confirmed", confirmations, amount_matched),
+            } => PaymentStatusResponse::factual("confirmed", confirmations, amount_matched),
         })
     }
 }

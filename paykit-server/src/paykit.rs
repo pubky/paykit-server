@@ -2,18 +2,21 @@
 
 use std::{
     collections::HashMap,
+    future::Future,
     sync::{Arc, Mutex as StdMutex, OnceLock, Weak},
 };
 
 use async_trait::async_trait;
 use paykit_lib::{
     PaykitReceiverPath, PaymentAmount, PaymentEndpointIdentifier, PaymentReference,
-    PaymentRequestTerms,
+    PaymentRequestId, PaymentRequestTerms,
 };
 use paykit_sdk::{
     LinkedPeerState, OutboundPrivateMessageStatus, PaykitSdk, PaykitSdkConfig, PaykitSdkError,
-    PaymentAdapter, PaymentRequestLifecycleState, PrivateReceivingDetail, PubkyPublicKey,
-    PubkySessionAccess, PubkySessionBootstrap, PubkySessionProvider, StorageAdapter,
+    PaymentAdapter, PaymentRequestLifecycleState as SdkPaymentRequestLifecycleState,
+    PaymentRequestLocalRole, PaymentRequestRecord, PrivateReceivingDetail,
+    PrivateStreamCounterpartyIntakeReport, PubkyPublicKey, PubkySessionAccess,
+    PubkySessionBootstrap, PubkySessionProvider, StorageAdapter,
 };
 use pubky::Pubky;
 use tokio::sync::Mutex as TokioMutex;
@@ -21,12 +24,28 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
-    application::semantic_intent::{DeliveryIntentV1, PaymentTermsV1, ReceivingDetailV1},
+    application::{
+        payment_drain::{PaymentDrainError, PaymentDrainResult},
+        payment_request_status::{PaymentRequestStatusError, PaymentRequestStatusSummary},
+        semantic_intent::{DeliveryIntentV1, PaymentTermsV1, ReceivingDetailV1},
+    },
     config::PaykitConfig,
-    domain::locks::CreatorPubky,
-    persistence::{CreatorStore, PostgresStorageAdapter},
+    domain::{
+        locks::{BundleId, CreatorPubky, PubkyLockResource},
+        payment_request_lifecycle::{
+            PaymentRequestLifecycleProjection,
+            PaymentRequestLifecycleState as PersistedPaymentRequestLifecycleState,
+            ProposalCorrelation,
+        },
+    },
+    persistence::{
+        ClaimedOutbox, CreatorStore, InvoiceStore, OutboxStore, PaymentDrainStore,
+        PaymentRequestLifecycleStore, PersistenceError, PostgresStorageAdapter,
+        RequiredReceiveTarget,
+    },
     workers::outbox::{
-        Adapter, HandoffError, HandoffFailure, HandoffResult, RetryableHandoffCause, handoff_steps,
+        Adapter, HandoffError, HandoffFailure, HandoffResult, RetryableHandoffCause,
+        RetryableHandoffStage, handoff_steps,
     },
 };
 
@@ -146,19 +165,17 @@ type CreatorSdk =
 pub struct PaykitAdapter {
     sdk: CreatorSdk,
     storage: PostgresStorageAdapter,
+    creator: CreatorPubky,
     mutation_lock: Arc<TokioMutex<()>>,
 }
 
-pub(crate) struct PaymentRequestLifecycleRefresh {
-    pub cancelled_ids: Vec<String>,
-    pub expired_ids: Vec<String>,
-    pub available: bool,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TerminalPaymentRequestStatus {
-    Cancelled,
-    Expired,
+pub enum LifecycleSyncError {
+    Sdk,
+    Persistence,
+    Conflict,
+    InvalidProjection,
+    PartialReceive,
 }
 
 impl std::fmt::Debug for PaykitAdapter {
@@ -173,6 +190,7 @@ impl PaykitAdapter {
         sessions: CreatorSessionProvider,
         config: &PaykitConfig,
     ) -> Result<Self, PaykitSdkError> {
+        let creator = sessions.creator.clone();
         let sdk = PaykitSdk::new(
             storage.clone(),
             sessions,
@@ -183,88 +201,412 @@ impl PaykitAdapter {
             sdk,
             mutation_lock: creator_mutation_lock(storage.creator_id()),
             storage,
+            creator,
         })
     }
 
-    /// Receives peer lifecycle events and returns terminal request IDs by cause.
-    pub(crate) async fn refresh_payment_request_lifecycles(
+    /// Receives linked-peer messages and durably projects the SDK's canonical
+    /// lifecycle view while serializing Creator-local SDK mutations.
+    pub async fn receive_and_project_payment_requests(
         &self,
-        expected_payment_request_ids: &[String],
-    ) -> Result<PaymentRequestLifecycleRefresh, HandoffError> {
+        lifecycles: &PaymentRequestLifecycleStore,
+    ) -> Result<(), LifecycleSyncError> {
         let _guard = self.mutation_lock.lock().await;
-        let existing_records = self.sdk.payment_requests().await.map_err(classify)?;
-        let expected_peers = existing_records
-            .iter()
-            .filter(|record| expected_payment_request_ids.contains(&record.payment_request_id))
-            .map(|record| {
-                (
-                    record.counterparty.clone(),
-                    record.counterparty_receiver_path.clone(),
-                )
-            })
-            .collect::<Vec<_>>();
-        let reports = self
+        self.refresh_payment_requests_locked(lifecycles, None).await
+    }
+
+    async fn refresh_payment_requests_locked(
+        &self,
+        lifecycles: &PaymentRequestLifecycleStore,
+        required_targets: Option<&[ReceiveTarget]>,
+    ) -> Result<(), LifecycleSyncError> {
+        let reports = self.sdk.receive_private_messages_from_linked_peers().await;
+        let receive_health =
+            receive_health_from_reports(reports.as_deref().map_err(|_| ()), required_targets);
+        let records = self
             .sdk
-            .receive_private_messages_from_linked_peers()
+            .payment_requests()
             .await
-            .map_err(classify)?;
-        let records = self.sdk.payment_requests().await.map_err(classify)?;
-        let report_availability = reports
-            .iter()
-            .map(|report| {
-                (
-                    (
-                        report.counterparty.clone(),
-                        report.counterparty_receiver_path.clone(),
-                    ),
-                    report.error.is_none(),
-                )
-            })
-            .collect::<Vec<_>>();
-        let mut cancelled_ids = Vec::new();
-        let mut expired_ids = Vec::new();
-        for record in records
-            .into_iter()
-            .filter(|record| expected_payment_request_ids.contains(&record.payment_request_id))
-        {
-            match terminal_payment_request_status(record.state) {
-                Some(TerminalPaymentRequestStatus::Cancelled) => {
-                    cancelled_ids.push(record.payment_request_id);
-                }
-                Some(TerminalPaymentRequestStatus::Expired) => {
-                    expired_ids.push(record.payment_request_id);
-                }
-                None => {}
-            }
-        }
-        Ok(PaymentRequestLifecycleRefresh {
-            cancelled_ids,
-            expired_ids,
-            available: expected_peers.len() == expected_payment_request_ids.len()
-                && lifecycle_peers_available(&expected_peers, &report_availability),
+            .map_err(|_| LifecycleSyncError::Sdk)?;
+        let projections = records.iter().map(lifecycle_projection).collect();
+        let creator_id = self.storage.creator_id();
+        project_lifecycles_after_receive(projections, receive_health, |projection| async move {
+            lifecycles
+                .apply(creator_id, &projection)
+                .await
+                .map_err(map_projection_persistence_error)?;
+            Ok(())
         })
+        .await
+    }
+
+    /// Receives and projects fresh canonical state before returning status, all
+    /// under the same Creator-local mutation fence.
+    pub async fn reconcile_and_lookup_payment_request_status(
+        &self,
+        lifecycles: &PaymentRequestLifecycleStore,
+        statuses: &InvoiceStore,
+        bundle_id: &BundleId,
+    ) -> Result<Option<PaymentRequestStatusSummary>, PaymentRequestStatusError> {
+        let _guard = self.mutation_lock.lock().await;
+        let required_targets = lifecycles
+            .required_receive_targets_for_bundle(self.storage.creator_id(), bundle_id)
+            .await
+            .map_err(|_| PaymentRequestStatusError::Unavailable)?;
+        let parsed_targets =
+            parse_receive_targets(&required_targets).map_err(map_lifecycle_status_error)?;
+        refresh_then(
+            || async {
+                self.refresh_payment_requests_locked(lifecycles, Some(&parsed_targets))
+                    .await
+                    .map_err(map_lifecycle_status_error)
+            },
+            || async {
+                statuses
+                    .payment_request_status_after_receive(
+                        lifecycles,
+                        &self.creator,
+                        bundle_id,
+                        &required_targets,
+                    )
+                    .await
+                    .map_err(|_| PaymentRequestStatusError::Unavailable)
+            },
+        )
+        .await
+    }
+
+    /// Reconciles receive and the canonical SDK reducer before atomically
+    /// snapshotting one lock's drain under the same Creator-local mutation lock.
+    pub async fn reconcile_and_create_payment_drain(
+        &self,
+        lifecycles: &PaymentRequestLifecycleStore,
+        drains: &PaymentDrainStore,
+        lock_resource: &PubkyLockResource,
+    ) -> Result<PaymentDrainResult, PaymentDrainError> {
+        if lock_resource.creator() != &self.creator {
+            return Err(PaymentDrainError::CreatorMismatch);
+        }
+        let _guard = self.mutation_lock.lock().await;
+        if let Some(replay) = drains
+            .exact_replay(lock_resource)
+            .await
+            .map_err(map_drain_persistence_error)?
+        {
+            return Ok(replay);
+        }
+        let required_targets = lifecycles
+            .required_receive_targets_for_lock(self.storage.creator_id(), lock_resource)
+            .await
+            .map_err(map_projection_persistence_error)
+            .map_err(map_lifecycle_drain_error)?;
+        let parsed_targets =
+            parse_receive_targets(&required_targets).map_err(map_lifecycle_drain_error)?;
+        self.refresh_payment_requests_locked(lifecycles, Some(&parsed_targets))
+            .await
+            .map_err(map_lifecycle_drain_error)?;
+        drains
+            .create_after_receive(lifecycles, lock_resource, &required_targets)
+            .await
+            .map_err(map_drain_persistence_error)
     }
 }
 
-fn lifecycle_peers_available<T: PartialEq>(expected: &[T], reports: &[(T, bool)]) -> bool {
-    expected.iter().all(|peer| {
-        reports
-            .iter()
-            .any(|(reported_peer, available)| reported_peer == peer && *available)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReceiveHealth {
+    Available,
+    Unavailable,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReceiveTarget {
+    counterparty: PubkyPublicKey,
+    receiver_path: PaykitReceiverPath,
+}
+
+fn parse_receive_targets(
+    targets: &[RequiredReceiveTarget],
+) -> Result<Vec<ReceiveTarget>, LifecycleSyncError> {
+    targets
+        .iter()
+        .map(|target| {
+            Ok(ReceiveTarget {
+                counterparty: PubkyPublicKey::from_raw_or_app_key(target.counterparty())
+                    .map_err(|_| LifecycleSyncError::InvalidProjection)?,
+                receiver_path: target.receiver_path().clone(),
+            })
+        })
+        .collect()
+}
+
+fn receive_health_for_required_targets(
+    reports: &[PrivateStreamCounterpartyIntakeReport],
+    required_targets: &[ReceiveTarget],
+) -> ReceiveHealth {
+    if required_targets.iter().all(|required| {
+        let matching = || {
+            reports.iter().filter(|report| {
+                report.counterparty == required.counterparty
+                    && report.counterparty_receiver_path == required.receiver_path
+            })
+        };
+        matching().all(|report| report.error.is_none())
+            && matching().any(|report| report.report.is_some() && report.error.is_none())
+    }) {
+        ReceiveHealth::Available
+    } else {
+        ReceiveHealth::Unavailable
+    }
+}
+
+fn receive_health_from_reports<E>(
+    reports: Result<&[PrivateStreamCounterpartyIntakeReport], E>,
+    required_targets: Option<&[ReceiveTarget]>,
+) -> ReceiveHealth {
+    match required_targets {
+        Some([]) => ReceiveHealth::Available,
+        Some(required) => reports.map_or(ReceiveHealth::Unavailable, |reports| {
+            receive_health_for_required_targets(reports, required)
+        }),
+        None => reports.map_or(ReceiveHealth::Unavailable, |reports| {
+            if reports.iter().all(|report| report.error.is_none()) {
+                ReceiveHealth::Available
+            } else {
+                ReceiveHealth::Unavailable
+            }
+        }),
+    }
+}
+
+async fn project_lifecycles_after_receive<F, Fut>(
+    projections: Vec<Result<PaymentRequestLifecycleProjection, LifecycleSyncError>>,
+    receive_health: ReceiveHealth,
+    mut persist: F,
+) -> Result<(), LifecycleSyncError>
+where
+    F: FnMut(PaymentRequestLifecycleProjection) -> Fut,
+    Fut: Future<Output = Result<(), LifecycleSyncError>>,
+{
+    let mut first_error = None;
+    for projection in projections {
+        match projection {
+            Ok(projection) => {
+                if let Err(error) = persist(projection).await {
+                    first_error.get_or_insert(error);
+                }
+            }
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+    if receive_health == ReceiveHealth::Unavailable {
+        return Err(LifecycleSyncError::PartialReceive);
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+#[cfg(test)]
+async fn replay_or_refresh_then<
+    T,
+    E,
+    Replay,
+    ReplayFuture,
+    Refresh,
+    RefreshFuture,
+    Operation,
+    OperationFuture,
+>(
+    replay: Replay,
+    refresh: Refresh,
+    operation: Operation,
+) -> Result<T, E>
+where
+    Replay: FnOnce() -> ReplayFuture,
+    ReplayFuture: Future<Output = Result<Option<T>, E>>,
+    Refresh: FnOnce() -> RefreshFuture,
+    RefreshFuture: Future<Output = Result<(), E>>,
+    Operation: FnOnce() -> OperationFuture,
+    OperationFuture: Future<Output = Result<T, E>>,
+{
+    if let Some(replay) = replay().await? {
+        return Ok(replay);
+    }
+    refresh_then(refresh, operation).await
+}
+
+async fn refresh_then<T, E, Refresh, RefreshFuture, Operation, OperationFuture>(
+    refresh: Refresh,
+    operation: Operation,
+) -> Result<T, E>
+where
+    Refresh: FnOnce() -> RefreshFuture,
+    RefreshFuture: Future<Output = Result<(), E>>,
+    Operation: FnOnce() -> OperationFuture,
+    OperationFuture: Future<Output = Result<T, E>>,
+{
+    refresh().await?;
+    operation().await
+}
+
+fn map_projection_persistence_error(error: PersistenceError) -> LifecycleSyncError {
+    match error {
+        PersistenceError::Conflict => LifecycleSyncError::Conflict,
+        _ => LifecycleSyncError::Persistence,
+    }
+}
+
+fn map_lifecycle_drain_error(error: LifecycleSyncError) -> PaymentDrainError {
+    match error {
+        LifecycleSyncError::Conflict => PaymentDrainError::Conflict,
+        LifecycleSyncError::Sdk
+        | LifecycleSyncError::Persistence
+        | LifecycleSyncError::InvalidProjection
+        | LifecycleSyncError::PartialReceive => PaymentDrainError::Unavailable,
+    }
+}
+
+fn map_lifecycle_status_error(error: LifecycleSyncError) -> PaymentRequestStatusError {
+    match error {
+        LifecycleSyncError::Conflict => PaymentRequestStatusError::Conflict,
+        LifecycleSyncError::Sdk
+        | LifecycleSyncError::Persistence
+        | LifecycleSyncError::InvalidProjection
+        | LifecycleSyncError::PartialReceive => PaymentRequestStatusError::Unavailable,
+    }
+}
+
+fn map_drain_persistence_error(error: PersistenceError) -> PaymentDrainError {
+    match error {
+        PersistenceError::Conflict => PaymentDrainError::Conflict,
+        _ => PaymentDrainError::Unavailable,
+    }
+}
+
+fn recovery_state_event_id<'a>(
+    canceled_event_id: Option<&'a str>,
+    rejected_event_id: Option<&'a str>,
+    latest_payment_proof_event_id: Option<&'a str>,
+    accepted_event_id: Option<&'a str>,
+    proposal_event_id: Option<&'a str>,
+) -> Option<&'a str> {
+    canceled_event_id
+        .or(rejected_event_id)
+        .or(latest_payment_proof_event_id)
+        .or(accepted_event_id)
+        .or(proposal_event_id)
+}
+
+fn lifecycle_projection(
+    record: &PaymentRequestRecord,
+) -> Result<PaymentRequestLifecycleProjection, LifecycleSyncError> {
+    if record.local_role != Some(PaymentRequestLocalRole::Payee) {
+        return Err(LifecycleSyncError::InvalidProjection);
+    }
+    let terms = record
+        .terms
+        .as_ref()
+        .filter(|terms| terms.recurrence.is_none())
+        .ok_or(LifecycleSyncError::InvalidProjection)?;
+    let request_state = persisted_lifecycle_state(record.state)?;
+    let state_event_id = match record.state {
+        SdkPaymentRequestLifecycleState::Proposed
+        | SdkPaymentRequestLifecycleState::ProposalExpired => record.proposal_event_id.clone(),
+        SdkPaymentRequestLifecycleState::Accepted
+        | SdkPaymentRequestLifecycleState::ActiveRecurring => record.accepted_event_id.clone(),
+        SdkPaymentRequestLifecycleState::Rejected => record.rejected_event_id.clone(),
+        SdkPaymentRequestLifecycleState::Canceled => record.canceled_event_id.clone(),
+        SdkPaymentRequestLifecycleState::ProofSubmitted => record
+            .payment_proofs
+            .last()
+            .map(|proof| proof.event_id.clone()),
+        SdkPaymentRequestLifecycleState::RecoveryRequired => recovery_state_event_id(
+            record.canceled_event_id.as_deref(),
+            record.rejected_event_id.as_deref(),
+            record
+                .payment_proofs
+                .last()
+                .map(|proof| proof.event_id.as_str()),
+            record.accepted_event_id.as_deref(),
+            record.proposal_event_id.as_deref(),
+        )
+        .map(str::to_owned),
+        SdkPaymentRequestLifecycleState::InvalidConflict => record
+            .canceled_event_id
+            .clone()
+            .or_else(|| record.rejected_event_id.clone())
+            .or_else(|| record.accepted_event_id.clone())
+            .or_else(|| record.proposal_event_id.clone()),
+        _ => return Err(LifecycleSyncError::InvalidProjection),
+    };
+    let last_event_at = record
+        .last_event_at
+        .ok_or(LifecycleSyncError::InvalidProjection)?;
+    let seconds = i128::from(last_event_at.timestamp());
+    let nanos = i128::from(last_event_at.timestamp_subsec_nanos());
+    let timestamp_nanos = seconds
+        .checked_mul(1_000_000_000)
+        .and_then(|value| value.checked_add(nanos))
+        .ok_or(LifecycleSyncError::InvalidProjection)?;
+    let last_event_at = time::OffsetDateTime::from_unix_timestamp_nanos(timestamp_nanos)
+        .map_err(|_| LifecycleSyncError::InvalidProjection)?;
+    Ok(PaymentRequestLifecycleProjection {
+        payment_request_id: record.payment_request_id.clone(),
+        proposal: ProposalCorrelation {
+            reader_pubky: format!("pubky{}", record.counterparty),
+            selected_reader_path: record.counterparty_receiver_path.to_string(),
+            terms: PaymentTermsV1 {
+                amount: terms.amount.value.clone(),
+                asset: terms.amount.asset.clone(),
+                payment_reference: terms.payment_reference.clone(),
+                proposal_expires_at: terms.proposal_expires_at.clone(),
+                accepted_endpoint_identifiers: terms.accepted_payment_endpoint_identifiers.clone(),
+                metadata: terms.metadata.clone(),
+            },
+        },
+        request_state,
+        state_event_id,
+        last_stream_item_id: record.last_stream_item_id,
+        last_outbound_message_id: record.last_outbound_message_id,
+        last_event_at,
     })
 }
 
-fn terminal_payment_request_status(
-    state: PaymentRequestLifecycleState,
-) -> Option<TerminalPaymentRequestStatus> {
+fn persisted_lifecycle_state(
+    state: SdkPaymentRequestLifecycleState,
+) -> Result<PersistedPaymentRequestLifecycleState, LifecycleSyncError> {
     match state {
-        PaymentRequestLifecycleState::Rejected | PaymentRequestLifecycleState::Canceled => {
-            Some(TerminalPaymentRequestStatus::Cancelled)
+        SdkPaymentRequestLifecycleState::Proposed => {
+            Ok(PersistedPaymentRequestLifecycleState::Proposed)
         }
-        PaymentRequestLifecycleState::ProposalExpired => {
-            Some(TerminalPaymentRequestStatus::Expired)
+        SdkPaymentRequestLifecycleState::ProposalExpired => {
+            Ok(PersistedPaymentRequestLifecycleState::ProposalExpired)
         }
-        _ => None,
+        SdkPaymentRequestLifecycleState::Accepted => {
+            Ok(PersistedPaymentRequestLifecycleState::Accepted)
+        }
+        SdkPaymentRequestLifecycleState::Rejected => {
+            Ok(PersistedPaymentRequestLifecycleState::Rejected)
+        }
+        SdkPaymentRequestLifecycleState::Canceled => {
+            Ok(PersistedPaymentRequestLifecycleState::Canceled)
+        }
+        SdkPaymentRequestLifecycleState::ProofSubmitted => {
+            Ok(PersistedPaymentRequestLifecycleState::ProofSubmitted)
+        }
+        SdkPaymentRequestLifecycleState::ActiveRecurring => {
+            Ok(PersistedPaymentRequestLifecycleState::ActiveRecurring)
+        }
+        SdkPaymentRequestLifecycleState::RecoveryRequired => {
+            Ok(PersistedPaymentRequestLifecycleState::RecoveryRequired)
+        }
+        SdkPaymentRequestLifecycleState::InvalidConflict => {
+            Ok(PersistedPaymentRequestLifecycleState::InvalidConflict)
+        }
+        _ => Err(LifecycleSyncError::InvalidProjection),
     }
 }
 
@@ -339,6 +681,22 @@ fn payment_terms(terms: &PaymentTermsV1) -> Result<PaymentRequestTerms, HandoffE
 
 #[async_trait]
 impl Adapter for PaykitAdapter {
+    async fn execute_claimed_handoff(
+        &self,
+        store: &OutboxStore,
+        claim: &ClaimedOutbox,
+        intent: &DeliveryIntentV1,
+    ) -> Result<HandoffResult, HandoffFailure> {
+        let _guard = self.mutation_lock.lock().await;
+        match store.claim_handoff_eligible(claim).await {
+            Ok(true) => handoff_steps(self, intent).await,
+            Ok(false) => Err(HandoffFailure::Permanent),
+            Err(_) => Err(HandoffFailure::Retryable(
+                RetryableHandoffStage::AdapterUnavailable,
+            )),
+        }
+    }
+
     async fn execute_handoff(
         &self,
         intent: &DeliveryIntentV1,
@@ -422,6 +780,29 @@ impl Adapter for PaykitAdapter {
         })
     }
 
+    async fn cancel_payment_request(
+        &self,
+        reader: &str,
+        path: &str,
+        payment_request_id: &str,
+    ) -> Result<HandoffResult, HandoffError> {
+        let (reader, path) = parse_peer(reader, path)?;
+        let payment_request_id = PaymentRequestId::new(payment_request_id.to_owned())
+            .map_err(|_| HandoffError::Permanent)?;
+        let record = self
+            .sdk
+            .cancel_payment_request(reader, path, &payment_request_id, None)
+            .await
+            .map_err(classify)?;
+        Ok(HandoffResult::PaymentRequestCancellation {
+            outbound_message_id: record
+                .last_outbound_message_id
+                .ok_or(HandoffError::Permanent)?,
+            event_id: record.canceled_event_id.ok_or(HandoffError::Permanent)?,
+            payment_request_id: record.payment_request_id,
+        })
+    }
+
     async fn outbound_status(
         &self,
         outbound_message_id: u64,
@@ -501,6 +882,129 @@ mod tests {
 
     const CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
 
+    fn receive_target(counterparty: &str, path: &str) -> ReceiveTarget {
+        ReceiveTarget {
+            counterparty: PubkyPublicKey::from_raw_or_app_key(counterparty).unwrap(),
+            receiver_path: PaykitReceiverPath::new(path).unwrap(),
+        }
+    }
+
+    fn intake_report(
+        counterparty: &str,
+        path: &str,
+        error: Option<&str>,
+    ) -> paykit_sdk::PrivateStreamCounterpartyIntakeReport {
+        paykit_sdk::PrivateStreamCounterpartyIntakeReport {
+            counterparty: PubkyPublicKey::from_raw_or_app_key(counterparty).unwrap(),
+            counterparty_receiver_path: PaykitReceiverPath::new(path).unwrap(),
+            report: error
+                .is_none()
+                .then_some(paykit_sdk::PrivateStreamIntakeReport {
+                    receive_batch_id: 1,
+                    stream_item_ids: Vec::new(),
+                    event_conflicts: Vec::new(),
+                }),
+            error: error.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn required_receive_target_rejects_empty_reports() {
+        let required = vec![receive_target(CREATOR, "bitkit/wallet")];
+
+        assert_eq!(
+            receive_health_for_required_targets(&[], &required),
+            ReceiveHealth::Unavailable
+        );
+    }
+
+    #[test]
+    fn required_receive_target_rejects_unrelated_reports() {
+        let required = vec![receive_target(CREATOR, "bitkit/wallet")];
+
+        assert_eq!(
+            receive_health_for_required_targets(
+                &[intake_report(CREATOR, "other/wallet", None)],
+                &required,
+            ),
+            ReceiveHealth::Unavailable
+        );
+    }
+
+    #[test]
+    fn required_receive_target_rejects_matching_report_errors() {
+        let required = vec![receive_target(CREATOR, "bitkit/wallet")];
+
+        assert_eq!(
+            receive_health_for_required_targets(
+                &[intake_report(CREATOR, "bitkit/wallet", Some("offline"))],
+                &required,
+            ),
+            ReceiveHealth::Unavailable
+        );
+    }
+
+    #[test]
+    fn required_receive_target_rejects_any_matching_report_error() {
+        let required = vec![receive_target(CREATOR, "bitkit/wallet")];
+
+        assert_eq!(
+            receive_health_for_required_targets(
+                &[
+                    intake_report(CREATOR, "bitkit/wallet", None),
+                    intake_report(CREATOR, "bitkit/wallet", Some("offline")),
+                ],
+                &required,
+            ),
+            ReceiveHealth::Unavailable
+        );
+    }
+
+    #[test]
+    fn every_required_receive_target_must_have_a_successful_exact_sdk_report() {
+        let required = vec![
+            receive_target(CREATOR, "bitkit/wallet"),
+            receive_target(CREATOR, "bitkit/server"),
+        ];
+
+        assert_eq!(
+            receive_health_for_required_targets(
+                &[
+                    intake_report(CREATOR, "bitkit/wallet", None),
+                    intake_report(CREATOR, "bitkit/server", None),
+                ],
+                &required,
+            ),
+            ReceiveHealth::Available
+        );
+        assert_eq!(
+            receive_health_for_required_targets(
+                &[intake_report(CREATOR, "bitkit/wallet", None)],
+                &required,
+            ),
+            ReceiveHealth::Unavailable
+        );
+    }
+
+    #[test]
+    fn no_required_receive_targets_ignore_unrelated_failures() {
+        assert_eq!(
+            receive_health_for_required_targets(
+                &[intake_report(CREATOR, "bitkit/wallet", Some("offline"))],
+                &[],
+            ),
+            ReceiveHealth::Available
+        );
+    }
+
+    #[test]
+    fn no_required_receive_targets_ignore_top_level_receive_failure() {
+        assert_eq!(
+            receive_health_from_reports(Err(()), Some(&[])),
+            ReceiveHealth::Available
+        );
+    }
+
     #[test]
     fn mutation_locks_are_shared_per_creator_and_isolated_between_creators() {
         let creator = Uuid::new_v4();
@@ -525,33 +1029,6 @@ mod tests {
                 RetryableHandoffCause::RecoveryRequired
             ))
         );
-    }
-
-    #[test]
-    fn rejected_and_canceled_requests_are_cancelled_while_expiry_stays_expired() {
-        for state in [
-            PaymentRequestLifecycleState::Rejected,
-            PaymentRequestLifecycleState::Canceled,
-        ] {
-            assert_eq!(
-                terminal_payment_request_status(state),
-                Some(TerminalPaymentRequestStatus::Cancelled)
-            );
-        }
-        assert_eq!(
-            terminal_payment_request_status(PaymentRequestLifecycleState::ProposalExpired),
-            Some(TerminalPaymentRequestStatus::Expired)
-        );
-        for state in [
-            PaymentRequestLifecycleState::Proposed,
-            PaymentRequestLifecycleState::Accepted,
-            PaymentRequestLifecycleState::ProofSubmitted,
-            PaymentRequestLifecycleState::ActiveRecurring,
-            PaymentRequestLifecycleState::RecoveryRequired,
-            PaymentRequestLifecycleState::InvalidConflict,
-        ] {
-            assert_eq!(terminal_payment_request_status(state), None);
-        }
     }
 
     #[test]
@@ -618,16 +1095,6 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_readiness_requires_a_successful_report_for_every_expected_peer() {
-        assert!(lifecycle_peers_available(&[1, 2], &[(1, true), (2, true)]));
-        assert!(!lifecycle_peers_available(&[1, 2], &[(1, true)]));
-        assert!(!lifecycle_peers_available(
-            &[1, 2],
-            &[(1, true), (2, false)]
-        ));
-    }
-
-    #[test]
     fn restored_session_identity_must_match_selected_creator() {
         let expected = crate::domain::locks::parse_creator(CREATOR).unwrap();
         let expected_key = PubkyPublicKey::from_raw_or_app_key(CREATOR).unwrap();
@@ -646,5 +1113,283 @@ mod tests {
             bind_session_to_creator(actual, &expected),
             Err(PaykitSdkError::Identity { .. })
         ));
+    }
+
+    #[test]
+    fn every_known_sdk_lifecycle_state_maps_one_to_one() {
+        let cases = [
+            (
+                SdkPaymentRequestLifecycleState::Proposed,
+                PersistedPaymentRequestLifecycleState::Proposed,
+            ),
+            (
+                SdkPaymentRequestLifecycleState::ProposalExpired,
+                PersistedPaymentRequestLifecycleState::ProposalExpired,
+            ),
+            (
+                SdkPaymentRequestLifecycleState::Accepted,
+                PersistedPaymentRequestLifecycleState::Accepted,
+            ),
+            (
+                SdkPaymentRequestLifecycleState::Rejected,
+                PersistedPaymentRequestLifecycleState::Rejected,
+            ),
+            (
+                SdkPaymentRequestLifecycleState::Canceled,
+                PersistedPaymentRequestLifecycleState::Canceled,
+            ),
+            (
+                SdkPaymentRequestLifecycleState::ProofSubmitted,
+                PersistedPaymentRequestLifecycleState::ProofSubmitted,
+            ),
+            (
+                SdkPaymentRequestLifecycleState::ActiveRecurring,
+                PersistedPaymentRequestLifecycleState::ActiveRecurring,
+            ),
+            (
+                SdkPaymentRequestLifecycleState::RecoveryRequired,
+                PersistedPaymentRequestLifecycleState::RecoveryRequired,
+            ),
+            (
+                SdkPaymentRequestLifecycleState::InvalidConflict,
+                PersistedPaymentRequestLifecycleState::InvalidConflict,
+            ),
+        ];
+        for (sdk, persisted) in cases {
+            assert_eq!(persisted_lifecycle_state(sdk), Ok(persisted));
+        }
+    }
+
+    #[test]
+    fn recovery_projection_uses_the_latest_underlying_event_identity() {
+        assert_eq!(
+            recovery_state_event_id(
+                Some("cancel"),
+                Some("reject"),
+                Some("proof"),
+                Some("accept"),
+                Some("proposal"),
+            ),
+            Some("cancel")
+        );
+        assert_eq!(
+            recovery_state_event_id(
+                None,
+                Some("reject"),
+                Some("proof"),
+                Some("accept"),
+                Some("proposal"),
+            ),
+            Some("reject")
+        );
+        assert_eq!(
+            recovery_state_event_id(None, None, Some("proof"), Some("accept"), Some("proposal")),
+            Some("proof")
+        );
+        assert_eq!(
+            recovery_state_event_id(None, None, None, Some("accept"), Some("proposal")),
+            Some("accept")
+        );
+        assert_eq!(
+            recovery_state_event_id(None, None, None, None, Some("proposal")),
+            Some("proposal")
+        );
+    }
+
+    #[test]
+    fn drain_refresh_error_mapping_preserves_conflicts_and_degrades_malformed_records() {
+        assert_eq!(
+            map_projection_persistence_error(PersistenceError::Conflict),
+            LifecycleSyncError::Conflict
+        );
+        assert_eq!(
+            map_lifecycle_drain_error(LifecycleSyncError::Conflict),
+            PaymentDrainError::Conflict
+        );
+        assert_eq!(
+            map_lifecycle_drain_error(LifecycleSyncError::InvalidProjection),
+            PaymentDrainError::Unavailable
+        );
+        assert_eq!(
+            map_lifecycle_status_error(LifecycleSyncError::Conflict),
+            PaymentRequestStatusError::Conflict
+        );
+        assert_eq!(
+            map_lifecycle_status_error(LifecycleSyncError::InvalidProjection),
+            PaymentRequestStatusError::Unavailable
+        );
+    }
+
+    fn projection(
+        index: u64,
+        request_state: PersistedPaymentRequestLifecycleState,
+    ) -> PaymentRequestLifecycleProjection {
+        PaymentRequestLifecycleProjection {
+            payment_request_id: Uuid::new_v4().to_string(),
+            proposal: ProposalCorrelation {
+                reader_pubky: CREATOR.into(),
+                selected_reader_path: "bitkit/wallet".into(),
+                terms: PaymentTermsV1 {
+                    amount: "1".into(),
+                    asset: "btc".into(),
+                    payment_reference: Uuid::new_v4().to_string(),
+                    proposal_expires_at: None,
+                    accepted_endpoint_identifiers: vec!["btc-bitcoin-p2wpkh".into()],
+                    metadata: serde_json::Map::new(),
+                },
+            },
+            request_state,
+            state_event_id: Some(Uuid::new_v4().to_string()),
+            last_stream_item_id: Some(index),
+            last_outbound_message_id: None,
+            last_event_at: time::OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap(),
+        }
+    }
+
+    #[tokio::test]
+    async fn top_level_receive_failure_projects_every_canonical_record_before_returning_degraded() {
+        let projections = vec![
+            Ok(projection(
+                1,
+                PersistedPaymentRequestLifecycleState::Proposed,
+            )),
+            Ok(projection(
+                2,
+                PersistedPaymentRequestLifecycleState::Accepted,
+            )),
+        ];
+        let persisted = Arc::new(StdMutex::new(Vec::new()));
+        let captured = persisted.clone();
+
+        let result = project_lifecycles_after_receive(
+            projections,
+            ReceiveHealth::Unavailable,
+            move |projection| {
+                captured.lock().unwrap().push(projection.request_state);
+                std::future::ready(Ok(()))
+            },
+        )
+        .await;
+
+        assert_eq!(result, Err(LifecycleSyncError::PartialReceive));
+        assert_eq!(
+            *persisted.lock().unwrap(),
+            vec![
+                PersistedPaymentRequestLifecycleState::Proposed,
+                PersistedPaymentRequestLifecycleState::Accepted,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_canonical_record_does_not_prevent_later_valid_projection() {
+        let projections = vec![
+            Ok(projection(
+                1,
+                PersistedPaymentRequestLifecycleState::Proposed,
+            )),
+            Err(LifecycleSyncError::InvalidProjection),
+            Ok(projection(
+                3,
+                PersistedPaymentRequestLifecycleState::Accepted,
+            )),
+        ];
+        let persisted = Arc::new(StdMutex::new(Vec::new()));
+        let captured = persisted.clone();
+
+        let result = project_lifecycles_after_receive(
+            projections,
+            ReceiveHealth::Available,
+            move |projection| {
+                captured.lock().unwrap().push(projection.request_state);
+                std::future::ready(Ok(()))
+            },
+        )
+        .await;
+
+        assert_eq!(result, Err(LifecycleSyncError::InvalidProjection));
+        assert_eq!(
+            *persisted.lock().unwrap(),
+            vec![
+                PersistedPaymentRequestLifecycleState::Proposed,
+                PersistedPaymentRequestLifecycleState::Accepted,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_replay_precedes_and_bypasses_fresh_mutable_work() {
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        let replay_calls = calls.clone();
+        let refresh_calls = calls.clone();
+        let operation_calls = calls.clone();
+
+        let result = replay_or_refresh_then(
+            move || {
+                replay_calls.lock().unwrap().push("replay");
+                std::future::ready(Ok::<_, PaymentDrainError>(Some(7_u8)))
+            },
+            move || {
+                refresh_calls.lock().unwrap().push("refresh");
+                std::future::ready(Ok::<_, PaymentDrainError>(()))
+            },
+            move || {
+                operation_calls.lock().unwrap().push("operation");
+                std::future::ready(Ok::<_, PaymentDrainError>(9_u8))
+            },
+        )
+        .await;
+
+        assert_eq!(result, Ok(7));
+        assert_eq!(*calls.lock().unwrap(), vec!["replay"]);
+    }
+
+    #[tokio::test]
+    async fn unavailable_refresh_prevents_stale_operation_result() {
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        let replay_calls = calls.clone();
+        let refresh_calls = calls.clone();
+        let operation_calls = calls.clone();
+
+        let result = replay_or_refresh_then(
+            move || {
+                replay_calls.lock().unwrap().push("replay");
+                std::future::ready(Ok::<_, PaymentDrainError>(None))
+            },
+            move || {
+                refresh_calls.lock().unwrap().push("refresh");
+                std::future::ready(Err(PaymentDrainError::Unavailable))
+            },
+            move || {
+                operation_calls.lock().unwrap().push("operation");
+                std::future::ready(Ok::<_, PaymentDrainError>(9_u8))
+            },
+        )
+        .await;
+
+        assert_eq!(result, Err(PaymentDrainError::Unavailable));
+        assert_eq!(*calls.lock().unwrap(), vec!["replay", "refresh"]);
+    }
+
+    #[tokio::test]
+    async fn unavailable_required_intake_prevents_payment_request_status_lookup() {
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        let refresh_calls = calls.clone();
+        let lookup_calls = calls.clone();
+
+        let result = refresh_then(
+            move || {
+                refresh_calls.lock().unwrap().push("refresh");
+                std::future::ready(Err(PaymentRequestStatusError::Unavailable))
+            },
+            move || {
+                lookup_calls.lock().unwrap().push("lookup");
+                std::future::ready(Ok::<_, PaymentRequestStatusError>(Some(7_u8)))
+            },
+        )
+        .await;
+
+        assert_eq!(result, Err(PaymentRequestStatusError::Unavailable));
+        assert_eq!(*calls.lock().unwrap(), vec!["refresh"]);
     }
 }

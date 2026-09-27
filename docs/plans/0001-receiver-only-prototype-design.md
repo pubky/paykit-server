@@ -20,8 +20,8 @@ Only **EXPLICIT**, **AUTHORITATIVE SOURCE**, and **CONSTRAINT** entries may driv
 
 The user designated these as authoritative for Locks Server ↔ Paykit Server HTTP behavior:
 
-- [Locks ADR 0020](https://github.com/pubky/locks/blob/v0.1.0-rc1/docs/ADRs/0020-locks-paykit-v1-integration-boundary.md)
-- matching [Locks Paykit HTTP client](https://github.com/pubky/locks/blob/v0.1.0-rc1/locks-server/src/paykit_http_client.rs)
+- [Locks ADR 0020](https://github.com/pubky/locks/blob/v0.1.0-rc3/docs/ADRs/0020-locks-paykit-v1-integration-boundary.md)
+- matching [Locks Paykit HTTP client](https://github.com/pubky/locks/blob/v0.1.0-rc3/locks-server/src/paykit_http_client.rs)
 
 ### Product flow
 
@@ -41,7 +41,7 @@ Current `../paykit-rs` code/specifications define dependency behavior. They are 
 
 - Canonical Locks creator, reader, bundle, addressed lock-resource identifiers,
   and Paykit-payment policy validation use `locks-core` pinned at public release
-  `v0.1.0-rc1`; Paykit Server does not duplicate
+  `v0.1.0-rc3`; Paykit Server does not duplicate
   their parsing, canonicalization, or policy grammar.
 
 ## Actors and key boundaries
@@ -84,7 +84,7 @@ Current `../paykit-rs` code/specifications define dependency behavior. They are 
 - `POST /transactions/status`
 - Requests carry `X-Paykit-Signature`.
 - Exactly one trusted Lock Server public key is configured statically. No allowlist and no signer-ID header.
-- Paykit Server verifies Ed25519 signature over exact received body bytes.
+- Paykit Server verifies Ed25519 over the versioned request preimage `b"paykit-http-signature-v1\0" + uppercase_method + b"\0" + exact_query_free_path + b"\0" + exact_received_body`; body-only signatures are rejected.
 - Parsed JSON must RFC 8785-canonicalize to the exact received bytes. Signed noncanonical JSON is rejected.
 - Request schemas are closed according to the authoritative Locks contract.
 - Locks API request body limit is 16 KiB, enforced on raw bytes before JSON parsing; excess returns `413 payload_too_large`.
@@ -205,10 +205,9 @@ Current `../paykit-rs` code/specifications define dependency behavior. They are 
   from authenticated persisted state after restart.
 - PostgreSQL SDK adapter locks one creator SDK-state row, decrypts/deserializes full `StorageState`, runs SDK transaction callback, serializes/encrypts updated state, and commits atomically.
 - SDK-state mutation and address allocation are serialized per Creator, while work for different Creators may proceed concurrently.
-- Payer-facing inbox persistence APIs and tables remain removed. A later lifecycle
-  projection requirement added an internal SDK receive/reconciliation worker and
-  an independent readiness component for canonical Payment Request terminal states;
-  it did not add a public payer inbox, proof processing, or payer-facing API.
+- SDK receive-intake and server inbox persistence APIs and tables have been removed.
+  Production composition has no receive/inbox worker, payer-facing behavior,
+  readiness component, or metric.
 
 ## PostgreSQL privacy boundary
 
@@ -274,9 +273,10 @@ Rules:
 - Criterion asset must equal `BTC`.
 - Paykit Server snapshots validated invoice terms; later status does not refetch lock.
 - Generate UUID-v4 Payment Reference once per new invoice; persist and reuse it.
-- Exact replay returns `204 No Content` without refetching lock, reallocating
-  address, recreating delivery, revalidating creator session, or observing Noise
-  state.
+- Exact replay returns `200 OK` with the original RFC 3339
+  `invoice_created_at` and `payment_deadline` timestamps, without refetching lock,
+  reallocating address, recreating delivery, revalidating creator session, or
+  observing Noise state.
 - Same `(creator, bundle_id)` with changed request binding returns `409 Conflict`.
 - New invoice requires active network validation of creator Pubky session on every request:
   - revoked/expired → `409 creator_session_invalid`;
@@ -320,13 +320,16 @@ Rules:
 
 - Paykit v0.2 Payment Request wire message has `version: 1`, `kind: "paykit.payment_request"`, UUID-v4 `event_id`, UUID-v4 `payment_request_id`, and a `request` wrapper containing the accepted one-time request fields.
 - New invoice creates one immutable one-time Payment Request.
-- Payment Request `proposal_expires_at` is `null`; prototype has no proposal-expiry timer.
+- Payment Request `proposal_expires_at` equals the persisted application `payment_deadline`.
 - Payment Request `recurrence` is `null` because request is one-time.
-- Request remains payable until verified Bitcoin settlement or terminal lifecycle projection.
+- Paykit Server accepts only a qualifying output first observed by the application deadline;
+  late payment can receive no access or refund. A timely matched output remains monitored to
+  factual Bitcoin finality after the deadline.
 - Payment Request metadata contains exact fields `bundle_id`, `lock_resource`, and `reader` copied from accepted invoice request.
 - Metadata does not duplicate amount, asset, Payment Reference, address, or creator identity.
-- `POST /invoices` returns `204 No Content` after the invoice and encrypted, versioned
-  server semantic intent containing all `PaymentRequestTerms` inputs are durably
+- `POST /invoices` returns `200 OK` with only RFC 3339 `invoice_created_at` and
+  `payment_deadline` timestamps after the invoice and encrypted, versioned server
+  semantic intent containing all `PaymentRequestTerms` inputs are durably
   committed. This is not the final SDK Payment Request event or wire JSON.
 - Invoice creation does not expose Noise state. `POST /connections/status` accepts
   the authenticated persisted invoice identity `{ "creator", "bundle_id" }`,
@@ -368,24 +371,20 @@ Rules:
 
 ## Payer-originated events
 
-**SUPERSEDED IN PART — terminal lifecycle projection only**:
+**EXPLICIT — out of scope for this receiver-only prototype**:
 
-- Paykit Server has no payer-facing inbox, payment-proof attribution, or public
-  payer event API.
-- A later internal SDK receive/reconciliation worker consumes canonical Payment
-  Request lifecycle states for correlated requests. SDK `Rejected` and `Canceled`
-  terminalize the invoice as `cancelled`; `ProposalExpired` terminalizes it as
-  `expired`.
+- Paykit Server has no payer-facing inbox and does not receive or process payer-originated payment events.
+- The server's Paykit role is limited to establishing the receiver-side link,
+  publishing the invoice-specific endpoint, and sending the Payment Request.
 - Bitcoin observation of the invoice-specific `(creator, reader, bundle_id)` address
-  remains the sole payment-attribution authority. Lifecycle events can terminalize
-  an invoice but never prove payment.
+  is the sole payment-state authority.
 
 ## Direct Bitcoin observation
 
 **EXPLICIT**:
 
-- The invoice-specific address is the sole payment-attribution key; payer-originated
-  lifecycle messages cannot attribute payment.
+- The invoice-specific address is the sole attribution key; payer-originated
+  messages are out of scope.
 - Output amount matches when `output_sats >= invoice_sats`; overpayment is accepted.
 - No aggregation or top-up semantics: one output must satisfy the full invoice amount.
 - Wrong-address output or no observed output leaves the invoice `undetected`.
@@ -409,10 +408,16 @@ Rules:
   - `undetected`: no valid referenced output currently observed;
   - `detected`: valid output observed at 0 confirmations;
   - `confirmed`: valid output observed with at least 1 confirmation;
-  - `cancelled`: correlated SDK Payment Request is `Rejected` or `Canceled`;
-  - `expired`: correlated SDK Payment Request is `ProposalExpired`.
-- `cancelled` and `expired` are terminal lifecycle facts with `confirmations = 0`
-  and `amount_matched = false`; Bitcoin observation cannot overwrite them.
+  - `cancelled`: every durable proposal attempt is lifecycle-terminal and the
+    aggregate request state is `Rejected` or `Canceled`;
+  - `expired`: the aggregate request state is `ProposalExpired`, or the
+    application payment window expired without timely qualifying settlement.
+- Any non-terminal proposal attempt outranks terminal attempt history. A
+  reversible `RecoveryRequired` transport overlay does not alter payment status.
+- `cancelled` takes label precedence over application-window `expired`.
+- Lifecycle-derived labels retain the persisted Bitcoin `confirmations` and
+  `amount_matched` facts; lifecycle projection never rewrites invoice payment
+  state or deletes observations.
 - Locks applies access threshold from returned confirmation count.
 - Before six confirmations, reorg may regress status and confirmation count.
 - At six confirmations, an amount-matched payment becomes final, monitoring stops, and persisted/reported confirmation count remains `6`.

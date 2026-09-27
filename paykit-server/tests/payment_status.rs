@@ -107,12 +107,14 @@ fn signed_request(key: &SigningKey) -> Request<Body> {
 }
 
 fn signed_request_with_body(key: &SigningKey, body: Vec<u8>) -> Request<Body> {
+    let preimage =
+        paykit_server::http::auth::signature_preimage("POST", "/transactions/status", &body);
     Request::builder()
         .method(Method::POST)
         .uri("/transactions/status")
         .header(
             "X-Paykit-Signature",
-            URL_SAFE_NO_PAD.encode(key.sign(&body).to_bytes()),
+            URL_SAFE_NO_PAD.encode(key.sign(&preimage).to_bytes()),
         )
         .body(Body::from(body))
         .unwrap()
@@ -155,32 +157,44 @@ async fn known_unobserved_status_is_exactly_undetected() {
 }
 
 #[tokio::test]
-async fn dismissed_payment_request_is_exactly_cancelled() {
+async fn cancelled_request_preserves_observed_bitcoin_facts() {
     let key = SigningKey::from_bytes(&[7; 32]);
-    let response = router(&key, Some(PersistedPaymentStatus::Cancelled))
-        .oneshot(signed_request(&key))
-        .await
-        .unwrap();
+    let response = router(
+        &key,
+        Some(PersistedPaymentStatus::Cancelled {
+            confirmations: 3,
+            amount_matched: true,
+        }),
+    )
+    .oneshot(signed_request(&key))
+    .await
+    .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         response_body(response).await,
-        r#"{"status":"cancelled","confirmations":0,"amount_matched":false}"#
+        r#"{"status":"cancelled","confirmations":3,"amount_matched":true}"#
     );
 }
 
 #[tokio::test]
-async fn expired_payment_request_is_exactly_expired() {
+async fn expired_request_preserves_observed_bitcoin_facts() {
     let key = SigningKey::from_bytes(&[7; 32]);
-    let response = router(&key, Some(PersistedPaymentStatus::Expired))
-        .oneshot(signed_request(&key))
-        .await
-        .unwrap();
+    let response = router(
+        &key,
+        Some(PersistedPaymentStatus::Expired {
+            confirmations: 1,
+            amount_matched: true,
+        }),
+    )
+    .oneshot(signed_request(&key))
+    .await
+    .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         response_body(response).await,
-        r#"{"status":"expired","confirmations":0,"amount_matched":false}"#
+        r#"{"status":"expired","confirmations":1,"amount_matched":true}"#
     );
 }
 

@@ -8,11 +8,12 @@ use std::fmt;
 
 use paykit_lib::{
     PaykitReceiverMarker, PaykitReceiverPath, PaymentAmount, PaymentEndpointIdentifier,
-    PaymentEndpointPayload, PaymentReference, PaymentRequestTerms,
+    PaymentEndpointPayload, PaymentReference, PaymentRequestId, PaymentRequestTerms,
     serialize_paykit_receiver_marker,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 /// Server-owned delivery intent stored inside the Creator-bound outbox AEAD envelope.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
@@ -33,6 +34,9 @@ pub enum DeliveryOperationV1 {
     },
     PaymentRequestProposal {
         terms: PaymentTermsV1,
+    },
+    PaymentRequestCancellation {
+        payment_request_id: String,
     },
 }
 
@@ -84,6 +88,40 @@ pub enum DeliveryIntentError {
 }
 
 impl DeliveryIntentV1 {
+    /// Returns the stable Payment Reference carried by a proposal intent.
+    pub fn proposal_payment_reference(&self) -> Result<&str, DeliveryIntentError> {
+        match &self.operation {
+            DeliveryOperationV1::PaymentRequestProposal { terms } => {
+                PaymentReference::new(terms.payment_reference.clone())
+                    .map_err(|_| DeliveryIntentError::Invalid)?;
+                Ok(&terms.payment_reference)
+            }
+            DeliveryOperationV1::EndpointPublication { .. }
+            | DeliveryOperationV1::PaymentRequestCancellation { .. } => {
+                Err(DeliveryIntentError::Invalid)
+            }
+        }
+    }
+
+    /// Sets the transaction-authoritative proposal expiry before persistence.
+    pub fn set_proposal_expires_at(
+        &mut self,
+        proposal_expires_at: String,
+    ) -> Result<(), DeliveryIntentError> {
+        OffsetDateTime::parse(&proposal_expires_at, &Rfc3339)
+            .map_err(|_| DeliveryIntentError::Invalid)?;
+        match &mut self.operation {
+            DeliveryOperationV1::PaymentRequestProposal { terms } => {
+                terms.proposal_expires_at = Some(proposal_expires_at);
+                self.validate()
+            }
+            DeliveryOperationV1::EndpointPublication { .. }
+            | DeliveryOperationV1::PaymentRequestCancellation { .. } => {
+                Err(DeliveryIntentError::Invalid)
+            }
+        }
+    }
+
     pub fn fingerprint(marker: &PaykitReceiverMarker) -> Result<[u8; 32], DeliveryIntentError> {
         let canonical =
             serialize_paykit_receiver_marker(marker).map_err(|_| DeliveryIntentError::Marker)?;
@@ -157,6 +195,30 @@ impl DeliveryIntentV1 {
         Ok(intent)
     }
 
+    /// Derives a cancellation from the authenticated proposal peer/path context.
+    pub fn payment_request_cancellation(
+        proposal: &Self,
+        payment_request_id: String,
+    ) -> Result<Self, DeliveryIntentError> {
+        if !matches!(
+            proposal.operation,
+            DeliveryOperationV1::PaymentRequestProposal { .. }
+        ) || PaymentRequestId::new(payment_request_id.clone()).is_err()
+        {
+            return Err(DeliveryIntentError::Invalid);
+        }
+        let intent = Self {
+            version: 2,
+            reader_pubky: proposal.reader_pubky.clone(),
+            selected_reader_path: proposal.selected_reader_path.clone(),
+            marker_fingerprint: proposal.marker_fingerprint,
+            local_receiver_path: proposal.local_receiver_path.clone(),
+            operation: DeliveryOperationV1::PaymentRequestCancellation { payment_request_id },
+        };
+        intent.validate()?;
+        Ok(intent)
+    }
+
     pub fn version(&self) -> u8 {
         self.version
     }
@@ -206,10 +268,17 @@ impl DeliveryIntentV1 {
                 if reference.get_version_num() != 4
                     || reference.get_variant() != uuid::Variant::RFC4122
                     || terms.payment_reference != reference.hyphenated().to_string()
-                    || terms.proposal_expires_at.is_some()
+                    || terms
+                        .proposal_expires_at
+                        .as_ref()
+                        .is_some_and(|value| OffsetDateTime::parse(value, &Rfc3339).is_err())
                 {
                     return Err(DeliveryIntentError::Invalid);
                 }
+            }
+            DeliveryOperationV1::PaymentRequestCancellation { payment_request_id } => {
+                PaymentRequestId::new(payment_request_id.clone())
+                    .map_err(|_| DeliveryIntentError::Invalid)?;
             }
         }
         Ok(())
@@ -236,6 +305,25 @@ impl DeliveryIntentV1 {
     pub fn operation(&self) -> &DeliveryOperationV1 {
         &self.operation
     }
+
+    /// Matches the complete SDK-visible proposal semantics. The payment
+    /// reference narrows correlation, but never substitutes for exact peer,
+    /// path, and terms validation.
+    pub fn matches_proposal(
+        &self,
+        reader_pubky: &str,
+        selected_reader_path: &str,
+        expected_terms: &PaymentTermsV1,
+    ) -> bool {
+        self.reader_pubky == reader_pubky
+            && self.selected_reader_path == selected_reader_path
+            && matches!(
+                &self.operation,
+                DeliveryOperationV1::PaymentRequestProposal { terms }
+                    if terms.payment_reference == expected_terms.payment_reference
+                        && terms == expected_terms
+            )
+    }
 }
 
 impl fmt::Debug for DeliveryIntentV1 {
@@ -253,6 +341,7 @@ impl fmt::Debug for DeliveryOperationV1 {
         formatter.write_str(match self {
             Self::EndpointPublication { .. } => "EndpointPublication { .. }",
             Self::PaymentRequestProposal { .. } => "PaymentRequestProposal { .. }",
+            Self::PaymentRequestCancellation { .. } => "PaymentRequestCancellation { .. }",
         })
     }
 }
@@ -347,6 +436,54 @@ mod tests {
 
         let decoded = DeliveryIntentV1::decode(&postcard::to_allocvec(&intent).unwrap()).unwrap();
         assert_eq!(decoded, intent);
+    }
+
+    #[test]
+    fn proposal_correlation_requires_exact_peer_path_and_terms() {
+        let intent = DeliveryIntentV1 {
+            version: 2,
+            reader_pubky: "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy".into(),
+            selected_reader_path: "bitkit/wallet".into(),
+            marker_fingerprint: [9; 32],
+            local_receiver_path: "paykit/server".into(),
+            operation: DeliveryOperationV1::PaymentRequestProposal {
+                terms: PaymentTermsV1 {
+                    amount: "0.00000100".into(),
+                    asset: "btc".into(),
+                    payment_reference: "550e8400-e29b-41d4-a716-446655440000".into(),
+                    proposal_expires_at: Some("2027-01-15T08:00:00Z".into()),
+                    accepted_endpoint_identifiers: vec!["btc-bitcoin-p2wpkh".into()],
+                    metadata: serde_json::Map::from_iter([(
+                        "bundle_id".into(),
+                        serde_json::json!("bundle-secret"),
+                    )]),
+                },
+            },
+        };
+        let terms = match intent.operation() {
+            DeliveryOperationV1::PaymentRequestProposal { terms } => terms.clone(),
+            _ => unreachable!(),
+        };
+
+        assert!(intent.matches_proposal(
+            "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+            "bitkit/wallet",
+            &terms,
+        ));
+        assert!(!intent.matches_proposal(
+            "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+            "paykit/other",
+            &terms,
+        ));
+        let mut changed_terms = terms.clone();
+        changed_terms
+            .metadata
+            .insert("extra".into(), serde_json::json!(true));
+        assert!(!intent.matches_proposal(
+            "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+            "bitkit/wallet",
+            &changed_terms,
+        ));
     }
 
     #[test]

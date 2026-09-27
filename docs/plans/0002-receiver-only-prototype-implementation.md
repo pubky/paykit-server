@@ -10,8 +10,8 @@
 
 **Authoritative requirements:**
 - `docs/plans/0001-receiver-only-prototype-design.md`
-- [Locks ADR 0020](https://github.com/pubky/locks/blob/v0.1.0-rc1/docs/ADRs/0020-locks-paykit-v1-integration-boundary.md)
-- Matching [Locks Paykit HTTP client](https://github.com/pubky/locks/blob/v0.1.0-rc1/locks-server/src/paykit_http_client.rs)
+- [Locks ADR 0020](https://github.com/pubky/locks/blob/v0.1.0-rc3/docs/ADRs/0020-locks-paykit-v1-integration-boundary.md)
+- Matching [Locks Paykit HTTP client](https://github.com/pubky/locks/blob/v0.1.0-rc3/locks-server/src/paykit_http_client.rs)
 
 **Hard boundary:** Do not implement unsupported Paykit wire/Encrypted-Link behavior locally. Delegate it to the pinned `paykit-sdk` dependency.
 
@@ -326,9 +326,10 @@ cargo clippy -p paykit-server --all-targets -- -D warnings
 - The canonical Creator selects only its own persisted credentials, xpub/account index, derivation counter, and SDK state; missing state has no default or cross-Creator fallback.
 - Validate exactly one referenced `paykit-payment` criterion with recipient equal to canonical creator, `BTC`, and positive sats.
 - Session invalid/unavailable returns approved 409/503 without allocation/commit.
-- Exact replay is `204 No Content` without lock refetch, session revalidation, or
-  Noise observation; changed binding is 409. Dedicated `POST /connections/status`
-  returns the closed five-state local Noise view from persisted binding.
+- Exact replay is `200 OK` with the original `invoice_created_at` and `payment_deadline`
+  timestamps, without lock refetch, session revalidation, or Noise observation; changed
+  binding is 409. Dedicated `POST /connections/status` returns the closed five-state
+  local Noise view from persisted binding.
 - New reader transaction creates assignment, endpoint-publication intent, then dependent Payment Request intent.
 - Concurrent invoices for different Creators use independent derivation counters and may share a numeric child index without sharing an address or SDK transaction.
 - Invoice handler returns before link establishment/delivery. Cancel-safe invoice
@@ -362,6 +363,14 @@ cargo test --workspace
 **RED tests:**
 - Unknown creator/bundle returns 404.
 - Known invoice without an observed output returns exact undetected zero/false response.
+- Rejected/canceled requests project `cancelled`; proposal expiry and accepted
+  application-window expiry project `expired`.
+- Multiple proposal attempts aggregate before projection, and any non-terminal
+  attempt prevents terminal history from overriding the Bitcoin label.
+- Lifecycle-derived labels retain factual confirmations and amount matching;
+  later lifecycle events never rewrite invoice payment columns.
+- `RecoveryRequired` remains a transport-availability overlay rather than a
+  payment lifecycle transition.
 - Status never triggers creator-session validation or lock refetch.
 - Status serialization contains only `status`, `confirmations`, and `amount_matched`.
 
@@ -413,9 +422,11 @@ cargo test --workspace
 
 **Suggested user commit:** `feat: deliver Paykit endpoint and payment intents`
 
-### Task 13: Superseded — terminal Payment Request lifecycle projection only
+### Task 13: Internal Payment Request lifecycle projection
 
-The original payer-facing inbox and proof/event processing scope remains removed. A later cross-service requirement added an internal SDK receive/reconciliation loop that projects canonical `Rejected` and `Canceled` states onto correlated invoices as `cancelled`, and `ProposalExpired` as `expired`. Task 14 remains the sole source of payment attribution.
+There is no payer-facing inbox or proof/event API. The composed SDK receive path
+durably projects canonical Payment Request lifecycle for status and drain
+decisions. Task 14 remains the only payment-attribution path.
 
 ### Task 14: Implement direct Electrum observation and finality policy
 
@@ -532,7 +543,7 @@ Mitigation Task 12 completed the retired-surface cleanup.
 | 0 | Removed by product decision | No upstream SDK deletion API gate applies. |
 | 1–11 | Implemented | Workspace, config, PostgreSQL/encryption, setup/signed-route, invoice/status seams are present and covered by unit/PostgreSQL tests. |
 | 12 | Implemented, composed, and live-smoke verified | Outbox behavior is composed through the public SDK. A separate local Pubky relay/homeserver delivered one live-smoke Payment Request. Delivery remains at least once, not a strict end-to-end idempotence guarantee. |
-| 13 | Superseded and implemented | No public payer inbox or proof attribution. Internal SDK receive/reconciliation projects rejected and canceled requests as terminal invoice cancellation, while proposal-expired requests become terminal invoice expiry. |
+| 13 | Implemented internally | No payer-facing inbox/API; canonical SDK lifecycle is durably projected independently from Bitcoin payment facts. |
 | 14 | Implemented, composed, and live-smoke verified | Direct invoice-specific address observation is PostgreSQL-tested and one exact mainnet output/confirmation result passed through the production BDK adapter against Fulcrum. |
 | 15 | Implemented | Operational health, metrics, capacity, and drain behavior are composed by the binary. |
 | 16 | Removed by product decision | No payload-deletion worker or config/API contract. |

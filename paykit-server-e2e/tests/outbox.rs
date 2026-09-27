@@ -114,6 +114,15 @@ impl Adapter for ReconciliationAdapter {
         Err(HandoffError::Permanent)
     }
 
+    async fn cancel_payment_request(
+        &self,
+        _reader: &str,
+        _path: &str,
+        _payment_request_id: &str,
+    ) -> Result<HandoffResult, HandoffError> {
+        Err(HandoffError::Permanent)
+    }
+
     async fn outbound_status(
         &self,
         _outbound_message_id: u64,
@@ -132,8 +141,9 @@ async fn assert_reconciliation_status(
 ) {
     let row_id: Uuid = sqlx::query_scalar(
         "INSERT INTO outbox \
-         (creator_id, intent_envelope, status, sdk_outbound_message_id) \
-         SELECT id, decode('00', 'hex'), 'handed_off', $1 FROM creators LIMIT 1 \
+         (creator_id, intent_envelope, intent_kind, status, sdk_outbound_message_id) \
+         SELECT id, decode('00', 'hex'), 'endpoint_publication', 'handed_off', $1 \
+         FROM creators LIMIT 1 \
          RETURNING id",
     )
     .bind(outbound_id.to_string())
@@ -203,10 +213,12 @@ async fn every_claimed_invoice_row_has_one_complete_decryptable_intent_and_depen
             creator: &creator,
             reader: &reader,
             bundle_binding: b"outbox-bundle",
+            lock_resource_binding: b"outbox-lock",
             payment_request_binding: b"outbox-payment-request",
             new_reader_payloads: &payloads,
             payment_request_intent: common::payment_intent(&reader),
             required_sats: 100,
+            payment_in_hours: 24,
         })
         .await
         .unwrap();
@@ -260,6 +272,38 @@ async fn every_claimed_invoice_row_has_one_complete_decryptable_intent_and_depen
         .await
         .unwrap();
     assert_eq!(endpoint_claims.len(), 1);
+    sqlx::query(
+        "UPDATE outbox SET lease_expires_at = clock_timestamp() + INTERVAL '300 milliseconds' WHERE id = $1",
+    )
+    .bind(endpoint_claims[0].id())
+    .execute(database.pool())
+    .await
+    .unwrap();
+    let mut blocker = database.pool().begin().await.unwrap();
+    sqlx::query("SELECT id FROM outbox WHERE id = $1 FOR UPDATE")
+        .bind(endpoint_claims[0].id())
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+    let blocked_outbox = outbox.clone();
+    let blocked_claim = endpoint_claims[0].clone();
+    let transition = tokio::spawn(async move {
+        blocked_outbox
+            .mark_handed_off(
+                &blocked_claim,
+                &HandoffResult::EndpointPublication {
+                    outbound_message_id: 15,
+                },
+            )
+            .await
+            .unwrap()
+    });
+    tokio::time::sleep(Duration::from_millis(450)).await;
+    blocker.commit().await.unwrap();
+    assert!(
+        !transition.await.unwrap(),
+        "a transition that waited past lease expiry committed with stale transaction time"
+    );
     sqlx::query("UPDATE outbox SET lease_expires_at = NOW() - INTERVAL '1 second' WHERE id = $1")
         .bind(endpoint_claims[0].id())
         .execute(database.pool())
@@ -481,8 +525,9 @@ async fn every_claimed_invoice_row_has_one_complete_decryptable_intent_and_depen
     }
 
     let corrupt_id: Uuid = sqlx::query_scalar(
-        "INSERT INTO outbox (creator_id, intent_envelope, status) \
-         SELECT id, decode('00', 'hex'), 'queued' FROM creators LIMIT 1 RETURNING id",
+        "INSERT INTO outbox (creator_id, intent_envelope, intent_kind, status) \
+         SELECT id, decode('00', 'hex'), 'endpoint_publication', 'queued' \
+         FROM creators LIMIT 1 RETURNING id",
     )
     .fetch_one(database.pool())
     .await
@@ -524,8 +569,9 @@ async fn every_claimed_invoice_row_has_one_complete_decryptable_intent_and_depen
         "schema accepted a claimable row without an intent"
     );
     let unattributed_handoff = sqlx::query(
-        "INSERT INTO outbox (creator_id, intent_envelope, status) \
-         SELECT id, decode('00', 'hex'), 'handed_off' FROM creators LIMIT 1",
+        "INSERT INTO outbox (creator_id, intent_envelope, intent_kind, status) \
+         SELECT id, decode('00', 'hex'), 'endpoint_publication', 'handed_off' \
+         FROM creators LIMIT 1",
     )
     .execute(database.pool())
     .await;
@@ -534,8 +580,10 @@ async fn every_claimed_invoice_row_has_one_complete_decryptable_intent_and_depen
         "schema accepted handed_off without an SDK outbound ID"
     );
     let unpaired_payment_ids = sqlx::query(
-        "INSERT INTO outbox (creator_id, intent_envelope, status, sdk_event_id) \
-         SELECT id, decode('00', 'hex'), 'queued', 'event-only' FROM creators LIMIT 1",
+        "INSERT INTO outbox (
+             creator_id, intent_envelope, intent_kind, status, sdk_event_id
+         ) SELECT id, decode('00', 'hex'), 'payment_request_proposal', 'queued', \
+                  'event-only' FROM creators LIMIT 1",
     )
     .execute(database.pool())
     .await;
@@ -686,12 +734,14 @@ async fn public_sdk_payment_request_retry_persists_distinct_ids_and_only_active_
             creator: &creator,
             reader: &reader,
             bundle_binding: b"public-sdk-crash-window-bundle",
+            lock_resource_binding: b"public-sdk-crash-window-lock",
             payment_request_binding: b"public-sdk-crash-window-request",
             new_reader_payloads: &Payloads {
                 reader: reader.clone(),
             },
             payment_request_intent: common::payment_intent(&reader),
             required_sats: 100,
+            payment_in_hours: 24,
         })
         .await
         .unwrap();
@@ -727,6 +777,9 @@ async fn public_sdk_payment_request_retry_persists_distinct_ids_and_only_active_
             metadata: terms.metadata.clone(),
         },
         DeliveryOperationV1::EndpointPublication { .. } => panic!("claimed endpoint row"),
+        DeliveryOperationV1::PaymentRequestCancellation { .. } => {
+            panic!("claimed cancellation row")
+        }
     };
 
     let first = creator_sdk
@@ -770,7 +823,8 @@ async fn public_sdk_payment_request_retry_persists_distinct_ids_and_only_active_
             event_id,
             payment_request_id,
         } => (*outbound_message_id, event_id, payment_request_id),
-        HandoffResult::EndpointPublication { .. } => unreachable!(),
+        HandoffResult::EndpointPublication { .. }
+        | HandoffResult::PaymentRequestCancellation { .. } => unreachable!(),
     };
     let (second_outbound, second_event, second_request) = match &second_result {
         HandoffResult::PaymentRequestProposal {
@@ -778,7 +832,8 @@ async fn public_sdk_payment_request_retry_persists_distinct_ids_and_only_active_
             event_id,
             payment_request_id,
         } => (*outbound_message_id, event_id, payment_request_id),
-        HandoffResult::EndpointPublication { .. } => unreachable!(),
+        HandoffResult::EndpointPublication { .. }
+        | HandoffResult::PaymentRequestCancellation { .. } => unreachable!(),
     };
     assert_ne!(first_outbound, second_outbound);
     assert_ne!(first_event, second_event);
