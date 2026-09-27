@@ -1,26 +1,34 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use paykit_lib::{
     PaykitReceiverCapabilities, PaykitReceiverMarker, PaykitReceiverPath, PaymentAmount,
-    PaymentEndpointIdentifier, PaymentReference, PaymentRequestTerms, PublicKey,
+    PaymentEndpointIdentifier, PaymentEndpointPayload, PaymentReference, PaymentRequestTerms,
+    PublicKey,
 };
 use paykit_sdk::{PubkyPublicKey, ReceiverNoiseSecretKey, storage::StorageState};
 use paykit_server::{
     application::{
         payment_drain::PaymentDrainError,
         payment_request_status::PaymentRequestStatusError,
-        semantic_intent::{DeliveryIntentV1, DeliveryOperationV1},
+        semantic_intent::{DeliveryIntentV1, DeliveryOperationV1, PaymentTermsV1},
     },
     config::{PaykitConfig, PaykitNetwork, ReceiverPathPriority},
     crypto::{Crypto, EncryptedEnvelope, EnvelopeContext},
     domain::{
-        locks::{PubkyLockResource, parse_addressed_lock_resource, parse_bundle_id, parse_creator},
-        payment_request_lifecycle::PaymentRequestLifecycleState,
+        locks::{
+            PubkyLockResource, parse_addressed_lock_resource, parse_bundle_id, parse_creator,
+            parse_reader,
+        },
+        payment_request_lifecycle::{
+            PaymentRequestLifecycleProjection, PaymentRequestLifecycleState, ProposalCorrelation,
+        },
     },
     paykit::{CreatorSessionProvider, PaykitAdapter},
     persistence::{
-        CreatorCredentials, CreatorStore, InvoiceStore, OutboxStore, PaymentDrainStore,
-        PaymentRequestLifecycleStore, PersistenceError, PostgresStorageAdapter, run_migrations,
+        AtomicInvoiceInput, CreatorCredentials, CreatorStore, InvoiceStore,
+        NewReaderPayloadFactory, NewReaderPayloads, OutboxStore, PaymentDrainStore,
+        PaymentRequestLifecycleApply, PaymentRequestLifecycleStore, PersistenceError,
+        PostgresStorageAdapter, run_migrations,
     },
 };
 use paykit_server_e2e::postgres::TestDatabase;
@@ -52,14 +60,17 @@ fn marker(receiver_path: &str) -> PaykitReceiverMarker {
 }
 
 fn proposal_intent(receiver_path: &str) -> DeliveryIntentV1 {
+    proposal_intent_for_reference(receiver_path, &Uuid::new_v4().hyphenated().to_string())
+}
+
+fn proposal_intent_for_reference(receiver_path: &str, payment_reference: &str) -> DeliveryIntentV1 {
     DeliveryIntentV1::payment_request(
         READER.into(),
         &marker(receiver_path),
         PaykitReceiverPath::new("paykit/server").unwrap(),
         &PaymentRequestTerms {
             amount: PaymentAmount::new("0.00001000", "BTC").unwrap(),
-            payment_reference: PaymentReference::new(Uuid::new_v4().hyphenated().to_string())
-                .unwrap(),
+            payment_reference: PaymentReference::new(payment_reference.to_owned()).unwrap(),
             proposal_expires_at: Some("2027-01-15T08:00:00Z".into()),
             recurrence: None,
             accepted_payment_endpoint_identifiers: vec![
@@ -69,6 +80,73 @@ fn proposal_intent(receiver_path: &str) -> DeliveryIntentV1 {
         },
     )
     .unwrap()
+}
+
+struct RacePayloads;
+
+impl NewReaderPayloadFactory for RacePayloads {
+    fn for_child_index(&self, child_index: i64) -> Result<NewReaderPayloads, PersistenceError> {
+        let address = format!("race-address-{child_index}");
+        Ok(NewReaderPayloads {
+            endpoint_intent: DeliveryIntentV1::endpoint(
+                READER.into(),
+                &marker("new/wallet"),
+                PaykitReceiverPath::new("paykit/server").unwrap(),
+                vec![(
+                    PaymentEndpointIdentifier::new("btc-bitcoin-p2wpkh").unwrap(),
+                    PaymentEndpointPayload::new(address.clone()),
+                )],
+            )
+            .unwrap(),
+            bitcoin_address: address,
+        })
+    }
+}
+
+static RACE_PAYLOADS: RacePayloads = RacePayloads;
+
+fn admission_input<'a>(
+    creator: &'a paykit_server::domain::locks::CreatorPubky,
+    reader: &'a paykit_server::domain::locks::ReaderPubky,
+) -> AtomicInvoiceInput<'a> {
+    AtomicInvoiceInput {
+        creator,
+        reader,
+        bundle_binding: b"concurrent-admission-bundle",
+        lock_resource_binding: LOCK_RESOURCE.as_bytes(),
+        payment_request_binding: b"concurrent-admission-request",
+        new_reader_payloads: &RACE_PAYLOADS,
+        payment_request_intent: proposal_intent_for_reference(
+            "new/wallet",
+            "00000000-0000-4000-8000-000000000001",
+        ),
+        required_sats: 1_000,
+        payment_in_hours: 24,
+    }
+}
+
+async fn wait_for_lock_wait(database: &TestDatabase, query_fragment: &str) {
+    let pattern = format!("%{query_fragment}%");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let blocked: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM pg_stat_activity
+                 WHERE datname = current_database()
+                   AND wait_event_type = 'Lock'
+                   AND query LIKE $1",
+            )
+            .bind(&pattern)
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+            if blocked > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("expected query containing {query_fragment:?} to wait on a lock"));
 }
 
 async fn insert_invoice(
@@ -221,6 +299,70 @@ async fn insert_attempt(
     .await
     .unwrap();
     request_id
+}
+
+async fn insert_projectable_attempt(
+    database: &TestDatabase,
+    crypto: &Crypto,
+    creator_id: Uuid,
+    invoice_id: Uuid,
+) -> PaymentRequestLifecycleProjection {
+    let request_id = Uuid::new_v4().to_string();
+    let event_id = Uuid::new_v4().to_string();
+    let outbox_id = Uuid::new_v4();
+    let intent = proposal_intent_for_reference("new/wallet", &request_id);
+    let plaintext = postcard::to_allocvec(&intent).unwrap();
+    let creator_hash = crypto.lookup_hash(CREATOR.as_bytes());
+    let envelope = crypto
+        .encrypt(
+            &EnvelopeContext::outbox_semantic_intent(creator_hash, outbox_id),
+            &plaintext,
+        )
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO outbox (
+             id, creator_id, invoice_id, intent_envelope, intent_kind, status,
+             sdk_outbound_message_id, sdk_event_id, sdk_payment_request_id,
+             proposal_lookup_hash
+         ) VALUES ($1, $2, $3, $4, 'payment_request_proposal', 'delivered', $5, $6, $7, $8)",
+    )
+    .bind(outbox_id)
+    .bind(creator_id)
+    .bind(invoice_id)
+    .bind(envelope.as_bytes())
+    .bind("99")
+    .bind(&event_id)
+    .bind(&request_id)
+    .bind(
+        crypto
+            .payment_request_proposal_lookup_hash(request_id.as_bytes())
+            .as_bytes()
+            .as_slice(),
+    )
+    .execute(database.pool())
+    .await
+    .unwrap();
+
+    PaymentRequestLifecycleProjection {
+        payment_request_id: request_id.clone(),
+        proposal: ProposalCorrelation {
+            reader_pubky: READER.into(),
+            selected_reader_path: "new/wallet".into(),
+            terms: PaymentTermsV1 {
+                amount: "0.00001000".into(),
+                asset: "BTC".into(),
+                payment_reference: request_id,
+                proposal_expires_at: Some("2027-01-15T08:00:00Z".into()),
+                accepted_endpoint_identifiers: vec!["btc-bitcoin-p2wpkh".into()],
+                metadata: serde_json::Map::new(),
+            },
+        },
+        request_state: PaymentRequestLifecycleState::Proposed,
+        state_event_id: Some(event_id),
+        last_stream_item_id: Some(99),
+        last_outbound_message_id: Some(99),
+        last_event_at: OffsetDateTime::from_unix_timestamp(1_800_000_100).unwrap(),
+    }
 }
 
 #[tokio::test]
@@ -428,7 +570,7 @@ async fn missing_required_intake_blocks_drain_snapshot_and_status_lookup() {
 }
 
 #[tokio::test]
-async fn drain_revalidates_receive_evidence_after_invoice_admission() {
+async fn concurrent_invoice_admission_precedes_drain_freshness_decision() {
     let database = TestDatabase::create().await;
     run_migrations(database.pool()).await.unwrap();
     let crypto = Arc::new(Crypto::from_master_key(&[48; 32]).unwrap());
@@ -472,24 +614,44 @@ async fn drain_revalidates_receive_evidence_after_invoice_admission() {
         .unwrap();
     assert!(stale_evidence.is_empty());
 
-    insert_invoice_with_receiver_path(
-        &database,
-        &crypto,
-        creator_id,
-        1,
-        0,
-        PaymentRequestLifecycleState::Proposed,
-        "new/wallet",
+    let lock_hash = crypto.lookup_hash(lock_resource().to_string().as_bytes());
+    let mut generation_blocker = database.pool().begin().await.unwrap();
+    sqlx::query(
+        "SELECT current_generation FROM lock_payment_generations
+         WHERE creator_id = $1 AND lock_resource_lookup_hash = $2
+         FOR UPDATE",
     )
-    .await;
+    .bind(creator_id)
+    .bind(lock_hash.as_bytes().as_slice())
+    .fetch_one(&mut *generation_blocker)
+    .await
+    .unwrap();
 
-    let drains = PaymentDrainStore::new(database.pool(), crypto);
-    assert_eq!(
+    let invoice_store = InvoiceStore::new(database.pool(), crypto.clone());
+    let admission = tokio::spawn(async move {
+        let creator = parse_creator(CREATOR).unwrap();
+        let reader = parse_reader(READER).unwrap();
+        invoice_store
+            .create_atomic(admission_input(&creator, &reader))
+            .await
+    });
+    wait_for_lock_wait(&database, "lock_payment_generations").await;
+
+    let drains = PaymentDrainStore::new(database.pool(), crypto.clone());
+    let competing_drain = tokio::spawn(async move {
         drains
             .create_after_receive(&lifecycles, &lock_resource(), &stale_evidence)
-            .await,
+            .await
+    });
+    wait_for_lock_wait(&database, "FROM creators").await;
+
+    generation_blocker.commit().await.unwrap();
+    admission.await.unwrap().unwrap();
+    assert_eq!(
+        competing_drain.await.unwrap(),
         Err(PersistenceError::Unavailable)
     );
+    let drains = PaymentDrainStore::new(database.pool(), crypto);
     assert!(
         drains
             .exact_replay(&lock_resource())
@@ -500,7 +662,7 @@ async fn drain_revalidates_receive_evidence_after_invoice_admission() {
 }
 
 #[tokio::test]
-async fn status_revalidates_receive_evidence_after_new_nonterminal_attempt() {
+async fn concurrent_lifecycle_projection_precedes_status_freshness_decision() {
     let database = TestDatabase::create().await;
     run_migrations(database.pool()).await.unwrap();
     let crypto = Arc::new(Crypto::from_master_key(&[47; 32]).unwrap());
@@ -552,25 +714,43 @@ async fn status_revalidates_receive_evidence_after_new_nonterminal_attempt() {
         .unwrap();
     assert!(stale_evidence.is_empty());
 
-    insert_attempt(
-        &database,
-        invoice_id,
-        1,
-        PaymentRequestLifecycleState::Proposed,
-    )
-    .await;
+    let projection = insert_projectable_attempt(&database, &crypto, creator_id, invoice_id).await;
+    let mut invoice_blocker = database.pool().begin().await.unwrap();
+    sqlx::query("SELECT id FROM invoices WHERE id = $1 FOR UPDATE")
+        .bind(invoice_id)
+        .fetch_one(&mut *invoice_blocker)
+        .await
+        .unwrap();
 
-    assert_eq!(
-        InvoiceStore::new(database.pool(), crypto)
+    let applying_lifecycles = lifecycles.clone();
+    let apply =
+        tokio::spawn(async move { applying_lifecycles.apply(creator_id, &projection).await });
+    wait_for_lock_wait(&database, "AND creator_id = $2").await;
+
+    let status_lifecycles = lifecycles.clone();
+    let invoice_store = InvoiceStore::new(database.pool(), crypto);
+    let status = tokio::spawn(async move {
+        invoice_store
             .payment_request_status_after_receive(
-                &lifecycles,
+                &status_lifecycles,
                 &creator,
                 &bundle_id,
                 &stale_evidence,
             )
-            .await,
-        Err(PersistenceError::Unavailable)
+            .await
+    });
+    wait_for_lock_wait(
+        &database,
+        "SELECT id FROM invoices WHERE id = $1 FOR UPDATE",
+    )
+    .await;
+
+    invoice_blocker.commit().await.unwrap();
+    assert_eq!(
+        apply.await.unwrap(),
+        Ok(PaymentRequestLifecycleApply::Applied)
     );
+    assert_eq!(status.await.unwrap(), Err(PersistenceError::Unavailable));
 }
 
 #[tokio::test]
