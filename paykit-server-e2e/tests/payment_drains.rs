@@ -4,31 +4,43 @@ use paykit_lib::{
     PaykitReceiverCapabilities, PaykitReceiverMarker, PaykitReceiverPath, PaymentAmount,
     PaymentEndpointIdentifier, PaymentReference, PaymentRequestTerms, PublicKey,
 };
+use paykit_sdk::{PubkyPublicKey, ReceiverNoiseSecretKey, storage::StorageState};
 use paykit_server::{
-    application::semantic_intent::{DeliveryIntentV1, DeliveryOperationV1},
+    application::{
+        payment_drain::PaymentDrainError,
+        payment_request_status::PaymentRequestStatusError,
+        semantic_intent::{DeliveryIntentV1, DeliveryOperationV1},
+    },
+    config::{PaykitConfig, PaykitNetwork, ReceiverPathPriority},
     crypto::{Crypto, EncryptedEnvelope, EnvelopeContext},
     domain::{
-        locks::{PubkyLockResource, parse_addressed_lock_resource},
+        locks::{PubkyLockResource, parse_addressed_lock_resource, parse_bundle_id, parse_creator},
         payment_request_lifecycle::PaymentRequestLifecycleState,
     },
-    persistence::{OutboxStore, PaymentDrainStore, PersistenceError, run_migrations},
+    paykit::{CreatorSessionProvider, PaykitAdapter},
+    persistence::{
+        CreatorCredentials, CreatorStore, InvoiceStore, OutboxStore, PaymentDrainStore,
+        PaymentRequestLifecycleStore, PersistenceError, PostgresStorageAdapter, run_migrations,
+    },
 };
 use paykit_server_e2e::postgres::TestDatabase;
+use pubky::{ClientId, Pubky};
 use sqlx::Row;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
 const CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
 const READER: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
+const BUNDLE: &str = "000G40R40M30E209185GR38E1W";
 const LOCK_RESOURCE: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/locks.app/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json";
 
 fn lock_resource() -> PubkyLockResource {
     parse_addressed_lock_resource(LOCK_RESOURCE).unwrap()
 }
 
-fn marker() -> PaykitReceiverMarker {
+fn marker(receiver_path: &str) -> PaykitReceiverMarker {
     PaykitReceiverMarker::new(
-        PaykitReceiverPath::new("bitkit/wallet").unwrap(),
+        PaykitReceiverPath::new(receiver_path).unwrap(),
         PaykitReceiverCapabilities {
             private_payments: true,
             payment_requests: true,
@@ -39,10 +51,10 @@ fn marker() -> PaykitReceiverMarker {
     )
 }
 
-fn proposal_intent() -> DeliveryIntentV1 {
+fn proposal_intent(receiver_path: &str) -> DeliveryIntentV1 {
     DeliveryIntentV1::payment_request(
         READER.into(),
-        &marker(),
+        &marker(receiver_path),
         PaykitReceiverPath::new("paykit/server").unwrap(),
         &PaymentRequestTerms {
             amount: PaymentAmount::new("0.00001000", "BTC").unwrap(),
@@ -67,12 +79,33 @@ async fn insert_invoice(
     lock_resource_generation: i64,
     state: PaymentRequestLifecycleState,
 ) -> (Uuid, String) {
+    insert_invoice_with_receiver_path(
+        database,
+        crypto,
+        creator_id,
+        ordinal,
+        lock_resource_generation,
+        state,
+        "bitkit/wallet",
+    )
+    .await
+}
+
+async fn insert_invoice_with_receiver_path(
+    database: &TestDatabase,
+    crypto: &Crypto,
+    creator_id: Uuid,
+    ordinal: u8,
+    lock_resource_generation: i64,
+    state: PaymentRequestLifecycleState,
+    receiver_path: &str,
+) -> (Uuid, String) {
     let invoice_id = Uuid::new_v4();
     let outbox_id = Uuid::new_v4();
     let request_id = Uuid::new_v4().to_string();
     let event_id = Uuid::new_v4().to_string();
     let creator_hash = crypto.lookup_hash(CREATOR.as_bytes());
-    let intent = proposal_intent();
+    let intent = proposal_intent(receiver_path);
     let plaintext = postcard::to_allocvec(&intent).unwrap();
     let envelope = crypto
         .encrypt(
@@ -188,6 +221,210 @@ async fn insert_attempt(
     .await
     .unwrap();
     request_id
+}
+
+#[tokio::test]
+async fn current_generation_nonterminal_attempts_are_the_only_required_receive_targets() {
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(&[50; 32]).unwrap());
+    let creator_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO creators (creator_lookup_hash, credential_envelope)
+         VALUES ($1, $2) RETURNING id",
+    )
+    .bind(crypto.lookup_hash(CREATOR.as_bytes()).as_bytes().as_slice())
+    .bind(b"encrypted-creator".as_slice())
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    let (mixed_invoice, _) = insert_invoice_with_receiver_path(
+        &database,
+        &crypto,
+        creator_id,
+        0,
+        0,
+        PaymentRequestLifecycleState::Rejected,
+        "mixed/wallet",
+    )
+    .await;
+    insert_attempt(
+        &database,
+        mixed_invoice,
+        3,
+        PaymentRequestLifecycleState::Proposed,
+    )
+    .await;
+    insert_invoice_with_receiver_path(
+        &database,
+        &crypto,
+        creator_id,
+        1,
+        0,
+        PaymentRequestLifecycleState::Rejected,
+        "terminal/wallet",
+    )
+    .await;
+    insert_invoice_with_receiver_path(
+        &database,
+        &crypto,
+        creator_id,
+        2,
+        1,
+        PaymentRequestLifecycleState::Accepted,
+        "historical/wallet",
+    )
+    .await;
+    sqlx::query(
+        "INSERT INTO lock_payment_generations
+             (creator_id, lock_resource_lookup_hash, current_generation)
+         VALUES ($1, $2, 0)",
+    )
+    .bind(creator_id)
+    .bind(
+        crypto
+            .lookup_hash(lock_resource().to_string().as_bytes())
+            .as_bytes()
+            .as_slice(),
+    )
+    .execute(database.pool())
+    .await
+    .unwrap();
+
+    let targets = PaymentRequestLifecycleStore::new(database.pool(), crypto.clone())
+        .required_receive_targets_for_lock(creator_id, &lock_resource())
+        .await
+        .unwrap();
+
+    assert_eq!(targets.len(), 1);
+    assert_eq!(targets[0].counterparty(), READER);
+    assert_eq!(targets[0].receiver_path().as_str(), "mixed/wallet");
+    let sdk_counterparty = PubkyPublicKey::from_raw_or_app_key(targets[0].counterparty()).unwrap();
+    assert_eq!(sdk_counterparty.to_app_key(), targets[0].counterparty());
+    assert_eq!(
+        targets[0].receiver_path(),
+        &PaykitReceiverPath::new("mixed/wallet").unwrap()
+    );
+
+    sqlx::query("UPDATE invoices SET bundle_lookup_hash = $1 WHERE id = $2")
+        .bind(crypto.lookup_hash(BUNDLE.as_bytes()).as_bytes().as_slice())
+        .bind(mixed_invoice)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    let status_targets = PaymentRequestLifecycleStore::new(database.pool(), crypto.clone())
+        .required_receive_targets_for_bundle(creator_id, &parse_bundle_id(BUNDLE).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(status_targets, targets);
+
+    sqlx::query(
+        "UPDATE payment_request_lifecycles
+         SET request_state = 'rejected'
+         WHERE invoice_id = $1",
+    )
+    .bind(mixed_invoice)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    assert!(
+        PaymentRequestLifecycleStore::new(database.pool(), crypto)
+            .required_receive_targets_for_lock(creator_id, &lock_resource())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn missing_required_intake_blocks_drain_snapshot_and_status_lookup() {
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(&[49; 32]).unwrap());
+    let creator = parse_creator(CREATOR).unwrap();
+    let creators = CreatorStore::new(database.pool(), crypto.clone());
+    let persisted = creators
+        .create(
+            &CreatorCredentials::new(
+                creator.clone(),
+                "test-session-secret".into(),
+                ReceiverNoiseSecretKey::random(),
+                "test-account-xpub".into(),
+                0,
+            ),
+            &StorageState::default(),
+        )
+        .await
+        .unwrap();
+    let (invoice_id, _) = insert_invoice(
+        &database,
+        &crypto,
+        persisted.id(),
+        0,
+        0,
+        PaymentRequestLifecycleState::Proposed,
+    )
+    .await;
+    sqlx::query(
+        "INSERT INTO lock_payment_generations
+             (creator_id, lock_resource_lookup_hash, current_generation)
+         VALUES ($1, $2, 0)",
+    )
+    .bind(persisted.id())
+    .bind(
+        crypto
+            .lookup_hash(lock_resource().to_string().as_bytes())
+            .as_bytes()
+            .as_slice(),
+    )
+    .execute(database.pool())
+    .await
+    .unwrap();
+    sqlx::query("UPDATE invoices SET bundle_lookup_hash = $1 WHERE id = $2")
+        .bind(crypto.lookup_hash(BUNDLE.as_bytes()).as_bytes().as_slice())
+        .bind(invoice_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+
+    let paykit = PaykitConfig {
+        client_id: ClientId::new("app.paykit.server").unwrap(),
+        receiver_path: PaykitReceiverPath::new("paykit/server").unwrap(),
+        receiver_path_priority: vec![ReceiverPathPriority::parse("bitkit".into()).unwrap()],
+        network: PaykitNetwork::Testnet,
+    };
+    let storage = PostgresStorageAdapter::new(database.pool(), crypto.clone(), persisted.id());
+    let sessions =
+        CreatorSessionProvider::with_pubky(creators, creator, Pubky::new().unwrap(), &paykit);
+    let adapter = PaykitAdapter::new(storage, sessions, &paykit).unwrap();
+    let lifecycles = PaymentRequestLifecycleStore::new(database.pool(), crypto.clone());
+    let drains = PaymentDrainStore::new(database.pool(), crypto.clone());
+
+    let drain_result = adapter
+        .reconcile_and_create_payment_drain(&lifecycles, &drains, &lock_resource())
+        .await;
+
+    assert_eq!(drain_result, Err(PaymentDrainError::Unavailable));
+    assert!(
+        drains
+            .exact_replay(&lock_resource())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let drain_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_drains")
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+    assert_eq!(drain_count, 0);
+
+    let status_result = adapter
+        .reconcile_and_lookup_payment_request_status(
+            &lifecycles,
+            &InvoiceStore::new(database.pool(), crypto),
+            &parse_bundle_id(BUNDLE).unwrap(),
+        )
+        .await;
+    assert_eq!(status_result, Err(PaymentRequestStatusError::Unavailable));
 }
 
 #[tokio::test]

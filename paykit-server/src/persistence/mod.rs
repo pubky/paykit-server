@@ -19,5 +19,7 @@ pub use invoices::{
 pub use migrations::{MIGRATION_ADVISORY_LOCK_KEY, MigrationLock, run_migrations};
 pub use outbox::{ClaimedHandoff, ClaimedOutbox, HandoffResult, OutboxRetryClass, OutboxStore};
 pub use payment_drains::{PaymentDrainSnapshot, PaymentDrainStore};
-pub use payment_request_lifecycles::{PaymentRequestLifecycleApply, PaymentRequestLifecycleStore};
+pub use payment_request_lifecycles::{
+    PaymentRequestLifecycleApply, PaymentRequestLifecycleStore, RequiredReceiveTarget,
+};
 pub use sdk_state::{PostgresStorageAdapter, SdkStateStore};

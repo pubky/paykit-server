@@ -14,8 +14,9 @@ use paykit_lib::{
 use paykit_sdk::{
     LinkedPeerState, OutboundPrivateMessageStatus, PaykitSdk, PaykitSdkConfig, PaykitSdkError,
     PaymentAdapter, PaymentRequestLifecycleState as SdkPaymentRequestLifecycleState,
-    PaymentRequestLocalRole, PaymentRequestRecord, PrivateReceivingDetail, PubkyPublicKey,
-    PubkySessionAccess, PubkySessionBootstrap, PubkySessionProvider, StorageAdapter,
+    PaymentRequestLocalRole, PaymentRequestRecord, PrivateReceivingDetail,
+    PrivateStreamCounterpartyIntakeReport, PubkyPublicKey, PubkySessionAccess,
+    PubkySessionBootstrap, PubkySessionProvider, StorageAdapter,
 };
 use pubky::Pubky;
 use tokio::sync::Mutex as TokioMutex;
@@ -41,7 +42,7 @@ use crate::{
     },
     persistence::{
         ClaimedOutbox, CreatorStore, OutboxStore, PaymentDrainStore, PaymentRequestLifecycleStore,
-        PersistenceError, PostgresStorageAdapter,
+        PersistenceError, PostgresStorageAdapter, RequiredReceiveTarget,
     },
     workers::outbox::{
         Adapter, HandoffError, HandoffFailure, HandoffResult, RetryableHandoffCause,
@@ -212,19 +213,17 @@ impl PaykitAdapter {
         lifecycles: &PaymentRequestLifecycleStore,
     ) -> Result<(), LifecycleSyncError> {
         let _guard = self.mutation_lock.lock().await;
-        self.refresh_payment_requests_locked(lifecycles).await
+        self.refresh_payment_requests_locked(lifecycles, None).await
     }
 
     async fn refresh_payment_requests_locked(
         &self,
         lifecycles: &PaymentRequestLifecycleStore,
+        required_targets: Option<&[ReceiveTarget]>,
     ) -> Result<(), LifecycleSyncError> {
-        let receive_health = match self.sdk.receive_private_messages_from_linked_peers().await {
-            Ok(reports) if reports.iter().all(|report| report.error.is_none()) => {
-                ReceiveHealth::Available
-            }
-            Ok(_) | Err(_) => ReceiveHealth::Unavailable,
-        };
+        let reports = self.sdk.receive_private_messages_from_linked_peers().await;
+        let receive_health =
+            receive_health_from_reports(reports.as_deref().map_err(|_| ()), required_targets);
         let records = self
             .sdk
             .payment_requests()
@@ -251,9 +250,15 @@ impl PaykitAdapter {
         bundle_id: &BundleId,
     ) -> Result<Option<PaymentRequestStatusSummary>, PaymentRequestStatusError> {
         let _guard = self.mutation_lock.lock().await;
+        let required_targets = lifecycles
+            .required_receive_targets_for_bundle(self.storage.creator_id(), bundle_id)
+            .await
+            .map_err(|_| PaymentRequestStatusError::Unavailable)?;
+        let required_targets =
+            parse_receive_targets(&required_targets).map_err(map_lifecycle_status_error)?;
         refresh_then(
             || async {
-                self.refresh_payment_requests_locked(lifecycles)
+                self.refresh_payment_requests_locked(lifecycles, Some(&required_targets))
                     .await
                     .map_err(map_lifecycle_status_error)
             },
@@ -282,7 +287,14 @@ impl PaykitAdapter {
                     .map_err(map_drain_persistence_error)
             },
             || async {
-                self.refresh_payment_requests_locked(lifecycles)
+                let required_targets = lifecycles
+                    .required_receive_targets_for_lock(self.storage.creator_id(), lock_resource)
+                    .await
+                    .map_err(map_projection_persistence_error)
+                    .map_err(map_lifecycle_drain_error)?;
+                let required_targets =
+                    parse_receive_targets(&required_targets).map_err(map_lifecycle_drain_error)?;
+                self.refresh_payment_requests_locked(lifecycles, Some(&required_targets))
                     .await
                     .map_err(map_lifecycle_drain_error)
             },
@@ -301,6 +313,66 @@ impl PaykitAdapter {
 enum ReceiveHealth {
     Available,
     Unavailable,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReceiveTarget {
+    counterparty: PubkyPublicKey,
+    receiver_path: PaykitReceiverPath,
+}
+
+fn parse_receive_targets(
+    targets: &[RequiredReceiveTarget],
+) -> Result<Vec<ReceiveTarget>, LifecycleSyncError> {
+    targets
+        .iter()
+        .map(|target| {
+            Ok(ReceiveTarget {
+                counterparty: PubkyPublicKey::from_raw_or_app_key(target.counterparty())
+                    .map_err(|_| LifecycleSyncError::InvalidProjection)?,
+                receiver_path: target.receiver_path().clone(),
+            })
+        })
+        .collect()
+}
+
+fn receive_health_for_required_targets(
+    reports: &[PrivateStreamCounterpartyIntakeReport],
+    required_targets: &[ReceiveTarget],
+) -> ReceiveHealth {
+    if required_targets.iter().all(|required| {
+        let matching = || {
+            reports.iter().filter(|report| {
+                report.counterparty == required.counterparty
+                    && report.counterparty_receiver_path == required.receiver_path
+            })
+        };
+        matching().all(|report| report.error.is_none())
+            && matching().any(|report| report.report.is_some() && report.error.is_none())
+    }) {
+        ReceiveHealth::Available
+    } else {
+        ReceiveHealth::Unavailable
+    }
+}
+
+fn receive_health_from_reports<E>(
+    reports: Result<&[PrivateStreamCounterpartyIntakeReport], E>,
+    required_targets: Option<&[ReceiveTarget]>,
+) -> ReceiveHealth {
+    match required_targets {
+        Some([]) => ReceiveHealth::Available,
+        Some(required) => reports.map_or(ReceiveHealth::Unavailable, |reports| {
+            receive_health_for_required_targets(reports, required)
+        }),
+        None => reports.map_or(ReceiveHealth::Unavailable, |reports| {
+            if reports.iter().all(|report| report.error.is_none()) {
+                ReceiveHealth::Available
+            } else {
+                ReceiveHealth::Unavailable
+            }
+        }),
+    }
 }
 
 async fn project_lifecycles_after_receive<F, Fut>(
@@ -806,6 +878,129 @@ mod tests {
 
     const CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
 
+    fn receive_target(counterparty: &str, path: &str) -> ReceiveTarget {
+        ReceiveTarget {
+            counterparty: PubkyPublicKey::from_raw_or_app_key(counterparty).unwrap(),
+            receiver_path: PaykitReceiverPath::new(path).unwrap(),
+        }
+    }
+
+    fn intake_report(
+        counterparty: &str,
+        path: &str,
+        error: Option<&str>,
+    ) -> paykit_sdk::PrivateStreamCounterpartyIntakeReport {
+        paykit_sdk::PrivateStreamCounterpartyIntakeReport {
+            counterparty: PubkyPublicKey::from_raw_or_app_key(counterparty).unwrap(),
+            counterparty_receiver_path: PaykitReceiverPath::new(path).unwrap(),
+            report: error
+                .is_none()
+                .then_some(paykit_sdk::PrivateStreamIntakeReport {
+                    receive_batch_id: 1,
+                    stream_item_ids: Vec::new(),
+                    event_conflicts: Vec::new(),
+                }),
+            error: error.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn required_receive_target_rejects_empty_reports() {
+        let required = vec![receive_target(CREATOR, "bitkit/wallet")];
+
+        assert_eq!(
+            receive_health_for_required_targets(&[], &required),
+            ReceiveHealth::Unavailable
+        );
+    }
+
+    #[test]
+    fn required_receive_target_rejects_unrelated_reports() {
+        let required = vec![receive_target(CREATOR, "bitkit/wallet")];
+
+        assert_eq!(
+            receive_health_for_required_targets(
+                &[intake_report(CREATOR, "other/wallet", None)],
+                &required,
+            ),
+            ReceiveHealth::Unavailable
+        );
+    }
+
+    #[test]
+    fn required_receive_target_rejects_matching_report_errors() {
+        let required = vec![receive_target(CREATOR, "bitkit/wallet")];
+
+        assert_eq!(
+            receive_health_for_required_targets(
+                &[intake_report(CREATOR, "bitkit/wallet", Some("offline"))],
+                &required,
+            ),
+            ReceiveHealth::Unavailable
+        );
+    }
+
+    #[test]
+    fn required_receive_target_rejects_any_matching_report_error() {
+        let required = vec![receive_target(CREATOR, "bitkit/wallet")];
+
+        assert_eq!(
+            receive_health_for_required_targets(
+                &[
+                    intake_report(CREATOR, "bitkit/wallet", None),
+                    intake_report(CREATOR, "bitkit/wallet", Some("offline")),
+                ],
+                &required,
+            ),
+            ReceiveHealth::Unavailable
+        );
+    }
+
+    #[test]
+    fn every_required_receive_target_must_have_a_successful_exact_sdk_report() {
+        let required = vec![
+            receive_target(CREATOR, "bitkit/wallet"),
+            receive_target(CREATOR, "bitkit/server"),
+        ];
+
+        assert_eq!(
+            receive_health_for_required_targets(
+                &[
+                    intake_report(CREATOR, "bitkit/wallet", None),
+                    intake_report(CREATOR, "bitkit/server", None),
+                ],
+                &required,
+            ),
+            ReceiveHealth::Available
+        );
+        assert_eq!(
+            receive_health_for_required_targets(
+                &[intake_report(CREATOR, "bitkit/wallet", None)],
+                &required,
+            ),
+            ReceiveHealth::Unavailable
+        );
+    }
+
+    #[test]
+    fn no_required_receive_targets_ignore_unrelated_failures() {
+        assert_eq!(
+            receive_health_for_required_targets(
+                &[intake_report(CREATOR, "bitkit/wallet", Some("offline"))],
+                &[],
+            ),
+            ReceiveHealth::Available
+        );
+    }
+
+    #[test]
+    fn no_required_receive_targets_ignore_top_level_receive_failure() {
+        assert_eq!(
+            receive_health_from_reports(Err(()), Some(&[])),
+            ReceiveHealth::Available
+        );
+    }
+
     #[test]
     fn mutation_locks_are_shared_per_creator_and_isolated_between_creators() {
         let creator = Uuid::new_v4();
@@ -1170,5 +1365,27 @@ mod tests {
 
         assert_eq!(result, Err(PaymentDrainError::Unavailable));
         assert_eq!(*calls.lock().unwrap(), vec!["replay", "refresh"]);
+    }
+
+    #[tokio::test]
+    async fn unavailable_required_intake_prevents_payment_request_status_lookup() {
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        let refresh_calls = calls.clone();
+        let lookup_calls = calls.clone();
+
+        let result = refresh_then(
+            move || {
+                refresh_calls.lock().unwrap().push("refresh");
+                std::future::ready(Err(PaymentRequestStatusError::Unavailable))
+            },
+            move || {
+                lookup_calls.lock().unwrap().push("lookup");
+                std::future::ready(Ok::<_, PaymentRequestStatusError>(Some(7_u8)))
+            },
+        )
+        .await;
+
+        assert_eq!(result, Err(PaymentRequestStatusError::Unavailable));
+        assert_eq!(*calls.lock().unwrap(), vec!["refresh"]);
     }
 }

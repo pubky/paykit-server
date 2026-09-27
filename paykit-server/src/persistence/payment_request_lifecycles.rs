@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use paykit_lib::PaykitReceiverPath;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -9,7 +10,7 @@ use crate::{
     application::semantic_intent::DeliveryIntentV1,
     crypto::{Crypto, EncryptedEnvelope, EnvelopeContext, LookupHash},
     domain::{
-        locks::CreatorPubky,
+        locks::{BundleId, CreatorPubky, PubkyLockResource},
         payment_request_lifecycle::{
             PaymentRequestLifecycleProjection, PaymentRequestLifecycleState,
             PersistedPaymentRequestLifecycle, aggregate_lifecycle,
@@ -32,6 +33,28 @@ pub enum PaymentRequestLifecycleApply {
     NotAttributable,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct RequiredReceiveTarget {
+    counterparty: String,
+    receiver_path: PaykitReceiverPath,
+}
+
+impl std::fmt::Debug for RequiredReceiveTarget {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RequiredReceiveTarget(<redacted>)")
+    }
+}
+
+impl RequiredReceiveTarget {
+    pub fn counterparty(&self) -> &str {
+        &self.counterparty
+    }
+
+    pub fn receiver_path(&self) -> &PaykitReceiverPath {
+        &self.receiver_path
+    }
+}
+
 #[derive(sqlx::FromRow)]
 struct LifecycleRow {
     invoice_id: Uuid,
@@ -51,12 +74,142 @@ struct IntentRow {
     intent_envelope: Vec<u8>,
 }
 
+#[derive(sqlx::FromRow)]
+struct RequiredReceiveTargetRow {
+    id: Uuid,
+    creator_lookup_hash: Vec<u8>,
+    intent_envelope: Vec<u8>,
+}
+
 impl PaymentRequestLifecycleStore {
     pub fn new(pool: &PgPool, crypto: Arc<Crypto>) -> Self {
         Self {
             pool: pool.clone(),
             crypto,
         }
+    }
+
+    pub async fn required_receive_targets_for_lock(
+        &self,
+        creator_id: Uuid,
+        lock_resource: &PubkyLockResource,
+    ) -> Result<Vec<RequiredReceiveTarget>, PersistenceError> {
+        let lock_hash = self
+            .crypto
+            .lookup_hash(lock_resource.to_string().as_bytes());
+        let rows = sqlx::query_as::<_, RequiredReceiveTargetRow>(
+            "SELECT DISTINCT ON (invoice.id)
+                    proposal.id, creator.creator_lookup_hash, proposal.intent_envelope
+             FROM invoices AS invoice
+             JOIN creators AS creator ON creator.id = invoice.creator_id
+             JOIN lock_payment_generations AS generation
+               ON generation.creator_id = invoice.creator_id
+              AND generation.lock_resource_lookup_hash = invoice.lock_resource_lookup_hash
+              AND generation.current_generation = invoice.lock_resource_generation
+             JOIN outbox AS proposal
+               ON proposal.invoice_id = invoice.id
+              AND proposal.intent_kind = 'payment_request_proposal'
+             WHERE invoice.creator_id = $1
+               AND invoice.lock_resource_lookup_hash = $2
+               AND (
+                   NOT EXISTS (
+                       SELECT 1 FROM payment_request_lifecycles AS lifecycle
+                       WHERE lifecycle.invoice_id = invoice.id
+                   )
+                   OR EXISTS (
+                       SELECT 1 FROM payment_request_lifecycles AS lifecycle
+                       WHERE lifecycle.invoice_id = invoice.id
+                         AND lifecycle.request_state NOT IN (
+                             'proposal_expired', 'rejected', 'canceled'
+                         )
+                   )
+               )
+             ORDER BY invoice.id, proposal.created_at, proposal.id",
+        )
+        .bind(creator_id)
+        .bind(lock_hash.as_bytes().as_slice())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        self.decode_required_receive_targets(rows)
+    }
+
+    pub async fn required_receive_targets_for_bundle(
+        &self,
+        creator_id: Uuid,
+        bundle_id: &BundleId,
+    ) -> Result<Vec<RequiredReceiveTarget>, PersistenceError> {
+        let bundle_hash = self.crypto.lookup_hash(bundle_id.to_string().as_bytes());
+        let rows = sqlx::query_as::<_, RequiredReceiveTargetRow>(
+            "SELECT DISTINCT ON (invoice.id)
+                    proposal.id, creator.creator_lookup_hash, proposal.intent_envelope
+             FROM invoices AS invoice
+             JOIN creators AS creator ON creator.id = invoice.creator_id
+             JOIN lock_payment_generations AS generation
+               ON generation.creator_id = invoice.creator_id
+              AND generation.lock_resource_lookup_hash = invoice.lock_resource_lookup_hash
+              AND generation.current_generation = invoice.lock_resource_generation
+             JOIN outbox AS proposal
+               ON proposal.invoice_id = invoice.id
+              AND proposal.intent_kind = 'payment_request_proposal'
+             WHERE invoice.creator_id = $1
+               AND invoice.bundle_lookup_hash = $2
+               AND (
+                   NOT EXISTS (
+                       SELECT 1 FROM payment_request_lifecycles AS lifecycle
+                       WHERE lifecycle.invoice_id = invoice.id
+                   )
+                   OR EXISTS (
+                       SELECT 1 FROM payment_request_lifecycles AS lifecycle
+                       WHERE lifecycle.invoice_id = invoice.id
+                         AND lifecycle.request_state NOT IN (
+                             'proposal_expired', 'rejected', 'canceled'
+                         )
+                   )
+               )
+             ORDER BY invoice.id, proposal.created_at, proposal.id",
+        )
+        .bind(creator_id)
+        .bind(bundle_hash.as_bytes().as_slice())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        self.decode_required_receive_targets(rows)
+    }
+
+    fn decode_required_receive_targets(
+        &self,
+        rows: Vec<RequiredReceiveTargetRow>,
+    ) -> Result<Vec<RequiredReceiveTarget>, PersistenceError> {
+        let mut targets = Vec::new();
+        for row in rows {
+            let creator_hash = lookup_hash(&row.creator_lookup_hash)?;
+            let plaintext = self
+                .crypto
+                .decrypt(
+                    &EnvelopeContext::outbox_semantic_intent(creator_hash, row.id),
+                    &EncryptedEnvelope::from_bytes(row.intent_envelope),
+                )
+                .map_err(|_| PersistenceError::CorruptOrMissing)?;
+            let intent = DeliveryIntentV1::decode(&plaintext)
+                .map_err(|_| PersistenceError::CorruptOrMissing)?;
+            if !matches!(
+                intent.operation(),
+                crate::application::semantic_intent::DeliveryOperationV1::PaymentRequestProposal { .. }
+            ) {
+                return Err(PersistenceError::CorruptOrMissing);
+            }
+            let target = RequiredReceiveTarget {
+                counterparty: intent.reader_pubky().to_owned(),
+                receiver_path: intent
+                    .selected_reader_path()
+                    .map_err(|_| PersistenceError::CorruptOrMissing)?,
+            };
+            if !targets.contains(&target) {
+                targets.push(target);
+            }
+        }
+        Ok(targets)
     }
 
     /// Applies a canonical SDK snapshot only when its exact request ID or full
