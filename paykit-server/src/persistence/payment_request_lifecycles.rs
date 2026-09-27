@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use paykit_lib::PaykitReceiverPath;
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::{
@@ -175,6 +175,99 @@ impl PaymentRequestLifecycleStore {
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
         self.decode_required_receive_targets(rows)
+    }
+
+    pub(crate) async fn required_receive_targets_for_lock_in_transaction(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        creator_id: Uuid,
+        lock_hash: &LookupHash,
+    ) -> Result<Vec<RequiredReceiveTarget>, PersistenceError> {
+        let rows = sqlx::query_as::<_, RequiredReceiveTargetRow>(
+            "SELECT DISTINCT ON (invoice.id)
+                    proposal.id, creator.creator_lookup_hash, proposal.intent_envelope
+             FROM invoices AS invoice
+             JOIN creators AS creator ON creator.id = invoice.creator_id
+             JOIN lock_payment_generations AS generation
+               ON generation.creator_id = invoice.creator_id
+              AND generation.lock_resource_lookup_hash = invoice.lock_resource_lookup_hash
+              AND generation.current_generation = invoice.lock_resource_generation
+             JOIN outbox AS proposal
+               ON proposal.invoice_id = invoice.id
+              AND proposal.intent_kind = 'payment_request_proposal'
+             WHERE invoice.creator_id = $1
+               AND invoice.lock_resource_lookup_hash = $2
+               AND (
+                   NOT EXISTS (
+                       SELECT 1 FROM payment_request_lifecycles AS lifecycle
+                       WHERE lifecycle.invoice_id = invoice.id
+                   )
+                   OR EXISTS (
+                       SELECT 1 FROM payment_request_lifecycles AS lifecycle
+                       WHERE lifecycle.invoice_id = invoice.id
+                         AND lifecycle.request_state NOT IN (
+                             'proposal_expired', 'rejected', 'canceled'
+                         )
+                   )
+               )
+             ORDER BY invoice.id, proposal.created_at, proposal.id",
+        )
+        .bind(creator_id)
+        .bind(lock_hash.as_bytes().as_slice())
+        .fetch_all(&mut **transaction)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        self.decode_required_receive_targets(rows)
+    }
+
+    pub(crate) async fn required_receive_targets_for_bundle_in_transaction(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        creator_id: Uuid,
+        bundle_hash: &LookupHash,
+    ) -> Result<Vec<RequiredReceiveTarget>, PersistenceError> {
+        let rows = sqlx::query_as::<_, RequiredReceiveTargetRow>(
+            "SELECT DISTINCT ON (invoice.id)
+                    proposal.id, creator.creator_lookup_hash, proposal.intent_envelope
+             FROM invoices AS invoice
+             JOIN creators AS creator ON creator.id = invoice.creator_id
+             JOIN lock_payment_generations AS generation
+               ON generation.creator_id = invoice.creator_id
+              AND generation.lock_resource_lookup_hash = invoice.lock_resource_lookup_hash
+              AND generation.current_generation = invoice.lock_resource_generation
+             JOIN outbox AS proposal
+               ON proposal.invoice_id = invoice.id
+              AND proposal.intent_kind = 'payment_request_proposal'
+             WHERE invoice.creator_id = $1
+               AND invoice.bundle_lookup_hash = $2
+               AND (
+                   NOT EXISTS (
+                       SELECT 1 FROM payment_request_lifecycles AS lifecycle
+                       WHERE lifecycle.invoice_id = invoice.id
+                   )
+                   OR EXISTS (
+                       SELECT 1 FROM payment_request_lifecycles AS lifecycle
+                       WHERE lifecycle.invoice_id = invoice.id
+                         AND lifecycle.request_state NOT IN (
+                             'proposal_expired', 'rejected', 'canceled'
+                         )
+                   )
+               )
+             ORDER BY invoice.id, proposal.created_at, proposal.id",
+        )
+        .bind(creator_id)
+        .bind(bundle_hash.as_bytes().as_slice())
+        .fetch_all(&mut **transaction)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        self.decode_required_receive_targets(rows)
+    }
+
+    pub(crate) fn receive_evidence_covers(
+        current: &[RequiredReceiveTarget],
+        evidence: &[RequiredReceiveTarget],
+    ) -> bool {
+        current.iter().all(|target| evidence.contains(target))
     }
 
     fn decode_required_receive_targets(

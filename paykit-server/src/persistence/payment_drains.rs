@@ -10,7 +10,7 @@ use crate::{
     application::semantic_intent::DeliveryIntentV1,
     crypto::{Crypto, EncryptedEnvelope, EnvelopeContext, LookupHash},
     domain::{locks::PubkyLockResource, payment_request_lifecycle::PaymentRequestLifecycleState},
-    persistence::PersistenceError,
+    persistence::{PaymentRequestLifecycleStore, PersistenceError, RequiredReceiveTarget},
 };
 
 #[derive(Clone, Debug)]
@@ -427,6 +427,24 @@ impl PaymentDrainStore {
         &self,
         lock_resource: &PubkyLockResource,
     ) -> Result<PaymentDrainSnapshot, PersistenceError> {
+        self.create_inner(lock_resource, None).await
+    }
+
+    pub async fn create_after_receive(
+        &self,
+        lifecycles: &PaymentRequestLifecycleStore,
+        lock_resource: &PubkyLockResource,
+        evidence: &[RequiredReceiveTarget],
+    ) -> Result<PaymentDrainSnapshot, PersistenceError> {
+        self.create_inner(lock_resource, Some((lifecycles, evidence)))
+            .await
+    }
+
+    async fn create_inner(
+        &self,
+        lock_resource: &PubkyLockResource,
+        receive_evidence: Option<(&PaymentRequestLifecycleStore, &[RequiredReceiveTarget])>,
+    ) -> Result<PaymentDrainSnapshot, PersistenceError> {
         let canonical_lock = lock_resource.to_string();
         let creator_hash = self
             .crypto
@@ -508,6 +526,35 @@ impl PaymentDrainStore {
         .map_err(|_| PersistenceError::Unavailable)?;
         if lock_resource_generation < 0 || active_drain_id.is_some() {
             return Err(PersistenceError::CorruptOrMissing);
+        }
+
+        let _: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT id
+             FROM invoices
+             WHERE creator_id = $1
+               AND lock_resource_lookup_hash = $2
+               AND lock_resource_generation = $3
+             ORDER BY id
+             FOR UPDATE",
+        )
+        .bind(creator.id)
+        .bind(lock_hash.as_bytes().as_slice())
+        .bind(lock_resource_generation)
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+
+        if let Some((lifecycles, evidence)) = receive_evidence {
+            let current = lifecycles
+                .required_receive_targets_for_lock_in_transaction(
+                    &mut transaction,
+                    creator.id,
+                    &lock_hash,
+                )
+                .await?;
+            if !PaymentRequestLifecycleStore::receive_evidence_covers(&current, evidence) {
+                return Err(PersistenceError::Unavailable);
+            }
         }
 
         let rows = sqlx::query_as::<_, InvoiceLifecycleRow>(

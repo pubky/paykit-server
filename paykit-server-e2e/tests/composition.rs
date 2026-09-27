@@ -20,12 +20,12 @@ use paykit_server::{
     application::semantic_intent::DeliveryIntentV1,
     config::{Config, ConfigEnvironment},
     crypto::Crypto,
-    domain::locks::{CreatorPubky, ReaderPubky, parse_creator, parse_reader},
+    domain::locks::{CreatorPubky, ReaderPubky, parse_bundle_id, parse_creator, parse_reader},
     http::auth::signature_preimage,
     persistence::{
         AtomicInvoiceInput, CreatorCredentials, CreatorStore, InvoiceStore,
-        NewReaderPayloadFactory, NewReaderPayloads, PersistenceError, PostgresStorageAdapter,
-        SdkStateStore, run_migrations,
+        NewReaderPayloadFactory, NewReaderPayloads, PaymentRequestLifecycleStore, PersistenceError,
+        PostgresStorageAdapter, SdkStateStore, run_migrations,
     },
     runtime::ComponentState,
 };
@@ -174,6 +174,113 @@ async fn link(
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn real_sdk_receive_report_matches_durable_required_target() {
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let testnet = build_pubky_testnet().await;
+    let pubky = testnet.sdk().unwrap();
+    let bootstrap = PubkySessionBootstrap::with_pubky(pubky, "app.paykit.server").unwrap();
+    let homeserver = PubkyPublicKey::from_public_key(&testnet.homeserver_app().public_key());
+    let crypto = Arc::new(Crypto::from_master_key(&[3; 32]).unwrap());
+    let creators = CreatorStore::new(database.pool(), crypto.clone());
+
+    let peer_path = PaykitReceiverPath::new("bitkit/server").unwrap();
+    let peer_account = bootstrap
+        .sign_up(
+            &PubkyLocalSecretKey::new(Keypair::random().secret_key()),
+            ReceiverNoiseSecretKey::random(),
+            &homeserver,
+            None,
+            &PaykitSdkConfig::new(peer_path.clone()).required_session_capabilities(),
+        )
+        .await
+        .unwrap();
+    let peer_key = peer_account.public_key.clone();
+    let peer_sdk = PaykitSdk::new(
+        InMemoryStorage::default(),
+        TestSessionProvider::new(peer_account.access),
+        TestPaymentAdapter,
+        PaykitSdkConfig::new(peer_path.clone()),
+    )
+    .unwrap();
+    peer_sdk.initialize().await.unwrap();
+    peer_sdk
+        .publish_paykit_receiver_marker(PaykitReceiverCapabilities {
+            private_payments: true,
+            payment_requests: true,
+            receipts: true,
+            outgoing_payments: true,
+        })
+        .await
+        .unwrap();
+    let marker = peer_sdk
+        .paykit_receiver_marker(peer_key.clone(), peer_path)
+        .await
+        .unwrap()
+        .unwrap();
+    let reader = parse_reader(&format!("pubky{peer_key}")).unwrap();
+    let (creator, creator_sdk) = create_creator(
+        &bootstrap,
+        &homeserver,
+        &creators,
+        database.pool(),
+        crypto.clone(),
+        200,
+    )
+    .await;
+    let creator_key = PubkyPublicKey::from_raw_or_app_key(creator.to_string()).unwrap();
+    link(&creator_sdk, creator_key, &peer_sdk, peer_key).await;
+
+    let bundle = "000G40R40M30E209185GR38E1W";
+    let invoice = InvoiceStore::new(database.pool(), crypto.clone())
+        .create_atomic(AtomicInvoiceInput {
+            creator: &creator,
+            reader: &reader,
+            bundle_binding: bundle.as_bytes(),
+            lock_resource_binding: b"receive-report-normalization-lock",
+            payment_request_binding: b"receive-report-normalization-request",
+            new_reader_payloads: &Payloads {
+                reader: reader.clone(),
+                marker: marker.clone(),
+                address_prefix: "receive-report-normalization-address",
+            },
+            payment_request_intent: payment_intent(&reader, &marker),
+            required_sats: 100,
+            payment_in_hours: 24,
+        })
+        .await
+        .unwrap();
+    let creator_id: Uuid = sqlx::query_scalar("SELECT creator_id FROM invoices WHERE id = $1")
+        .bind(invoice.invoice_id())
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+    let targets = PaymentRequestLifecycleStore::new(database.pool(), crypto)
+        .required_receive_targets_for_bundle(creator_id, &parse_bundle_id(bundle).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(targets.len(), 1);
+
+    let reports = creator_sdk
+        .receive_private_messages_from_linked_peers()
+        .await
+        .unwrap();
+    assert_eq!(reports.len(), 1);
+    assert!(reports[0].error.is_none());
+    assert!(reports[0].report.is_some());
+    assert_eq!(
+        reports[0].counterparty,
+        PubkyPublicKey::from_raw_or_app_key(targets[0].counterparty()).unwrap()
+    );
+    assert_eq!(
+        reports[0].counterparty_receiver_path,
+        *targets[0].receiver_path()
+    );
+
+    database.cleanup().await;
 }
 
 fn payment_intent(reader: &ReaderPubky, marker: &PaykitReceiverMarker) -> DeliveryIntentV1 {

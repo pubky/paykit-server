@@ -26,9 +26,7 @@ use uuid::Uuid;
 use crate::{
     application::{
         payment_drain::{PaymentDrainError, PaymentDrainResult},
-        payment_request_status::{
-            PaymentRequestStatusError, PaymentRequestStatusOperations, PaymentRequestStatusSummary,
-        },
+        payment_request_status::{PaymentRequestStatusError, PaymentRequestStatusSummary},
         semantic_intent::{DeliveryIntentV1, PaymentTermsV1, ReceivingDetailV1},
     },
     config::PaykitConfig,
@@ -41,8 +39,9 @@ use crate::{
         },
     },
     persistence::{
-        ClaimedOutbox, CreatorStore, OutboxStore, PaymentDrainStore, PaymentRequestLifecycleStore,
-        PersistenceError, PostgresStorageAdapter, RequiredReceiveTarget,
+        ClaimedOutbox, CreatorStore, InvoiceStore, OutboxStore, PaymentDrainStore,
+        PaymentRequestLifecycleStore, PersistenceError, PostgresStorageAdapter,
+        RequiredReceiveTarget,
     },
     workers::outbox::{
         Adapter, HandoffError, HandoffFailure, HandoffResult, RetryableHandoffCause,
@@ -246,7 +245,7 @@ impl PaykitAdapter {
     pub async fn reconcile_and_lookup_payment_request_status(
         &self,
         lifecycles: &PaymentRequestLifecycleStore,
-        statuses: &dyn PaymentRequestStatusOperations,
+        statuses: &InvoiceStore,
         bundle_id: &BundleId,
     ) -> Result<Option<PaymentRequestStatusSummary>, PaymentRequestStatusError> {
         let _guard = self.mutation_lock.lock().await;
@@ -254,15 +253,25 @@ impl PaykitAdapter {
             .required_receive_targets_for_bundle(self.storage.creator_id(), bundle_id)
             .await
             .map_err(|_| PaymentRequestStatusError::Unavailable)?;
-        let required_targets =
+        let parsed_targets =
             parse_receive_targets(&required_targets).map_err(map_lifecycle_status_error)?;
         refresh_then(
             || async {
-                self.refresh_payment_requests_locked(lifecycles, Some(&required_targets))
+                self.refresh_payment_requests_locked(lifecycles, Some(&parsed_targets))
                     .await
                     .map_err(map_lifecycle_status_error)
             },
-            || async { statuses.lookup(&self.creator, bundle_id).await },
+            || async {
+                statuses
+                    .payment_request_status_after_receive(
+                        lifecycles,
+                        &self.creator,
+                        bundle_id,
+                        &required_targets,
+                    )
+                    .await
+                    .map_err(|_| PaymentRequestStatusError::Unavailable)
+            },
         )
         .await
     }
@@ -279,33 +288,27 @@ impl PaykitAdapter {
             return Err(PaymentDrainError::CreatorMismatch);
         }
         let _guard = self.mutation_lock.lock().await;
-        replay_or_refresh_then(
-            || async {
-                drains
-                    .exact_replay(lock_resource)
-                    .await
-                    .map_err(map_drain_persistence_error)
-            },
-            || async {
-                let required_targets = lifecycles
-                    .required_receive_targets_for_lock(self.storage.creator_id(), lock_resource)
-                    .await
-                    .map_err(map_projection_persistence_error)
-                    .map_err(map_lifecycle_drain_error)?;
-                let required_targets =
-                    parse_receive_targets(&required_targets).map_err(map_lifecycle_drain_error)?;
-                self.refresh_payment_requests_locked(lifecycles, Some(&required_targets))
-                    .await
-                    .map_err(map_lifecycle_drain_error)
-            },
-            || async {
-                drains
-                    .create(lock_resource)
-                    .await
-                    .map_err(map_drain_persistence_error)
-            },
-        )
-        .await
+        if let Some(replay) = drains
+            .exact_replay(lock_resource)
+            .await
+            .map_err(map_drain_persistence_error)?
+        {
+            return Ok(replay);
+        }
+        let required_targets = lifecycles
+            .required_receive_targets_for_lock(self.storage.creator_id(), lock_resource)
+            .await
+            .map_err(map_projection_persistence_error)
+            .map_err(map_lifecycle_drain_error)?;
+        let parsed_targets =
+            parse_receive_targets(&required_targets).map_err(map_lifecycle_drain_error)?;
+        self.refresh_payment_requests_locked(lifecycles, Some(&parsed_targets))
+            .await
+            .map_err(map_lifecycle_drain_error)?;
+        drains
+            .create_after_receive(lifecycles, lock_resource, &required_targets)
+            .await
+            .map_err(map_drain_persistence_error)
     }
 }
 
@@ -406,6 +409,7 @@ where
     }
 }
 
+#[cfg(test)]
 async fn replay_or_refresh_then<
     T,
     E,

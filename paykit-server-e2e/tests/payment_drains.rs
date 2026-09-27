@@ -428,6 +428,152 @@ async fn missing_required_intake_blocks_drain_snapshot_and_status_lookup() {
 }
 
 #[tokio::test]
+async fn drain_revalidates_receive_evidence_after_invoice_admission() {
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(&[48; 32]).unwrap());
+    let creator_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO creators (creator_lookup_hash, credential_envelope)
+         VALUES ($1, $2) RETURNING id",
+    )
+    .bind(crypto.lookup_hash(CREATOR.as_bytes()).as_bytes().as_slice())
+    .bind(b"encrypted-creator".as_slice())
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    insert_invoice(
+        &database,
+        &crypto,
+        creator_id,
+        0,
+        0,
+        PaymentRequestLifecycleState::Rejected,
+    )
+    .await;
+    sqlx::query(
+        "INSERT INTO lock_payment_generations
+             (creator_id, lock_resource_lookup_hash, current_generation)
+         VALUES ($1, $2, 0)",
+    )
+    .bind(creator_id)
+    .bind(
+        crypto
+            .lookup_hash(lock_resource().to_string().as_bytes())
+            .as_bytes()
+            .as_slice(),
+    )
+    .execute(database.pool())
+    .await
+    .unwrap();
+    let lifecycles = PaymentRequestLifecycleStore::new(database.pool(), crypto.clone());
+    let stale_evidence = lifecycles
+        .required_receive_targets_for_lock(creator_id, &lock_resource())
+        .await
+        .unwrap();
+    assert!(stale_evidence.is_empty());
+
+    insert_invoice_with_receiver_path(
+        &database,
+        &crypto,
+        creator_id,
+        1,
+        0,
+        PaymentRequestLifecycleState::Proposed,
+        "new/wallet",
+    )
+    .await;
+
+    let drains = PaymentDrainStore::new(database.pool(), crypto);
+    assert_eq!(
+        drains
+            .create_after_receive(&lifecycles, &lock_resource(), &stale_evidence)
+            .await,
+        Err(PersistenceError::Unavailable)
+    );
+    assert!(
+        drains
+            .exact_replay(&lock_resource())
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn status_revalidates_receive_evidence_after_new_nonterminal_attempt() {
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(&[47; 32]).unwrap());
+    let creator = parse_creator(CREATOR).unwrap();
+    let creator_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO creators (creator_lookup_hash, credential_envelope)
+         VALUES ($1, $2) RETURNING id",
+    )
+    .bind(crypto.lookup_hash(CREATOR.as_bytes()).as_bytes().as_slice())
+    .bind(b"encrypted-creator".as_slice())
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    let (invoice_id, _) = insert_invoice(
+        &database,
+        &crypto,
+        creator_id,
+        0,
+        0,
+        PaymentRequestLifecycleState::Rejected,
+    )
+    .await;
+    sqlx::query(
+        "INSERT INTO lock_payment_generations
+             (creator_id, lock_resource_lookup_hash, current_generation)
+         VALUES ($1, $2, 0)",
+    )
+    .bind(creator_id)
+    .bind(
+        crypto
+            .lookup_hash(lock_resource().to_string().as_bytes())
+            .as_bytes()
+            .as_slice(),
+    )
+    .execute(database.pool())
+    .await
+    .unwrap();
+    sqlx::query("UPDATE invoices SET bundle_lookup_hash = $1 WHERE id = $2")
+        .bind(crypto.lookup_hash(BUNDLE.as_bytes()).as_bytes().as_slice())
+        .bind(invoice_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    let bundle_id = parse_bundle_id(BUNDLE).unwrap();
+    let lifecycles = PaymentRequestLifecycleStore::new(database.pool(), crypto.clone());
+    let stale_evidence = lifecycles
+        .required_receive_targets_for_bundle(creator_id, &bundle_id)
+        .await
+        .unwrap();
+    assert!(stale_evidence.is_empty());
+
+    insert_attempt(
+        &database,
+        invoice_id,
+        1,
+        PaymentRequestLifecycleState::Proposed,
+    )
+    .await;
+
+    assert_eq!(
+        InvoiceStore::new(database.pool(), crypto)
+            .payment_request_status_after_receive(
+                &lifecycles,
+                &creator,
+                &bundle_id,
+                &stale_evidence,
+            )
+            .await,
+        Err(PersistenceError::Unavailable)
+    );
+}
+
+#[tokio::test]
 async fn drain_atomically_freezes_classification_and_cancellation_intent_for_exact_replay() {
     let database = TestDatabase::create().await;
     run_migrations(database.pool()).await.unwrap();
