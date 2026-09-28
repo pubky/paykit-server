@@ -15,37 +15,60 @@
 ## Status and provenance
 
 - Plan status: **implemented and verified against an isolated PostgreSQL 16 test database**.
+- Deadline/lifecycle amendment (2026-09-28): the later Payment Request rejection work
+  supersedes this plan's original equal-deadline and stop-observing design. Current
+  contract uses separate deployment-configured proposal/payment windows, preserves
+  late factual payment evidence, and keeps request lifecycle, payment status,
+  deadline eligibility, and observed Bitcoin evidence orthogonal. Historical task
+  descriptions below are updated where their old wording would otherwise direct a
+  current implementation incorrectly.
 - Repository inspected: `/home/u/Projects/Synonym/Paykit/paykit-server`.
 - Planning base when written: clean `master` at `f38c791`.
 - Current Locks Core dependency is pinned to `df5ea1b...`; implementation must update it to the reviewed Locks revision containing required `payment_in`.
 - Current Paykit Rust dependency remains pinned to `52a8529...` unless ordinary compatibility work proves a reviewed update necessary. No new Paykit protocol field/event is planned.
-- There has been no production deployment. Migration `0002` performs the approved one-time destructive reset of migration-`0001` prototype data before adding non-backfillable invoice facts; SQLx records it once, so later starts do not repeat the reset.
+- There has been no production deployment. Migration `0007` performs the approved
+  one-time destructive staging reset before installing the separate immutable
+  proposal/payment deadline terms; SQLx records it once, so later starts do not
+  repeat the reset. Earlier migration `0002` remains historical migration context.
 
 ## Explicit requirements and confirmed decisions
 
-1. Signed invoice creation accepts `payment_in` as a nonzero JSON `u64` whole-hour value. For compatibility with current Locks, an omitted request value defaults to `24`; explicit invalid values remain rejected.
-2. Paykit fetches the canonical lock and requires request `payment_in` to equal the lock criterion value. An omitted canonical criterion value also defaults to `24`; explicit mismatch rejects before invoice/outbox/allocation side effects. Omitted and explicit `24` normalize to the same idempotency binding.
-3. Paykit computes and persists:
+1. Signed invoice creation still accepts `payment_in` as a nonzero JSON `u64`
+   whole-hour compatibility field. An omitted request value defaults to `24`;
+   explicit invalid values remain rejected. It does not configure either persisted
+   deadline.
+2. Paykit fetches the canonical lock and requires request `payment_in` to equal the
+   lock criterion value. An omitted canonical criterion value also defaults to `24`;
+   explicit mismatch rejects before invoice/outbox/allocation side effects. Omitted
+   and explicit `24` normalize to the same idempotency binding.
+3. Paykit Server deployment config owns both windows and computes/persists:
 
 ```text
 invoice_created_at = authoritative database creation timestamp
-payment_deadline = checked(invoice_created_at + payment_in hours)
+proposal_expires_at = checked(invoice_created_at + proposal_acceptance_window)
+payment_deadline = checked(invoice_created_at + payment_window)
+0 < proposal_acceptance_window < payment_window
 ```
+
+Defaults are one hour for proposal acceptance and 24 hours for payment. Both are
+configurable deployment policy.
 
 Production samples `clock_timestamp()` only after acquiring the decisive Creator or invoice row fence. This prevents lock wait from making a transaction-start timestamp stale across a deadline. Deterministic caller-time seams remain test-only.
 
 4. Integer-to-duration and timestamp addition are checked. Unrepresentable deadlines reject before side effects.
 5. Exact invoice replay resolves persisted state before mutable lock fetch and returns original timestamps without recomputation.
-6. Payment Request `proposal_expires_at` is set to the same absolute deadline, while retaining its existing proposal-only Paykit meaning.
+6. Payment Request `proposal_expires_at` is strictly earlier than
+   `payment_deadline`; it governs proposal acceptance only. Once accepted, proposal
+   expiry has no settlement effect.
 7. Post-acceptance expiry is Paykit Server/Locks application policy, not a Paykit protocol event or `paykit-sdk` lifecycle change.
 8. Payment is timely when Paykit’s durable first amount-matched observation satisfies `first_amount_matched_observed_at <= payment_deadline`. An earlier underpayment does not lend its timestamp to a later qualifying output.
 9. Bitcoin has no trusted broadcast time; miner block time is not used. Polling latency is accepted.
-10. At deadline:
-   - no output: expire and stop active observation;
-   - underpayment: expire and stop active observation;
-   - amount-matched output observed in time: continue observation through confirmation progress;
-   - already factual-final amount match: complete observation.
-11. Underpayment may be replaced by a qualifying output only through the deadline. It does not extend monitoring.
+10. After the inclusive deadline passes without a timely amount-matched observation,
+    payment eligibility expires, but observation continues until factual Bitcoin
+    finality. Late or underpaid outputs remain durable evidence and cannot grant
+    automatic access.
+11. An underpayment may be replaced by a qualifying output after the deadline for
+    factual reconciliation, but that replacement is late and cannot become timely.
 12. Timely amount-matched payment has no second timeout and may keep graceful deletion blocked during unresolved confirmations/reorg behavior.
 13. Paykit reports factual confirmations/amount match only. Locks owns `minimum_confirmations`; drain requests do not carry it.
 14. Before a new drain or per-Bundle status result, Paykit receives linked-peer messages and projects the canonical SDK reducer under the same Creator mutation fence. Partial receive or projection failure returns unavailable instead of using stale lifecycle state. A durable lock-wide drain then atomically snapshots lifecycle:
@@ -63,7 +86,10 @@ Production samples `clock_timestamp()` only after acquiring the decisive Creator
 22. After graceful completion, Locks asks Paykit to remove the operational drain record. Invoice/payment records remain terminal financial history.
 23. Old delayed lifecycle messages cannot reopen canceled/expired state or contaminate a later fresh publication of the same canonical Lock ID.
 24. Reader/payment UI must stop presenting payment at the application deadline. Late payment yields no Locks access or automatic refund; that risk is explicitly accepted.
-25. Deployment from the migration-`0001` prototype automatically clears Paykit application rows inside migration `0002`. The migration is transactional and SQLx applies it once. It does not drop the schema or migration history, does not touch the Locks database, and must not be modified into a recurring startup reset.
+25. Migration `0007` transactionally clears incompatible staging-only Paykit
+    application rows before replacing the old deadline columns. SQLx applies it once;
+    it preserves migration history, does not touch the Locks database, and is not a
+    recurring startup reset.
 
 ## Source-derived constraints
 
@@ -71,7 +97,9 @@ Production samples `clock_timestamp()` only after acquiring the decisive Creator
 - Paykit SDK derives `ProposalExpired` only when current lifecycle is `Proposed`; accepted state is not expired by this timestamp.
 - Existing invoice creation persists encrypted Payment Request intent and invoice allocation atomically.
 - Existing exact replay runs before new mutable discovery/creation work and must remain replay-first.
-- Existing observer loads all invoices not factual-final at six amount-matched confirmations. Deadline filtering must be persisted/queryable; do not bolt a worker-local timeout onto this query.
+- Existing observer loads all invoices not factual-final at six amount-matched
+  confirmations, including business-expired invoices. Persist deadline eligibility
+  separately; do not filter late factual reconciliation out of observation targets.
 - Existing `/transactions/status` is factual Bitcoin state only. New Payment Request lifecycle status must not silently change that stable contract.
 - Existing Bitcoin integration uses `bdk_electrum`; do not add direct ad hoc `electrum-client` scanning.
 - Outbox handoff is at-least-once and distinct from counterparty delivery.
@@ -91,8 +119,8 @@ Production samples `clock_timestamp()` only after acquiring the decisive Creator
 | --- | --- |
 | `payment_in` schema and canonical lock validation | Locks Core |
 | Signed request production | Locks Server |
-| Request/lock `payment_in` comparison | Paykit Server |
-| Invoice creation timestamp/deadline | Paykit Server |
+| Request/lock `payment_in` compatibility comparison | Paykit Server |
+| Deployment proposal/payment windows and invoice timestamps | Paykit Server |
 | `proposal_expires_at` population | Paykit Server |
 | Payment Request event projection | Paykit SDK consumed by Paykit Server |
 | Lock-wide drain classification/cancellations | Paykit Server |
@@ -233,10 +261,12 @@ On success it returns the exact closed response `200 {"status":"removed"}`. Clea
 Persist non-null:
 
 - `invoice_created_at` as authoritative UTC database/application commit time;
+- `proposal_expires_at` as immutable UTC proposal-acceptance cutoff;
 - `payment_deadline` as immutable UTC timestamp;
-- `payment_in_hours` or equivalent bound value needed for integrity/replay checks;
+- `proposal_acceptance_seconds` and `payment_window_seconds` as immutable deployment-policy bindings;
 - `first_amount_matched_observed_at` when an amount-matched output first becomes durably observed;
-- application observation state sufficient to distinguish active, expired-undetected, expired-underpaid, timely-matched-monitoring, and factual-final.
+- application eligibility state separate from factual observation state, sufficient
+  to retain late/underpaid evidence through factual finality.
 
 The timestamp used to decide timeliness must be assigned in the same transaction that first persists an amount-matched observation. An underpayment does not set this timestamp. Replacing/reorging an output must not move the original timely matched observation later or allow an untimely replacement to become timely.
 
@@ -297,9 +327,16 @@ cargo test --workspace --no-run
 - Test: invoice persistence/application/HTTP tests
 - Test: relevant `paykit-server-e2e` invoice tests
 
-**RED:** Test the one-time migration-`0001` prototype reset and restart preservation, checked duration/timestamp overflow, one timestamp assignment per new invoice, exact replay after clock advance, conflict on changed `payment_in`, strict JSON response, and rollback of invoice/allocation/outbox on failure.
+**RED:** Test the one-time staging reset and restart preservation, checked
+duration/timestamp overflow, one timestamp assignment per new invoice, exact replay
+after clock advance, strict proposal-before-payment ordering, strict JSON response,
+and rollback of invoice/allocation/outbox on failure.
 
-**GREEN:** Clear migration-`0001` application rows transactionally in migration `0002`, generate the authoritative timestamp in the atomic persistence boundary, set `proposal_expires_at` to `payment_deadline`, persist both, and return a typed result. Preserve replay-first behavior; SQLx migration history prevents a second reset.
+**GREEN:** Migration `0007` clears incompatible staging application rows
+transactionally, removes `payment_in_hours`, and installs separately bound proposal
+and payment windows. Generate the authoritative timestamp in the atomic persistence
+boundary, persist both strictly ordered deadlines, and return a typed result.
+Preserve replay-first behavior; SQLx migration history prevents a second reset.
 
 **Verify:**
 
@@ -313,7 +350,8 @@ cargo test -p paykit-server-e2e
 
 ### Task 3: Persist first observation and enforce deadline-aware targets
 
-**Objective:** Stop polling expired undetected/underpaid invoices while retaining timely amount-matched confirmation monitoring.
+**Objective:** Persist deadline eligibility without stopping factual reconciliation
+of expired, late, or underpaid invoices.
 
 **Files:**
 - Create: next SQL migration under `paykit-server/migrations/`
@@ -323,9 +361,15 @@ cargo test -p paykit-server-e2e
 - Test: observer and invoice persistence tests
 - Test: relevant E2E observer tests
 
-**RED:** With an injected clock, cover observation before/equal/after deadline, underpayment replacement before deadline, underpayment at deadline expiry, late qualifying replacement rejection, timely matched continuation, restart persistence, reorg/replacement behavior, and target query exclusion.
+**RED:** With an injected clock, cover observation before/equal/after deadline,
+underpayment replacement on both sides of the deadline, late qualifying evidence,
+timely matched continuation, restart persistence, reorg/replacement behavior, and
+continued target inclusion until factual finality.
 
-**GREEN:** Assign `first_amount_matched_observed_at` durably when first persisting an amount-matched output. Apply inclusive deadline comparison. Persist terminal application expiry instead of relying on worker memory. Continue timely matched observations to existing factual finality.
+**GREEN:** Assign `first_amount_matched_observed_at` durably when first persisting an
+amount-matched output. Apply inclusive deadline comparison for eligibility. Persist
+application expiry independently, then continue all non-final factual observations,
+including late and underpaid evidence, to existing factual finality.
 
 **Suggested commit:** `feat(observer): enforce invoice payment deadlines`
 
@@ -460,9 +504,10 @@ Cross-service acceptance must prove:
 
 - invoice request/canonical lock `payment_in` equality;
 - timestamp checked addition and exact replay;
-- same absolute proposal expiry and application deadline;
+- separate proposal expiry and payment deadline with strict ordering;
+- deployment-configured one-hour/24-hour defaults and immutable replay bindings;
 - inclusive durable first amount-matched-observation cutoff;
-- underpayment expiry and timely matched confirmation continuation;
+- continued late/underpaid factual reconciliation without automatic access;
 - local atomic acceptance/cancellation snapshot and delayed-acceptance loss;
 - durable enqueue without delivery wait;
 - no `minimum_confirmations` in Paykit drain;
