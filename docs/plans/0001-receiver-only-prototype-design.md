@@ -414,17 +414,10 @@ and stop-observing design**:
 - Status values:
   - `undetected`: no valid referenced output currently observed;
   - `detected`: valid output observed at 0 confirmations;
-  - `confirmed`: valid output observed with at least 1 confirmation;
-  - `cancelled`: every durable proposal attempt is lifecycle-terminal and the
-    aggregate request state is `Rejected` or `Canceled`;
-  - `expired`: the aggregate request state is `ProposalExpired`, or the
-    application payment window expired without timely qualifying settlement.
-- Any non-terminal proposal attempt outranks terminal attempt history. A
-  reversible `RecoveryRequired` transport overlay does not alter payment status.
-- `cancelled` takes label precedence over application-window `expired`.
-- Lifecycle-derived labels retain the persisted Bitcoin `confirmations` and
-  `amount_matched` facts; lifecycle projection never rewrites invoice payment
-  state or deletes observations.
+  - `confirmed`: valid output observed with at least 1 confirmation.
+- Payment Request lifecycle is exposed separately through the canonical signed
+  `POST /payment-requests/status` contract. It never widens this legacy closed
+  Bitcoin vocabulary.
 - Locks applies access threshold from returned confirmation count.
 - Before six confirmations, reorg may regress status and confirmation count.
 - At six confirmations, an amount-matched payment becomes final, monitoring stops, and persisted/reported confirmation count remains `6`.

@@ -363,14 +363,8 @@ cargo test --workspace
 **RED tests:**
 - Unknown creator/bundle returns 404.
 - Known invoice without an observed output returns exact undetected zero/false response.
-- Rejected/canceled requests project `cancelled`; proposal expiry and accepted
-  application-window expiry project `expired`.
-- Multiple proposal attempts aggregate before projection, and any non-terminal
-  attempt prevents terminal history from overriding the Bitcoin label.
-- Lifecycle-derived labels retain factual confirmations and amount matching;
-  later lifecycle events never rewrite invoice payment columns.
-- `RecoveryRequired` remains a transport-availability overlay rather than a
-  payment lifecycle transition.
+- Legacy status remains limited to factual `undetected`, `detected`, and
+  `confirmed` Bitcoin labels regardless of Payment Request lifecycle.
 - Status never triggers creator-session validation or lock refetch.
 - Status serialization contains only `status`, `confirmations`, and `amount_matched`.
 

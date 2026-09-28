@@ -255,24 +255,18 @@ Each invoice receives a unique BIP84 external-chain address. Observation uses th
 
 The server has no Bitcoin spending keys and cannot spend, refund, or create change.
 
-`POST /transactions/status` keeps Bitcoin observations factual while projecting
-terminal Payment Request outcomes into its legacy status label. Across all
-durable proposal attempts, any non-terminal attempt keeps the Bitcoin label;
-only an aggregate `Rejected` or `Canceled` projects `cancelled`, while aggregate
-`ProposalExpired` or an expired application payment window projects `expired`.
-Cancellation takes label precedence over window expiry. `RecoveryRequired` is a
-transport-availability overlay and never changes the payment label. Projected
-`cancelled` and `expired` responses retain persisted `confirmations` and
-`amount_matched`; lifecycle never rewrites or erases Bitcoin evidence.
-Before deriving that label, the route uses the same linked-peer receive,
-required-target freshness proof, Creator-local SDK mutation fence, and
-transactional target revalidation as `POST /payment-requests/status`. Missing,
-partial, unrelated, or failed required-peer intake returns unavailable instead
-of exposing a stale lifecycle projection. Adding the two labels is a closed-enum
-compatibility change for legacy clients.
+`POST /transactions/status` remains the legacy Bitcoin-only compatibility
+endpoint. Its closed `status` vocabulary is `undetected`, `detected`, and
+`confirmed`; Payment Request lifecycle never changes those labels.
 
-`POST /payment-requests/status` exposes the request lifecycle and payment state
-as separate fields for callers that need both facts directly.
+`POST /payment-requests/status` is the canonical Locks lifecycle contract. It
+exposes request lifecycle, payment state, invoice timestamps, confirmations, and
+amount matching as separate facts. Before returning them, it performs linked-peer
+receive, exact required-target freshness checks, Creator-local SDK mutation
+serialization, and transactional target revalidation. Missing, partial,
+unrelated, or failed required-peer intake returns unavailable. Exact terminal
+response fixtures for Locks are published under
+`docs/fixtures/payment-request-status/`.
 
 ## Payer, proof, and receipt exclusions
 
