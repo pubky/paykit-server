@@ -14,6 +14,7 @@ pub mod crypto;
 /// Side-effect-free protocol and business value objects.
 pub mod domain;
 pub mod http;
+mod log_correlation;
 /// Identifier-free operational metrics.
 pub mod metrics;
 /// Concrete per-Creator public Paykit SDK adapter.

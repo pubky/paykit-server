@@ -23,7 +23,7 @@ pub enum OutboxRetryClass {
 }
 
 impl OutboxRetryClass {
-    const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::AdapterUnavailable => "adapter_unavailable",
             Self::MarkerFetch => "marker_fetch",

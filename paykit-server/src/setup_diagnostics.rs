@@ -1,4 +1,7 @@
-use crate::{bitkit_claim::ClaimError, persistence::PersistenceError};
+use crate::{
+    bitkit_claim::ClaimError, domain::locks::CreatorPubky, log_correlation::pubky_ref,
+    persistence::PersistenceError,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SetupStage {
@@ -169,6 +172,45 @@ pub(crate) fn emit_setup_stage(stage: SetupStage, outcome: SetupOutcome, class: 
             stage,
             outcome,
             class,
+            "Paykit setup completion stage"
+        ),
+    }
+}
+
+pub(crate) fn emit_setup_stage_for_creator(
+    stage: SetupStage,
+    outcome: SetupOutcome,
+    class: SetupFailureClass,
+    creator: &CreatorPubky,
+) {
+    emit_setup_stage_for_pubky(stage, outcome, class, &creator.to_string());
+}
+
+pub(crate) fn emit_setup_stage_for_pubky(
+    stage: SetupStage,
+    outcome: SetupOutcome,
+    class: SetupFailureClass,
+    canonical_pubky: &str,
+) {
+    let stage = stage.as_str();
+    let outcome = outcome.as_str();
+    let class = class.as_str();
+    let creator_ref = pubky_ref(canonical_pubky);
+    match outcome {
+        "failed" | "absent" => tracing::warn!(
+            event = "paykit_setup_completion",
+            stage,
+            outcome,
+            class,
+            creator_ref,
+            "Paykit setup completion stage"
+        ),
+        _ => tracing::info!(
+            event = "paykit_setup_completion",
+            stage,
+            outcome,
+            class,
+            creator_ref,
             "Paykit setup completion stage"
         ),
     }
@@ -395,5 +437,33 @@ mod tests {
                 .iter()
                 .all(|(_, value)| !value.contains("sensitive nested source detail"))
         );
+    }
+
+    #[test]
+    fn creator_scoped_failure_emits_only_short_role_specific_identity_ref() {
+        let full = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
+        let creator = crate::domain::locks::parse_creator(full).unwrap();
+        let capture = EventCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            emit_setup_stage_for_creator(
+                SetupStage::XpubValidate,
+                SetupOutcome::Failed,
+                SetupFailureClass::InvalidPayload,
+                &creator,
+            );
+        });
+
+        let events = capture.0.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(
+            events[0]
+                .iter()
+                .any(|(name, value)| { name == "creator_ref" && value == "\"tkrq...p7qy\"" })
+        );
+        assert!(events[0].iter().all(|(_, value)| !value.contains(full)));
+        for forbidden in ["reader_ref", "xpub", "account", "payload", "secret"] {
+            assert!(events[0].iter().all(|(name, _)| name != forbidden));
+        }
     }
 }

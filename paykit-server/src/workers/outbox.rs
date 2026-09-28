@@ -11,6 +11,7 @@ use paykit_sdk::OutboundPrivateMessageStatus;
 
 use crate::{
     application::semantic_intent::{DeliveryIntentV1, DeliveryOperationV1},
+    log_correlation::emit_handoff_failure,
     persistence::{ClaimedHandoff, ClaimedOutbox, OutboxStore, PersistenceError},
 };
 use std::time::Duration;
@@ -63,14 +64,27 @@ impl RetryableHandoffCause {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HandoffFailure {
-    Retryable(RetryableHandoffStage),
+    Retryable {
+        stage: RetryableHandoffStage,
+        cause: RetryableHandoffCause,
+    },
     Permanent,
 }
 
 fn at_stage(error: HandoffError, stage: RetryableHandoffStage) -> HandoffFailure {
     match error {
-        HandoffError::Retryable(_) => HandoffFailure::Retryable(stage),
+        HandoffError::Retryable(cause) => HandoffFailure::Retryable { stage, cause },
         HandoffError::Permanent => HandoffFailure::Permanent,
+    }
+}
+
+fn retryable(stage: RetryableHandoffStage) -> HandoffFailure {
+    HandoffFailure::Retryable {
+        stage,
+        cause: match stage {
+            RetryableHandoffStage::MarkerMissing => RetryableHandoffCause::NotFound,
+            _ => RetryableHandoffCause::Other,
+        },
     }
 }
 
@@ -112,6 +126,11 @@ impl RetrySchedule {
 /// through the creator SDK-state service; an in-memory runtime is test-only.
 #[async_trait]
 pub trait Adapter: Send + Sync {
+    /// Canonical Creator Pubky when this adapter is bound to a production Creator.
+    fn creator_pubky(&self) -> Option<&str> {
+        None
+    }
+
     /// Executes one complete semantic handoff. Concrete adapters may override
     /// this to serialize a multi-call SDK operation under one Creator lock.
     async fn execute_handoff(
@@ -166,18 +185,14 @@ pub(crate) async fn handoff_steps<A: Adapter + ?Sized>(
         .fetch_marker(intent.reader_pubky(), selected_path.as_str())
         .await
         .map_err(|error| at_stage(error, RetryableHandoffStage::MarkerFetch))?
-        .ok_or(HandoffFailure::Retryable(
-            RetryableHandoffStage::MarkerMissing,
-        ))?;
+        .ok_or_else(|| retryable(RetryableHandoffStage::MarkerMissing))?;
     if !marker.capabilities.private_payments
         || !marker.capabilities.payment_requests
         || DeliveryIntentV1::fingerprint(&marker)
-            .map_err(|_| HandoffFailure::Retryable(RetryableHandoffStage::MarkerChanged))?
+            .map_err(|_| retryable(RetryableHandoffStage::MarkerChanged))?
             != intent.marker_fingerprint()
     {
-        return Err(HandoffFailure::Retryable(
-            RetryableHandoffStage::MarkerChanged,
-        ));
+        return Err(retryable(RetryableHandoffStage::MarkerChanged));
     }
     adapter
         .ensure_link_with_peer(intent.reader_pubky(), selected_path.as_str())
@@ -239,7 +254,14 @@ pub async fn process_claim_with_health(
             .mark_handed_off(claim, &result)
             .await
             .map(|transitioned| (transitioned, ProcessingHealth::Available)),
-        Err(HandoffFailure::Retryable(stage)) => {
+        Err(HandoffFailure::Retryable { stage, cause }) => {
+            emit_handoff_failure(
+                stage.as_str(),
+                cause.diagnostic_label(),
+                adapter.creator_pubky(),
+                intent.reader_pubky(),
+                claim.id(),
+            );
             let delay = retry_schedule.delay_for(stage);
             store
                 .mark_retryable(claim, delay, stage)

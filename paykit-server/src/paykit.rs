@@ -17,7 +17,6 @@ use paykit_sdk::{
 };
 use pubky::Pubky;
 use tokio::sync::Mutex as TokioMutex;
-use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
@@ -146,6 +145,7 @@ type CreatorSdk =
 pub struct PaykitAdapter {
     sdk: CreatorSdk,
     storage: PostgresStorageAdapter,
+    creator_pubky: String,
     mutation_lock: Arc<TokioMutex<()>>,
 }
 
@@ -161,6 +161,7 @@ impl PaykitAdapter {
         sessions: CreatorSessionProvider,
         config: &PaykitConfig,
     ) -> Result<Self, PaykitSdkError> {
+        let creator_pubky = sessions.creator.to_string();
         let sdk = PaykitSdk::new(
             storage.clone(),
             sessions,
@@ -171,6 +172,7 @@ impl PaykitAdapter {
             sdk,
             mutation_lock: creator_mutation_lock(storage.creator_id()),
             storage,
+            creator_pubky,
         })
     }
 }
@@ -246,6 +248,10 @@ fn payment_terms(terms: &PaymentTermsV1) -> Result<PaymentRequestTerms, HandoffE
 
 #[async_trait]
 impl Adapter for PaykitAdapter {
+    fn creator_pubky(&self) -> Option<&str> {
+        Some(&self.creator_pubky)
+    }
+
     async fn execute_handoff(
         &self,
         intent: &DeliveryIntentV1,
@@ -268,20 +274,11 @@ impl Adapter for PaykitAdapter {
 
     async fn ensure_link_with_peer(&self, reader: &str, path: &str) -> Result<(), HandoffError> {
         let (reader, path) = parse_peer(reader, path)?;
-        let result = self
-            .sdk
+        self.sdk
             .ensure_link_with_peer(reader, path, 1)
             .await
             .map_err(classify)
-            .and_then(|report| require_linked(report.state));
-        if let Err(error) = result {
-            warn!(
-                stage = "link_establishment",
-                cause = error.diagnostic_label(),
-                "Paykit handoff failed"
-            );
-        }
-        result
+            .and_then(|report| require_linked(report.state))
     }
 
     async fn enqueue_private_payment_list_with_receiving_details(

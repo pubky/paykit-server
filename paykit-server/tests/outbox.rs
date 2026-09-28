@@ -111,9 +111,10 @@ async fn changed_selected_marker_is_retryable_without_a_reselection() {
 
     assert_eq!(
         handoff(&adapter, &payment_intent(&selected)).await,
-        Err(HandoffFailure::Retryable(
-            RetryableHandoffStage::MarkerChanged
-        ))
+        Err(HandoffFailure::Retryable {
+            stage: RetryableHandoffStage::MarkerChanged,
+            cause: RetryableHandoffCause::Other,
+        })
     );
     assert_eq!(*adapter.payment_request_calls.lock().unwrap(), 0);
 }
@@ -129,9 +130,10 @@ async fn link_failure_has_one_durable_diagnostic_stage() {
 
     assert_eq!(
         handoff(&adapter, &payment_intent(&selected)).await,
-        Err(HandoffFailure::Retryable(
-            RetryableHandoffStage::LinkEstablishment
-        ))
+        Err(HandoffFailure::Retryable {
+            stage: RetryableHandoffStage::LinkEstablishment,
+            cause: RetryableHandoffCause::Transport,
+        })
     );
 }
 

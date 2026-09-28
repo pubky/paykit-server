@@ -15,6 +15,7 @@ use crate::bitkit_claim::{
 };
 use crate::setup_diagnostics::{
     SetupFailureClass, SetupOutcome, SetupStage, claim_failure_class, emit_setup_stage,
+    emit_setup_stage_for_pubky,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -112,14 +113,61 @@ where
     R: CompanionRelay + ?Sized,
     C: VerifiedSetupCommit + ?Sized,
 {
-    emit_setup_stage(
+    receive_verify_commit_with_creator(relay, commit, request, creator, deadline, None).await
+}
+
+pub(crate) async fn receive_verify_commit_for_creator<R, C>(
+    relay: &R,
+    commit: &C,
+    request: &AuthRequest,
+    creator: &VerifyingKey,
+    deadline: Duration,
+    creator_pubky: &str,
+) -> Result<bool, ClaimError>
+where
+    R: CompanionRelay + ?Sized,
+    C: VerifiedSetupCommit + ?Sized,
+{
+    receive_verify_commit_with_creator(
+        relay,
+        commit,
+        request,
+        creator,
+        deadline,
+        Some(creator_pubky),
+    )
+    .await
+}
+
+async fn receive_verify_commit_with_creator<R, C>(
+    relay: &R,
+    commit: &C,
+    request: &AuthRequest,
+    creator: &VerifyingKey,
+    deadline: Duration,
+    creator_pubky: Option<&str>,
+) -> Result<bool, ClaimError>
+where
+    R: CompanionRelay + ?Sized,
+    C: VerifiedSetupCommit + ?Sized,
+{
+    macro_rules! emit {
+        ($stage:expr, $outcome:expr, $class:expr $(,)?) => {
+            if let Some(creator_pubky) = creator_pubky {
+                emit_setup_stage_for_pubky($stage, $outcome, $class, creator_pubky)
+            } else {
+                emit_setup_stage($stage, $outcome, $class)
+            }
+        };
+    }
+    emit!(
         SetupStage::RelayReceive,
         SetupOutcome::Started,
         SetupFailureClass::None,
     );
     let body = match relay.receive(request, deadline).await {
         Ok(Some(body)) => {
-            emit_setup_stage(
+            emit!(
                 SetupStage::RelayReceive,
                 SetupOutcome::Succeeded,
                 SetupFailureClass::None,
@@ -127,7 +175,7 @@ where
             body
         }
         Ok(None) => {
-            emit_setup_stage(
+            emit!(
                 SetupStage::RelayReceive,
                 SetupOutcome::Absent,
                 SetupFailureClass::BodyAbsent,
@@ -135,7 +183,7 @@ where
             return Ok(false);
         }
         Err(error) => {
-            emit_setup_stage(
+            emit!(
                 SetupStage::RelayReceive,
                 SetupOutcome::Failed,
                 error.failure_class(),
@@ -143,14 +191,14 @@ where
             return Err(error.into_claim_error());
         }
     };
-    emit_setup_stage(
+    emit!(
         SetupStage::ClaimVerify,
         SetupOutcome::Started,
         SetupFailureClass::None,
     );
     let claim = match decrypt_and_verify(&body, request.secret(), creator) {
         Ok(claim) => {
-            emit_setup_stage(
+            emit!(
                 SetupStage::ClaimVerify,
                 SetupOutcome::Succeeded,
                 SetupFailureClass::None,
@@ -158,7 +206,7 @@ where
             claim
         }
         Err(error) => {
-            emit_setup_stage(
+            emit!(
                 SetupStage::ClaimVerify,
                 SetupOutcome::Failed,
                 claim_failure_class(&error),
@@ -167,20 +215,20 @@ where
         }
     };
     commit.publish_readback_and_commit(claim).await?;
-    emit_setup_stage(
+    emit!(
         SetupStage::RelayAck,
         SetupOutcome::Started,
         SetupFailureClass::None,
     );
     if let Err(error) = relay.acknowledge(request).await {
-        emit_setup_stage(
+        emit!(
             SetupStage::RelayAck,
             SetupOutcome::Failed,
             error.failure_class(),
         );
         return Err(error.into_claim_error());
     }
-    emit_setup_stage(
+    emit!(
         SetupStage::RelayAck,
         SetupOutcome::Succeeded,
         SetupFailureClass::None,
