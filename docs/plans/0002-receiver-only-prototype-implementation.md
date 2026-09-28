@@ -515,7 +515,7 @@ git status --short
 
 ## Execution order and gates
 
-1. Tasks 0, 13, and 16 are removed by product decision and must not be reintroduced without a new product decision.
+1. Tasks 0 and 16 are removed by product decision and must not be reintroduced without a new product decision.
 2. Execute implemented tasks in order, using RED → GREEN → refactor for every behavioral task.
 3. After every task: spec-compliance review first, code-quality review second, user review/commit third.
 4. If a task discovers a missing public/persistence/security contract, stop, notify and ask about adding it to the design ledger before choosing behavior.
