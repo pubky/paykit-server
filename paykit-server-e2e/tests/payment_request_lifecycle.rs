@@ -43,16 +43,13 @@ fn proposal_intent(payment_reference: &str) -> DeliveryIntentV1 {
         CREATOR.into(),
         &marker,
         PaykitReceiverPath::new("paykit/server").unwrap(),
-        &PaymentRequestTerms {
-            amount: PaymentAmount::new("1", "btc").unwrap(),
-            payment_reference: PaymentReference::new(payment_reference.to_owned()).unwrap(),
-            proposal_expires_at: None,
-            recurrence: None,
-            accepted_payment_endpoint_identifiers: vec![
-                PaymentEndpointIdentifier::new("btc-bitcoin-p2wpkh").unwrap(),
-            ],
-            metadata: serde_json::Map::new(),
-        },
+        &PaymentRequestTerms::builder(
+            PaymentAmount::new("1", "btc").unwrap(),
+            PaymentReference::new(payment_reference.to_owned()).unwrap(),
+            vec![PaymentEndpointIdentifier::new("btc-bitcoin-p2wpkh").unwrap()],
+        )
+        .build()
+        .unwrap(),
     )
     .unwrap()
 }
@@ -114,9 +111,11 @@ async fn attributable_invoice(
              invoice_envelope, payment_record_envelope,
              bitcoin_address_lookup_hash, derivation_index_lookup_hash,
              payment_status, confirmation_count, amount_matched,
-             invoice_created_at, payment_deadline, payment_in_hours
+             invoice_created_at, proposal_expires_at, payment_deadline,
+             proposal_acceptance_seconds, payment_window_seconds
          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                   'pending', 0, FALSE, $11, $12, 24)",
+                   'pending', 0, FALSE, $11, $11 + INTERVAL '1 hour', $12,
+                   3600, 86400)",
     )
     .bind(invoice_id)
     .bind(creator_id)
@@ -197,6 +196,7 @@ fn projection(
                 asset: "btc".into(),
                 payment_reference: payment_request_id.clone(),
                 proposal_expires_at: None,
+                payment_deadline: None,
                 accepted_endpoint_identifiers: vec!["btc-bitcoin-p2wpkh".into()],
                 metadata: serde_json::Map::new(),
             },

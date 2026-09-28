@@ -187,7 +187,7 @@ impl Server {
             pubky: pubky.clone(),
             paykit: config.paykit.clone(),
         });
-        let invoice_service = Arc::new(CreateInvoiceService::new(
+        let invoice_service = Arc::new(CreateInvoiceService::with_invoice_windows(
             session_validator.clone(),
             Arc::new(PubkyLockFetcher {
                 storage: pubky.public_storage(),
@@ -205,6 +205,8 @@ impl Server {
             Arc::new(PaykitIntentBuilder::new(
                 config.deployment_invariants().bitcoin_network.clone(),
             )),
+            config.paykit.proposal_acceptance_window,
+            config.paykit.payment_window,
         ));
         let connection_status_service = Arc::new(ConnectionStatusService::new(
             Arc::new(invoices.clone()),

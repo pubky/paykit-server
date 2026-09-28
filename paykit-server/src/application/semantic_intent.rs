@@ -52,6 +52,7 @@ pub struct PaymentTermsV1 {
     pub asset: String,
     pub payment_reference: String,
     pub proposal_expires_at: Option<String>,
+    pub payment_deadline: Option<String>,
     pub accepted_endpoint_identifiers: Vec<String>,
     #[serde(with = "json_map_as_string")]
     pub metadata: serde_json::Map<String, serde_json::Value>,
@@ -103,16 +104,23 @@ impl DeliveryIntentV1 {
         }
     }
 
-    /// Sets the transaction-authoritative proposal expiry before persistence.
-    pub fn set_proposal_expires_at(
+    /// Sets transaction-authoritative proposal and payment deadlines before persistence.
+    pub fn set_deadlines(
         &mut self,
         proposal_expires_at: String,
+        payment_deadline: String,
     ) -> Result<(), DeliveryIntentError> {
-        OffsetDateTime::parse(&proposal_expires_at, &Rfc3339)
+        let proposal = OffsetDateTime::parse(&proposal_expires_at, &Rfc3339)
             .map_err(|_| DeliveryIntentError::Invalid)?;
+        let payment = OffsetDateTime::parse(&payment_deadline, &Rfc3339)
+            .map_err(|_| DeliveryIntentError::Invalid)?;
+        if proposal >= payment {
+            return Err(DeliveryIntentError::Invalid);
+        }
         match &mut self.operation {
             DeliveryOperationV1::PaymentRequestProposal { terms } => {
                 terms.proposal_expires_at = Some(proposal_expires_at);
+                terms.payment_deadline = Some(payment_deadline);
                 self.validate()
             }
             DeliveryOperationV1::EndpointPublication { .. }
@@ -142,7 +150,7 @@ impl DeliveryIntentV1 {
             return Err(DeliveryIntentError::Invalid);
         }
         let intent = Self {
-            version: 2,
+            version: 3,
             reader_pubky,
             selected_reader_path: marker.receiver_path.as_str().into(),
             marker_fingerprint: Self::fingerprint(marker)?,
@@ -167,27 +175,32 @@ impl DeliveryIntentV1 {
         local_receiver_path: PaykitReceiverPath,
         terms: &PaymentRequestTerms,
     ) -> Result<Self, DeliveryIntentError> {
-        if terms.recurrence.is_some() {
+        if terms.recurrence().is_some() || terms.conversion().is_some() {
             return Err(DeliveryIntentError::Invalid);
         }
         let intent = Self {
-            version: 2,
+            version: 3,
             reader_pubky,
             selected_reader_path: marker.receiver_path.as_str().into(),
             marker_fingerprint: Self::fingerprint(marker)?,
             local_receiver_path: local_receiver_path.as_str().into(),
             operation: DeliveryOperationV1::PaymentRequestProposal {
                 terms: PaymentTermsV1 {
-                    amount: terms.amount.value.clone(),
-                    asset: terms.amount.asset.clone(),
-                    payment_reference: terms.payment_reference.to_string(),
-                    proposal_expires_at: terms.proposal_expires_at.clone(),
+                    amount: terms.amount().value().to_owned(),
+                    asset: terms.amount().asset().to_owned(),
+                    payment_reference: terms.payment_reference().to_string(),
+                    proposal_expires_at: terms.proposal_expires_at().clone(),
+                    payment_deadline: terms
+                        .payment_deadline()
+                        .map(|deadline| deadline.at(None))
+                        .transpose()
+                        .map_err(|_| DeliveryIntentError::Invalid)?,
                     accepted_endpoint_identifiers: terms
-                        .accepted_payment_endpoint_identifiers
+                        .accepted_payment_endpoint_identifiers()
                         .iter()
                         .map(ToString::to_string)
                         .collect(),
-                    metadata: terms.metadata.clone(),
+                    metadata: terms.metadata().clone(),
                 },
             },
         };
@@ -208,7 +221,7 @@ impl DeliveryIntentV1 {
             return Err(DeliveryIntentError::Invalid);
         }
         let intent = Self {
-            version: 2,
+            version: 3,
             reader_pubky: proposal.reader_pubky.clone(),
             selected_reader_path: proposal.selected_reader_path.clone(),
             marker_fingerprint: proposal.marker_fingerprint,
@@ -232,7 +245,7 @@ impl DeliveryIntentV1 {
 
     /// Revalidates every canonical value after authenticated deserialization.
     pub fn validate(&self) -> Result<(), DeliveryIntentError> {
-        if self.version != 2
+        if self.version != 3
             || crate::domain::locks::parse_reader(&self.reader_pubky).is_err()
             || PaykitReceiverPath::new(self.selected_reader_path.clone()).is_err()
             || PaykitReceiverPath::new(self.local_receiver_path.clone()).is_err()
@@ -272,8 +285,19 @@ impl DeliveryIntentV1 {
                         .proposal_expires_at
                         .as_ref()
                         .is_some_and(|value| OffsetDateTime::parse(value, &Rfc3339).is_err())
+                    || terms
+                        .payment_deadline
+                        .as_ref()
+                        .is_some_and(|value| OffsetDateTime::parse(value, &Rfc3339).is_err())
                 {
                     return Err(DeliveryIntentError::Invalid);
+                }
+                match (&terms.proposal_expires_at, &terms.payment_deadline) {
+                    (None, None) => {}
+                    (Some(proposal), Some(payment))
+                        if OffsetDateTime::parse(proposal, &Rfc3339).ok()
+                            < OffsetDateTime::parse(payment, &Rfc3339).ok() => {}
+                    _ => return Err(DeliveryIntentError::Invalid),
                 }
             }
             DeliveryOperationV1::PaymentRequestCancellation { payment_request_id } => {
@@ -365,7 +389,7 @@ mod tests {
     #[test]
     fn authenticated_but_invalid_stored_paths_fail_without_panicking() {
         let intent = DeliveryIntentV1 {
-            version: 2,
+            version: 3,
             reader_pubky: "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy".into(),
             selected_reader_path: "../invalid".into(),
             marker_fingerprint: [0; 32],
@@ -388,7 +412,7 @@ mod tests {
     #[test]
     fn debug_formatting_redacts_encrypted_business_values() {
         let intent = DeliveryIntentV1 {
-            version: 2,
+            version: 3,
             reader_pubky: "reader-secret".into(),
             selected_reader_path: "bitkit/wallet".into(),
             marker_fingerprint: [0; 32],
@@ -417,7 +441,7 @@ mod tests {
             ),
         ]);
         let intent = DeliveryIntentV1 {
-            version: 2,
+            version: 3,
             reader_pubky: "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy".into(),
             selected_reader_path: "bitkit/wallet".into(),
             marker_fingerprint: [9; 32],
@@ -428,6 +452,7 @@ mod tests {
                     asset: "btc".into(),
                     payment_reference: "550e8400-e29b-41d4-a716-446655440000".into(),
                     proposal_expires_at: None,
+                    payment_deadline: None,
                     accepted_endpoint_identifiers: vec!["btc-bitcoin-p2wpkh".into()],
                     metadata: metadata.clone(),
                 },
@@ -439,9 +464,47 @@ mod tests {
     }
 
     #[test]
+    fn persisted_payment_terms_keep_distinct_proposal_and_payment_deadlines() {
+        let proposal = "2027-01-15T08:00:00Z".to_owned();
+        let payment = "2027-01-16T07:00:00Z".to_owned();
+        let mut intent = DeliveryIntentV1 {
+            version: 3,
+            reader_pubky: "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy".into(),
+            selected_reader_path: "bitkit/wallet".into(),
+            marker_fingerprint: [9; 32],
+            local_receiver_path: "paykit/server".into(),
+            operation: DeliveryOperationV1::PaymentRequestProposal {
+                terms: PaymentTermsV1 {
+                    amount: "0.00000100".into(),
+                    asset: "btc".into(),
+                    payment_reference: "550e8400-e29b-41d4-a716-446655440000".into(),
+                    proposal_expires_at: None,
+                    payment_deadline: None,
+                    accepted_endpoint_identifiers: vec!["btc-bitcoin-p2wpkh".into()],
+                    metadata: Default::default(),
+                },
+            },
+        };
+
+        intent
+            .set_deadlines(proposal.clone(), payment.clone())
+            .unwrap();
+        let decoded = DeliveryIntentV1::decode(&postcard::to_allocvec(&intent).unwrap()).unwrap();
+        let DeliveryOperationV1::PaymentRequestProposal { terms } = decoded.operation() else {
+            panic!("proposal intent");
+        };
+        assert_eq!(
+            terms.proposal_expires_at.as_deref(),
+            Some(proposal.as_str())
+        );
+        assert_eq!(terms.payment_deadline.as_deref(), Some(payment.as_str()));
+        assert_ne!(terms.proposal_expires_at, terms.payment_deadline);
+    }
+
+    #[test]
     fn proposal_correlation_requires_exact_peer_path_and_terms() {
         let intent = DeliveryIntentV1 {
-            version: 2,
+            version: 3,
             reader_pubky: "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy".into(),
             selected_reader_path: "bitkit/wallet".into(),
             marker_fingerprint: [9; 32],
@@ -452,6 +515,7 @@ mod tests {
                     asset: "btc".into(),
                     payment_reference: "550e8400-e29b-41d4-a716-446655440000".into(),
                     proposal_expires_at: Some("2027-01-15T08:00:00Z".into()),
+                    payment_deadline: Some("2027-01-16T08:00:00Z".into()),
                     accepted_endpoint_identifiers: vec!["btc-bitcoin-p2wpkh".into()],
                     metadata: serde_json::Map::from_iter([(
                         "bundle_id".into(),

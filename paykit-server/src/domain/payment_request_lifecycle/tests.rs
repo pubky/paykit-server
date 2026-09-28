@@ -62,6 +62,7 @@ fn lifecycle_projection_debug_redacts_correlation_metadata() {
                 asset: "btc".into(),
                 payment_reference: "reference-secret".into(),
                 proposal_expires_at: None,
+                payment_deadline: None,
                 accepted_endpoint_identifiers: vec!["endpoint-secret".into()],
                 metadata: serde_json::Map::new(),
             },

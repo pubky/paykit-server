@@ -264,10 +264,11 @@ async fn startup_rejects_corrupt_encrypted_payment_records_before_readiness() {
           lock_resource_lookup_hash, payment_request_lookup_hash,
           invoice_envelope, payment_status,
           payment_record_envelope, bitcoin_address_lookup_hash,
-           derivation_index_lookup_hash, invoice_created_at, payment_deadline,
-           payment_in_hours)
+           derivation_index_lookup_hash, invoice_created_at, proposal_expires_at,
+           payment_deadline, proposal_acceptance_seconds, payment_window_seconds)
           VALUES ($1, $2, $3, $4, $5, $6, $7, 'undetected', $8, $9, $10,
-                  NOW(), NOW() + INTERVAL '1 hour', 1)",
+                  NOW(), NOW() + INTERVAL '30 minutes', NOW() + INTERVAL '1 hour',
+                  1800, 3600)",
     )
     .bind(invoice_id)
     .bind(creator_id)
@@ -670,7 +671,7 @@ async fn boot_scan_rejects_corrupt_creator_sdk_and_missing_state_without_histori
         )
         .await
         .unwrap();
-    sqlx::query("INSERT INTO invoices (creator_id, reader_lookup_hash, bundle_lookup_hash, lock_resource_lookup_hash, payment_request_lookup_hash, invoice_envelope, payment_record_envelope, bitcoin_address_lookup_hash, derivation_index_lookup_hash, payment_status, invoice_created_at, payment_deadline, payment_in_hours) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), NOW() + INTERVAL '1 hour', 1)")
+    sqlx::query("INSERT INTO invoices (creator_id, reader_lookup_hash, bundle_lookup_hash, lock_resource_lookup_hash, payment_request_lookup_hash, invoice_envelope, payment_record_envelope, bitcoin_address_lookup_hash, derivation_index_lookup_hash, payment_status, invoice_created_at, proposal_expires_at, payment_deadline, proposal_acceptance_seconds, payment_window_seconds) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), NOW() + INTERVAL '30 minutes', NOW() + INTERVAL '1 hour', 1800, 3600)")
         .bind(persisted.id()).bind(b"poison-reader".as_slice()).bind(b"poison-bundle".as_slice()).bind(b"poison-lock-resource".as_slice()).bind(b"poison-request".as_slice()).bind(b"poison-invoice".as_slice()).bind(b"poison-payment-record".as_slice()).bind(b"poison-address-hash".as_slice()).bind(b"poison-index-hash".as_slice()).bind("undetected").execute(database.pool()).await.unwrap();
     sqlx::query("INSERT INTO outbox (creator_id, intent_envelope, intent_kind, status) VALUES ($1, $2, 'endpoint_publication', $3)")
         .bind(persisted.id())

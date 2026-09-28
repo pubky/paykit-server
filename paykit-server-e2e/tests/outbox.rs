@@ -6,8 +6,8 @@ use std::{
 
 use async_trait::async_trait;
 use paykit_lib::{
-    PaykitReceiverMarker, PaykitReceiverPath, PaymentAmount, PaymentEndpointIdentifier,
-    PaymentReference, PaymentRequestTerms,
+    PaykitReceiverMarker, PaykitReceiverPath, PaymentAmount, PaymentDeadline,
+    PaymentEndpointIdentifier, PaymentReference, PaymentRequestTerms,
 };
 use paykit_sdk::{
     InMemoryStorage, LinkedPeerState, OutboundPrivateMessageStatus, PaykitReceiverCapabilities,
@@ -218,7 +218,8 @@ async fn every_claimed_invoice_row_has_one_complete_decryptable_intent_and_depen
             new_reader_payloads: &payloads,
             payment_request_intent: common::payment_intent(&reader),
             required_sats: 100,
-            payment_in_hours: 24,
+            proposal_acceptance_seconds: 60 * 60,
+            payment_window_seconds: 24 * 60 * 60,
         })
         .await
         .unwrap();
@@ -741,7 +742,8 @@ async fn public_sdk_payment_request_retry_persists_distinct_ids_and_only_active_
             },
             payment_request_intent: common::payment_intent(&reader),
             required_sats: 100,
-            payment_in_hours: 24,
+            proposal_acceptance_seconds: 60 * 60,
+            payment_window_seconds: 24 * 60 * 60,
         })
         .await
         .unwrap();
@@ -762,20 +764,27 @@ async fn public_sdk_payment_request_retry_persists_distinct_ids_and_only_active_
     assert_eq!(first_claim.id(), invoice.payment_request_outbox_id());
     let intent = outbox.delivery_intent(&first_claim).unwrap();
     let terms = match intent.operation() {
-        DeliveryOperationV1::PaymentRequestProposal { terms } => PaymentRequestTerms {
-            amount: PaymentAmount::new(terms.amount.clone(), terms.asset.clone()).unwrap(),
-            payment_reference: PaymentReference::new(terms.payment_reference.clone()).unwrap(),
-            proposal_expires_at: terms.proposal_expires_at.clone(),
-            recurrence: None,
-            accepted_payment_endpoint_identifiers: terms
+        DeliveryOperationV1::PaymentRequestProposal { terms } => PaymentRequestTerms::builder(
+            PaymentAmount::new(terms.amount.clone(), terms.asset.clone()).unwrap(),
+            PaymentReference::new(terms.payment_reference.clone()).unwrap(),
+            terms
                 .accepted_endpoint_identifiers
                 .iter()
                 .cloned()
                 .map(PaymentEndpointIdentifier::new)
                 .collect::<Result<Vec<_>, _>>()
                 .unwrap(),
-            metadata: terms.metadata.clone(),
-        },
+        )
+        .proposal_expires_at(terms.proposal_expires_at.clone())
+        .payment_deadline(
+            terms
+                .payment_deadline
+                .clone()
+                .map(|timestamp| PaymentDeadline::At { timestamp }),
+        )
+        .metadata(terms.metadata.clone())
+        .build()
+        .unwrap(),
         DeliveryOperationV1::EndpointPublication { .. } => panic!("claimed endpoint row"),
         DeliveryOperationV1::PaymentRequestCancellation { .. } => {
             panic!("claimed cancellation row")

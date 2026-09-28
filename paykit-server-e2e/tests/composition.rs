@@ -249,7 +249,8 @@ async fn real_sdk_receive_report_matches_durable_required_target() {
             },
             payment_request_intent: payment_intent(&reader, &marker),
             required_sats: 100,
-            payment_in_hours: 24,
+            proposal_acceptance_seconds: 60 * 60,
+            payment_window_seconds: 24 * 60 * 60,
         })
         .await
         .unwrap();
@@ -288,16 +289,13 @@ fn payment_intent(reader: &ReaderPubky, marker: &PaykitReceiverMarker) -> Delive
         reader.to_string(),
         marker,
         PaykitReceiverPath::new("paykit/server").unwrap(),
-        &PaymentRequestTerms {
-            amount: PaymentAmount::new("0.00000100", "btc").unwrap(),
-            payment_reference: PaymentReference::new(Uuid::new_v4().to_string()).unwrap(),
-            proposal_expires_at: None,
-            recurrence: None,
-            accepted_payment_endpoint_identifiers: vec![
-                PaymentEndpointIdentifier::new("btc-bitcoin-p2wpkh").unwrap(),
-            ],
-            metadata: Default::default(),
-        },
+        &PaymentRequestTerms::builder(
+            PaymentAmount::new("0.00000100", "btc").unwrap(),
+            PaymentReference::new(Uuid::new_v4().to_string()).unwrap(),
+            vec![PaymentEndpointIdentifier::new("btc-bitcoin-p2wpkh").unwrap()],
+        )
+        .build()
+        .unwrap(),
     )
     .unwrap()
 }
@@ -590,7 +588,8 @@ async fn production_server_workers_process_two_creators_without_sdk_state_fallba
             },
             payment_request_intent: payment_intent(&reader, &marker),
             required_sats: 100,
-            payment_in_hours: 24,
+            proposal_acceptance_seconds: 60 * 60,
+            payment_window_seconds: 24 * 60 * 60,
         })
         .await
         .unwrap();
@@ -608,7 +607,8 @@ async fn production_server_workers_process_two_creators_without_sdk_state_fallba
             },
             payment_request_intent: payment_intent(&reader, &marker),
             required_sats: 200,
-            payment_in_hours: 24,
+            proposal_acceptance_seconds: 60 * 60,
+            payment_window_seconds: 24 * 60 * 60,
         })
         .await
         .unwrap();
@@ -628,7 +628,8 @@ async fn production_server_workers_process_two_creators_without_sdk_state_fallba
             },
             payment_request_intent: payment_intent(&unreachable_reader, &marker),
             required_sats: 300,
-            payment_in_hours: 24,
+            proposal_acceptance_seconds: 60 * 60,
+            payment_window_seconds: 24 * 60 * 60,
         })
         .await
         .unwrap();
@@ -710,7 +711,9 @@ async fn production_server_workers_process_two_creators_without_sdk_state_fallba
 
     let payment_a = invoice_a.payment_request_outbox_id();
     let payment_b = invoice_b.payment_request_outbox_id();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    // Each Creator owns an independent SDK receive cycle. Under a loaded full
+    // workspace run, projecting both cycles can require more than one poll round.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let (request_a, request_b) = loop {
         let rows: Vec<(Uuid, String, Option<String>, Option<String>)> = sqlx::query_as(
             "SELECT id, status, sdk_payment_request_id, error_class
