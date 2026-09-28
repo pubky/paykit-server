@@ -465,7 +465,7 @@ Keep `/transactions/status` factual and backward-compatible.
 - Modify: `README.md` and operator docs discovered at implementation time
 - Test: runtime/readiness/shutdown tests
 
-**RED:** Cover expired backlog target exclusion, degraded persistence/provider behavior, shutdown stopping new work, bounded join, and identifier-free metrics/health.
+**RED:** Cover continued targeting of expired/non-final invoices for factual reconciliation while access eligibility remains expired, degraded persistence/provider behavior, shutdown stopping new work, bounded join, and identifier-free metrics/health.
 
 **GREEN:** Reuse existing observer/outbox worker ownership. Do not create a hot-loop drain poller when state can be updated transactionally/through existing workers.
 
