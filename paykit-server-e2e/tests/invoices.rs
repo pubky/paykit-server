@@ -96,16 +96,13 @@ fn payment_intent() -> DeliveryIntentV1 {
         reader().to_string(),
         &marker(),
         PaykitReceiverPath::new("paykit/server").unwrap(),
-        &PaymentRequestTerms {
-            amount: PaymentAmount::new("0.00000100", "btc").unwrap(),
-            payment_reference: PaymentReference::new(uuid::Uuid::new_v4().to_string()).unwrap(),
-            proposal_expires_at: None,
-            recurrence: None,
-            accepted_payment_endpoint_identifiers: vec![
-                PaymentEndpointIdentifier::new("btc-bitcoin-p2wpkh").unwrap(),
-            ],
-            metadata: Default::default(),
-        },
+        &PaymentRequestTerms::builder(
+            PaymentAmount::new("0.00000100", "btc").unwrap(),
+            PaymentReference::new(uuid::Uuid::new_v4().to_string()).unwrap(),
+            vec![PaymentEndpointIdentifier::new("btc-bitcoin-p2wpkh").unwrap()],
+        )
+        .build()
+        .unwrap(),
     )
     .unwrap()
 }
@@ -218,7 +215,8 @@ fn input<'a>(
         new_reader_payloads: &TEST_PAYLOADS,
         payment_request_intent: payment_intent(),
         required_sats: 100,
-        payment_in_hours: 24,
+        proposal_acceptance_seconds: 60 * 60,
+        payment_window_seconds: 24 * 60 * 60,
     }
 }
 
@@ -345,7 +343,9 @@ async fn invoice_allocation_encrypts_payloads_orders_outbox_and_replays() {
         time::Duration::hours(24)
     );
     let persisted_times = sqlx::query(
-        "SELECT invoice_created_at, payment_deadline, payment_in_hours FROM invoices WHERE id = $1",
+        "SELECT invoice_created_at, proposal_expires_at, payment_deadline,
+                proposal_acceptance_seconds, payment_window_seconds
+         FROM invoices WHERE id = $1",
     )
     .bind(first.invoice_id())
     .fetch_one(database.pool())
@@ -359,7 +359,19 @@ async fn invoice_allocation_encrypts_payloads_orders_outbox_and_replays() {
         persisted_times.get::<time::OffsetDateTime, _>("payment_deadline"),
         first.payment_deadline()
     );
-    assert_eq!(persisted_times.get::<i64, _>("payment_in_hours"), 24);
+    let proposal_expires_at = persisted_times.get::<time::OffsetDateTime, _>("proposal_expires_at");
+    assert_eq!(
+        proposal_expires_at - first.invoice_created_at(),
+        time::Duration::hours(1)
+    );
+    assert_eq!(
+        persisted_times.get::<i64, _>("proposal_acceptance_seconds"),
+        60 * 60
+    );
+    assert_eq!(
+        persisted_times.get::<i64, _>("payment_window_seconds"),
+        24 * 60 * 60
+    );
     assert_eq!(
         store
             .preflight(&creator, b"bundle-one", b"request-one")
@@ -490,10 +502,13 @@ async fn invoice_allocation_encrypts_payloads_orders_outbox_and_replays() {
     let original_reference = match original_intent.operation() {
         DeliveryOperationV1::PaymentRequestProposal { terms } => {
             let deadline = first.payment_deadline().format(&Rfc3339).unwrap();
+            let proposal_expiry = proposal_expires_at.format(&Rfc3339).unwrap();
             assert_eq!(
                 terms.proposal_expires_at.as_deref(),
-                Some(deadline.as_str())
+                Some(proposal_expiry.as_str())
             );
+            assert_eq!(terms.payment_deadline.as_deref(), Some(deadline.as_str()));
+            assert_ne!(terms.proposal_expires_at, terms.payment_deadline);
             terms.payment_reference.clone()
         }
         DeliveryOperationV1::EndpointPublication { .. } => {
@@ -587,10 +602,18 @@ async fn invoice_allocation_encrypts_payloads_orders_outbox_and_replays() {
         Err(PersistenceError::Conflict)
     );
     let mut changed_window = input(&creator, &reader, b"bundle-one", b"request-one");
-    changed_window.payment_in_hours = 12;
+    changed_window.proposal_acceptance_seconds = 30 * 60;
+    changed_window.payment_window_seconds = 12 * 60 * 60;
+    let replay_after_policy_change = store.create_atomic(changed_window).await.unwrap();
+    assert!(replay_after_policy_change.replayed());
+    assert_eq!(replay_after_policy_change.invoice_id(), first.invoice_id());
     assert_eq!(
-        store.create_atomic(changed_window).await,
-        Err(PersistenceError::Conflict)
+        replay_after_policy_change.invoice_created_at(),
+        first.invoice_created_at()
+    );
+    assert_eq!(
+        replay_after_policy_change.payment_deadline(),
+        first.payment_deadline()
     );
 
     let second = store
@@ -640,15 +663,15 @@ async fn unrepresentable_payment_deadline_rolls_back_all_invoice_side_effects() 
     let store = invoice_store(&database).await;
     let creator = creator();
     let reader = reader();
-    for (suffix, payment_in_hours) in [
+    for (suffix, payment_window_seconds) in [
         ("u64", u64::MAX),
         ("duration", i64::MAX as u64),
-        ("rfc3339", 100_000_000_u64),
+        ("rfc3339", 1_000_000_000_000_u64),
     ] {
         let bundle = format!("overflow-bundle-{suffix}");
         let request = format!("overflow-request-{suffix}");
         let mut invalid = input(&creator, &reader, bundle.as_bytes(), request.as_bytes());
-        invalid.payment_in_hours = payment_in_hours;
+        invalid.payment_window_seconds = payment_window_seconds;
         assert_eq!(
             store.create_atomic(invalid).await,
             Err(PersistenceError::InvalidInput)
@@ -888,7 +911,8 @@ async fn concurrent_creators_own_distinct_intents_at_the_same_child_index() {
             new_reader_payloads: &first_payloads,
             payment_request_intent: payment_intent(),
             required_sats: 100,
-            payment_in_hours: 24,
+            proposal_acceptance_seconds: 60 * 60,
+            payment_window_seconds: 24 * 60 * 60,
         }),
         second_store.create_atomic(AtomicInvoiceInput {
             creator: &second_creator,
@@ -899,7 +923,8 @@ async fn concurrent_creators_own_distinct_intents_at_the_same_child_index() {
             new_reader_payloads: &second_payloads,
             payment_request_intent: payment_intent(),
             required_sats: 100,
-            payment_in_hours: 24,
+            proposal_acceptance_seconds: 60 * 60,
+            payment_window_seconds: 24 * 60 * 60,
         })
     );
     let first = first.unwrap();

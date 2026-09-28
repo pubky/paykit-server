@@ -107,16 +107,16 @@ fn library_payment_request_has_exact_terms_amount_and_metadata() {
     let terms = PaykitIntentBuilder::new(BitcoinNetwork::Mainnet)
         .payment_request_terms(&request, &valid_lock())
         .unwrap();
-    assert_eq!(terms.amount.value, "0.00050000");
-    assert_eq!(terms.amount.asset, "btc");
-    assert_eq!(terms.proposal_expires_at, None);
-    assert_eq!(terms.recurrence, None);
+    assert_eq!(terms.amount().value(), "0.00050000");
+    assert_eq!(terms.amount().asset(), "btc");
+    assert_eq!(terms.proposal_expires_at(), &None);
+    assert_eq!(terms.recurrence(), &None);
     assert_eq!(
-        terms.accepted_payment_endpoint_identifiers[0].as_str(),
+        terms.accepted_payment_endpoint_identifiers()[0].as_str(),
         "btc-bitcoin-p2wpkh"
     );
     assert_eq!(
-        serde_json::Value::Object(terms.metadata),
+        serde_json::Value::Object(terms.metadata().clone()),
         serde_json::json!({"bundle_id":BUNDLE,"lock_resource":LOCK_RESOURCE,"reader":reader()})
     );
 }
@@ -136,7 +136,7 @@ fn payment_request_and_private_payment_list_use_the_configured_network() {
         let details = builder.receiving_details("address").unwrap();
 
         assert_eq!(
-            terms.accepted_payment_endpoint_identifiers[0].as_str(),
+            terms.accepted_payment_endpoint_identifiers()[0].as_str(),
             expected_identifier
         );
         assert_eq!(details[0].0.as_str(), expected_identifier);

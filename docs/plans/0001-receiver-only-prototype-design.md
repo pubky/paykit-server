@@ -316,15 +316,20 @@ Rules:
 
 ## Payment Request delivery
 
-**EXPLICIT**:
+**EXPLICIT — deadline amendment (2026-09-28) supersedes the earlier equal-deadline
+and stop-observing design**:
 
 - Paykit v0.2 Payment Request wire message has `version: 1`, `kind: "paykit.payment_request"`, UUID-v4 `event_id`, UUID-v4 `payment_request_id`, and a `request` wrapper containing the accepted one-time request fields.
 - New invoice creates one immutable one-time Payment Request.
-- Payment Request `proposal_expires_at` equals the persisted application `payment_deadline`.
+- Paykit Server deployment config owns separate proposal-acceptance and payment
+  windows, defaulting to one hour and 24 hours from persisted invoice creation.
+  `proposal_expires_at` is strictly earlier than `payment_deadline`; proposal expiry
+  has no settlement effect after acceptance.
 - Payment Request `recurrence` is `null` because request is one-time.
-- Paykit Server accepts only a qualifying output first observed by the application deadline;
-  late payment can receive no access or refund. A timely matched output remains monitored to
-  factual Bitcoin finality after the deadline.
+- Paykit Server classifies a qualifying first observation at or before the inclusive
+  payment deadline as timely. Late payment receives no automatic access or refund,
+  but late and underpaid outputs remain observed and durable through factual Bitcoin
+  finality for reconciliation.
 - Payment Request metadata contains exact fields `bundle_id`, `lock_resource`, and `reader` copied from accepted invoice request.
 - Metadata does not duplicate amount, asset, Payment Reference, address, or creator identity.
 - `POST /invoices` returns `200 OK` with only RFC 3339 `invoice_created_at` and
@@ -367,7 +372,9 @@ Rules:
 - Attempt count and `next_attempt_at` are persisted.
 - Workers claim outbox work with a 30-second lease; expired lease makes work reclaimable after worker failure.
 - Non-retryable SDK/protocol failure marks row `permanently_failed`, retains it with redacted error class, degrades health, and receives no automatic retry.
-- Transient failures never dead-letter by attempt count because invoices have no expiry.
+- Transient delivery failures never dead-letter by attempt count. Proposal/payment
+  eligibility deadlines remain orthogonal to outbox delivery and factual Bitcoin
+  reconciliation.
 
 ## Payer-originated events
 

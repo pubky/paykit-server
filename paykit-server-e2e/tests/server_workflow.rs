@@ -655,6 +655,7 @@ async fn assert_persisted_workflow_inputs(
     crypto: &Crypto,
     reader: &ReaderPubky,
     fixtures: &[(&CreatorFixture, &str)],
+    http_deadlines: &HashMap<&str, String>,
 ) {
     type Row = (
         Vec<u8>,
@@ -662,6 +663,7 @@ async fn assert_persisted_workflow_inputs(
         uuid::Uuid,
         Vec<u8>,
         uuid::Uuid,
+        time::OffsetDateTime,
         time::OffsetDateTime,
         Vec<u8>,
         Vec<u8>,
@@ -673,7 +675,8 @@ async fn assert_persisted_workflow_inputs(
     let rows: Vec<Row> = sqlx::query_as(
         "SELECT c.creator_lookup_hash, c.next_child_index,
                 r.id, r.assignment_envelope,
-                i.id, i.payment_deadline, i.invoice_envelope, i.payment_record_envelope,
+                i.id, i.proposal_expires_at, i.payment_deadline,
+                i.invoice_envelope, i.payment_record_envelope,
                 endpoint.id, endpoint.intent_envelope,
                 payment.id, payment.intent_envelope
          FROM creators c
@@ -695,6 +698,7 @@ async fn assert_persisted_workflow_inputs(
         assignment_id,
         assignment_envelope,
         invoice_id,
+        proposal_expires_at,
         payment_deadline,
         invoice_envelope,
         payment_record_envelope,
@@ -732,7 +736,7 @@ async fn assert_persisted_workflow_inputs(
             )
             .unwrap();
         let endpoint = DeliveryIntentV1::decode(&endpoint_plaintext).unwrap();
-        assert_eq!(endpoint.version(), 2);
+        assert_eq!(endpoint.version(), 3);
         assert_eq!(endpoint.reader_pubky(), reader.to_string());
         assert_eq!(
             endpoint.selected_reader_path().unwrap().as_str(),
@@ -759,7 +763,7 @@ async fn assert_persisted_workflow_inputs(
             )
             .unwrap();
         let payment = DeliveryIntentV1::decode(&payment_plaintext).unwrap();
-        assert_eq!(payment.version(), 2);
+        assert_eq!(payment.version(), 3);
         assert_eq!(payment.reader_pubky(), reader.to_string());
         assert_eq!(
             payment.selected_reader_path().unwrap().as_str(),
@@ -775,9 +779,14 @@ async fn assert_persisted_workflow_inputs(
             fixture.amount_sats / 100_000_000,
             fixture.amount_sats % 100_000_000
         );
+        let proposal_expires_at = proposal_expires_at
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
         let payment_deadline = payment_deadline
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap();
+        assert_ne!(proposal_expires_at, payment_deadline);
+        assert_eq!(http_deadlines.get(bundle), Some(&payment_deadline));
         assert!(matches!(
             payment.operation(),
             DeliveryOperationV1::PaymentRequestProposal { terms }
@@ -787,7 +796,8 @@ async fn assert_persisted_workflow_inputs(
                         .is_ok_and(|reference| reference.get_version_num() == 4
                             && reference.get_variant() == uuid::Variant::RFC4122
                             && terms.payment_reference == reference.hyphenated().to_string())
-                    && terms.proposal_expires_at.as_deref() == Some(payment_deadline.as_str())
+                    && terms.proposal_expires_at.as_deref() == Some(proposal_expires_at.as_str())
+                    && terms.payment_deadline.as_deref() == Some(payment_deadline.as_str())
                     && terms.accepted_endpoint_identifiers == ["btc-testnet-p2wpkh"]
                     && terms.metadata.get("bundle_id") == Some(&serde_json::json!(bundle))
                     && terms.metadata.get("lock_resource")
@@ -909,7 +919,8 @@ async fn composed_two_creator_receiver_workflow_survives_restart() {
         "Creator B invoice body: {}",
         String::from_utf8_lossy(&invoice_b.body)
     );
-    for response in [&invoice_a, &invoice_b] {
+    let mut http_deadlines = HashMap::new();
+    for (bundle, response) in [(BUNDLE_A, &invoice_a), (BUNDLE_B, &invoice_b)] {
         let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
         let object = body.as_object().unwrap();
         assert_eq!(object.len(), 2);
@@ -923,12 +934,21 @@ async fn composed_two_creator_receiver_workflow_survives_restart() {
             )
             .unwrap();
         }
+        http_deadlines.insert(
+            bundle,
+            object
+                .get("payment_deadline")
+                .and_then(serde_json::Value::as_str)
+                .unwrap()
+                .to_owned(),
+        );
     }
     assert_persisted_workflow_inputs(
         &first_pool,
         &crypto,
         &reader,
         &[(&creator_a, BUNDLE_A), (&creator_b, BUNDLE_B)],
+        &http_deadlines,
     )
     .await;
 

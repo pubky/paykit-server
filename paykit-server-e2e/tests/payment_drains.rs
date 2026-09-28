@@ -2,8 +2,8 @@ use std::{sync::Arc, time::Duration};
 
 use paykit_lib::{
     PaykitReceiverCapabilities, PaykitReceiverMarker, PaykitReceiverPath, PaymentAmount,
-    PaymentEndpointIdentifier, PaymentEndpointPayload, PaymentReference, PaymentRequestTerms,
-    PublicKey,
+    PaymentDeadline, PaymentEndpointIdentifier, PaymentEndpointPayload, PaymentReference,
+    PaymentRequestTerms, PublicKey,
 };
 use paykit_sdk::{PubkyPublicKey, ReceiverNoiseSecretKey, storage::StorageState};
 use paykit_server::{
@@ -68,16 +68,17 @@ fn proposal_intent_for_reference(receiver_path: &str, payment_reference: &str) -
         READER.into(),
         &marker(receiver_path),
         PaykitReceiverPath::new("paykit/server").unwrap(),
-        &PaymentRequestTerms {
-            amount: PaymentAmount::new("0.00001000", "BTC").unwrap(),
-            payment_reference: PaymentReference::new(payment_reference.to_owned()).unwrap(),
-            proposal_expires_at: Some("2027-01-15T08:00:00Z".into()),
-            recurrence: None,
-            accepted_payment_endpoint_identifiers: vec![
-                PaymentEndpointIdentifier::new("btc-bitcoin-p2wpkh").unwrap(),
-            ],
-            metadata: serde_json::Map::new(),
-        },
+        &PaymentRequestTerms::builder(
+            PaymentAmount::new("0.00001000", "BTC").unwrap(),
+            PaymentReference::new(payment_reference.to_owned()).unwrap(),
+            vec![PaymentEndpointIdentifier::new("btc-bitcoin-p2wpkh").unwrap()],
+        )
+        .proposal_expires_at(Some("2027-01-15T08:00:00Z".into()))
+        .payment_deadline(Some(PaymentDeadline::At {
+            timestamp: "2027-01-16T08:00:00Z".into(),
+        }))
+        .build()
+        .unwrap(),
     )
     .unwrap()
 }
@@ -121,7 +122,8 @@ fn admission_input<'a>(
             "00000000-0000-4000-8000-000000000001",
         ),
         required_sats: 1_000,
-        payment_in_hours: 24,
+        proposal_acceptance_seconds: 60 * 60,
+        payment_window_seconds: 24 * 60 * 60,
     }
 }
 
@@ -206,9 +208,11 @@ async fn insert_invoice_with_receiver_path(
              payment_request_lookup_hash,
              invoice_envelope, payment_record_envelope, bitcoin_address_lookup_hash,
              derivation_index_lookup_hash, payment_status, confirmation_count,
-             amount_matched, invoice_created_at, payment_deadline, payment_in_hours
+             amount_matched, invoice_created_at, proposal_expires_at, payment_deadline,
+             proposal_acceptance_seconds, payment_window_seconds
          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
-                   'undetected', 0, FALSE, $12, $13, 24)",
+                   'undetected', 0, FALSE, $12, $12 + INTERVAL '1 hour', $13,
+                   3600, 86400)",
     )
     .bind(invoice_id)
     .bind(creator_id)
@@ -353,6 +357,7 @@ async fn insert_projectable_attempt(
                 asset: "BTC".into(),
                 payment_reference: request_id,
                 proposal_expires_at: Some("2027-01-15T08:00:00Z".into()),
+                payment_deadline: Some("2027-01-16T08:00:00Z".into()),
                 accepted_endpoint_identifiers: vec!["btc-bitcoin-p2wpkh".into()],
                 metadata: serde_json::Map::new(),
             },
@@ -533,6 +538,8 @@ async fn missing_required_intake_blocks_drain_snapshot_and_status_lookup() {
         receiver_path: PaykitReceiverPath::new("paykit/server").unwrap(),
         receiver_path_priority: vec![ReceiverPathPriority::parse("bitkit".into()).unwrap()],
         network: PaykitNetwork::Testnet,
+        proposal_acceptance_window: Duration::from_secs(60 * 60),
+        payment_window: Duration::from_secs(24 * 60 * 60),
     };
     let storage = PostgresStorageAdapter::new(database.pool(), crypto.clone(), persisted.id());
     let sessions =

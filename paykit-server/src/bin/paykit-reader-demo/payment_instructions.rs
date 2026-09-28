@@ -59,7 +59,7 @@ pub(super) fn payment_instructions(
     let terms = request.terms.as_ref().ok_or(Failure::ProtocolFailed)?;
     if terms.amount.asset != "btc"
         || terms.recurrence.is_some()
-        || terms.proposal_expires_at.is_some()
+        || terms.conversion.is_some()
         || terms.accepted_payment_endpoint_identifiers != [BITCOIN_ENDPOINT.to_owned()]
         || terms
             .metadata
@@ -155,6 +155,8 @@ mod tests {
                 payment_reference: "reference-1".into(),
                 proposal_expires_at: None,
                 recurrence: None,
+                conversion: None,
+                payment_deadline: None,
                 accepted_payment_endpoint_identifiers: vec![BITCOIN_ENDPOINT.into()],
                 metadata: Map::from_iter([("reader".into(), json!(reader.to_app_key()))]),
             }),
@@ -165,6 +167,7 @@ mod tests {
             canceled_event_id: None,
             canceled_outbound_status: None,
             payment_proofs: Vec::new(),
+            conversion_quotes: Vec::new(),
             last_stream_item_id: Some(1),
             last_outbound_message_id: None,
             last_outbound_status: None,
@@ -227,6 +230,20 @@ mod tests {
                 ),
                 "optional_mining_command": "docker compose exec -T bitcoin sh -ec 'bitcoin-cli -conf=\"$BITCOIN_DATA/bitcoin.conf\" -regtest -rpcwallet=miner generatetoaddress 6 \"$(bitcoin-cli -conf=\"$BITCOIN_DATA/bitcoin.conf\" -regtest -rpcwallet=miner getnewaddress)\"'"
             })
+        );
+    }
+
+    #[test]
+    fn accepts_server_owned_distinct_proposal_and_payment_deadlines() {
+        let mut request = request();
+        let terms = request.terms.as_mut().unwrap();
+        terms.proposal_expires_at = Some("2027-01-15T08:00:00Z".into());
+        terms.payment_deadline = Some(paykit_lib::PaymentDeadline::At {
+            timestamp: "2027-01-16T08:00:00Z".into(),
+        });
+
+        assert!(
+            payment_instructions(&request, &private_list(&regtest_p2wpkh()), &reader()).is_ok()
         );
     }
 

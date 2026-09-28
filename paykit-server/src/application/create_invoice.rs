@@ -191,22 +191,22 @@ impl IntentBuilder for PaykitIntentBuilder {
             Value::String(request.lock_resource.to_string()),
         );
         metadata.insert("reader".into(), Value::String(request.reader.to_string()));
-        Ok(PaymentRequestTerms {
-            amount: PaymentAmount::new(
+        PaymentRequestTerms::builder(
+            PaymentAmount::new(
                 format!("{}.{:08}", sats / 100_000_000, sats % 100_000_000),
                 "btc",
             )
             .map_err(|_| CreateInvoiceError::InvalidRequest)?,
-            payment_reference: PaymentReference::new(uuid::Uuid::new_v4().hyphenated().to_string())
+            PaymentReference::new(uuid::Uuid::new_v4().hyphenated().to_string())
                 .map_err(|_| CreateInvoiceError::InvalidRequest)?,
-            proposal_expires_at: None,
-            recurrence: None,
-            accepted_payment_endpoint_identifiers: vec![
+            vec![
                 PaymentEndpointIdentifier::new(self.p2wpkh_identifier())
                     .map_err(|_| CreateInvoiceError::InvalidRequest)?,
             ],
-            metadata,
-        })
+        )
+        .metadata(metadata)
+        .build()
+        .map_err(|_| CreateInvoiceError::InvalidRequest)
     }
 
     fn receiving_details(
@@ -314,6 +314,8 @@ pub struct CreateInvoiceService {
     store: Arc<dyn InvoicePersistence>,
     intents: Arc<dyn IntentBuilder>,
     clock: Arc<dyn DeadlineClock>,
+    proposal_acceptance_window: Duration,
+    payment_window: Duration,
 }
 impl CreateInvoiceService {
     #[allow(clippy::too_many_arguments)]
@@ -355,6 +357,67 @@ impl CreateInvoiceService {
         intents: Arc<dyn IntentBuilder>,
         clock: Arc<dyn DeadlineClock>,
     ) -> Self {
+        Self::with_clock_and_windows(
+            sessions,
+            locks,
+            markers,
+            marker_priority,
+            local_receiver_path,
+            credentials,
+            bitcoin_network,
+            store,
+            intents,
+            clock,
+            Duration::from_secs(60 * 60),
+            Duration::from_secs(24 * 60 * 60),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_invoice_windows(
+        sessions: Arc<dyn SessionValidator>,
+        locks: Arc<dyn LockFetcher>,
+        markers: Arc<dyn MarkerDiscovery>,
+        marker_priority: Vec<ReceiverPathPriority>,
+        local_receiver_path: PaykitReceiverPath,
+        credentials: Arc<dyn CreatorXpubProvider>,
+        bitcoin_network: crate::config::BitcoinNetwork,
+        store: Arc<dyn InvoicePersistence>,
+        intents: Arc<dyn IntentBuilder>,
+        proposal_acceptance_window: Duration,
+        payment_window: Duration,
+    ) -> Self {
+        Self::with_clock_and_windows(
+            sessions,
+            locks,
+            markers,
+            marker_priority,
+            local_receiver_path,
+            credentials,
+            bitcoin_network,
+            store,
+            intents,
+            Arc::new(SystemDeadlineClock),
+            proposal_acceptance_window,
+            payment_window,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn with_clock_and_windows(
+        sessions: Arc<dyn SessionValidator>,
+        locks: Arc<dyn LockFetcher>,
+        markers: Arc<dyn MarkerDiscovery>,
+        marker_priority: Vec<ReceiverPathPriority>,
+        local_receiver_path: PaykitReceiverPath,
+        credentials: Arc<dyn CreatorXpubProvider>,
+        bitcoin_network: crate::config::BitcoinNetwork,
+        store: Arc<dyn InvoicePersistence>,
+        intents: Arc<dyn IntentBuilder>,
+        clock: Arc<dyn DeadlineClock>,
+        proposal_acceptance_window: Duration,
+        payment_window: Duration,
+    ) -> Self {
         Self {
             sessions,
             locks,
@@ -366,6 +429,8 @@ impl CreateInvoiceService {
             store,
             intents,
             clock,
+            proposal_acceptance_window,
+            payment_window,
         }
     }
 
@@ -497,7 +562,8 @@ impl CreateInvoiceService {
                 new_reader_payloads: &new_reader_payloads,
                 payment_request_intent,
                 required_sats: extract_terms(&lock)?.as_sats(),
-                payment_in_hours: request.payment_in.get(),
+                proposal_acceptance_seconds: self.proposal_acceptance_window.as_secs(),
+                payment_window_seconds: self.payment_window.as_secs(),
             })
             .await
             .map_err(map_store)

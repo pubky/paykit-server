@@ -8,8 +8,8 @@ use std::{
 
 use async_trait::async_trait;
 use paykit_lib::{
-    PaykitReceiverPath, PaymentAmount, PaymentEndpointIdentifier, PaymentReference,
-    PaymentRequestId, PaymentRequestTerms,
+    PaykitReceiverPath, PaymentAmount, PaymentDeadline, PaymentEndpointIdentifier,
+    PaymentReference, PaymentRequestId, PaymentRequestTerms,
 };
 use paykit_sdk::{
     LinkedPeerState, OutboundPrivateMessageStatus, PaykitSdk, PaykitSdkConfig, PaykitSdkError,
@@ -563,6 +563,12 @@ fn lifecycle_projection(
                 asset: terms.amount.asset.clone(),
                 payment_reference: terms.payment_reference.clone(),
                 proposal_expires_at: terms.proposal_expires_at.clone(),
+                payment_deadline: terms
+                    .payment_deadline
+                    .as_ref()
+                    .map(|deadline| deadline.at(None))
+                    .transpose()
+                    .map_err(|_| LifecycleSyncError::InvalidProjection)?,
                 accepted_endpoint_identifiers: terms.accepted_payment_endpoint_identifiers.clone(),
                 metadata: terms.metadata.clone(),
             },
@@ -669,14 +675,21 @@ fn payment_terms(terms: &PaymentTermsV1) -> Result<PaymentRequestTerms, HandoffE
         .map(PaymentEndpointIdentifier::new)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| HandoffError::Permanent)?;
-    Ok(PaymentRequestTerms {
+    PaymentRequestTerms::builder(
         amount,
         payment_reference,
-        proposal_expires_at: terms.proposal_expires_at.clone(),
-        recurrence: None,
         accepted_payment_endpoint_identifiers,
-        metadata: terms.metadata.clone(),
-    })
+    )
+    .proposal_expires_at(terms.proposal_expires_at.clone())
+    .payment_deadline(
+        terms
+            .payment_deadline
+            .clone()
+            .map(|timestamp| PaymentDeadline::At { timestamp }),
+    )
+    .metadata(terms.metadata.clone())
+    .build()
+    .map_err(|_| HandoffError::Permanent)
 }
 
 #[async_trait]
@@ -900,7 +913,7 @@ mod tests {
             report: error
                 .is_none()
                 .then_some(paykit_sdk::PrivateStreamIntakeReport {
-                    receive_batch_id: 1,
+                    receive_batch_id: Some(1),
                     stream_item_ids: Vec::new(),
                     event_conflicts: Vec::new(),
                 }),
@@ -1250,6 +1263,7 @@ mod tests {
                     asset: "btc".into(),
                     payment_reference: Uuid::new_v4().to_string(),
                     proposal_expires_at: None,
+                    payment_deadline: None,
                     accepted_endpoint_identifiers: vec!["btc-bitcoin-p2wpkh".into()],
                     metadata: serde_json::Map::new(),
                 },
