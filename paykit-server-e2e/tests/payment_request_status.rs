@@ -196,6 +196,78 @@ async fn per_bundle_status_joins_canonical_lifecycle_and_payment_facts() {
     assert!(tied.amount_matched());
     assert_confirmed_payment(&store, &creator, &bundle).await;
 
+    sqlx::query(
+        "UPDATE invoices
+         SET payment_status = 'undetected', confirmation_count = 0, amount_matched = FALSE
+         WHERE id = $1",
+    )
+    .bind(invoice_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    let rejected_undetected = PaymentRequestStatusOperations::lookup(&store, &creator, &bundle)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        rejected_undetected.request_state(),
+        PaymentRequestLifecycleState::Rejected
+    );
+    assert_eq!(
+        rejected_undetected.payment_state(),
+        PaymentState::Undetected
+    );
+    assert_eq!(rejected_undetected.confirmations(), 0);
+    assert!(!rejected_undetected.amount_matched());
+    assert_eq!(
+        store.payment_status(&creator, &bundle).await.unwrap(),
+        Some(PersistedPaymentStatus::Undetected)
+    );
+
+    sqlx::query(
+        "UPDATE invoices
+         SET payment_status = 'confirmed', confirmation_count = 3, amount_matched = TRUE
+         WHERE id = $1",
+    )
+    .bind(invoice_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "DELETE FROM payment_request_lifecycles
+         WHERE invoice_id = $1 AND request_state = 'rejected'",
+    )
+    .bind(invoice_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    let canceled = PaymentRequestStatusOperations::lookup(&store, &creator, &bundle)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        canceled.request_state(),
+        PaymentRequestLifecycleState::Canceled
+    );
+    assert_eq!(canceled.payment_state(), PaymentState::Confirmed);
+    assert_eq!(canceled.confirmations(), 3);
+    assert!(canceled.amount_matched());
+    assert_confirmed_payment(&store, &creator, &bundle).await;
+
+    sqlx::query(
+        "INSERT INTO payment_request_lifecycles (
+             invoice_id, sdk_payment_request_id, request_state, state_event_id,
+             last_stream_item_id, last_outbound_message_id, last_event_at
+         ) VALUES ($1, $2, 'rejected', $3, 2, 2, $4)",
+    )
+    .bind(invoice_id)
+    .bind("00000000-0000-0000-0000-000000000001")
+    .bind(Uuid::new_v4().to_string())
+    .bind(tied_at)
+    .execute(database.pool())
+    .await
+    .unwrap();
+
     let corrupt_lifecycle = sqlx::query(
         "UPDATE payment_request_lifecycles SET request_state = 'unexpected' WHERE invoice_id = $1",
     )
