@@ -2976,7 +2976,7 @@ dependencies = [
 [[package]]
 name = "paykit-lib"
 version = "0.1.0-rc56"
-source = "git+https://github.com/pubky/paykit-rs.git?rev=24162ebbcc703251d8038f2e176d1f4cfb117c6a#24162ebbcc703251d8038f2e176d1f4cfb117c6a"
+source = "git+https://github.com/pubky/paykit-rs.git?tag=v0.1.0-rc56#24162ebbcc703251d8038f2e176d1f4cfb117c6a"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2996,7 +2996,7 @@ dependencies = [
 [[package]]
 name = "paykit-sdk"
 version = "0.1.0-rc56"
-source = "git+https://github.com/pubky/paykit-rs.git?rev=24162ebbcc703251d8038f2e176d1f4cfb117c6a#24162ebbcc703251d8038f2e176d1f4cfb117c6a"
+source = "git+https://github.com/pubky/paykit-rs.git?tag=v0.1.0-rc56#24162ebbcc703251d8038f2e176d1f4cfb117c6a"
 dependencies = [
  "anyhow",
  "async-trait",
