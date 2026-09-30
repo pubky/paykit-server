@@ -48,6 +48,7 @@ use pubky_testnet::{EphemeralTestnet, pubky::Keypair};
 use sqlx::PgPool;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tower::ServiceExt;
+use uuid::Uuid;
 
 #[path = "fixtures/sdk.rs"]
 mod sdk_fixtures;
@@ -1078,24 +1079,24 @@ async fn composed_two_creator_receiver_workflow_survives_restart() {
     database.cleanup().await;
 }
 
-/// `(status, attempt_count)` of every outbox row, oldest first.
-async fn outbox_rows(pool: &PgPool) -> Vec<(String, i32)> {
-    sqlx::query_as("SELECT status, attempt_count FROM outbox ORDER BY created_at, id")
+async fn outbox_ids(pool: &PgPool) -> HashSet<Uuid> {
+    sqlx::query_scalar("SELECT id FROM outbox")
         .fetch_all(pool)
         .await
         .unwrap()
+        .into_iter()
+        .collect()
 }
 
-/// Waits until every outbox row is `delivered`, and reports whether they got
-/// there within `timeout`.
-async fn outbox_settles_within(pool: &PgPool, timeout: Duration) -> bool {
+async fn outbox_row_is_delivered(pool: &PgPool, id: Uuid, timeout: Duration) -> bool {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        if outbox_rows(pool)
+        let status: String = sqlx::query_scalar("SELECT status FROM outbox WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
             .await
-            .iter()
-            .all(|(status, _)| status == "delivered")
-        {
+            .unwrap();
+        if status == "delivered" {
             return true;
         }
         if tokio::time::Instant::now() >= deadline {
@@ -1105,14 +1106,16 @@ async fn outbox_settles_within(pool: &PgPool, timeout: Duration) -> bool {
     }
 }
 
-/// Opens one Locks invoice (single phase), which queues its handoff.
+/// Opens one Locks invoice and returns its exact endpoint and Payment Request rows.
 async fn open_invoice(
+    pool: &PgPool,
     address: SocketAddr,
     signing_key: &SigningKey,
     fixture: &CreatorFixture,
     reader: &ReaderPubky,
     bundle: &str,
-) {
+) -> (Uuid, Uuid) {
+    let before = outbox_ids(pool).await;
     let response = send_http(
         address,
         invoice_request(signing_key, fixture, reader, bundle),
@@ -1121,9 +1124,93 @@ async fn open_invoice(
     assert_eq!(
         response.status,
         StatusCode::NO_CONTENT,
-        "invoice body: {}",
-        String::from_utf8_lossy(&response.body)
+        "invoice creation failed"
     );
+    let rows: Vec<(Uuid, Option<Uuid>)> =
+        sqlx::query_as("SELECT id, depends_on_id FROM outbox ORDER BY created_at, id")
+            .fetch_all(pool)
+            .await
+            .unwrap();
+    let created: Vec<_> = rows
+        .into_iter()
+        .filter(|(id, _)| !before.contains(id))
+        .collect();
+    assert_eq!(
+        created.len(),
+        2,
+        "invoice must create exactly two outbox rows"
+    );
+    let endpoint = created
+        .iter()
+        .find_map(|(id, dependency)| dependency.is_none().then_some(*id))
+        .expect("invoice endpoint row");
+    let payment = created
+        .iter()
+        .find_map(|(id, dependency)| (*dependency == Some(endpoint)).then_some(*id))
+        .expect("invoice Payment Request row");
+    (endpoint, payment)
+}
+
+fn connection_status_request(
+    signing_key: &SigningKey,
+    fixture: &CreatorFixture,
+    bundle: &str,
+) -> Request<Body> {
+    signed_request(
+        signing_key,
+        Method::POST,
+        "/connections/status",
+        format!(
+            r#"{{"bundle_id":"{bundle}","creator":"{}"}}"#,
+            fixture.creator
+        ),
+    )
+}
+
+struct FreshServerLinkExpectation<'a> {
+    signing_key: &'a SigningKey,
+    fixture: &'a CreatorFixture,
+    bundle: &'a str,
+    state_store: &'a SdkStateStore,
+    reader_key: &'a PubkyPublicKey,
+    reader_path: &'a PaykitReceiverPath,
+    old_generation: u64,
+}
+
+async fn wait_for_fresh_server_link_state(
+    address: SocketAddr,
+    expected: FreshServerLinkExpectation<'_>,
+) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let response = send_http(
+            address,
+            connection_status_request(expected.signing_key, expected.fixture, expected.bundle),
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::OK);
+        let state = serde_json::from_slice::<serde_json::Value>(&response.body).unwrap();
+        let public_state = state["state"].as_str().unwrap();
+        let storage = expected
+            .state_store
+            .load(&expected.fixture.creator)
+            .await
+            .unwrap();
+        let fresh_generation = storage.encrypted_link_states.values().any(|link| {
+            &link.counterparty == expected.reader_key
+                && &link.counterparty_receiver_path == expected.reader_path
+                && link.generation > expected.old_generation
+        });
+        if public_state != "connected" && fresh_generation {
+            assert!(matches!(public_state, "recovery_required" | "handshake"));
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "server did not leave old connected generation"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 /// The reader's wallet: keeps its side of the handshake moving, reads the
@@ -1160,10 +1247,12 @@ async fn wait_for_request(
             }
         }
         if tokio::time::Instant::now() >= deadline {
-            panic!(
-                "request for {bundle} never arrived: link={state:?} outbox={:?}",
-                outbox_rows(pool).await
-            );
+            let unsettled: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM outbox WHERE status <> 'delivered'")
+                    .fetch_one(pool)
+                    .await
+                    .unwrap();
+            panic!("request did not arrive; unsettled_rows={unsettled}");
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -1217,13 +1306,29 @@ async fn server_relinks_when_the_reader_publishes_a_recovery_marker() {
     wait_until_ready(address).await;
 
     // The first unlock links the reader's wallet to the creator's server link.
-    open_invoice(address, &signing_key, &creator, &reader, BUNDLE_A).await;
+    let (first_endpoint, first_payment) =
+        open_invoice(&pool, address, &signing_key, &creator, &reader, BUNDLE_A).await;
     wait_for_request(&peer_sdk, &creator_key, BUNDLE_A, &pool).await;
     assert!(
-        outbox_settles_within(&pool, Duration::from_secs(10)).await,
-        "first unlock never settled: {:?}",
-        outbox_rows(&pool).await
+        outbox_row_is_delivered(&pool, first_endpoint, Duration::from_secs(10)).await,
+        "first endpoint row never settled"
     );
+    assert!(
+        outbox_row_is_delivered(&pool, first_payment, Duration::from_secs(10)).await,
+        "first Payment Request row never settled"
+    );
+    let state_store = SdkStateStore::new(&pool, crypto.clone());
+    let reader_key = PubkyPublicKey::from_raw_or_app_key(reader.to_string()).unwrap();
+    let reader_path = PaykitReceiverPath::new("bitkit/server").unwrap();
+    let linked_state = state_store.load(&creator.creator).await.unwrap();
+    let old_generation = linked_state
+        .encrypted_link_states
+        .values()
+        .find(|link| {
+            link.counterparty == reader_key && link.counterparty_receiver_path == reader_path
+        })
+        .expect("initial linked generation")
+        .generation;
 
     // The wallet drops its side of the link and asks for a new handshake, as
     // Bitkit does after a failed link restore. Marker times have second
@@ -1240,15 +1345,62 @@ async fn server_relinks_when_the_reader_publishes_a_recovery_marker() {
 
     // The next unlock, while the wallet is away: the server must not hand
     // the request to the link the wallet abandoned.
-    open_invoice(address, &signing_key, &creator, &reader, BUNDLE_B).await;
-    assert!(
-        !outbox_settles_within(&pool, Duration::from_secs(5)).await,
-        "the request was handed to the abandoned link: {:?}",
-        outbox_rows(&pool).await
-    );
+    let (_second_endpoint, second_payment) =
+        open_invoice(&pool, address, &signing_key, &creator, &reader, BUNDLE_B).await;
+    wait_for_fresh_server_link_state(
+        address,
+        FreshServerLinkExpectation {
+            signing_key: &signing_key,
+            fixture: &creator,
+            bundle: BUNDLE_B,
+            state_store: &state_store,
+            reader_key: &reader_key,
+            reader_path: &reader_path,
+            old_generation,
+        },
+    )
+    .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let pending_payment: (String, Option<String>, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT status, sdk_outbound_message_id, sdk_event_id, sdk_payment_request_id \
+             FROM outbox WHERE id = $1",
+    )
+    .bind(second_payment)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(!matches!(
+        pending_payment.0.as_str(),
+        "handed_off" | "delivered"
+    ));
+    assert!(pending_payment.1.is_none());
+    assert!(pending_payment.2.is_none());
+    assert!(pending_payment.3.is_none());
 
     // Once the wallet is back, the new link carries the request.
     wait_for_request(&peer_sdk, &creator_key, BUNDLE_B, &pool).await;
+    assert!(
+        outbox_row_is_delivered(&pool, second_payment, Duration::from_secs(10)).await,
+        "second Payment Request row never settled"
+    );
+    let received = peer_sdk
+        .payment_requests_with(
+            &creator_key,
+            &PaykitReceiverPath::new("paykit/server").unwrap(),
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|request| {
+            request.terms.as_ref().is_some_and(|terms| {
+                terms.metadata.get("bundle_id") == Some(&serde_json::json!(BUNDLE_B))
+            })
+        })
+        .count();
+    assert_eq!(
+        received, 1,
+        "fresh link delivered duplicate logical requests"
+    );
 
     let _ = shutdown_tx.send(());
     running.await.unwrap().unwrap();
