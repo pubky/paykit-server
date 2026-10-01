@@ -3299,6 +3299,7 @@ dependencies = [
 name = "paykit-server-e2e"
 version = "0.1.0-rc4"
 dependencies = [
+ "anyhow",
  "async-trait",
  "axum",
  "base64 0.23.1",
@@ -3314,6 +3315,7 @@ dependencies = [
  "pubky-testnet",
  "serde",
  "serde_json",
+ "serde_json_canonicalizer",
  "sqlx",
  "time",
  "tokio",

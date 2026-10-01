@@ -25,6 +25,11 @@ TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres \
 
 The two live-adapter tests remain ignored by default because they require either a local Pubky static testnet or a recorded public Electrum fixture. See [`docs/live-adapter-smoke.md`](docs/live-adapter-smoke.md) before running them explicitly.
 
+For a complete local SDK payment without a frontend or Bitkit, run
+[`sdk-example/run.sh`](sdk-example/README.md). It starts disposable Docker
+infrastructure, authorizes a Creator, delivers an invoice over Paykit, and pays
+it with regtest Bitcoin.
+
 Before submitting changes, read [`CONTRIBUTING.md`](CONTRIBUTING.md). Report security problems through the private process in [`SECURITY.md`](SECURITY.md), not a public issue.
 
 The [architecture contract](docs/architecture.md) describes shared identity,
