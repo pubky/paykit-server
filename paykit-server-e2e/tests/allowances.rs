@@ -1,12 +1,12 @@
 //! An Allowance a reader proposes on the Paykit Server's own link covers the
 //! Locks invoice the server sends next.
 //!
-//! The reader's Bitkit and the server share one Encrypted Link:
-//! `(creator, bitkit/server) <-> (reader, bitkit/wallet)`. Only the server
-//! holds the creator's `bitkit/server` Noise key, so only the server can
-//! accept an Allowance on that link. This test runs the production server
-//! (PostgreSQL, the outbox worker, an ephemeral Pubky testnet) against a
-//! reader on the same Allowances SDK, and checks the payer's admission.
+//! The reader's Bitkit and the server share one identity-wide Encrypted Link:
+//! `creator <-> reader`. The server runs the creator's `paykit-server` App on
+//! that identity's shared state, so it can accept an Allowance on the link.
+//! This test runs the production server (PostgreSQL, the outbox worker, an
+//! ephemeral Pubky testnet) against a reader on the same SDK, and checks the
+//! payer's admission.
 
 use std::{collections::BTreeMap, net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
 
@@ -31,16 +31,15 @@ use locks_core::{
 };
 use paykit_lib::{
     AllowanceAmountRange, AllowanceId, AllowancePeriod, AllowancePeriodLimit, AllowancePeriodUnit,
-    AllowanceTerms, PaykitReceiverCapabilities, PaykitReceiverPath, PaymentAmount,
-    PaymentEndpointIdentifier, PaymentRequestId,
+    AllowanceTerms, PaymentAmount, PaymentEndpointIdentifier, PaymentRequestId,
 };
 use paykit_sdk::{
     AllowanceAccountingBlock, AllowanceAccountingReconciliation, AllowanceFilter,
     AllowanceHistoryStatus, AllowanceLifecycleState, AllowanceLocalRole, AllowanceSelectionInput,
-    InMemoryStorage, LinkedPeerState, OutboundPrivateMessageStatus, PaykitSdk, PaykitSdkConfig,
+    LinkedPeerState, OutboundPrivateMessageStatus, PAYKIT_SESSION_CAPABILITIES,
     PaymentAttemptDecision, PaymentExecutionChecks, PaymentExecutionMode, PaymentOccurrence,
     PaymentRequestRecord, PaymentRequestScope, PubkyLocalSecretKey, PubkyPublicKey,
-    PubkySessionBootstrap, ReceiverNoiseSecretKey, storage::StorageState,
+    PubkySessionBootstrap,
 };
 use paykit_server::{
     Server,
@@ -48,7 +47,7 @@ use paykit_server::{
     config::{Config, ConfigEnvironment},
     crypto::Crypto,
     domain::locks::{CreatorPubky, ReaderPubky, parse_creator, parse_reader},
-    persistence::{CreatorCredentials, CreatorStore, PostgresStorageAdapter, SdkStateStore},
+    persistence::{CreatorCredentials, CreatorStore},
     startup::initialize_database,
     workers::observer::{ElectrumPort, ObserverError},
 };
@@ -60,19 +59,17 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[path = "fixtures/sdk.rs"]
 mod sdk_fixtures;
 
-use sdk_fixtures::{TestPaymentAdapter, TestSessionProvider};
+use sdk_fixtures::{HostedSdk, hosted_sdk};
 
 const MASTER_KEY: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE";
 const BUNDLE_BEFORE_GRANT: &str = "000G40R40M30E209185GR38E1W";
 const BUNDLE_AFTER_GRANT: &str = "000G40R40M30E209185GR38E2W";
 /// The $2 locked post, at about $100k per BTC.
 const LOCK_SATS: u64 = 2_000;
-const SERVER_PATH: &str = "bitkit/server";
-const READER_PATH: &str = "bitkit/wallet";
 const REGTEST_ONCHAIN: &str = "btc-regtest-p2wpkh";
 static PUBKY_TESTNET_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-type ReaderSdk = PaykitSdk<InMemoryStorage, TestSessionProvider, TestPaymentAdapter>;
+type ReaderSdk = HostedSdk;
 
 /// No payment is observed in this test.
 struct EmptyElectrum;
@@ -87,8 +84,8 @@ impl ElectrumPort for EmptyElectrum {
     }
 }
 
-/// The server settings that matter here: the `bitkit/server` receiver path
-/// and regtest endpoints. The outbox polls fast so handoffs run within the
+/// The server settings that matter here: the `paykit-server` App and regtest
+/// endpoints. The outbox polls fast so handoffs run within the
 /// test.
 fn config(database_url: &str, signing_key: &SigningKey) -> Config {
     let trusted_key = pubky::PublicKey::from(
@@ -106,8 +103,7 @@ trusted_public_key = "{trusted_key}"
 allowed_origins = ["https://app.example"]
 [paykit]
 client_id = "app.paykit.server"
-receiver_path = "{SERVER_PATH}"
-receiver_path_priority = ["bitkit"]
+app_id = "paykit-server"
 network = "testnet"
 [bitcoin]
 network = "regtest"
@@ -179,10 +175,11 @@ fn content_lock(creator: &CreatorPubky) -> ContentLock {
 struct Stack {
     address: SocketAddr,
     pool: PgPool,
-    crypto: Arc<Crypto>,
     signing_key: SigningKey,
-    creator: CreatorPubky,
     creator_key: PubkyPublicKey,
+    /// The creator identity's shared state, read through the same hosted
+    /// storage the server writes.
+    creator_sdk: HostedSdk,
     lock_resource: String,
     reader: ReaderPubky,
     reader_sdk: ReaderSdk,
@@ -201,9 +198,9 @@ impl Stack {
     }
 }
 
-/// Boots the production server with one creator (server-held `bitkit/server`
-/// credentials, published marker and content lock) and one reader (a
-/// `bitkit/wallet` wallet SDK with its marker published).
+/// Boots the production server with one creator (server-held delegated
+/// credentials, published `paykit-server` App and content lock) and one reader
+/// (a `bitkit` wallet SDK on its own identity, App published).
 async fn boot(seed: u8) -> Stack {
     let database = TestDatabase::create().await;
     let signing_key = SigningKey::from_bytes(&[seed; 32]);
@@ -223,47 +220,26 @@ async fn boot(seed: u8) -> Stack {
     let bootstrap = PubkySessionBootstrap::with_pubky(pubky.clone(), "app.paykit.server").unwrap();
     let homeserver = PubkyPublicKey::from_public_key(&testnet.homeserver_app().public_key());
     let crypto = Arc::new(Crypto::from_master_key(&[1; 32]).unwrap());
-    let capabilities = |path: &str| {
-        PaykitSdkConfig::new(PaykitReceiverPath::new(path).unwrap()).required_session_capabilities()
-    };
 
     let reader_account = bootstrap
         .sign_up(
             &PubkyLocalSecretKey::new(Keypair::random().secret_key()),
-            ReceiverNoiseSecretKey::random(),
             &homeserver,
             None,
-            &capabilities(READER_PATH),
+            PAYKIT_SESSION_CAPABILITIES,
         )
         .await
         .unwrap();
     let reader = parse_reader(&format!("pubky{}", reader_account.public_key)).unwrap();
-    let reader_sdk = PaykitSdk::new(
-        InMemoryStorage::default(),
-        TestSessionProvider::new(reader_account.access),
-        TestPaymentAdapter,
-        PaykitSdkConfig::new(PaykitReceiverPath::new(READER_PATH).unwrap()),
-    )
-    .unwrap();
-    reader_sdk.initialize().await.unwrap();
-    reader_sdk
-        .publish_paykit_receiver_marker(PaykitReceiverCapabilities {
-            private_payments: true,
-            payment_requests: true,
-            receipts: false,
-            outgoing_payments: true,
-        })
-        .await
-        .unwrap();
+    let reader_sdk = hosted_sdk(reader_account.access, "bitkit", 0).await;
 
-    let creator_secret = PubkyLocalSecretKey::new(Keypair::random().secret_key());
+    let creator_keypair = Keypair::random();
     let creator_account = bootstrap
         .sign_up(
-            &creator_secret,
-            ReceiverNoiseSecretKey::random(),
+            &PubkyLocalSecretKey::new(creator_keypair.secret_key()),
             &homeserver,
             None,
-            &capabilities(SERVER_PATH),
+            PAYKIT_SESSION_CAPABILITIES,
         )
         .await
         .unwrap();
@@ -273,8 +249,7 @@ async fn boot(seed: u8) -> Stack {
     let lock_path = lock.content_lock_path().unwrap().to_string();
     bootstrap
         .sign_in(
-            &creator_secret,
-            ReceiverNoiseSecretKey::random(),
+            &PubkyLocalSecretKey::new(creator_keypair.secret_key()),
             "/pub/locks.app/:rw",
         )
         .await
@@ -285,42 +260,38 @@ async fn boot(seed: u8) -> Stack {
         .put_json(lock_path.clone(), &lock)
         .await
         .unwrap();
-    let row = CreatorStore::new(&pool, crypto.clone())
-        .create(
-            &CreatorCredentials::new(
-                creator.clone(),
-                creator_account
-                    .export_session_secret()
-                    .await
-                    .unwrap()
-                    .into_inner(),
-                creator_account.access.receiver_noise_secret_key.clone(),
-                account_xpub(seed),
-                0,
-            ),
-            &StorageState::default(),
-        )
+    let store = CreatorStore::new(&pool, crypto.clone());
+    store
+        .create(&CreatorCredentials::new(
+            creator.clone(),
+            creator_account
+                .export_session_secret()
+                .await
+                .unwrap()
+                .into_inner(),
+            PubkyLocalSecretKey::new(creator_keypair.secret_key())
+                .derive_paykit_identity_secret_key(1)
+                .unwrap(),
+            account_xpub(seed),
+            0,
+        ))
         .await
         .unwrap();
-    // Setup completion publishes the creator's marker with the stored Noise
-    // key; do the same through the creator's own SDK state.
-    let creator_sdk = PaykitSdk::new(
-        PostgresStorageAdapter::new(&pool, crypto.clone(), row.id()),
-        TestSessionProvider::new(creator_account.access),
-        TestPaymentAdapter,
-        PaykitSdkConfig::new(PaykitReceiverPath::new(SERVER_PATH).unwrap()),
+    // Setup completion publishes the server's App on the creator's shared
+    // state; do the same through a second grant on the creator's identity.
+    let observer = PubkySessionBootstrap::with_pubky(
+        creator_account.access.outbox_client.clone(),
+        "app.paykit.test-observer",
     )
+    .unwrap()
+    .sign_in(
+        &PubkyLocalSecretKey::new(creator_keypair.secret_key()),
+        PAYKIT_SESSION_CAPABILITIES,
+    )
+    .await
     .unwrap();
-    creator_sdk.initialize().await.unwrap();
-    creator_sdk
-        .publish_paykit_receiver_marker(PaykitReceiverCapabilities {
-            private_payments: true,
-            payment_requests: true,
-            receipts: false,
-            outgoing_payments: false,
-        })
-        .await
-        .unwrap();
+    let creator_sdk = hosted_sdk(observer.access, "paykit-server", 0).await;
+    store.mark_setup_complete(&creator).await.unwrap();
 
     let server =
         Server::build_with_transports(server_config, pool.clone(), pubky, Arc::new(EmptyElectrum))
@@ -337,11 +308,10 @@ async fn boot(seed: u8) -> Stack {
     Stack {
         address,
         pool,
-        crypto,
         signing_key,
         lock_resource: format!("{creator}{lock_path}"),
-        creator,
         creator_key,
+        creator_sdk,
         reader,
         reader_sdk,
         _testnet: testnet,
@@ -424,23 +394,22 @@ async fn post_locks_invoice(stack: &Stack, bundle: &str) {
 /// The reader's Bitkit: keeps its side of the handshake moving, reads the
 /// link and returns the request for `bundle` once it has arrived.
 async fn wait_for_request(stack: &Stack, bundle: &str) -> PaymentRequestRecord {
-    let server_path = PaykitReceiverPath::new(SERVER_PATH).unwrap();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     loop {
         let state = stack
             .reader_sdk
-            .ensure_link_with_peer(stack.creator_key.clone(), server_path.clone(), 1)
+            .ensure_link_with_peer(stack.creator_key.clone(), 1)
             .await
             .map(|report| report.state);
         if matches!(state, Ok(LinkedPeerState::Linked)) {
             stack
                 .reader_sdk
-                .receive_private_messages(stack.creator_key.clone(), server_path.clone())
+                .receive_private_messages(stack.creator_key.clone())
                 .await
                 .unwrap();
             if let Some(request) = stack
                 .reader_sdk
-                .payment_requests_with(&stack.creator_key, &server_path)
+                .payment_requests_with(&stack.creator_key)
                 .await
                 .unwrap()
                 .into_iter()
@@ -491,14 +460,13 @@ fn allowance_terms(per_payment_maximum: &str) -> AllowanceTerms {
 async fn allowance_proposed_on_the_server_link_covers_the_next_locks_invoice() {
     let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
     let stack = boot(71).await;
-    let server_path = PaykitReceiverPath::new(SERVER_PATH).unwrap();
     let reader = &stack.reader_sdk;
 
     // An earlier unlock creates the server link. No Allowance exists yet, and
     // the server's intake on an empty link changes nothing.
     post_locks_invoice(&stack, BUNDLE_BEFORE_GRANT).await;
     let before = wait_for_request(&stack, BUNDLE_BEFORE_GRANT).await;
-    assert_eq!(before.counterparty_receiver_path, server_path);
+    assert_eq!(before.counterparty, stack.creator_key);
     assert!(
         reader
             .list_allowances(AllowanceFilter::default())
@@ -507,12 +475,11 @@ async fn allowance_proposed_on_the_server_link_covers_the_next_locks_invoice() {
             .is_empty()
     );
 
-    // The reader grants on the creator's server link: one grant covers the
+    // The reader grants on the creator's link: one grant covers the
     // lock price, the other's per-payment maximum is one sat below it.
     let covering = reader
         .propose_allowance(
             stack.creator_key.clone(),
-            server_path.clone(),
             AllowanceLocalRole::Allower,
             allowance_terms("0.00005000"),
         )
@@ -521,17 +488,25 @@ async fn allowance_proposed_on_the_server_link_covers_the_next_locks_invoice() {
     let tight = reader
         .propose_allowance(
             stack.creator_key.clone(),
-            server_path.clone(),
             AllowanceLocalRole::Allower,
             allowance_terms("0.00001999"),
         )
         .await
         .unwrap();
     let sent = reader
-        .process_outbound_private_messages(stack.creator_key.clone(), server_path.clone())
+        .process_outbound_private_messages(stack.creator_key.clone())
         .await
         .unwrap();
-    assert_eq!(sent.sent.len(), 2, "both proposals reach the server link");
+    // The identity-wide queue may also carry earlier link traffic.
+    assert!(sent.failed.is_empty(), "{sent:?}");
+    for proposal in [&covering, &tight] {
+        assert!(
+            proposal
+                .proposal_outbound_message_id
+                .is_some_and(|id| sent.sent.contains(&id)),
+            "a proposal did not reach the server link: {sent:?}"
+        );
+    }
 
     // The next unlock: the server accepts both during the handoff, before it
     // proposes the request.
@@ -540,7 +515,6 @@ async fn allowance_proposed_on_the_server_link_covers_the_next_locks_invoice() {
     let allowances = reader
         .list_allowances(AllowanceFilter {
             counterparty: Some(stack.creator_key.clone()),
-            counterparty_receiver_path: Some(server_path.clone()),
             local_role: Some(AllowanceLocalRole::Allower),
             states: Vec::new(),
         })
@@ -580,7 +554,6 @@ async fn allowance_proposed_on_the_server_link_covers_the_next_locks_invoice() {
         .unwrap();
     let scope = PaymentRequestScope {
         counterparty: stack.creator_key.clone(),
-        counterparty_receiver_path: server_path.clone(),
         payment_request_id: PaymentRequestId::new(request.payment_request_id.clone()).unwrap(),
     };
     let candidates = reader
@@ -616,6 +589,11 @@ async fn allowance_proposed_on_the_server_link_covers_the_next_locks_invoice() {
         local_enabled: true,
         recurrence_eligible: true,
     };
+    // The wallet App claims the request for execution before it accepts it.
+    reader
+        .claim_payment_request_for_execution(scope.counterparty.clone(), &scope.payment_request_id)
+        .await
+        .unwrap();
     let association = reader
         .accept_payment_request_automatically(
             scope.clone(),
@@ -651,10 +629,7 @@ async fn allowance_proposed_on_the_server_link_covers_the_next_locks_invoice() {
 
     // On the server, both acceptances were sent on the reader link ahead of
     // the second request, and the server keeps no Allowance accounting.
-    let state = SdkStateStore::new(&stack.pool, stack.crypto.clone())
-        .load(&stack.creator)
-        .await
-        .unwrap();
+    let state = stack.creator_sdk.export_backup_state().await.unwrap();
     assert!(state.allowance_accounting.is_none());
     let outbound = |kind: &str| {
         state
