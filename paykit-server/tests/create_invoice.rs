@@ -11,7 +11,7 @@ use std::{
 use async_trait::async_trait;
 use axum::{
     Extension,
-    body::{Body, to_bytes},
+    body::Body,
     http::{Method, Request, StatusCode},
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -25,18 +25,18 @@ use locks_core::{
 };
 use paykit_server::{
     application::create_invoice::{
-        CreateInvoiceError, CreateInvoiceRequest, CreateInvoiceService, CreatorXpubProvider,
-        DeadlineClock, IntentBuilder, InvoicePersistence, LockFetchError, LockFetcher,
-        MarkerDiscovery, PaykitIntentBuilder, SessionValidationError, SessionValidator,
+        AppRegistryDiscovery, CreateInvoiceError, CreateInvoiceRequest, CreateInvoiceService,
+        CreatorXpubProvider, DeadlineClock, IntentBuilder, InvoicePersistence, LockFetchError,
+        LockFetcher, PaykitIntentBuilder, SessionValidationError, SessionValidator,
         derive_bip84_p2wpkh_address,
     },
-    application::semantic_intent::{DeliveryIntentV1, DeliveryOperationV1},
+    application::semantic_intent::DeliveryIntentV1,
     config::{BitcoinNetwork, Config, ConfigEnvironment},
-    domain::{
-        invoice::CriterionPaymentWindowHours,
-        locks::{CreatorPubky, parse_addressed_lock_resource, parse_bundle_id, parse_reader},
+    domain::locks::{CreatorPubky, parse_addressed_lock_resource, parse_bundle_id, parse_reader},
+    http::{
+        auth::{SignedLocksAuth, signature_preimage},
+        invoices::invoices_router,
     },
-    http::{auth::SignedLocksAuth, invoices::invoices_router},
     persistence::{AtomicInvoiceInput, AtomicInvoiceResult, InvoicePreflight, PersistenceError},
 };
 use tower::ServiceExt;
@@ -61,7 +61,7 @@ fn request() -> CreateInvoiceRequest {
         bundle_id: parse_bundle_id(BUNDLE).unwrap(),
         lock_resource: parse_addressed_lock_resource(LOCK_RESOURCE).unwrap(),
         reader: parse_reader(&reader()).unwrap(),
-        payment_in: CriterionPaymentWindowHours::parse(&serde_json::json!(24)).unwrap(),
+        payment_in: paykit_server::domain::invoice::CriterionPaymentWindowHours::new(24).unwrap(),
     }
 }
 
@@ -74,7 +74,7 @@ fn valid_lock() -> ContentLock {
         criteria: vec![Criterion {
             criterion_id: "payment".into(),
             verifier_type: VerifierType::PaykitPayment,
-            params: serde_json::json!({"recipient_pubky":CREATOR,"amount":"50000","asset":"BTC","payment_in":24}),
+            params: serde_json::json!({"recipient_pubky":CREATOR,"amount":"50000","asset":"BTC"}),
         }],
         lock_logic: LockLogic::All {
             criteria: vec!["payment".into()],
@@ -87,25 +87,33 @@ fn valid_lock() -> ContentLock {
     }
 }
 
-fn capable_marker() -> paykit_lib::PaykitReceiverMarker {
-    paykit_lib::PaykitReceiverMarker::new(
-        paykit_lib::PaykitReceiverPath::new("bitkit/wallet").unwrap(),
-        paykit_lib::PaykitReceiverCapabilities {
-            private_payments: true,
-            payment_requests: true,
-            receipts: false,
-            outgoing_payments: true,
-        },
-        paykit_lib::PublicKey::try_from_z32("tkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy")
+fn capable_registry() -> paykit_lib::PaykitAppRegistry {
+    let mut registry = paykit_lib::PaykitAppRegistry::new(Some(
+        paykit_lib::derive_paykit_noise_public_key(&[8; 32]),
+    ));
+    registry
+        .register_app(
+            paykit_lib::PaykitAppId::new("bitkit").unwrap(),
+            paykit_lib::PaykitApp::new(
+                "Bitkit",
+                paykit_lib::PaykitAppCapabilities {
+                    private_payments: true,
+                    payment_requests: true,
+                    receipts: false,
+                    outgoing_payments: true,
+                },
+            )
             .unwrap(),
-    )
+        )
+        .unwrap();
+    registry
 }
 
 #[test]
 fn library_payment_request_has_exact_terms_amount_and_metadata() {
     let request = request();
     let terms = PaykitIntentBuilder::new(BitcoinNetwork::Mainnet)
-        .payment_request_terms(&request, &valid_lock())
+        .payment_request_terms(&request, &valid_lock(), "address")
         .unwrap();
     assert_eq!(terms.amount().value(), "0.00050000");
     assert_eq!(terms.amount().asset(), "btc");
@@ -122,7 +130,7 @@ fn library_payment_request_has_exact_terms_amount_and_metadata() {
 }
 
 #[test]
-fn payment_request_and_private_payment_list_use_the_configured_network() {
+fn payment_request_bound_endpoint_uses_the_configured_network() {
     for (network, expected_identifier) in [
         (BitcoinNetwork::Mainnet, "btc-bitcoin-p2wpkh"),
         (BitcoinNetwork::Testnet, "btc-testnet-p2wpkh"),
@@ -131,20 +139,28 @@ fn payment_request_and_private_payment_list_use_the_configured_network() {
     ] {
         let builder = PaykitIntentBuilder::new(network);
         let terms = builder
-            .payment_request_terms(&request(), &valid_lock())
+            .payment_request_terms(&request(), &valid_lock(), "address")
             .unwrap();
-        let details = builder.receiving_details("address").unwrap();
 
         assert_eq!(
             terms.accepted_payment_endpoint_identifiers()[0].as_str(),
             expected_identifier
         );
-        assert_eq!(details[0].0.as_str(), expected_identifier);
+        assert_eq!(
+            terms
+                .payment_endpoints()
+                .unwrap()
+                .keys()
+                .next()
+                .unwrap()
+                .as_str(),
+            expected_identifier
+        );
     }
 }
 
 #[test]
-fn private_payment_list_uses_derived_bech32_p2wpkh_address() {
+fn payment_request_binds_derived_bech32_p2wpkh_address() {
     use bitcoin::{
         Network,
         bip32::{ChildNumber, Xpriv, Xpub},
@@ -166,12 +182,13 @@ fn private_payment_list_uses_derived_bech32_p2wpkh_address() {
     let xpub = Xpub::from_priv(&secp, &account).to_string();
     let address = derive_bip84_p2wpkh_address(&xpub, 0, &BitcoinNetwork::Mainnet, 0)
         .expect("valid account xpub derives an address");
-    let details = PaykitIntentBuilder::new(BitcoinNetwork::Mainnet)
-        .receiving_details(&address)
+    let terms = PaykitIntentBuilder::new(BitcoinNetwork::Mainnet)
+        .payment_request_terms(&request(), &valid_lock(), &address)
         .expect("canonical library types accept endpoint");
-    assert_eq!(details[0].0.as_str(), "btc-bitcoin-p2wpkh");
+    let (identifier, payload) = terms.payment_endpoints().unwrap().iter().next().unwrap();
+    assert_eq!(identifier.as_str(), "btc-bitcoin-p2wpkh");
     assert_eq!(
-        serde_json::from_str::<serde_json::Value>(details[0].1.as_str()).unwrap(),
+        serde_json::from_str::<serde_json::Value>(payload.as_str()).unwrap(),
         serde_json::json!({ "value": address })
     );
 }
@@ -180,7 +197,6 @@ struct FakeStore {
     preflight: Mutex<InvoicePreflight>,
     preflight_calls: AtomicUsize,
     create_calls: AtomicUsize,
-    payment_bindings: Mutex<Vec<Vec<u8>>>,
 }
 
 impl FakeStore {
@@ -189,7 +205,6 @@ impl FakeStore {
             preflight: Mutex::new(preflight),
             preflight_calls: AtomicUsize::default(),
             create_calls: AtomicUsize::default(),
-            payment_bindings: Mutex::new(vec![]),
         }
     }
 }
@@ -200,13 +215,9 @@ impl InvoicePersistence for FakeStore {
         &self,
         _creator: &CreatorPubky,
         _bundle_binding: &[u8],
-        payment_binding: &[u8],
+        _payment_binding: &[u8],
     ) -> Result<InvoicePreflight, PersistenceError> {
         self.preflight_calls.fetch_add(1, Ordering::SeqCst);
-        self.payment_bindings
-            .lock()
-            .unwrap()
-            .push(payment_binding.to_vec());
         Ok(*self.preflight.lock().unwrap())
     }
 
@@ -221,12 +232,10 @@ impl InvoicePersistence for FakeStore {
         Ok(AtomicInvoiceResult::new(
             uuid::Uuid::nil(),
             uuid::Uuid::nil(),
-            None,
             uuid::Uuid::nil(),
             0,
             time::OffsetDateTime::UNIX_EPOCH,
             time::OffsetDateTime::UNIX_EPOCH + time::Duration::hours(24),
-            paykit_lib::PaykitReceiverPath::new("bitkit/wallet").unwrap(),
             true,
         ))
     }
@@ -239,12 +248,10 @@ impl InvoicePersistence for FakeStore {
         Ok(AtomicInvoiceResult::new(
             uuid::Uuid::nil(),
             uuid::Uuid::nil(),
-            None,
             uuid::Uuid::nil(),
             0,
             time::OffsetDateTime::UNIX_EPOCH,
             time::OffsetDateTime::UNIX_EPOCH + time::Duration::hours(24),
-            paykit_lib::PaykitReceiverPath::new("bitkit/wallet").unwrap(),
             true,
         ))
     }
@@ -331,12 +338,11 @@ fn service(
     CreateInvoiceService::new(
         session,
         locks,
-        Arc::new(FakeMarkers {
-            markers: vec![capable_marker()],
+        Arc::new(FakeRegistries {
+            registry: Some(capable_registry()),
             calls: AtomicUsize::default(),
         }),
-        vec![paykit_server::config::ReceiverPathPriority::parse("bitkit".into()).unwrap()],
-        paykit_lib::PaykitReceiverPath::new("paykit/server").unwrap(),
+        paykit_lib::PaykitAppId::new("paykit-server").unwrap(),
         Arc::new(FakeCredentials),
         BitcoinNetwork::Mainnet,
         store,
@@ -372,135 +378,6 @@ async fn invalid_locks_policy_never_persists_an_invoice() {
     assert_eq!(session.calls.load(Ordering::SeqCst), 1);
     assert_eq!(locks.calls.load(Ordering::SeqCst), 1);
     assert_eq!(store.create_calls.load(Ordering::SeqCst), 0);
-}
-
-#[tokio::test]
-async fn malformed_canonical_lock_payment_window_never_persists_an_invoice() {
-    let out_of_range = serde_json::Value::Number(
-        serde_json::Number::from_f64(18_446_744_073_709_551_616.0).unwrap(),
-    );
-    for payment_in in [
-        Some(serde_json::json!(0)),
-        Some(serde_json::json!("24")),
-        Some(serde_json::json!(1.5)),
-        Some(out_of_range),
-    ] {
-        let mut lock = valid_lock();
-        let params = lock.criteria[0].params.as_object_mut().unwrap();
-        if let Some(payment_in) = payment_in {
-            params.insert("payment_in".into(), payment_in);
-        } else {
-            params.remove("payment_in");
-        }
-        let store = Arc::new(FakeStore::with_preflight(InvoicePreflight::New));
-        assert_eq!(
-            service(
-                Arc::new(FakeSession {
-                    result: Ok(()),
-                    calls: AtomicUsize::default(),
-                    creators: Mutex::new(vec![]),
-                }),
-                Arc::new(FakeLocks {
-                    result: Ok(lock),
-                    calls: AtomicUsize::default(),
-                }),
-                store.clone(),
-            )
-            .create(request())
-            .await,
-            Err(CreateInvoiceError::InvalidRequest)
-        );
-        assert_eq!(store.create_calls.load(Ordering::SeqCst), 0);
-    }
-}
-
-#[tokio::test]
-async fn missing_canonical_lock_payment_window_defaults_to_twenty_four_hours() {
-    let mut lock = valid_lock();
-    lock.criteria[0]
-        .params
-        .as_object_mut()
-        .unwrap()
-        .remove("payment_in");
-    let store = Arc::new(FakeStore::with_preflight(InvoicePreflight::New));
-
-    let result = service(
-        Arc::new(FakeSession {
-            result: Ok(()),
-            calls: AtomicUsize::default(),
-            creators: Mutex::new(vec![]),
-        }),
-        Arc::new(FakeLocks {
-            result: Ok(lock),
-            calls: AtomicUsize::default(),
-        }),
-        store.clone(),
-    )
-    .create(request())
-    .await;
-
-    assert!(result.is_ok());
-    assert_eq!(store.create_calls.load(Ordering::SeqCst), 1);
-}
-
-#[tokio::test]
-async fn payment_window_mismatch_never_persists_an_invoice() {
-    let session = Arc::new(FakeSession {
-        result: Ok(()),
-        calls: AtomicUsize::default(),
-        creators: Mutex::new(vec![]),
-    });
-    let locks = Arc::new(FakeLocks {
-        result: Ok(valid_lock()),
-        calls: AtomicUsize::default(),
-    });
-    let store = Arc::new(FakeStore::with_preflight(InvoicePreflight::New));
-    let mut mismatched = request();
-    mismatched.payment_in = CriterionPaymentWindowHours::parse(&serde_json::json!(12)).unwrap();
-
-    assert_eq!(
-        service(session, locks, store.clone())
-            .create(mismatched)
-            .await,
-        Err(CreateInvoiceError::InvalidRequest)
-    );
-    assert_eq!(store.create_calls.load(Ordering::SeqCst), 0);
-}
-
-#[tokio::test]
-async fn payment_window_is_part_of_the_exact_request_binding() {
-    let store = Arc::new(FakeStore::with_preflight(InvoicePreflight::Conflict));
-    for hours in [12, 24] {
-        let mut invoice = request();
-        invoice.payment_in = CriterionPaymentWindowHours::parse(&serde_json::json!(hours)).unwrap();
-        assert_eq!(
-            service(
-                Arc::new(FakeSession {
-                    result: Ok(()),
-                    calls: AtomicUsize::default(),
-                    creators: Mutex::new(vec![]),
-                }),
-                Arc::new(FakeLocks {
-                    result: Ok(valid_lock()),
-                    calls: AtomicUsize::default(),
-                }),
-                store.clone(),
-            )
-            .create(invoice)
-            .await,
-            Err(CreateInvoiceError::Conflict)
-        );
-    }
-    let bindings = store.payment_bindings.lock().unwrap();
-    assert_ne!(bindings[0], bindings[1]);
-    assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(&bindings[0]).unwrap()["payment_in"],
-        serde_json::json!(12)
-    );
-    assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(&bindings[1]).unwrap()["payment_in"],
-        serde_json::json!(24)
-    );
 }
 
 #[tokio::test]
@@ -553,10 +430,7 @@ async fn exact_replay_returns_persisted_result_without_validator_or_lock_fetch()
         .create(request())
         .await
         .unwrap();
-    assert_eq!(
-        result.selected_reader_path(),
-        &paykit_lib::PaykitReceiverPath::new("bitkit/wallet").unwrap()
-    );
+    assert!(result.replayed());
     assert_eq!(session.calls.load(Ordering::SeqCst), 0);
     assert_eq!(locks.calls.load(Ordering::SeqCst), 0);
     assert_eq!(store.create_calls.load(Ordering::SeqCst), 1);
@@ -602,12 +476,11 @@ async fn fifteen_second_deadline_is_safe_and_does_not_commit() {
     let service = CreateInvoiceService::with_clock(
         session.clone(),
         locks.clone(),
-        Arc::new(FakeMarkers {
-            markers: vec![capable_marker()],
+        Arc::new(FakeRegistries {
+            registry: Some(capable_registry()),
             calls: AtomicUsize::default(),
         }),
-        vec![paykit_server::config::ReceiverPathPriority::parse("bitkit".into()).unwrap()],
-        paykit_lib::PaykitReceiverPath::new("paykit/server").unwrap(),
+        paykit_lib::PaykitAppId::new("paykit-server").unwrap(),
         Arc::new(FakeCredentials),
         BitcoinNetwork::Mainnet,
         store.clone(),
@@ -624,7 +497,7 @@ async fn fifteen_second_deadline_is_safe_and_does_not_commit() {
 }
 
 #[tokio::test]
-async fn marker_discovery_cannot_start_after_the_whole_request_deadline() {
+async fn registry_discovery_cannot_start_after_the_whole_request_deadline() {
     let session = Arc::new(FakeSession {
         result: Ok(()),
         calls: AtomicUsize::default(),
@@ -634,8 +507,8 @@ async fn marker_discovery_cannot_start_after_the_whole_request_deadline() {
         result: Ok(valid_lock()),
         calls: AtomicUsize::default(),
     });
-    let markers = Arc::new(FakeMarkers {
-        markers: vec![capable_marker()],
+    let registries = Arc::new(FakeRegistries {
+        registry: Some(capable_registry()),
         calls: AtomicUsize::default(),
     });
     let store = Arc::new(FakeStore::with_preflight(InvoicePreflight::New));
@@ -643,9 +516,8 @@ async fn marker_discovery_cannot_start_after_the_whole_request_deadline() {
     let service = CreateInvoiceService::with_clock(
         session,
         locks,
-        markers.clone(),
-        vec![paykit_server::config::ReceiverPathPriority::parse("bitkit".into()).unwrap()],
-        paykit_lib::PaykitReceiverPath::new("paykit/server").unwrap(),
+        registries.clone(),
+        paykit_lib::PaykitAppId::new("paykit-server").unwrap(),
         Arc::new(FakeCredentials),
         BitcoinNetwork::Mainnet,
         store.clone(),
@@ -663,7 +535,7 @@ async fn marker_discovery_cannot_start_after_the_whole_request_deadline() {
         service.create(request()).await,
         Err(CreateInvoiceError::DeadlineExceeded)
     );
-    assert_eq!(markers.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(registries.calls.load(Ordering::SeqCst), 0);
     assert_eq!(store.create_calls.load(Ordering::SeqCst), 0);
 }
 
@@ -684,12 +556,11 @@ async fn signed_router_maps_deadline_exhaustion_to_dependency_timeout() {
     let service = CreateInvoiceService::with_clock(
         session,
         locks,
-        Arc::new(FakeMarkers {
-            markers: vec![capable_marker()],
+        Arc::new(FakeRegistries {
+            registry: Some(capable_registry()),
             calls: AtomicUsize::default(),
         }),
-        vec![paykit_server::config::ReceiverPathPriority::parse("bitkit".into()).unwrap()],
-        paykit_lib::PaykitReceiverPath::new("paykit/server").unwrap(),
+        paykit_lib::PaykitAppId::new("paykit-server").unwrap(),
         Arc::new(FakeCredentials),
         BitcoinNetwork::Mainnet,
         store,
@@ -700,7 +571,6 @@ async fn signed_router_maps_deadline_exhaustion_to_dependency_timeout() {
     let body = serde_json_canonicalizer::to_vec(&serde_json::json!({
         "bundle_id": BUNDLE,
         "lock_resource": LOCK_RESOURCE,
-        "payment_in": 24,
         "reader": reader()
     }))
     .unwrap();
@@ -726,7 +596,6 @@ async fn signed_router_distinguishes_session_and_lock_unavailability() {
         serde_json_canonicalizer::to_vec(&serde_json::json!({
             "bundle_id": BUNDLE,
             "lock_resource": LOCK_RESOURCE,
-            "payment_in": 24,
             "reader": reader()
         }))
         .unwrap()
@@ -801,7 +670,7 @@ trusted_public_key = "{key}"
 allowed_origins = ["https://app.example"]
 [paykit]
 client_id = "app.paykit.server"
-receiver_path = "paykit/server"
+app_id = "paykit-server"
 network = "testnet"
 [bitcoin]
 network = "mainnet"
@@ -826,7 +695,7 @@ signed_burst = 100
 }
 
 fn signed_invoice_request(key: &SigningKey, body: Vec<u8>) -> Request<Body> {
-    let preimage = paykit_server::http::auth::signature_preimage("POST", "/invoices", &body);
+    let preimage = signature_preimage("POST", "/invoices", &body);
     Request::builder()
         .method(Method::POST)
         .uri("/invoices")
@@ -856,7 +725,6 @@ async fn signed_router_parses_canonical_invoice_and_derives_creator_from_lock_re
     let body = serde_json_canonicalizer::to_vec(&serde_json::json!({
         "bundle_id": BUNDLE,
         "lock_resource": LOCK_RESOURCE,
-        "payment_in": 24,
         "reader": reader()
     }))
     .unwrap();
@@ -866,183 +734,17 @@ async fn signed_router_parses_canonical_invoice_and_derives_creator_from_lock_re
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let response_body: serde_json::Value =
-        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let body = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .unwrap();
     assert_eq!(
-        response_body,
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
         serde_json::json!({
             "invoice_created_at": "1970-01-01T00:00:00Z",
             "payment_deadline": "1970-01-02T00:00:00Z"
         })
     );
     assert_eq!(session.creators.lock().unwrap().as_slice(), [CREATOR]);
-}
-
-#[tokio::test]
-async fn signed_router_exact_replay_returns_original_timestamps_without_mutable_dependencies() {
-    let key = SigningKey::from_bytes(&[12; 32]);
-    let session = Arc::new(FakeSession {
-        result: Ok(()),
-        calls: AtomicUsize::default(),
-        creators: Mutex::new(vec![]),
-    });
-    let locks = Arc::new(FakeLocks {
-        result: Ok(valid_lock()),
-        calls: AtomicUsize::default(),
-    });
-    let store = Arc::new(FakeStore::with_preflight(InvoicePreflight::ExactReplay));
-    let router = invoices_router(Arc::new(service(
-        session.clone(),
-        locks.clone(),
-        store.clone(),
-    )))
-    .layer(Extension(signed_auth(&key)));
-    let body = serde_json_canonicalizer::to_vec(&serde_json::json!({
-        "bundle_id": BUNDLE,
-        "lock_resource": LOCK_RESOURCE,
-        "payment_in": 24,
-        "reader": reader()
-    }))
-    .unwrap();
-
-    let response = router
-        .oneshot(signed_invoice_request(&key, body))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let response_body: serde_json::Value =
-        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
-    assert_eq!(
-        response_body,
-        serde_json::json!({
-            "invoice_created_at": "1970-01-01T00:00:00Z",
-            "payment_deadline": "1970-01-02T00:00:00Z"
-        })
-    );
-    assert_eq!(session.calls.load(Ordering::SeqCst), 0);
-    assert_eq!(locks.calls.load(Ordering::SeqCst), 0);
-    assert_eq!(store.create_calls.load(Ordering::SeqCst), 1);
-}
-
-#[tokio::test]
-async fn signed_router_rejects_invalid_payment_window_shapes_before_persistence() {
-    let key = SigningKey::from_bytes(&[13; 32]);
-    for payment_in in [
-        Some(serde_json::Value::Null),
-        Some(serde_json::json!(0)),
-        Some(serde_json::json!("24")),
-        Some(serde_json::json!(1.5)),
-    ] {
-        let store = Arc::new(FakeStore::with_preflight(InvoicePreflight::New));
-        let router = invoices_router(Arc::new(service(
-            Arc::new(FakeSession {
-                result: Ok(()),
-                calls: AtomicUsize::default(),
-                creators: Mutex::new(vec![]),
-            }),
-            Arc::new(FakeLocks {
-                result: Ok(valid_lock()),
-                calls: AtomicUsize::default(),
-            }),
-            store.clone(),
-        )))
-        .layer(Extension(signed_auth(&key)));
-        let mut value = serde_json::json!({
-            "bundle_id": BUNDLE,
-            "lock_resource": LOCK_RESOURCE,
-            "reader": reader()
-        });
-        if let Some(payment_in) = payment_in {
-            value["payment_in"] = payment_in;
-        }
-        let body = serde_json_canonicalizer::to_vec(&value).unwrap();
-        assert_eq!(
-            router
-                .oneshot(signed_invoice_request(&key, body))
-                .await
-                .unwrap()
-                .status(),
-            StatusCode::BAD_REQUEST
-        );
-        assert_eq!(store.create_calls.load(Ordering::SeqCst), 0);
-    }
-
-    let store = Arc::new(FakeStore::with_preflight(InvoicePreflight::New));
-    let router = invoices_router(Arc::new(service(
-        Arc::new(FakeSession {
-            result: Ok(()),
-            calls: AtomicUsize::default(),
-            creators: Mutex::new(vec![]),
-        }),
-        Arc::new(FakeLocks {
-            result: Ok(valid_lock()),
-            calls: AtomicUsize::default(),
-        }),
-        store.clone(),
-    )))
-    .layer(Extension(signed_auth(&key)));
-    let body = format!(
-        r#"{{"bundle_id":"{BUNDLE}","lock_resource":"{LOCK_RESOURCE}","payment_in":18446744073709551616,"reader":"{}"}}"#,
-        reader()
-    )
-    .into_bytes();
-    assert_eq!(
-        router
-            .oneshot(signed_invoice_request(&key, body))
-            .await
-            .unwrap()
-            .status(),
-        StatusCode::BAD_REQUEST
-    );
-    assert_eq!(store.create_calls.load(Ordering::SeqCst), 0);
-}
-
-#[tokio::test]
-async fn omitted_and_explicit_default_payment_windows_share_one_binding() {
-    let key = SigningKey::from_bytes(&[14; 32]);
-    let store = Arc::new(FakeStore::with_preflight(InvoicePreflight::Conflict));
-    let router = invoices_router(Arc::new(service(
-        Arc::new(FakeSession {
-            result: Ok(()),
-            calls: AtomicUsize::default(),
-            creators: Mutex::new(vec![]),
-        }),
-        Arc::new(FakeLocks {
-            result: Ok(valid_lock()),
-            calls: AtomicUsize::default(),
-        }),
-        store.clone(),
-    )))
-    .layer(Extension(signed_auth(&key)));
-
-    for payment_in in [None, Some(serde_json::json!(24))] {
-        let mut value = serde_json::json!({
-            "bundle_id": BUNDLE,
-            "lock_resource": LOCK_RESOURCE,
-            "reader": reader()
-        });
-        if let Some(payment_in) = payment_in {
-            value["payment_in"] = payment_in;
-        }
-        let body = serde_json_canonicalizer::to_vec(&value).unwrap();
-        assert_eq!(
-            router
-                .clone()
-                .oneshot(signed_invoice_request(&key, body))
-                .await
-                .unwrap()
-                .status(),
-            StatusCode::CONFLICT
-        );
-    }
-
-    let bindings = store.payment_bindings.lock().unwrap();
-    assert_eq!(bindings.len(), 2);
-    assert_eq!(bindings[0], bindings[1]);
-    assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(&bindings[0]).unwrap()["payment_in"],
-        serde_json::json!(24)
-    );
 }
 
 #[tokio::test]
@@ -1070,7 +772,6 @@ async fn signed_router_maps_session_invalid_and_unavailable_and_rejects_bad_iden
         let body = serde_json_canonicalizer::to_vec(&serde_json::json!({
             "bundle_id": BUNDLE,
             "lock_resource": LOCK_RESOURCE,
-            "payment_in": 24,
             "reader": reader()
         }))
         .unwrap();
@@ -1099,7 +800,6 @@ async fn signed_router_maps_session_invalid_and_unavailable_and_rejects_bad_iden
     let body = serde_json_canonicalizer::to_vec(&serde_json::json!({
         "bundle_id": BUNDLE,
         "lock_resource": "not-a-lock-resource",
-        "payment_in": 24,
         "reader": reader()
     }))
     .unwrap();
@@ -1114,19 +814,19 @@ async fn signed_router_maps_session_invalid_and_unavailable_and_rejects_bad_iden
     assert_eq!(session.calls.load(Ordering::SeqCst), 0);
 }
 
-struct FakeMarkers {
-    markers: Vec<paykit_lib::PaykitReceiverMarker>,
+struct FakeRegistries {
+    registry: Option<paykit_lib::PaykitAppRegistry>,
     calls: AtomicUsize,
 }
 
 #[async_trait]
-impl MarkerDiscovery for FakeMarkers {
+impl AppRegistryDiscovery for FakeRegistries {
     async fn discover(
         &self,
         _reader: &paykit_server::domain::locks::ReaderPubky,
-    ) -> Result<Vec<paykit_lib::PaykitReceiverMarker>, CreateInvoiceError> {
+    ) -> Result<Option<paykit_lib::PaykitAppRegistry>, CreateInvoiceError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        Ok(self.markers.clone())
+        Ok(self.registry.clone())
     }
 }
 
@@ -1159,49 +859,34 @@ impl InvoicePersistence for CapturingIntentStore {
         &self,
         input: AtomicInvoiceInput<'_>,
     ) -> Result<AtomicInvoiceResult, PersistenceError> {
-        let endpoint = input.new_reader_payloads.for_child_index(0)?;
-        let selected_reader_path = input.payment_request_intent.selected_reader_path().unwrap();
+        let invoice = input.invoice_payloads.for_child_index(0)?;
         self.captured
             .lock()
             .unwrap()
-            .extend([endpoint.endpoint_intent, input.payment_request_intent]);
+            .push(invoice.payment_request_intent);
         Ok(AtomicInvoiceResult::new(
             uuid::Uuid::nil(),
             uuid::Uuid::nil(),
-            Some(uuid::Uuid::nil()),
             uuid::Uuid::nil(),
             0,
             time::OffsetDateTime::UNIX_EPOCH,
             time::OffsetDateTime::UNIX_EPOCH + time::Duration::hours(24),
-            selected_reader_path,
             false,
         ))
     }
 }
 
 #[tokio::test]
-async fn new_invoice_discovers_marker_before_atomic_persistence_and_pins_it_in_both_intents() {
-    use paykit_lib::{
-        PaykitReceiverCapabilities, PaykitReceiverMarker, PaykitReceiverPath, PublicKey,
-    };
-    let marker = PaykitReceiverMarker::new(
-        PaykitReceiverPath::new("bitkit/wallet").unwrap(),
-        PaykitReceiverCapabilities {
-            private_payments: true,
-            payment_requests: true,
-            receipts: false,
-            outgoing_payments: true,
-        },
-        PublicKey::try_from_z32("tkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy").unwrap(),
-    );
-    let markers = Arc::new(FakeMarkers {
-        markers: vec![marker.clone()],
+async fn new_invoice_checks_registry_and_binds_invoice_address_to_request() {
+    let registry = capable_registry();
+    let registries = Arc::new(FakeRegistries {
+        registry: Some(registry.clone()),
         calls: AtomicUsize::default(),
     });
     let store = Arc::new(CapturingIntentStore {
         captured: Mutex::new(vec![]),
     });
-    let service = CreateInvoiceService::with_delivery_intents(
+    let service = CreateInvoiceService::new(
         Arc::new(FakeSession {
             result: Ok(()),
             calls: AtomicUsize::default(),
@@ -1211,9 +896,8 @@ async fn new_invoice_discovers_marker_before_atomic_persistence_and_pins_it_in_b
             result: Ok(valid_lock()),
             calls: AtomicUsize::default(),
         }),
-        markers.clone(),
-        vec![paykit_server::config::ReceiverPathPriority::parse("bitkit".into()).unwrap()],
-        PaykitReceiverPath::new("paykit/server").unwrap(),
+        registries.clone(),
+        paykit_lib::PaykitAppId::new("paykit-server").unwrap(),
         Arc::new(FakeCredentials),
         BitcoinNetwork::Mainnet,
         store.clone(),
@@ -1222,67 +906,30 @@ async fn new_invoice_discovers_marker_before_atomic_persistence_and_pins_it_in_b
 
     service.create(request()).await.unwrap();
 
-    assert_eq!(markers.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(registries.calls.load(Ordering::SeqCst), 1);
     let captured = store.captured.lock().unwrap();
-    assert_eq!(captured.len(), 2);
+    assert_eq!(captured.len(), 1);
     for intent in captured.iter() {
-        assert_eq!(
-            intent.selected_reader_path().unwrap().as_str(),
-            "bitkit/wallet"
-        );
-        assert_eq!(
-            intent.marker_fingerprint(),
-            DeliveryIntentV1::fingerprint(&marker).unwrap()
-        );
+        assert_eq!(intent.app_id(), "paykit-server");
     }
-    assert!(
-        matches!(captured[0].operation(), DeliveryOperationV1::EndpointPublication { receiving_details } if !receiving_details.is_empty())
-    );
-    assert!(
-        matches!(captured[1].operation(), DeliveryOperationV1::PaymentRequestProposal { terms } if uuid::Uuid::parse_str(&terms.payment_reference).is_ok())
-    );
+    assert!(uuid::Uuid::parse_str(&captured[0].terms().unwrap().payment_reference).is_ok());
+    assert_eq!(captured[0].terms().unwrap().payment_endpoints.len(), 1);
 }
 
 #[test]
 fn delivery_intent_is_closed_and_contains_complete_sdk_inputs_not_final_wire_ids() {
-    use paykit_lib::{
-        PaykitReceiverCapabilities, PaykitReceiverMarker, PaykitReceiverPath, PublicKey,
-    };
-
-    let marker = PaykitReceiverMarker::new(
-        PaykitReceiverPath::new("bitkit/wallet").unwrap(),
-        PaykitReceiverCapabilities {
-            private_payments: true,
-            payment_requests: true,
-            receipts: false,
-            outgoing_payments: false,
-        },
-        PublicKey::try_from_z32("tkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy").unwrap(),
-    );
-    let intent = DeliveryIntentV1::endpoint(
+    let terms = PaykitIntentBuilder::new(BitcoinNetwork::Mainnet)
+        .payment_request_terms(&request(), &valid_lock(), "bc1qmeaningfuladdress")
+        .unwrap();
+    let intent = DeliveryIntentV1::payment_request(
         reader(),
-        &marker,
-        PaykitReceiverPath::new("paykit/server").unwrap(),
-        vec![(
-            paykit_lib::PaymentEndpointIdentifier::new("btc-bitcoin-p2wpkh").unwrap(),
-            paykit_lib::PaymentEndpointPayload::new("bc1qmeaningfuladdress"),
-        )],
+        paykit_lib::PaykitAppId::new("paykit-server").unwrap(),
+        &terms,
     )
     .unwrap();
 
-    assert_eq!(
-        intent.selected_reader_path().unwrap().as_str(),
-        "bitkit/wallet"
-    );
-    assert_eq!(
-        intent.marker_fingerprint(),
-        DeliveryIntentV1::fingerprint(&marker).unwrap()
-    );
-    assert!(matches!(
-        intent.operation(),
-        DeliveryOperationV1::EndpointPublication { receiving_details }
-            if receiving_details.len() == 1
-    ));
+    assert_eq!(intent.app_id(), "paykit-server");
+    assert_eq!(intent.terms().unwrap().payment_endpoints.len(), 1);
     let serialized = postcard::to_allocvec(&intent).unwrap();
     assert!(
         !serialized

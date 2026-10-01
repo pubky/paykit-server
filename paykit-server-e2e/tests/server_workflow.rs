@@ -26,21 +26,18 @@ use locks_core::{
         VerifierType,
     },
 };
-use paykit_lib::{PaykitReceiverCapabilities, PaykitReceiverPath};
 use paykit_sdk::{
-    InMemoryStorage, LinkedPeerState, PaykitSdk, PaykitSdkConfig, PubkyLocalSecretKey,
-    PubkyPublicKey, PubkySessionBootstrap, ReceiverNoiseSecretKey, storage::StorageState,
+    LinkedPeerState, PubkyLocalSecretKey, PubkyPublicKey, PubkySessionAccess, PubkySessionBootstrap,
 };
 use paykit_server::{
     Server,
     application::create_invoice::derive_bip84_p2wpkh_address,
-    application::semantic_intent::{DeliveryIntentV1, DeliveryOperationV1},
+    application::semantic_intent::DeliveryIntentV1,
     bitcoin::{ObservationTarget, ObservedOutput},
     config::{BitcoinNetwork, Config, ConfigEnvironment},
     crypto::{Crypto, EncryptedEnvelope, EnvelopeContext},
     domain::locks::{CreatorPubky, ReaderPubky, parse_bundle_id, parse_creator, parse_reader},
-    http::auth::signature_preimage,
-    persistence::{CreatorCredentials, CreatorStore, PostgresStorageAdapter, SdkStateStore},
+    persistence::{CreatorCredentials, CreatorStore},
     startup::initialize_database,
     workers::observer::{ElectrumPort, ObserverError},
 };
@@ -49,19 +46,18 @@ use pubky_testnet::{EphemeralTestnet, pubky::Keypair};
 use sqlx::PgPool;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tower::ServiceExt;
+use uuid::Uuid;
 
 #[path = "fixtures/sdk.rs"]
 mod sdk_fixtures;
-
-use sdk_fixtures::{TestPaymentAdapter, TestSessionProvider};
 
 const MASTER_KEY: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE";
 const BUNDLE_A: &str = "000G40R40M30E209185GR38E1W";
 const BUNDLE_B: &str = "000G40R40M30E209185GR38E2W";
 static PUBKY_TESTNET_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-type CreatorSdk = PaykitSdk<PostgresStorageAdapter, TestSessionProvider, TestPaymentAdapter>;
-type PeerSdk = PaykitSdk<InMemoryStorage, TestSessionProvider, TestPaymentAdapter>;
+type CreatorSdk = sdk_fixtures::HostedSdk;
+type PeerSdk = sdk_fixtures::HostedSdk;
 
 struct CreatorFixture {
     creator: CreatorPubky,
@@ -81,7 +77,7 @@ struct CreatorSpec {
     counter_seed: u64,
 }
 
-type OutboxDiagnostic = (String, bool, i32, Option<String>);
+type OutboxDiagnostic = (String, i32, Option<String>);
 
 struct DeterministicElectrum {
     outputs: HashMap<String, (u64, OutPoint)>,
@@ -169,8 +165,7 @@ fn content_lock(creator: &CreatorPubky, amount_sats: u64) -> ContentLock {
             params: serde_json::json!({
                 "recipient_pubky": creator.to_string(),
                 "amount": amount_sats.to_string(),
-                "asset": "BTC",
-                "payment_in": 24
+                "asset": "BTC"
             }),
         }],
         lock_logic: LockLogic::All {
@@ -188,8 +183,6 @@ async fn create_creator(
     bootstrap: &PubkySessionBootstrap,
     homeserver: &PubkyPublicKey,
     store: &CreatorStore,
-    pool: &PgPool,
-    crypto: Arc<Crypto>,
     spec: CreatorSpec,
 ) -> CreatorFixture {
     let CreatorSpec {
@@ -198,22 +191,19 @@ async fn create_creator(
         amount_sats,
         counter_seed,
     } = spec;
-    let receiver_path = PaykitReceiverPath::new("paykit/server").unwrap();
     let keypair = Keypair::random();
     let account = bootstrap
         .sign_up(
             &PubkyLocalSecretKey::new(keypair.secret_key()),
-            ReceiverNoiseSecretKey::random(),
             homeserver,
             None,
-            &PaykitSdkConfig::new(receiver_path.clone()).required_session_capabilities(),
+            paykit_sdk::PAYKIT_SESSION_CAPABILITIES,
         )
         .await
         .unwrap();
     let lock_writer = bootstrap
         .sign_in(
             &PubkyLocalSecretKey::new(keypair.secret_key()),
-            ReceiverNoiseSecretKey::random(),
             "/pub/locks.app/:rw",
         )
         .await
@@ -233,39 +223,31 @@ async fn create_creator(
         .await
         .unwrap();
     let lock_resource = format!("{creator}{lock_path}");
-    let state = StorageState {
-        next_outbound_private_message_id: counter_seed,
-        ..StorageState::default()
-    };
-    let row = store
-        .create(
-            &CreatorCredentials::new(
-                creator.clone(),
-                session_secret,
-                account.access.receiver_noise_secret_key.clone(),
-                xpub.clone(),
-                account_index,
-            ),
-            &state,
-        )
+    store
+        .create(&CreatorCredentials::new(
+            creator.clone(),
+            session_secret,
+            PubkyLocalSecretKey::new(keypair.secret_key())
+                .derive_paykit_identity_secret_key(1)
+                .unwrap(),
+            xpub.clone(),
+            account_index,
+        ))
         .await
         .unwrap();
-    let sdk = PaykitSdk::new(
-        PostgresStorageAdapter::new(pool, crypto, row.id()),
-        TestSessionProvider::new(account.access),
-        TestPaymentAdapter,
-        PaykitSdkConfig::new(receiver_path),
+    let observer = PubkySessionBootstrap::with_pubky(
+        account.access.outbox_client.clone(),
+        "app.paykit.test-observer",
     )
-    .unwrap();
-    sdk.initialize().await.unwrap();
-    sdk.publish_paykit_receiver_marker(PaykitReceiverCapabilities {
-        private_payments: true,
-        payment_requests: true,
-        receipts: true,
-        outgoing_payments: true,
-    })
+    .unwrap()
+    .sign_in(
+        &PubkyLocalSecretKey::new(keypair.secret_key()),
+        paykit_sdk::PAYKIT_SESSION_CAPABILITIES,
+    )
     .await
     .unwrap();
+    let sdk = sdk_fixtures::hosted_sdk(observer.access, "paykit-server", counter_seed).await;
+    store.mark_setup_complete(&creator).await.unwrap();
     CreatorFixture {
         creator,
         sdk,
@@ -282,35 +264,32 @@ async fn create_peer(
     bootstrap: &PubkySessionBootstrap,
     homeserver: &PubkyPublicKey,
 ) -> (ReaderPubky, PubkyPublicKey, PeerSdk) {
-    let path = PaykitReceiverPath::new("bitkit/server").unwrap();
+    let (reader, key, sdk, _access) = create_peer_with_access(bootstrap, homeserver).await;
+    (reader, key, sdk)
+}
+
+async fn create_peer_with_access(
+    bootstrap: &PubkySessionBootstrap,
+    homeserver: &PubkyPublicKey,
+) -> (ReaderPubky, PubkyPublicKey, PeerSdk, PubkySessionAccess) {
     let account = bootstrap
         .sign_up(
             &PubkyLocalSecretKey::new(Keypair::random().secret_key()),
-            ReceiverNoiseSecretKey::random(),
             homeserver,
             None,
-            &PaykitSdkConfig::new(path.clone()).required_session_capabilities(),
+            paykit_sdk::PAYKIT_SESSION_CAPABILITIES,
         )
         .await
         .unwrap();
     let key = account.public_key.clone();
-    let sdk = PaykitSdk::new(
-        InMemoryStorage::default(),
-        TestSessionProvider::new(account.access),
-        TestPaymentAdapter,
-        PaykitSdkConfig::new(path),
+    let access = account.access.clone();
+    let sdk = sdk_fixtures::hosted_sdk(account.access, "bitkit", 0).await;
+    (
+        parse_reader(&format!("pubky{key}")).unwrap(),
+        key,
+        sdk,
+        access,
     )
-    .unwrap();
-    sdk.initialize().await.unwrap();
-    sdk.publish_paykit_receiver_marker(PaykitReceiverCapabilities {
-        private_payments: true,
-        payment_requests: true,
-        receipts: true,
-        outgoing_payments: true,
-    })
-    .await
-    .unwrap();
-    (parse_reader(&format!("pubky{key}")).unwrap(), key, sdk)
 }
 
 async fn link(
@@ -319,13 +298,11 @@ async fn link(
     peer: &PeerSdk,
     peer_key: PubkyPublicKey,
 ) {
-    let creator_path = PaykitReceiverPath::new("paykit/server").unwrap();
-    let peer_path = PaykitReceiverPath::new("bitkit/server").unwrap();
     creator
-        .initiate_link_with_peer(peer_key.clone(), peer_path.clone())
+        .initiate_link_with_peer(peer_key.clone())
         .await
         .unwrap();
-    peer.accept_link_with_peer(creator_key.clone(), creator_path.clone())
+    peer.accept_link_with_peer(creator_key.clone())
         .await
         .unwrap();
 
@@ -336,14 +313,14 @@ async fn link(
         assert!(tokio::time::Instant::now() < deadline, "link timed out");
         if creator_state != LinkedPeerState::Linked {
             creator_state = creator
-                .advance_link_handshake(peer_key.clone(), peer_path.clone())
+                .advance_link_handshake(peer_key.clone())
                 .await
                 .unwrap()
                 .state;
         }
         if peer_state != LinkedPeerState::Linked {
             peer_state = peer
-                .advance_link_handshake(creator_key.clone(), creator_path.clone())
+                .advance_link_handshake(creator_key.clone())
                 .await
                 .unwrap()
                 .state;
@@ -368,7 +345,7 @@ trusted_public_key = "{trusted_key}"
 allowed_origins = ["https://app.example"]
 [paykit]
 client_id = "app.paykit.server"
-receiver_path = "paykit/server"
+app_id = "paykit-server"
 network = "testnet"
 [bitcoin]
 network = "testnet"
@@ -401,14 +378,12 @@ fn signed_request(
     uri: &str,
     body: String,
 ) -> Request<Body> {
-    let path = uri.split('?').next().expect("request URI has a path");
-    let preimage = signature_preimage(method.as_str(), path, body.as_bytes());
     Request::builder()
         .method(method)
         .uri(uri)
         .header(
             "X-Paykit-Signature",
-            URL_SAFE_NO_PAD.encode(signing_key.sign(&preimage).to_bytes()),
+            URL_SAFE_NO_PAD.encode(signing_key.sign(body.as_bytes()).to_bytes()),
         )
         .body(Body::from(body))
         .unwrap()
@@ -425,7 +400,7 @@ fn invoice_request(
         Method::POST,
         "/invoices",
         format!(
-            r#"{{"bundle_id":"{bundle}","lock_resource":"{}","payment_in":24,"reader":"{reader}"}}"#,
+            r#"{{"bundle_id":"{bundle}","lock_resource":"{}","reader":"{reader}"}}"#,
             fixture.lock_resource
         ),
     )
@@ -573,17 +548,17 @@ async fn wait_for_completion(
                     "amount_matched": true
                 });
         }
-        if delivered == 4 && statuses_confirmed {
+        // Delivery can finish after this iteration's intake has already run.
+        let received = peer.payment_requests().await.unwrap().len();
+        if delivered == 2 && statuses_confirmed && received == fixtures.len() {
             return;
         }
         if tokio::time::Instant::now() >= deadline {
-            let rows: Vec<OutboxDiagnostic> = sqlx::query_as(
-                "SELECT status, depends_on_id IS NOT NULL, attempt_count, error_class FROM outbox ORDER BY depends_on_id NULLS FIRST",
-            )
-            .fetch_all(pool)
-            .await
-            .unwrap();
-            let received = peer.payment_requests().await.unwrap().len();
+            let rows: Vec<OutboxDiagnostic> =
+                sqlx::query_as("SELECT status, attempt_count, error_class FROM outbox ORDER BY id")
+                    .fetch_all(pool)
+                    .await
+                    .unwrap();
             panic!(
                 "composed workflow did not finish: delivered={delivered}, statuses_confirmed={statuses_confirmed}, received={received}, rows={rows:?}"
             );
@@ -596,7 +571,6 @@ async fn raw_database_bytes(pool: &PgPool) -> Vec<Vec<u8>> {
     let mut values = sqlx::query_scalar::<_, Vec<u8>>(
         "SELECT value FROM (
              SELECT convert_to(to_jsonb(c)::text, 'UTF8') AS value FROM creators c
-             UNION ALL SELECT convert_to(to_jsonb(s)::text, 'UTF8') FROM sdk_states s
              UNION ALL SELECT convert_to(to_jsonb(r)::text, 'UTF8') FROM reader_assignments r
              UNION ALL SELECT convert_to(to_jsonb(i)::text, 'UTF8') FROM invoices i
              UNION ALL SELECT convert_to(to_jsonb(o)::text, 'UTF8') FROM outbox o
@@ -618,7 +592,6 @@ async fn raw_database_bytes(pool: &PgPool) -> Vec<Vec<u8>> {
     .bind(
         &[
             "creators",
-            "sdk_states",
             "reader_assignments",
             "invoices",
             "outbox",
@@ -655,7 +628,6 @@ async fn assert_persisted_workflow_inputs(
     crypto: &Crypto,
     reader: &ReaderPubky,
     fixtures: &[(&CreatorFixture, &str)],
-    http_deadlines: &HashMap<&str, String>,
 ) {
     type Row = (
         Vec<u8>,
@@ -663,11 +635,7 @@ async fn assert_persisted_workflow_inputs(
         uuid::Uuid,
         Vec<u8>,
         uuid::Uuid,
-        time::OffsetDateTime,
-        time::OffsetDateTime,
         Vec<u8>,
-        Vec<u8>,
-        uuid::Uuid,
         Vec<u8>,
         uuid::Uuid,
         Vec<u8>,
@@ -675,15 +643,12 @@ async fn assert_persisted_workflow_inputs(
     let rows: Vec<Row> = sqlx::query_as(
         "SELECT c.creator_lookup_hash, c.next_child_index,
                 r.id, r.assignment_envelope,
-                i.id, i.proposal_expires_at, i.payment_deadline,
-                i.invoice_envelope, i.payment_record_envelope,
-                endpoint.id, endpoint.intent_envelope,
+                i.id, i.invoice_envelope, i.payment_record_envelope,
                 payment.id, payment.intent_envelope
          FROM creators c
          JOIN reader_assignments r ON r.creator_id = c.id
          JOIN invoices i ON i.creator_id = c.id
-         JOIN outbox payment ON payment.invoice_id = i.id AND payment.depends_on_id IS NOT NULL
-         JOIN outbox endpoint ON endpoint.id = payment.depends_on_id",
+         JOIN outbox payment ON payment.invoice_id = i.id",
     )
     .fetch_all(pool)
     .await
@@ -698,12 +663,8 @@ async fn assert_persisted_workflow_inputs(
         assignment_id,
         assignment_envelope,
         invoice_id,
-        proposal_expires_at,
-        payment_deadline,
         invoice_envelope,
         payment_record_envelope,
-        endpoint_id,
-        endpoint_envelope,
         payment_id,
         payment_envelope,
     ) in rows
@@ -719,42 +680,16 @@ async fn assert_persisted_workflow_inputs(
             })
             .unwrap();
         assert_eq!(next_child_index, 1, "each Creator must allocate child 0");
-        ids.extend([assignment_id, invoice_id, endpoint_id, payment_id]);
+        ids.extend([assignment_id, invoice_id, payment_id]);
         envelopes.extend([
             assignment_envelope,
             invoice_envelope,
             payment_record_envelope,
-            endpoint_envelope.clone(),
             payment_envelope.clone(),
         ]);
 
         let creator_hash = crypto.lookup_hash(fixture.creator.to_string().as_bytes());
-        let endpoint_plaintext = crypto
-            .decrypt(
-                &EnvelopeContext::outbox_semantic_intent(creator_hash, endpoint_id),
-                &EncryptedEnvelope::from_bytes(endpoint_envelope),
-            )
-            .unwrap();
-        let endpoint = DeliveryIntentV1::decode(&endpoint_plaintext).unwrap();
-        assert_eq!(endpoint.version(), 3);
-        assert_eq!(endpoint.reader_pubky(), reader.to_string());
-        assert_eq!(
-            endpoint.selected_reader_path().unwrap().as_str(),
-            "bitkit/server"
-        );
-        assert_eq!(
-            endpoint.local_receiver_path().unwrap().as_str(),
-            "paykit/server"
-        );
-        assert_ne!(endpoint.marker_fingerprint(), [0; 32]);
         let expected_payload = serde_json::json!({ "value": fixture.address }).to_string();
-        assert!(matches!(
-            endpoint.operation(),
-            DeliveryOperationV1::EndpointPublication { receiving_details }
-                if receiving_details.len() == 1
-                    && receiving_details[0].identifier == "btc-testnet-p2wpkh"
-                    && receiving_details[0].payload == expected_payload
-        ));
 
         let payment_plaintext = crypto
             .decrypt(
@@ -763,51 +698,36 @@ async fn assert_persisted_workflow_inputs(
             )
             .unwrap();
         let payment = DeliveryIntentV1::decode(&payment_plaintext).unwrap();
-        assert_eq!(payment.version(), 3);
+        assert_eq!(payment.version(), 1);
         assert_eq!(payment.reader_pubky(), reader.to_string());
-        assert_eq!(
-            payment.selected_reader_path().unwrap().as_str(),
-            "bitkit/server"
-        );
-        assert_eq!(
-            payment.local_receiver_path().unwrap().as_str(),
-            "paykit/server"
-        );
-        assert_eq!(payment.marker_fingerprint(), endpoint.marker_fingerprint());
+        assert_eq!(payment.app_id(), "paykit-server");
         let amount = format!(
             "{}.{:08}",
             fixture.amount_sats / 100_000_000,
             fixture.amount_sats % 100_000_000
         );
-        let proposal_expires_at = proposal_expires_at
-            .format(&time::format_description::well_known::Rfc3339)
-            .unwrap();
-        let payment_deadline = payment_deadline
-            .format(&time::format_description::well_known::Rfc3339)
-            .unwrap();
-        assert_ne!(proposal_expires_at, payment_deadline);
-        assert_eq!(http_deadlines.get(bundle), Some(&payment_deadline));
-        assert!(matches!(
-            payment.operation(),
-            DeliveryOperationV1::PaymentRequestProposal { terms }
-                if terms.amount == amount
-                    && terms.asset == "btc"
-                    && uuid::Uuid::parse_str(&terms.payment_reference)
-                        .is_ok_and(|reference| reference.get_version_num() == 4
-                            && reference.get_variant() == uuid::Variant::RFC4122
-                            && terms.payment_reference == reference.hyphenated().to_string())
-                    && terms.proposal_expires_at.as_deref() == Some(proposal_expires_at.as_str())
-                    && terms.payment_deadline.as_deref() == Some(payment_deadline.as_str())
-                    && terms.accepted_endpoint_identifiers == ["btc-testnet-p2wpkh"]
-                    && terms.metadata.get("bundle_id") == Some(&serde_json::json!(bundle))
-                    && terms.metadata.get("lock_resource")
-                        == Some(&serde_json::json!(fixture.lock_resource))
-        ));
+        let terms = payment.terms().unwrap();
+        assert!(
+            terms.amount == amount
+                && terms.asset == "btc"
+                && uuid::Uuid::parse_str(&terms.payment_reference).is_ok_and(|reference| reference
+                    .get_version_num()
+                    == 4
+                    && reference.get_variant() == uuid::Variant::RFC4122
+                    && terms.payment_reference == reference.hyphenated().to_string())
+                && terms.proposal_expires_at.is_none()
+                && terms.accepted_endpoint_identifiers == ["btc-testnet-p2wpkh"]
+                && terms.payment_endpoints.len() == 1
+                && terms.payment_endpoints["btc-testnet-p2wpkh"] == expected_payload
+                && terms.metadata.get("bundle_id") == Some(&serde_json::json!(bundle))
+                && terms.metadata.get("lock_resource")
+                    == Some(&serde_json::json!(fixture.lock_resource))
+        );
     }
-    assert_eq!(ids.len(), 8, "workflow row identifiers must be distinct");
+    assert_eq!(ids.len(), 6, "workflow row identifiers must be distinct");
     assert_eq!(
         envelopes.len(),
-        10,
+        8,
         "Creator-bound envelopes must be distinct"
     );
 }
@@ -833,8 +753,6 @@ async fn composed_two_creator_receiver_workflow_survives_restart() {
         &bootstrap,
         &homeserver,
         &creators,
-        &first_pool,
-        crypto.clone(),
         CreatorSpec {
             seed: 41,
             account_index: 0,
@@ -847,8 +765,6 @@ async fn composed_two_creator_receiver_workflow_survives_restart() {
         &bootstrap,
         &homeserver,
         &creators,
-        &first_pool,
-        crypto.clone(),
         CreatorSpec {
             seed: 42,
             account_index: 1,
@@ -907,48 +823,20 @@ async fn composed_two_creator_receiver_workflow_survives_restart() {
             invoice_request(&signing_key, &creator_b, &reader, BUNDLE_B)
         ),
     );
-    assert_eq!(
-        invoice_a.status,
-        StatusCode::OK,
-        "Creator A invoice body: {}",
-        String::from_utf8_lossy(&invoice_a.body)
-    );
-    assert_eq!(
-        invoice_b.status,
-        StatusCode::OK,
-        "Creator B invoice body: {}",
-        String::from_utf8_lossy(&invoice_b.body)
-    );
-    let mut http_deadlines = HashMap::new();
-    for (bundle, response) in [(BUNDLE_A, &invoice_a), (BUNDLE_B, &invoice_b)] {
-        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
-        let object = body.as_object().unwrap();
-        assert_eq!(object.len(), 2);
-        for field in ["invoice_created_at", "payment_deadline"] {
-            time::OffsetDateTime::parse(
-                object
-                    .get(field)
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap(),
-                &time::format_description::well_known::Rfc3339,
-            )
-            .unwrap();
-        }
-        http_deadlines.insert(
-            bundle,
-            object
-                .get("payment_deadline")
-                .and_then(serde_json::Value::as_str)
-                .unwrap()
-                .to_owned(),
+    for (label, response) in [("Creator A", &invoice_a), ("Creator B", &invoice_b)] {
+        assert_eq!(
+            response.status,
+            StatusCode::NO_CONTENT,
+            "{label} invoice body: {}",
+            String::from_utf8_lossy(&response.body)
         );
+        assert!(response.body.is_empty());
     }
     assert_persisted_workflow_inputs(
         &first_pool,
         &crypto,
         &reader,
         &[(&creator_a, BUNDLE_A), (&creator_b, BUNDLE_B)],
-        &http_deadlines,
     )
     .await;
 
@@ -957,7 +845,7 @@ async fn composed_two_creator_receiver_workflow_survives_restart() {
             .fetch_all(&first_pool)
             .await
             .unwrap();
-    assert_eq!(queued_before.len(), 4);
+    assert_eq!(queued_before.len(), 2);
     assert!(
         queued_before
             .iter()
@@ -1008,27 +896,55 @@ async fn composed_two_creator_receiver_workflow_survives_restart() {
         &peer_sdk,
     )
     .await;
-    assert_eq!(peer_sdk.payment_requests().await.unwrap().len(), 2);
+    let requests = peer_sdk.payment_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    for request in &requests {
+        let resolution = peer_sdk
+            .resolve_private_payment_request(
+                request.counterparty.clone(),
+                &paykit_lib::PaymentRequestId::new(request.payment_request_id.clone()).unwrap(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resolution.status,
+            paykit_sdk::PrivatePaymentResolutionStatus::Payable
+        );
+        assert_eq!(resolution.private_payment_list_version, None);
+        assert_eq!(resolution.payable_endpoints.len(), 1);
+        let expected = request
+            .terms
+            .as_ref()
+            .unwrap()
+            .payment_endpoints
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            resolution.payable_endpoints[0].target.payload,
+            expected["btc-testnet-p2wpkh"]
+        );
+    }
 
-    let outbox_rows: Vec<(String, bool)> = sqlx::query_as(
-        "SELECT status, depends_on_id IS NOT NULL FROM outbox ORDER BY invoice_id, depends_on_id NULLS FIRST",
-    )
-    .fetch_all(&second_pool)
-    .await
-    .unwrap();
+    let outbox_rows: Vec<String> =
+        sqlx::query_scalar("SELECT status FROM outbox ORDER BY invoice_id")
+            .fetch_all(&second_pool)
+            .await
+            .unwrap();
     assert_eq!(
         outbox_rows,
-        vec![
-            ("delivered".into(), false),
-            ("delivered".into(), true),
-            ("delivered".into(), false),
-            ("delivered".into(), true),
-        ]
+        vec!["delivered".to_owned(), "delivered".to_owned(),]
     );
 
-    let state_store = SdkStateStore::new(&second_pool, crypto.clone());
-    let state_a = state_store.load(&creator_a.creator).await.unwrap();
-    let state_b = state_store.load(&creator_b.creator).await.unwrap();
+    let state_a = creator_a.sdk.export_backup_state().await.unwrap();
+    let state_b = creator_b.sdk.export_backup_state().await.unwrap();
+    for state in [&state_a, &state_b] {
+        assert_eq!(state.outbound_private_messages.len(), 1);
+        assert!(
+            state.outbound_private_messages[0].raw_json.len()
+                <= paykit_lib::pubky_noise::snow_crypto::PUBKY_NOISE_MSG_LEN
+        );
+    }
     assert!(state_a.next_outbound_private_message_id > creator_a.counter_seed);
     assert!(state_b.next_outbound_private_message_id > creator_b.counter_seed);
 
@@ -1092,7 +1008,6 @@ async fn composed_two_creator_receiver_workflow_survives_restart() {
         "SELECT EXISTS (
              SELECT 1 FROM (
                  SELECT to_jsonb(c) AS value FROM creators c
-                 UNION ALL SELECT to_jsonb(s) FROM sdk_states s
                  UNION ALL SELECT to_jsonb(r) FROM reader_assignments r
                  UNION ALL SELECT to_jsonb(i) FROM invoices i
                  UNION ALL SELECT to_jsonb(o) FROM outbox o
@@ -1122,5 +1037,449 @@ async fn composed_two_creator_receiver_workflow_survives_restart() {
 
     first_pool.close().await;
     second_pool.close().await;
+    database.cleanup().await;
+}
+
+async fn outbox_ids(pool: &PgPool) -> HashSet<Uuid> {
+    sqlx::query_scalar("SELECT id FROM outbox")
+        .fetch_all(pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .collect()
+}
+
+async fn outbox_row_is_delivered(pool: &PgPool, id: Uuid, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let status: String = sqlx::query_scalar("SELECT status FROM outbox WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        if status == "delivered" {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Opens one Locks invoice and returns its exact Payment Request row.
+async fn open_invoice(
+    pool: &PgPool,
+    address: SocketAddr,
+    signing_key: &SigningKey,
+    fixture: &CreatorFixture,
+    reader: &ReaderPubky,
+    bundle: &str,
+) -> Uuid {
+    let before = outbox_ids(pool).await;
+    let response = send_http(
+        address,
+        invoice_request(signing_key, fixture, reader, bundle),
+    )
+    .await;
+    assert_eq!(
+        response.status,
+        StatusCode::NO_CONTENT,
+        "invoice creation failed"
+    );
+    let created: Vec<_> = outbox_ids(pool)
+        .await
+        .difference(&before)
+        .copied()
+        .collect();
+    assert_eq!(
+        created.len(),
+        1,
+        "invoice must create exactly one outbox row"
+    );
+    created[0]
+}
+
+fn connection_status_request(
+    signing_key: &SigningKey,
+    fixture: &CreatorFixture,
+    bundle: &str,
+) -> Request<Body> {
+    signed_request(
+        signing_key,
+        Method::POST,
+        "/connections/status",
+        format!(
+            r#"{{"bundle_id":"{bundle}","creator":"{}"}}"#,
+            fixture.creator
+        ),
+    )
+}
+
+struct FreshServerLinkExpectation<'a> {
+    signing_key: &'a SigningKey,
+    fixture: &'a CreatorFixture,
+    bundle: &'a str,
+    reader_key: &'a PubkyPublicKey,
+    old_generation: u64,
+}
+
+async fn wait_for_fresh_server_link_state(
+    address: SocketAddr,
+    expected: FreshServerLinkExpectation<'_>,
+) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let response = send_http(
+            address,
+            connection_status_request(expected.signing_key, expected.fixture, expected.bundle),
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::OK);
+        let state = serde_json::from_slice::<serde_json::Value>(&response.body).unwrap();
+        let public_state = state["state"].as_str().unwrap();
+        let storage = expected.fixture.sdk.export_backup_state().await.unwrap();
+        let fresh_generation = storage.encrypted_link_states.iter().any(|link| {
+            &link.counterparty == expected.reader_key && link.generation > expected.old_generation
+        });
+        if public_state != "connected" && fresh_generation {
+            assert!(matches!(public_state, "recovery_required" | "handshake"));
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "server did not leave old connected generation"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// The reader's wallet: keeps its side of the handshake moving, reads the
+/// link and returns once the request for `bundle` has arrived.
+async fn wait_for_request(
+    peer: &PeerSdk,
+    creator_key: &PubkyPublicKey,
+    bundle: &str,
+    pool: &PgPool,
+) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let state = peer
+            .ensure_link_with_peer(creator_key.clone(), 1)
+            .await
+            .map(|report| report.state);
+        if matches!(state, Ok(LinkedPeerState::Linked)) {
+            peer.receive_private_messages(creator_key.clone())
+                .await
+                .unwrap();
+            if peer
+                .payment_requests_with(creator_key)
+                .await
+                .unwrap()
+                .iter()
+                .any(|request| {
+                    request.terms.as_ref().is_some_and(|terms| {
+                        terms.metadata.get("bundle_id") == Some(&serde_json::json!(bundle))
+                    })
+                })
+            {
+                return;
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let unsettled: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM outbox WHERE status <> 'delivered'")
+                    .fetch_one(pool)
+                    .await
+                    .unwrap();
+            panic!("request did not arrive; unsettled_rows={unsettled}");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// A wallet that dropped its side of the server link publishes a recovery
+/// marker and waits for a new handshake. The server must not hand the next
+/// request to the abandoned link (and mark it `delivered`); it relinks, and
+/// the request arrives once the wallet is back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn server_relinks_when_the_reader_publishes_a_recovery_marker() {
+    let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
+    let database = TestDatabase::create().await;
+    let signing_key = SigningKey::from_bytes(&[72; 32]);
+    let server_config = config(database.database_url(), &signing_key, "100ms");
+    let pool = initialize_database(&server_config).await.unwrap();
+    let testnet = build_pubky_testnet().await;
+    let pubky = testnet.sdk().unwrap();
+    let bootstrap = PubkySessionBootstrap::with_pubky(pubky.clone(), "app.paykit.server").unwrap();
+    let homeserver = PubkyPublicKey::from_public_key(&testnet.homeserver_app().public_key());
+    let crypto = Arc::new(Crypto::from_master_key(&[1; 32]).unwrap());
+    let creators = CreatorStore::new(&pool, crypto.clone());
+    let (reader, _peer_key, peer_sdk) = create_peer(&bootstrap, &homeserver).await;
+    let creator = create_creator(
+        &bootstrap,
+        &homeserver,
+        &creators,
+        CreatorSpec {
+            seed: 72,
+            account_index: 0,
+            amount_sats: 2_000,
+            counter_seed: 100,
+        },
+    )
+    .await;
+    let creator_key = PubkyPublicKey::from_raw_or_app_key(creator.creator.to_string()).unwrap();
+
+    let observer = Arc::new(DeterministicElectrum::new(&[&creator]));
+    let server = Server::build_with_transports(server_config, pool.clone(), pubky, observer)
+        .await
+        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let running = tokio::spawn(server.run_until(listener, async move {
+        let _ = shutdown_rx.await;
+    }));
+    wait_until_listening(address).await;
+    wait_until_ready(address).await;
+
+    // The first unlock links the reader's wallet to the creator's server link.
+    let first_payment =
+        open_invoice(&pool, address, &signing_key, &creator, &reader, BUNDLE_A).await;
+    wait_for_request(&peer_sdk, &creator_key, BUNDLE_A, &pool).await;
+    assert!(
+        outbox_row_is_delivered(&pool, first_payment, Duration::from_secs(10)).await,
+        "first Payment Request row never settled"
+    );
+    let reader_key = PubkyPublicKey::from_raw_or_app_key(reader.to_string()).unwrap();
+    let linked_state = creator.sdk.export_backup_state().await.unwrap();
+    let old_generation = linked_state
+        .encrypted_link_states
+        .iter()
+        .find(|link| link.counterparty == reader_key)
+        .expect("initial linked generation")
+        .generation;
+
+    // The wallet drops its side of the link and asks for a new handshake, as
+    // Bitkit does after a failed link restore. Marker times have second
+    // precision; one from the second of the server's last link checkpoint
+    // counts as stale.
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    peer_sdk
+        .publish_encrypted_link_recovery_marker(creator_key.clone())
+        .await
+        .unwrap();
+
+    // The next unlock, while the wallet is away: the server must not hand
+    // the request to the link the wallet abandoned.
+    let second_payment =
+        open_invoice(&pool, address, &signing_key, &creator, &reader, BUNDLE_B).await;
+    wait_for_fresh_server_link_state(
+        address,
+        FreshServerLinkExpectation {
+            signing_key: &signing_key,
+            fixture: &creator,
+            bundle: BUNDLE_B,
+            reader_key: &reader_key,
+            old_generation,
+        },
+    )
+    .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let pending_payment: (String, Option<String>, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT status, sdk_outbound_message_id, sdk_event_id, sdk_payment_request_id \
+             FROM outbox WHERE id = $1",
+    )
+    .bind(second_payment)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(!matches!(
+        pending_payment.0.as_str(),
+        "handed_off" | "delivered"
+    ));
+    assert!(pending_payment.1.is_none());
+    assert!(pending_payment.2.is_none());
+    assert!(pending_payment.3.is_none());
+
+    // Once the wallet is back, the new link carries the request.
+    wait_for_request(&peer_sdk, &creator_key, BUNDLE_B, &pool).await;
+    assert!(
+        outbox_row_is_delivered(&pool, second_payment, Duration::from_secs(10)).await,
+        "second Payment Request row never settled"
+    );
+    let received = peer_sdk
+        .payment_requests_with(&creator_key)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|request| {
+            request.terms.as_ref().is_some_and(|terms| {
+                terms.metadata.get("bundle_id") == Some(&serde_json::json!(BUNDLE_B))
+            })
+        })
+        .count();
+    assert_eq!(
+        received, 1,
+        "fresh link delivered duplicate logical requests"
+    );
+
+    let _ = shutdown_tx.send(());
+    running.await.unwrap().unwrap();
+    pool.close().await;
+    database.cleanup().await;
+}
+
+async fn publish_unreadable_recovery_marker(
+    peer: &PeerSdk,
+    access: &PubkySessionAccess,
+    reader_key: &PubkyPublicKey,
+    creator_key: &PubkyPublicKey,
+) {
+    let registry = peer
+        .paykit_app_registry(creator_key.clone())
+        .await
+        .unwrap()
+        .expect("the creator publishes an App Registry");
+    let key = access
+        .local_secret_key
+        .as_ref()
+        .unwrap()
+        .derive_paykit_identity_secret_key(1)
+        .unwrap();
+    let (write_path, _) = paykit_lib::encrypted_link_recovery_marker_paths(
+        &paykit_lib::derive_paykit_noise_secret_key(key.as_bytes()),
+        &reader_key.to_public_key().unwrap(),
+        &creator_key.to_public_key().unwrap(),
+        registry.noise_public_key().unwrap(),
+    );
+    access
+        .session
+        .storage()
+        .put(write_path, String::from(r#"{"version":1}"#))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn malformed_recovery_marker_keeps_exact_handoff_retryable_until_repaired() {
+    let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
+    let database = TestDatabase::create().await;
+    let signing_key = SigningKey::from_bytes(&[73; 32]);
+    let server_config = config(database.database_url(), &signing_key, "100ms");
+    let pool = initialize_database(&server_config).await.unwrap();
+    let testnet = build_pubky_testnet().await;
+    let pubky = testnet.sdk().unwrap();
+    let bootstrap = PubkySessionBootstrap::with_pubky(pubky.clone(), "app.paykit.server").unwrap();
+    let homeserver = PubkyPublicKey::from_public_key(&testnet.homeserver_app().public_key());
+    let crypto = Arc::new(Crypto::from_master_key(&[1; 32]).unwrap());
+    let creators = CreatorStore::new(&pool, crypto.clone());
+    let (reader, reader_key, peer_sdk, peer_access) =
+        create_peer_with_access(&bootstrap, &homeserver).await;
+    let creator = create_creator(
+        &bootstrap,
+        &homeserver,
+        &creators,
+        CreatorSpec {
+            seed: 73,
+            account_index: 0,
+            amount_sats: 2_000,
+            counter_seed: 100,
+        },
+    )
+    .await;
+    let creator_key = PubkyPublicKey::from_raw_or_app_key(creator.creator.to_string()).unwrap();
+
+    let observer = Arc::new(DeterministicElectrum::new(&[&creator]));
+    let server = Server::build_with_transports(server_config, pool.clone(), pubky, observer)
+        .await
+        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let running = tokio::spawn(server.run_until(listener, async move {
+        let _ = shutdown_rx.await;
+    }));
+    wait_until_listening(address).await;
+    wait_until_ready(address).await;
+
+    let first_payment =
+        open_invoice(&pool, address, &signing_key, &creator, &reader, BUNDLE_A).await;
+    wait_for_request(&peer_sdk, &creator_key, BUNDLE_A, &pool).await;
+    assert!(
+        outbox_row_is_delivered(&pool, first_payment, Duration::from_secs(10)).await,
+        "first Payment Request row never settled"
+    );
+    let next_outbound_before = creator
+        .sdk
+        .export_backup_state()
+        .await
+        .unwrap()
+        .next_outbound_private_message_id;
+
+    publish_unreadable_recovery_marker(&peer_sdk, &peer_access, &reader_key, &creator_key).await;
+    let second_payment =
+        open_invoice(&pool, address, &signing_key, &creator, &reader, BUNDLE_B).await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let payment: (String, i32, Option<String>) =
+            sqlx::query_as("SELECT status, attempt_count, error_class FROM outbox WHERE id = $1")
+                .bind(second_payment)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            !matches!(payment.0.as_str(), "handed_off" | "delivered"),
+            "Payment Request was handed off while marker lookup failed"
+        );
+        if payment.0 == "retryable"
+            && payment.1 >= 2
+            && payment.2.as_deref() == Some("recovery_marker_observation")
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "handoff did not retry at recovery marker observation: {payment:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        creator
+            .sdk
+            .export_backup_state()
+            .await
+            .unwrap()
+            .next_outbound_private_message_id,
+        next_outbound_before,
+        "request was enqueued while recovery marker lookup failed"
+    );
+
+    peer_sdk
+        .publish_encrypted_link_recovery_marker(creator_key.clone())
+        .await
+        .unwrap();
+    wait_for_request(&peer_sdk, &creator_key, BUNDLE_B, &pool).await;
+    assert!(
+        outbox_row_is_delivered(&pool, second_payment, Duration::from_secs(10)).await,
+        "repaired handoff never settled"
+    );
+    let received = peer_sdk
+        .payment_requests_with(&creator_key)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|request| {
+            request.terms.as_ref().is_some_and(|terms| {
+                terms.metadata.get("bundle_id") == Some(&serde_json::json!(BUNDLE_B))
+            })
+        })
+        .count();
+    assert_eq!(received, 1, "repaired handoff delivered duplicate requests");
+
+    let _ = shutdown_tx.send(());
+    running.await.unwrap().unwrap();
+    pool.close().await;
     database.cleanup().await;
 }

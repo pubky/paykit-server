@@ -1,18 +1,12 @@
 use std::{sync::Arc, time::Duration};
 
 use paykit_lib::{
-    PaykitReceiverCapabilities, PaykitReceiverMarker, PaykitReceiverPath, PaymentAmount,
-    PaymentDeadline, PaymentEndpointIdentifier, PaymentEndpointPayload, PaymentReference,
-    PaymentRequestTerms, PublicKey,
+    PaykitAppId, PaymentAmount, PaymentDeadline, PaymentEndpointIdentifier, PaymentEndpointPayload,
+    PaymentReference, PaymentRequestTerms,
 };
-use paykit_sdk::{PubkyPublicKey, ReceiverNoiseSecretKey, storage::StorageState};
+use paykit_sdk::PubkyPublicKey;
 use paykit_server::{
-    application::{
-        payment_drain::PaymentDrainError,
-        payment_request_status::PaymentRequestStatusError,
-        semantic_intent::{DeliveryIntentV1, DeliveryOperationV1, PaymentTermsV1},
-    },
-    config::{PaykitConfig, PaykitNetwork, ReceiverPathPriority},
+    application::semantic_intent::{DeliveryIntentV1, DeliveryOperationV1, PaymentTermsV1},
     crypto::{Crypto, EncryptedEnvelope, EnvelopeContext},
     domain::{
         locks::{
@@ -23,17 +17,15 @@ use paykit_server::{
             PaymentRequestLifecycleProjection, PaymentRequestLifecycleState, ProposalCorrelation,
         },
     },
-    paykit::{CreatorSessionProvider, PaykitAdapter},
     persistence::{
-        AtomicInvoiceInput, CreatorCredentials, CreatorStore, InvoiceStore,
-        NewReaderPayloadFactory, NewReaderPayloads, OutboxStore, PaymentDrainStore,
-        PaymentRequestLifecycleApply, PaymentRequestLifecycleStore, PersistenceError,
-        PostgresStorageAdapter, run_migrations,
+        AtomicInvoiceInput, InvoicePayloadFactory, InvoicePayloads, InvoiceStore, OutboxStore,
+        PaymentDrainStore, PaymentRequestLifecycleApply, PaymentRequestLifecycleStore,
+        PersistenceError, run_migrations,
     },
 };
 use paykit_server_e2e::postgres::TestDatabase;
-use pubky::{ClientId, Pubky};
 use sqlx::Row;
+use std::collections::HashMap;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -46,28 +38,16 @@ fn lock_resource() -> PubkyLockResource {
     parse_addressed_lock_resource(LOCK_RESOURCE).unwrap()
 }
 
-fn marker(receiver_path: &str) -> PaykitReceiverMarker {
-    PaykitReceiverMarker::new(
-        PaykitReceiverPath::new(receiver_path).unwrap(),
-        PaykitReceiverCapabilities {
-            private_payments: true,
-            payment_requests: true,
-            receipts: false,
-            outgoing_payments: false,
-        },
-        PublicKey::try_from_z32("tkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy").unwrap(),
-    )
-}
-
 fn proposal_intent(receiver_path: &str) -> DeliveryIntentV1 {
     proposal_intent_for_reference(receiver_path, &Uuid::new_v4().hyphenated().to_string())
 }
 
 fn proposal_intent_for_reference(receiver_path: &str, payment_reference: &str) -> DeliveryIntentV1 {
+    let _ = receiver_path;
+    let app_id = PaykitAppId::new("paykit-server").unwrap();
     DeliveryIntentV1::payment_request(
         READER.into(),
-        &marker(receiver_path),
-        PaykitReceiverPath::new("paykit/server").unwrap(),
+        app_id.clone(),
         &PaymentRequestTerms::builder(
             PaymentAmount::new("0.00001000", "BTC").unwrap(),
             PaymentReference::new(payment_reference.to_owned()).unwrap(),
@@ -77,6 +57,11 @@ fn proposal_intent_for_reference(receiver_path: &str, payment_reference: &str) -
         .payment_deadline(Some(PaymentDeadline::At {
             timestamp: "2027-01-16T08:00:00Z".into(),
         }))
+        .required_app_id(Some(app_id))
+        .payment_endpoints(Some(HashMap::from([(
+            PaymentEndpointIdentifier::new("btc-bitcoin-p2wpkh").unwrap(),
+            PaymentEndpointPayload::new("payload"),
+        )])))
         .build()
         .unwrap(),
     )
@@ -85,20 +70,14 @@ fn proposal_intent_for_reference(receiver_path: &str, payment_reference: &str) -
 
 struct RacePayloads;
 
-impl NewReaderPayloadFactory for RacePayloads {
-    fn for_child_index(&self, child_index: i64) -> Result<NewReaderPayloads, PersistenceError> {
+impl InvoicePayloadFactory for RacePayloads {
+    fn for_child_index(&self, child_index: i64) -> Result<InvoicePayloads, PersistenceError> {
         let address = format!("race-address-{child_index}");
-        Ok(NewReaderPayloads {
-            endpoint_intent: DeliveryIntentV1::endpoint(
-                READER.into(),
-                &marker("new/wallet"),
-                PaykitReceiverPath::new("paykit/server").unwrap(),
-                vec![(
-                    PaymentEndpointIdentifier::new("btc-bitcoin-p2wpkh").unwrap(),
-                    PaymentEndpointPayload::new(address.clone()),
-                )],
-            )
-            .unwrap(),
+        Ok(InvoicePayloads {
+            payment_request_intent: proposal_intent_for_reference(
+                "new/wallet",
+                "00000000-0000-4000-8000-000000000001",
+            ),
             bitcoin_address: address,
         })
     }
@@ -116,11 +95,7 @@ fn admission_input<'a>(
         bundle_binding: b"concurrent-admission-bundle",
         lock_resource_binding: LOCK_RESOURCE.as_bytes(),
         payment_request_binding: b"concurrent-admission-request",
-        new_reader_payloads: &RACE_PAYLOADS,
-        payment_request_intent: proposal_intent_for_reference(
-            "new/wallet",
-            "00000000-0000-4000-8000-000000000001",
-        ),
+        invoice_payloads: &RACE_PAYLOADS,
         required_sats: 1_000,
         proposal_acceptance_seconds: 60 * 60,
         payment_window_seconds: 24 * 60 * 60,
@@ -351,7 +326,7 @@ async fn insert_projectable_attempt(
         payment_request_id: request_id.clone(),
         proposal: ProposalCorrelation {
             reader_pubky: READER.into(),
-            selected_reader_path: "new/wallet".into(),
+            proposal_app_id: "paykit-server".into(),
             terms: PaymentTermsV1 {
                 amount: "0.00001000".into(),
                 asset: "BTC".into(),
@@ -359,6 +334,9 @@ async fn insert_projectable_attempt(
                 proposal_expires_at: Some("2027-01-15T08:00:00Z".into()),
                 payment_deadline: Some("2027-01-16T08:00:00Z".into()),
                 accepted_endpoint_identifiers: vec!["btc-bitcoin-p2wpkh".into()],
+                payment_endpoints: [("btc-bitcoin-p2wpkh".into(), "payload".into())]
+                    .into_iter()
+                    .collect(),
                 metadata: serde_json::Map::new(),
             },
         },
@@ -444,13 +422,8 @@ async fn current_generation_nonterminal_attempts_are_the_only_required_receive_t
 
     assert_eq!(targets.len(), 1);
     assert_eq!(targets[0].counterparty(), READER);
-    assert_eq!(targets[0].receiver_path().as_str(), "mixed/wallet");
     let sdk_counterparty = PubkyPublicKey::from_raw_or_app_key(targets[0].counterparty()).unwrap();
     assert_eq!(sdk_counterparty.to_app_key(), targets[0].counterparty());
-    assert_eq!(
-        targets[0].receiver_path(),
-        &PaykitReceiverPath::new("mixed/wallet").unwrap()
-    );
 
     sqlx::query("UPDATE invoices SET bundle_lookup_hash = $1 WHERE id = $2")
         .bind(crypto.lookup_hash(BUNDLE.as_bytes()).as_bytes().as_slice())
@@ -488,24 +461,19 @@ async fn missing_required_intake_blocks_drain_snapshot_and_status_lookup() {
     run_migrations(database.pool()).await.unwrap();
     let crypto = Arc::new(Crypto::from_master_key(&[49; 32]).unwrap());
     let creator = parse_creator(CREATOR).unwrap();
-    let creators = CreatorStore::new(database.pool(), crypto.clone());
-    let persisted = creators
-        .create(
-            &CreatorCredentials::new(
-                creator.clone(),
-                "test-session-secret".into(),
-                ReceiverNoiseSecretKey::random(),
-                "test-account-xpub".into(),
-                0,
-            ),
-            &StorageState::default(),
-        )
-        .await
-        .unwrap();
+    let creator_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO creators (creator_lookup_hash, credential_envelope)
+         VALUES ($1, $2) RETURNING id",
+    )
+    .bind(crypto.lookup_hash(CREATOR.as_bytes()).as_bytes().as_slice())
+    .bind(b"encrypted-creator".as_slice())
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
     let (invoice_id, _) = insert_invoice(
         &database,
         &crypto,
-        persisted.id(),
+        creator_id,
         0,
         0,
         PaymentRequestLifecycleState::Proposed,
@@ -516,7 +484,7 @@ async fn missing_required_intake_blocks_drain_snapshot_and_status_lookup() {
              (creator_id, lock_resource_lookup_hash, current_generation)
          VALUES ($1, $2, 0)",
     )
-    .bind(persisted.id())
+    .bind(creator_id)
     .bind(
         crypto
             .lookup_hash(lock_resource().to_string().as_bytes())
@@ -533,26 +501,14 @@ async fn missing_required_intake_blocks_drain_snapshot_and_status_lookup() {
         .await
         .unwrap();
 
-    let paykit = PaykitConfig {
-        client_id: ClientId::new("app.paykit.server").unwrap(),
-        receiver_path: PaykitReceiverPath::new("paykit/server").unwrap(),
-        receiver_path_priority: vec![ReceiverPathPriority::parse("bitkit".into()).unwrap()],
-        network: PaykitNetwork::Testnet,
-        proposal_acceptance_window: Duration::from_secs(60 * 60),
-        payment_window: Duration::from_secs(24 * 60 * 60),
-    };
-    let storage = PostgresStorageAdapter::new(database.pool(), crypto.clone(), persisted.id());
-    let sessions =
-        CreatorSessionProvider::with_pubky(creators, creator, Pubky::new().unwrap(), &paykit);
-    let adapter = PaykitAdapter::new(storage, sessions, &paykit).unwrap();
     let lifecycles = PaymentRequestLifecycleStore::new(database.pool(), crypto.clone());
     let drains = PaymentDrainStore::new(database.pool(), crypto.clone());
 
-    let drain_result = adapter
-        .reconcile_and_create_payment_drain(&lifecycles, &drains, &lock_resource())
+    let drain_result = drains
+        .create_after_receive(&lifecycles, &lock_resource(), &[])
         .await;
 
-    assert_eq!(drain_result, Err(PaymentDrainError::Unavailable));
+    assert_eq!(drain_result, Err(PersistenceError::Unavailable));
     assert!(
         drains
             .exact_replay(&lock_resource())
@@ -566,14 +522,15 @@ async fn missing_required_intake_blocks_drain_snapshot_and_status_lookup() {
         .unwrap();
     assert_eq!(drain_count, 0);
 
-    let status_result = adapter
-        .reconcile_and_lookup_payment_request_status(
+    let status_result = InvoiceStore::new(database.pool(), crypto)
+        .payment_request_status_after_receive(
             &lifecycles,
-            &InvoiceStore::new(database.pool(), crypto),
+            &creator,
             &parse_bundle_id(BUNDLE).unwrap(),
+            &[],
         )
         .await;
-    assert_eq!(status_result, Err(PaymentRequestStatusError::Unavailable));
+    assert_eq!(status_result, Err(PersistenceError::Unavailable));
 }
 
 #[tokio::test]

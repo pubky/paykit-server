@@ -9,7 +9,6 @@ TRUNCATE TABLE
     outbox,
     invoices,
     reader_assignments,
-    sdk_states,
     creators,
     deployment_metadata;
 

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bitcoin::{OutPoint, Txid, hashes::Hash};
-use paykit_sdk::{ReceiverNoiseSecretKey, storage::StorageState};
+use paykit_sdk::PaykitIdentitySecretKey;
 use paykit_server::{
     bitcoin::{ObservationTarget, ObservedOutput, TrackedOutput},
     config::BitcoinNetwork,
@@ -10,8 +10,8 @@ use paykit_server::{
     domain::locks::{CreatorPubky, ReaderPubky, parse_creator, parse_reader},
     domain::payment::BitcoinOutpoint,
     persistence::{
-        AtomicInvoiceInput, CreatorCredentials, CreatorStore, InvoiceStore,
-        NewReaderPayloadFactory, NewReaderPayloads, PersistenceError, run_migrations,
+        AtomicInvoiceInput, CreatorCredentials, CreatorStore, InvoicePayloadFactory,
+        InvoicePayloads, InvoiceStore, PersistenceError, run_migrations,
     },
     workers::observer::{ElectrumPort, ObserverError, observe_once, observe_once_at},
 };
@@ -25,10 +25,10 @@ const CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy
 const REGTEST_ADDRESS: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
 
 struct Payloads;
-impl NewReaderPayloadFactory for Payloads {
-    fn for_child_index(&self, child_index: i64) -> Result<NewReaderPayloads, PersistenceError> {
-        Ok(NewReaderPayloads {
-            endpoint_intent: common::endpoint_intent(
+impl InvoicePayloadFactory for Payloads {
+    fn for_child_index(&self, child_index: i64) -> Result<InvoicePayloads, PersistenceError> {
+        Ok(InvoicePayloads {
+            payment_request_intent: common::payment_intent(
                 &reader(),
                 format!("bitcoin-address-{child_index}"),
             ),
@@ -70,16 +70,13 @@ async fn store(database: &TestDatabase) -> InvoiceStore {
     run_migrations(database.pool()).await.unwrap();
     let crypto = crypto();
     CreatorStore::new(database.pool(), crypto.clone())
-        .create(
-            &CreatorCredentials::new(
-                creator(),
-                "session".into(),
-                ReceiverNoiseSecretKey::new([9; 32]),
-                "xpub".into(),
-                0,
-            ),
-            &StorageState::default(),
-        )
+        .create(&CreatorCredentials::new(
+            creator(),
+            "session".into(),
+            PaykitIdentitySecretKey::new([9; 32], 1).unwrap(),
+            "xpub".into(),
+            0,
+        ))
         .await
         .unwrap();
     InvoiceStore::new(database.pool(), crypto)
@@ -101,8 +98,7 @@ async fn invoice_for(
             bundle_binding: bundle,
             lock_resource_binding: b"payment-observation-lock",
             payment_request_binding: request,
-            new_reader_payloads: &PAYLOADS,
-            payment_request_intent: common::payment_intent(&reader()),
+            invoice_payloads: &PAYLOADS,
             required_sats: 100,
             proposal_acceptance_seconds: 60 * 60,
             payment_window_seconds: 24 * 60 * 60,
@@ -113,10 +109,10 @@ async fn invoice_for(
 }
 
 struct FixedPayloads(&'static str);
-impl NewReaderPayloadFactory for FixedPayloads {
-    fn for_child_index(&self, _child_index: i64) -> Result<NewReaderPayloads, PersistenceError> {
-        Ok(NewReaderPayloads {
-            endpoint_intent: common::endpoint_intent(&reader(), self.0.to_owned()),
+impl InvoicePayloadFactory for FixedPayloads {
+    fn for_child_index(&self, _child_index: i64) -> Result<InvoicePayloads, PersistenceError> {
+        Ok(InvoicePayloads {
+            payment_request_intent: common::payment_intent(&reader(), self.0.to_owned()),
             bitcoin_address: self.0.into(),
         })
     }
@@ -124,16 +120,13 @@ impl NewReaderPayloadFactory for FixedPayloads {
 
 async fn create_other_creator(database: &TestDatabase) {
     CreatorStore::new(database.pool(), crypto())
-        .create(
-            &CreatorCredentials::new(
-                other_creator(),
-                "other-session".into(),
-                ReceiverNoiseSecretKey::new([8; 32]),
-                "other-xpub".into(),
-                0,
-            ),
-            &StorageState::default(),
-        )
+        .create(&CreatorCredentials::new(
+            other_creator(),
+            "other-session".into(),
+            PaykitIdentitySecretKey::new([8; 32], 1).unwrap(),
+            "other-xpub".into(),
+            0,
+        ))
         .await
         .unwrap();
 }
@@ -151,8 +144,7 @@ async fn other_creator_invoice(
             bundle_binding: bundle,
             lock_resource_binding: b"payment-observation-lock",
             payment_request_binding: request,
-            new_reader_payloads: &FixedPayloads(address),
-            payment_request_intent: common::payment_intent(&reader()),
+            invoice_payloads: &FixedPayloads(address),
             required_sats: 100,
             proposal_acceptance_seconds: 60 * 60,
             payment_window_seconds: 24 * 60 * 60,
@@ -211,8 +203,7 @@ async fn batch_invoice(database: &TestDatabase) -> (InvoiceStore, uuid::Uuid) {
             bundle_binding: b"batch-bundle",
             lock_resource_binding: b"batch-lock",
             payment_request_binding: b"batch-request",
-            new_reader_payloads: &FixedPayloads(REGTEST_ADDRESS),
-            payment_request_intent: common::payment_intent(&reader()),
+            invoice_payloads: &FixedPayloads(REGTEST_ADDRESS),
             required_sats: 100,
             proposal_acceptance_seconds: 60 * 60,
             payment_window_seconds: 24 * 60 * 60,

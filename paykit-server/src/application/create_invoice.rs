@@ -1,6 +1,7 @@
 //! Invoice application service: replay-first validation and atomic intent persistence.
 
 use std::{
+    collections::HashMap,
     str::FromStr,
     sync::Arc,
     time::{Duration, Instant},
@@ -17,21 +18,20 @@ use locks_core::{
     lock_policy::{ContentLock, VerifierType},
 };
 use paykit_lib::{
-    PaykitReceiverMarker, PaykitReceiverPath, PaymentAmount, PaymentEndpointIdentifier,
+    PaykitAppId, PaykitAppRegistry, PaymentAmount, PaymentEndpointIdentifier,
     PaymentEndpointPayload, PaymentReference, PaymentRequestTerms,
 };
 use serde_json::{Map, Value};
 
 use crate::{
-    application::{reader_marker::select_reader_marker, semantic_intent::DeliveryIntentV1},
-    config::ReceiverPathPriority,
+    application::{reader_registry::reader_is_capable, semantic_intent::DeliveryIntentV1},
     domain::{
         invoice::{CriterionAmount, CriterionAsset, CriterionPaymentWindowHours},
         locks::{BundleId, CreatorPubky, PubkyLockResource, ReaderPubky},
     },
     persistence::{
-        AtomicInvoiceInput, AtomicInvoiceResult, CreatorStore, InvoicePreflight, InvoiceStore,
-        NewReaderPayloadFactory, NewReaderPayloads, PersistenceError,
+        AtomicInvoiceInput, AtomicInvoiceResult, CreatorStore, InvoicePayloadFactory,
+        InvoicePayloads, InvoicePreflight, InvoiceStore, PersistenceError,
     },
 };
 
@@ -77,11 +77,11 @@ pub trait LockFetcher: Send + Sync {
     async fn fetch(&self, resource: &PubkyLockResource) -> Result<ContentLock, LockFetchError>;
 }
 #[async_trait]
-pub trait MarkerDiscovery: Send + Sync {
+pub trait AppRegistryDiscovery: Send + Sync {
     async fn discover(
         &self,
         reader: &ReaderPubky,
-    ) -> Result<Vec<paykit_lib::PaykitReceiverMarker>, CreateInvoiceError>;
+    ) -> Result<Option<PaykitAppRegistry>, CreateInvoiceError>;
 }
 #[async_trait]
 pub trait CreatorXpubProvider: Send + Sync {
@@ -147,11 +147,8 @@ pub trait IntentBuilder: Send + Sync {
         &self,
         request: &CreateInvoiceRequest,
         lock: &ContentLock,
-    ) -> Result<PaymentRequestTerms, CreateInvoiceError>;
-    fn receiving_details(
-        &self,
         address: &str,
-    ) -> Result<Vec<(PaymentEndpointIdentifier, PaymentEndpointPayload)>, CreateInvoiceError>;
+    ) -> Result<PaymentRequestTerms, CreateInvoiceError>;
 }
 
 pub struct PaykitIntentBuilder {
@@ -178,7 +175,15 @@ impl IntentBuilder for PaykitIntentBuilder {
         &self,
         request: &CreateInvoiceRequest,
         lock: &ContentLock,
+        address: &str,
     ) -> Result<PaymentRequestTerms, CreateInvoiceError> {
+        if address.is_empty() {
+            return Err(CreateInvoiceError::InvalidRequest);
+        }
+        let identifier = PaymentEndpointIdentifier::new(self.p2wpkh_identifier())
+            .map_err(|_| CreateInvoiceError::InvalidRequest)?;
+        let payload = serde_json::to_string(&serde_json::json!({ "value": address }))
+            .map_err(|_| CreateInvoiceError::InvalidRequest)?;
         let amount = extract_terms(lock)?;
         let sats = amount.as_sats();
         let mut metadata = Map::new();
@@ -199,28 +204,18 @@ impl IntentBuilder for PaykitIntentBuilder {
             .map_err(|_| CreateInvoiceError::InvalidRequest)?,
             PaymentReference::new(uuid::Uuid::new_v4().hyphenated().to_string())
                 .map_err(|_| CreateInvoiceError::InvalidRequest)?,
-            vec![
-                PaymentEndpointIdentifier::new(self.p2wpkh_identifier())
-                    .map_err(|_| CreateInvoiceError::InvalidRequest)?,
-            ],
+            vec![identifier.clone()],
         )
+        .required_app_id(Some(
+            PaykitAppId::new(crate::config::PAYKIT_APP_ID).expect("static app id"),
+        ))
+        .payment_endpoints(Some(HashMap::from([(
+            identifier,
+            PaymentEndpointPayload::new(payload),
+        )])))
         .metadata(metadata)
         .build()
         .map_err(|_| CreateInvoiceError::InvalidRequest)
-    }
-
-    fn receiving_details(
-        &self,
-        address: &str,
-    ) -> Result<Vec<(PaymentEndpointIdentifier, PaymentEndpointPayload)>, CreateInvoiceError> {
-        if address.is_empty() {
-            return Err(CreateInvoiceError::InvalidRequest);
-        }
-        let identifier = PaymentEndpointIdentifier::new(self.p2wpkh_identifier())
-            .map_err(|_| CreateInvoiceError::InvalidRequest)?;
-        let payload = serde_json::to_string(&serde_json::json!({ "value": address }))
-            .map_err(|_| CreateInvoiceError::InvalidRequest)?;
-        Ok(vec![(identifier, PaymentEndpointPayload::new(payload))])
     }
 }
 
@@ -260,33 +255,32 @@ pub fn derive_bip84_p2wpkh_address(
     Ok(Address::p2wpkh(&derived.to_pub(), network).to_string())
 }
 
-struct DerivedNewReaderPayloads {
+struct DerivedInvoicePayloads<'a> {
     intents: Arc<dyn IntentBuilder>,
     xpub: String,
     account_index: u32,
     network: crate::config::BitcoinNetwork,
-    reader: String,
-    marker: PaykitReceiverMarker,
-    local_receiver_path: PaykitReceiverPath,
+    request: &'a CreateInvoiceRequest,
+    lock: &'a ContentLock,
+    app_id: PaykitAppId,
 }
-impl NewReaderPayloadFactory for DerivedNewReaderPayloads {
-    fn for_child_index(&self, child_index: i64) -> Result<NewReaderPayloads, PersistenceError> {
+impl InvoicePayloadFactory for DerivedInvoicePayloads<'_> {
+    fn for_child_index(&self, child_index: i64) -> Result<InvoicePayloads, PersistenceError> {
         let address =
             derive_bip84_p2wpkh_address(&self.xpub, self.account_index, &self.network, child_index)
                 .map_err(|_| PersistenceError::CorruptOrMissing)?;
-        let receiving_details = self
+        let terms = self
             .intents
-            .receiving_details(&address)
+            .payment_request_terms(self.request, self.lock, &address)
             .map_err(|_| PersistenceError::CorruptOrMissing)?;
-        let endpoint_intent = DeliveryIntentV1::endpoint(
-            self.reader.clone(),
-            &self.marker,
-            self.local_receiver_path.clone(),
-            receiving_details,
+        let payment_request_intent = DeliveryIntentV1::payment_request(
+            self.request.reader.to_string(),
+            self.app_id.clone(),
+            &terms,
         )
         .map_err(|_| PersistenceError::CorruptOrMissing)?;
-        Ok(NewReaderPayloads {
-            endpoint_intent,
+        Ok(InvoicePayloads {
+            payment_request_intent,
             bitcoin_address: address,
         })
     }
@@ -306,9 +300,8 @@ impl DeadlineClock for SystemDeadlineClock {
 pub struct CreateInvoiceService {
     sessions: Arc<dyn SessionValidator>,
     locks: Arc<dyn LockFetcher>,
-    markers: Arc<dyn MarkerDiscovery>,
-    marker_priority: Vec<ReceiverPathPriority>,
-    local_receiver_path: PaykitReceiverPath,
+    registries: Arc<dyn AppRegistryDiscovery>,
+    app_id: PaykitAppId,
     credentials: Arc<dyn CreatorXpubProvider>,
     bitcoin_network: crate::config::BitcoinNetwork,
     store: Arc<dyn InvoicePersistence>,
@@ -322,9 +315,8 @@ impl CreateInvoiceService {
     pub fn new(
         sessions: Arc<dyn SessionValidator>,
         locks: Arc<dyn LockFetcher>,
-        markers: Arc<dyn MarkerDiscovery>,
-        marker_priority: Vec<ReceiverPathPriority>,
-        local_receiver_path: PaykitReceiverPath,
+        registries: Arc<dyn AppRegistryDiscovery>,
+        app_id: PaykitAppId,
         credentials: Arc<dyn CreatorXpubProvider>,
         bitcoin_network: crate::config::BitcoinNetwork,
         store: Arc<dyn InvoicePersistence>,
@@ -333,9 +325,8 @@ impl CreateInvoiceService {
         Self::with_clock(
             sessions,
             locks,
-            markers,
-            marker_priority,
-            local_receiver_path,
+            registries,
+            app_id,
             credentials,
             bitcoin_network,
             store,
@@ -348,9 +339,8 @@ impl CreateInvoiceService {
     pub fn with_clock(
         sessions: Arc<dyn SessionValidator>,
         locks: Arc<dyn LockFetcher>,
-        markers: Arc<dyn MarkerDiscovery>,
-        marker_priority: Vec<ReceiverPathPriority>,
-        local_receiver_path: PaykitReceiverPath,
+        registries: Arc<dyn AppRegistryDiscovery>,
+        app_id: PaykitAppId,
         credentials: Arc<dyn CreatorXpubProvider>,
         bitcoin_network: crate::config::BitcoinNetwork,
         store: Arc<dyn InvoicePersistence>,
@@ -360,9 +350,8 @@ impl CreateInvoiceService {
         Self::with_clock_and_windows(
             sessions,
             locks,
-            markers,
-            marker_priority,
-            local_receiver_path,
+            registries,
+            app_id,
             credentials,
             bitcoin_network,
             store,
@@ -377,9 +366,8 @@ impl CreateInvoiceService {
     pub fn with_invoice_windows(
         sessions: Arc<dyn SessionValidator>,
         locks: Arc<dyn LockFetcher>,
-        markers: Arc<dyn MarkerDiscovery>,
-        marker_priority: Vec<ReceiverPathPriority>,
-        local_receiver_path: PaykitReceiverPath,
+        registries: Arc<dyn AppRegistryDiscovery>,
+        app_id: PaykitAppId,
         credentials: Arc<dyn CreatorXpubProvider>,
         bitcoin_network: crate::config::BitcoinNetwork,
         store: Arc<dyn InvoicePersistence>,
@@ -390,9 +378,8 @@ impl CreateInvoiceService {
         Self::with_clock_and_windows(
             sessions,
             locks,
-            markers,
-            marker_priority,
-            local_receiver_path,
+            registries,
+            app_id,
             credentials,
             bitcoin_network,
             store,
@@ -407,9 +394,8 @@ impl CreateInvoiceService {
     fn with_clock_and_windows(
         sessions: Arc<dyn SessionValidator>,
         locks: Arc<dyn LockFetcher>,
-        markers: Arc<dyn MarkerDiscovery>,
-        marker_priority: Vec<ReceiverPathPriority>,
-        local_receiver_path: PaykitReceiverPath,
+        registries: Arc<dyn AppRegistryDiscovery>,
+        app_id: PaykitAppId,
         credentials: Arc<dyn CreatorXpubProvider>,
         bitcoin_network: crate::config::BitcoinNetwork,
         store: Arc<dyn InvoicePersistence>,
@@ -421,9 +407,8 @@ impl CreateInvoiceService {
         Self {
             sessions,
             locks,
-            markers,
-            marker_priority,
-            local_receiver_path,
+            registries,
+            app_id,
             credentials,
             bitcoin_network,
             store,
@@ -432,31 +417,6 @@ impl CreateInvoiceService {
             proposal_acceptance_window,
             payment_window,
         }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn with_delivery_intents(
-        sessions: Arc<dyn SessionValidator>,
-        locks: Arc<dyn LockFetcher>,
-        markers: Arc<dyn MarkerDiscovery>,
-        marker_priority: Vec<ReceiverPathPriority>,
-        local_receiver_path: PaykitReceiverPath,
-        credentials: Arc<dyn CreatorXpubProvider>,
-        bitcoin_network: crate::config::BitcoinNetwork,
-        store: Arc<dyn InvoicePersistence>,
-        intents: Arc<dyn IntentBuilder>,
-    ) -> Self {
-        Self::new(
-            sessions,
-            locks,
-            markers,
-            marker_priority,
-            local_receiver_path,
-            credentials,
-            bitcoin_network,
-            store,
-            intents,
-        )
     }
 
     pub async fn create(
@@ -507,46 +467,39 @@ impl CreateInvoiceService {
                 }
             })?;
         let lock_remaining = remaining(started, self.clock.now())?;
-        let mut lock =
-            tokio::time::timeout(lock_remaining, self.locks.fetch(&request.lock_resource))
-                .await
-                .map_err(|_| CreateInvoiceError::DeadlineExceeded)?
-                .map_err(|error| match error {
-                    LockFetchError::NotFound => CreateInvoiceError::LockNotFound,
-                    LockFetchError::Unavailable => CreateInvoiceError::LockUnavailable,
-                    LockFetchError::Invalid => CreateInvoiceError::InvalidRequest,
-                })?;
-        default_missing_payment_window(&mut lock);
+        let lock = tokio::time::timeout(lock_remaining, self.locks.fetch(&request.lock_resource))
+            .await
+            .map_err(|_| CreateInvoiceError::DeadlineExceeded)?
+            .map_err(|error| match error {
+                LockFetchError::NotFound => CreateInvoiceError::LockNotFound,
+                LockFetchError::Unavailable => CreateInvoiceError::LockUnavailable,
+                LockFetchError::Invalid => CreateInvoiceError::InvalidRequest,
+            })?;
         validate_lock(&request, &lock)?;
-        let marker_remaining = remaining(started, self.clock.now())?;
-        let discovered =
-            tokio::time::timeout(marker_remaining, self.markers.discover(&request.reader))
-                .await
-                .map_err(|_| CreateInvoiceError::DeadlineExceeded)??;
-        let selected = select_reader_marker(discovered, &self.marker_priority)
-            .ok_or(CreateInvoiceError::Unavailable)?;
+        let registry_remaining = remaining(started, self.clock.now())?;
+        let discovered = tokio::time::timeout(
+            registry_remaining,
+            self.registries.discover(&request.reader),
+        )
+        .await
+        .map_err(|_| CreateInvoiceError::DeadlineExceeded)??;
+        if !discovered.as_ref().is_some_and(reader_is_capable) {
+            return Err(CreateInvoiceError::Unavailable);
+        }
         let credentials_remaining = remaining(started, self.clock.now())?;
         let (xpub, account_index) =
             tokio::time::timeout(credentials_remaining, self.credentials.xpub(&creator))
                 .await
                 .map_err(|_| CreateInvoiceError::DeadlineExceeded)?
                 .map_err(map_store)?;
-        let terms = self.intents.payment_request_terms(&request, &lock)?;
-        let payment_request_intent = DeliveryIntentV1::payment_request(
-            request.reader.to_string(),
-            &selected.marker,
-            self.local_receiver_path.clone(),
-            &terms,
-        )
-        .map_err(|_| CreateInvoiceError::InvalidRequest)?;
-        let new_reader_payloads = DerivedNewReaderPayloads {
+        let invoice_payloads = DerivedInvoicePayloads {
             intents: self.intents.clone(),
             xpub,
             account_index,
             network: self.bitcoin_network.clone(),
-            reader: request.reader.to_string(),
-            marker: selected.marker,
-            local_receiver_path: self.local_receiver_path.clone(),
+            request: &request,
+            lock: &lock,
+            app_id: self.app_id.clone(),
         };
         remaining(started, self.clock.now())?;
         // Once PostgreSQL mutation starts it must be awaited to a factual
@@ -559,8 +512,7 @@ impl CreateInvoiceService {
                 bundle_binding: &bundle_binding,
                 lock_resource_binding: &lock_resource_binding,
                 payment_request_binding: &payment_request_binding,
-                new_reader_payloads: &new_reader_payloads,
-                payment_request_intent,
+                invoice_payloads: &invoice_payloads,
                 required_sats: extract_terms(&lock)?.as_sats(),
                 proposal_acceptance_seconds: self.proposal_acceptance_window.as_secs(),
                 payment_window_seconds: self.payment_window.as_secs(),
@@ -585,26 +537,10 @@ fn remaining(start: Instant, now: Instant) -> Result<Duration, CreateInvoiceErro
 fn map_store(error: PersistenceError) -> CreateInvoiceError {
     match error {
         PersistenceError::Conflict => CreateInvoiceError::Conflict,
-        PersistenceError::InvalidInput => CreateInvoiceError::InvalidRequest,
         PersistenceError::Unavailable => CreateInvoiceError::Unavailable,
         _ => CreateInvoiceError::Unavailable,
     }
 }
-
-fn default_missing_payment_window(lock: &mut ContentLock) {
-    for criterion in &mut lock.criteria {
-        if criterion.verifier_type != VerifierType::PaykitPayment {
-            continue;
-        }
-        let Some(params) = criterion.params.as_object_mut() else {
-            continue;
-        };
-        params.entry("payment_in").or_insert_with(|| {
-            serde_json::Value::from(crate::domain::invoice::DEFAULT_PAYMENT_WINDOW_HOURS)
-        });
-    }
-}
-
 fn validate_lock(
     request: &CreateInvoiceRequest,
     lock: &ContentLock,
@@ -621,17 +557,22 @@ fn validate_lock(
         .iter()
         .find(|criterion| criterion.verifier_type == VerifierType::PaykitPayment)
         .ok_or(CreateInvoiceError::InvalidRequest)?;
-    let params = criterion
-        .paykit_payment_params()
-        .map_err(|_| CreateInvoiceError::InvalidRequest)?
-        .ok_or(CreateInvoiceError::InvalidRequest)?;
-    CriterionAsset::parse(params.asset()).map_err(|_| CreateInvoiceError::InvalidRequest)?;
-    CriterionAmount::parse(params.amount()).map_err(|_| CreateInvoiceError::InvalidRequest)?;
-    let payment_in = CriterionPaymentWindowHours::new(params.payment_in())
-        .map_err(|_| CreateInvoiceError::InvalidRequest)?;
-    if payment_in != request.payment_in {
-        return Err(CreateInvoiceError::InvalidRequest);
-    }
+    CriterionAsset::parse(
+        criterion
+            .params
+            .get("asset")
+            .and_then(Value::as_str)
+            .ok_or(CreateInvoiceError::InvalidRequest)?,
+    )
+    .map_err(|_| CreateInvoiceError::InvalidRequest)?;
+    CriterionAmount::parse(
+        criterion
+            .params
+            .get("amount")
+            .and_then(Value::as_str)
+            .ok_or(CreateInvoiceError::InvalidRequest)?,
+    )
+    .map_err(|_| CreateInvoiceError::InvalidRequest)?;
     Ok(())
 }
 fn extract_terms(lock: &ContentLock) -> Result<CriterionAmount, CreateInvoiceError> {
@@ -640,10 +581,20 @@ fn extract_terms(lock: &ContentLock) -> Result<CriterionAmount, CreateInvoiceErr
         .iter()
         .find(|criterion| criterion.verifier_type == VerifierType::PaykitPayment)
         .ok_or(CreateInvoiceError::InvalidRequest)?;
-    let params = criterion
-        .paykit_payment_params()
-        .map_err(|_| CreateInvoiceError::InvalidRequest)?
-        .ok_or(CreateInvoiceError::InvalidRequest)?;
-    CriterionAsset::parse(params.asset()).map_err(|_| CreateInvoiceError::InvalidRequest)?;
-    CriterionAmount::parse(params.amount()).map_err(|_| CreateInvoiceError::InvalidRequest)
+    CriterionAsset::parse(
+        criterion
+            .params
+            .get("asset")
+            .and_then(Value::as_str)
+            .ok_or(CreateInvoiceError::InvalidRequest)?,
+    )
+    .map_err(|_| CreateInvoiceError::InvalidRequest)?;
+    CriterionAmount::parse(
+        criterion
+            .params
+            .get("amount")
+            .and_then(Value::as_str)
+            .ok_or(CreateInvoiceError::InvalidRequest)?,
+    )
+    .map_err(|_| CreateInvoiceError::InvalidRequest)
 }

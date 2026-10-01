@@ -86,7 +86,7 @@ pub struct PaymentRequestLifecycleProjection {
 #[derive(Clone, PartialEq)]
 pub struct ProposalCorrelation {
     pub reader_pubky: String,
-    pub selected_reader_path: String,
+    pub proposal_app_id: String,
     pub terms: PaymentTermsV1,
 }
 

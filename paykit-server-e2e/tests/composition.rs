@@ -1,69 +1,41 @@
 use std::{sync::Arc, time::Duration};
 
-use axum::{
-    body::{Body, to_bytes},
-    http::{Method, Request, StatusCode},
-};
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use ed25519_dalek::{Signer, SigningKey};
-use paykit_lib::{
-    PaykitReceiverCapabilities, PaykitReceiverMarker, PaykitReceiverPath, PaymentAmount,
-    PaymentEndpointIdentifier, PaymentEndpointPayload, PaymentReference, PaymentRequestId,
-    PaymentRequestTerms,
-};
-use paykit_sdk::{
-    InMemoryStorage, LinkedPeerState, PaykitSdk, PaykitSdkConfig, PubkyLocalSecretKey,
-    PubkyPublicKey, PubkySessionBootstrap, ReceiverNoiseSecretKey, storage::StorageState,
-};
+mod common;
+use paykit_sdk::{LinkedPeerState, PubkyLocalSecretKey, PubkyPublicKey, PubkySessionBootstrap};
 use paykit_server::{
     Server,
-    application::semantic_intent::DeliveryIntentV1,
     config::{Config, ConfigEnvironment},
     crypto::Crypto,
-    domain::locks::{CreatorPubky, ReaderPubky, parse_bundle_id, parse_creator, parse_reader},
-    http::auth::signature_preimage,
+    domain::locks::{CreatorPubky, ReaderPubky, parse_creator, parse_reader},
     persistence::{
-        AtomicInvoiceInput, CreatorCredentials, CreatorStore, InvoiceStore,
-        NewReaderPayloadFactory, NewReaderPayloads, PaymentRequestLifecycleStore, PersistenceError,
-        PostgresStorageAdapter, SdkStateStore, run_migrations,
+        AtomicInvoiceInput, CreatorCredentials, CreatorStore, InvoicePayloadFactory,
+        InvoicePayloads, InvoiceStore, PersistenceError, run_migrations,
     },
     runtime::ComponentState,
 };
 use paykit_server_e2e::postgres::TestDatabase;
 use pubky_testnet::{EphemeralTestnet, pubky::Keypair};
-use tower::ServiceExt;
 use uuid::Uuid;
 
 #[path = "fixtures/sdk.rs"]
 mod sdk_fixtures;
 
-use sdk_fixtures::{TestPaymentAdapter, TestSessionProvider};
-
 const MASTER_KEY: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE";
+const TRUSTED_KEY: &str = "pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo";
 
-type CreatorSdk = PaykitSdk<PostgresStorageAdapter, TestSessionProvider, TestPaymentAdapter>;
-type PeerSdk = PaykitSdk<InMemoryStorage, TestSessionProvider, TestPaymentAdapter>;
+type CreatorSdk = sdk_fixtures::HostedSdk;
+type PeerSdk = sdk_fixtures::HostedSdk;
 
 struct Payloads {
     reader: ReaderPubky,
-    marker: PaykitReceiverMarker,
     address_prefix: &'static str,
 }
 
-impl NewReaderPayloadFactory for Payloads {
-    fn for_child_index(&self, child_index: i64) -> Result<NewReaderPayloads, PersistenceError> {
+impl InvoicePayloadFactory for Payloads {
+    fn for_child_index(&self, child_index: i64) -> Result<InvoicePayloads, PersistenceError> {
         let address = format!("{}-{child_index}", self.address_prefix);
-        Ok(NewReaderPayloads {
-            endpoint_intent: DeliveryIntentV1::endpoint(
-                self.reader.to_string(),
-                &self.marker,
-                PaykitReceiverPath::new("paykit/server").unwrap(),
-                vec![(
-                    PaymentEndpointIdentifier::new("btc-bitcoin-p2wpkh").unwrap(),
-                    PaymentEndpointPayload::new(address.clone()),
-                )],
-            )
-            .unwrap(),
+        Ok(InvoicePayloads {
+            payment_request_intent: common::payment_intent(&self.reader, address.clone()),
             bitcoin_address: address,
         })
     }
@@ -83,57 +55,46 @@ async fn create_creator(
     bootstrap: &PubkySessionBootstrap,
     homeserver: &PubkyPublicKey,
     store: &CreatorStore,
-    pool: &sqlx::PgPool,
-    crypto: Arc<Crypto>,
     counter_seed: u64,
 ) -> (CreatorPubky, CreatorSdk) {
-    let receiver_path = PaykitReceiverPath::new("paykit/server").unwrap();
     let keypair = Keypair::random();
     let account = bootstrap
         .sign_up(
             &PubkyLocalSecretKey::new(keypair.secret_key()),
-            ReceiverNoiseSecretKey::random(),
             homeserver,
             None,
-            &PaykitSdkConfig::new(receiver_path.clone()).required_session_capabilities(),
+            paykit_sdk::PAYKIT_SESSION_CAPABILITIES,
         )
         .await
         .unwrap();
     let session_secret = account.export_session_secret().await.unwrap().into_inner();
     let creator = parse_creator(&format!("pubky{}", account.public_key)).unwrap();
-    let state = StorageState {
-        next_outbound_private_message_id: counter_seed,
-        ..StorageState::default()
-    };
-    let row = store
-        .create(
-            &CreatorCredentials::new(
-                creator.clone(),
-                session_secret,
-                account.access.receiver_noise_secret_key.clone(),
-                format!("test-xpub-{counter_seed}"),
-                0,
-            ),
-            &state,
-        )
+    store
+        .create(&CreatorCredentials::new(
+            creator.clone(),
+            session_secret,
+            PubkyLocalSecretKey::new(keypair.secret_key())
+                .derive_paykit_identity_secret_key(1)
+                .unwrap(),
+            format!("test-xpub-{counter_seed}"),
+            0,
+        ))
         .await
         .unwrap();
-    let sdk = PaykitSdk::new(
-        PostgresStorageAdapter::new(pool, crypto, row.id()),
-        TestSessionProvider::new(account.access),
-        TestPaymentAdapter,
-        PaykitSdkConfig::new(receiver_path),
+    // Independent apps must not refresh the same Pubky session credential.
+    let observer = PubkySessionBootstrap::with_pubky(
+        account.access.outbox_client.clone(),
+        "app.paykit.test-observer",
     )
-    .unwrap();
-    sdk.initialize().await.unwrap();
-    sdk.publish_paykit_receiver_marker(PaykitReceiverCapabilities {
-        private_payments: true,
-        payment_requests: true,
-        receipts: true,
-        outgoing_payments: true,
-    })
+    .unwrap()
+    .sign_in(
+        &PubkyLocalSecretKey::new(keypair.secret_key()),
+        paykit_sdk::PAYKIT_SESSION_CAPABILITIES,
+    )
     .await
     .unwrap();
+    let sdk = sdk_fixtures::hosted_sdk(observer.access, "paykit-server", counter_seed).await;
+    store.mark_setup_complete(&creator).await.unwrap();
     (creator, sdk)
 }
 
@@ -143,13 +104,11 @@ async fn link(
     peer: &PeerSdk,
     peer_key: PubkyPublicKey,
 ) {
-    let creator_path = PaykitReceiverPath::new("paykit/server").unwrap();
-    let peer_path = PaykitReceiverPath::new("bitkit/server").unwrap();
     creator
-        .initiate_link_with_peer(peer_key.clone(), peer_path.clone())
+        .initiate_link_with_peer(peer_key.clone())
         .await
         .unwrap();
-    peer.accept_link_with_peer(creator_key.clone(), creator_path.clone())
+    peer.accept_link_with_peer(creator_key.clone())
         .await
         .unwrap();
 
@@ -160,14 +119,14 @@ async fn link(
         assert!(tokio::time::Instant::now() < deadline, "link timed out");
         if creator_state != LinkedPeerState::Linked {
             creator_state = creator
-                .advance_link_handshake(peer_key.clone(), peer_path.clone())
+                .advance_link_handshake(peer_key.clone())
                 .await
                 .unwrap()
                 .state;
         }
         if peer_state != LinkedPeerState::Linked {
             peer_state = peer
-                .advance_link_handshake(creator_key.clone(), creator_path.clone())
+                .advance_link_handshake(creator_key.clone())
                 .await
                 .unwrap()
                 .state;
@@ -176,149 +135,21 @@ async fn link(
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn real_sdk_receive_report_matches_durable_required_target() {
-    let database = TestDatabase::create().await;
-    run_migrations(database.pool()).await.unwrap();
-    let testnet = build_pubky_testnet().await;
-    let pubky = testnet.sdk().unwrap();
-    let bootstrap = PubkySessionBootstrap::with_pubky(pubky, "app.paykit.server").unwrap();
-    let homeserver = PubkyPublicKey::from_public_key(&testnet.homeserver_app().public_key());
-    let crypto = Arc::new(Crypto::from_master_key(&[3; 32]).unwrap());
-    let creators = CreatorStore::new(database.pool(), crypto.clone());
-
-    let peer_path = PaykitReceiverPath::new("bitkit/server").unwrap();
-    let peer_account = bootstrap
-        .sign_up(
-            &PubkyLocalSecretKey::new(Keypair::random().secret_key()),
-            ReceiverNoiseSecretKey::random(),
-            &homeserver,
-            None,
-            &PaykitSdkConfig::new(peer_path.clone()).required_session_capabilities(),
-        )
-        .await
-        .unwrap();
-    let peer_key = peer_account.public_key.clone();
-    let peer_sdk = PaykitSdk::new(
-        InMemoryStorage::default(),
-        TestSessionProvider::new(peer_account.access),
-        TestPaymentAdapter,
-        PaykitSdkConfig::new(peer_path.clone()),
-    )
-    .unwrap();
-    peer_sdk.initialize().await.unwrap();
-    peer_sdk
-        .publish_paykit_receiver_marker(PaykitReceiverCapabilities {
-            private_payments: true,
-            payment_requests: true,
-            receipts: true,
-            outgoing_payments: true,
-        })
-        .await
-        .unwrap();
-    let marker = peer_sdk
-        .paykit_receiver_marker(peer_key.clone(), peer_path)
-        .await
-        .unwrap()
-        .unwrap();
-    let reader = parse_reader(&format!("pubky{peer_key}")).unwrap();
-    let (creator, creator_sdk) = create_creator(
-        &bootstrap,
-        &homeserver,
-        &creators,
-        database.pool(),
-        crypto.clone(),
-        200,
-    )
-    .await;
-    let creator_key = PubkyPublicKey::from_raw_or_app_key(creator.to_string()).unwrap();
-    link(&creator_sdk, creator_key, &peer_sdk, peer_key).await;
-
-    let bundle = "000G40R40M30E209185GR38E1W";
-    let invoice = InvoiceStore::new(database.pool(), crypto.clone())
-        .create_atomic(AtomicInvoiceInput {
-            creator: &creator,
-            reader: &reader,
-            bundle_binding: bundle.as_bytes(),
-            lock_resource_binding: b"receive-report-normalization-lock",
-            payment_request_binding: b"receive-report-normalization-request",
-            new_reader_payloads: &Payloads {
-                reader: reader.clone(),
-                marker: marker.clone(),
-                address_prefix: "receive-report-normalization-address",
-            },
-            payment_request_intent: payment_intent(&reader, &marker),
-            required_sats: 100,
-            proposal_acceptance_seconds: 60 * 60,
-            payment_window_seconds: 24 * 60 * 60,
-        })
-        .await
-        .unwrap();
-    let creator_id: Uuid = sqlx::query_scalar("SELECT creator_id FROM invoices WHERE id = $1")
-        .bind(invoice.invoice_id())
-        .fetch_one(database.pool())
-        .await
-        .unwrap();
-    let targets = PaymentRequestLifecycleStore::new(database.pool(), crypto)
-        .required_receive_targets_for_bundle(creator_id, &parse_bundle_id(bundle).unwrap())
-        .await
-        .unwrap();
-    assert_eq!(targets.len(), 1);
-
-    let reports = creator_sdk
-        .receive_private_messages_from_linked_peers()
-        .await
-        .unwrap();
-    assert_eq!(reports.len(), 1);
-    assert!(reports[0].error.is_none());
-    assert!(reports[0].report.is_some());
-    assert_eq!(
-        reports[0].counterparty,
-        PubkyPublicKey::from_raw_or_app_key(targets[0].counterparty()).unwrap()
-    );
-    assert_eq!(
-        reports[0].counterparty_receiver_path,
-        *targets[0].receiver_path()
-    );
-
-    database.cleanup().await;
-}
-
-fn payment_intent(reader: &ReaderPubky, marker: &PaykitReceiverMarker) -> DeliveryIntentV1 {
-    DeliveryIntentV1::payment_request(
-        reader.to_string(),
-        marker,
-        PaykitReceiverPath::new("paykit/server").unwrap(),
-        &PaymentRequestTerms::builder(
-            PaymentAmount::new("0.00000100", "btc").unwrap(),
-            PaymentReference::new(Uuid::new_v4().to_string()).unwrap(),
-            vec![PaymentEndpointIdentifier::new("btc-bitcoin-p2wpkh").unwrap()],
-        )
-        .build()
-        .unwrap(),
-    )
-    .unwrap()
-}
-
-fn config_with_trusted_key(
-    database_url: &str,
-    electrum_endpoint: &str,
-    trusted_key: &str,
-) -> Config {
+fn config(database_url: &str, electrum_endpoint: &str) -> Config {
     let toml = format!(
         r#"
 [http]
 listen_addr = "127.0.0.1:0"
 
 [locks]
-trusted_public_key = "{trusted_key}"
+trusted_public_key = "{TRUSTED_KEY}"
 
 [setup]
 allowed_origins = ["https://app.example"]
 
 [paykit]
 client_id = "app.paykit.server"
-receiver_path = "paykit/server"
+app_id = "paykit-server"
 network = "testnet"
 
 [bitcoin]
@@ -348,128 +179,6 @@ retry_max = "2s"
     .unwrap()
 }
 
-#[tokio::test]
-async fn production_composition_registers_all_payment_drain_routes_as_signed() {
-    let database = TestDatabase::create().await;
-    run_migrations(database.pool()).await.unwrap();
-    let unavailable = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let electrum_endpoint = format!("tcp://{}", unavailable.local_addr().unwrap());
-    drop(unavailable);
-    let signing_key = SigningKey::from_bytes(&[7; 32]);
-    let trusted_key = pubky::PublicKey::from(
-        pubky::pkarr::PublicKey::try_from(signing_key.verifying_key().as_bytes()).unwrap(),
-    )
-    .to_string();
-    let server = Server::build_with_pubky(
-        config_with_trusted_key(database.database_url(), &electrum_endpoint, &trusted_key),
-        database.pool().clone(),
-        pubky::Pubky::testnet().unwrap(),
-    )
-    .await
-    .unwrap();
-
-    for path in [
-        "/payment-request-drains",
-        "/payment-request-drain-lookups",
-        "/payment-request-drain-cleanups",
-        "/payment-requests/status",
-    ] {
-        let response = server
-            .router()
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri(path)
-                    .body(Body::from("{}"))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
-    }
-
-    for (path, body) in [
-        (
-            "/payment-request-drain-lookups",
-            br#"{"lock_resource":"pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/locks.app/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json"}"#
-                .as_slice(),
-        ),
-        (
-            "/payment-requests/status",
-            br#"{"bundle_id":"000G40R40M30E209185GR38E1W","creator":"pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy"}"#
-                .as_slice(),
-        ),
-    ] {
-        let preimage = signature_preimage("POST", path, body);
-        let response = server
-            .router()
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri(path)
-                    .header(
-                        "X-Paykit-Signature",
-                        URL_SAFE_NO_PAD.encode(signing_key.sign(&preimage).to_bytes()),
-                    )
-                    .body(Body::from(body))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
-    }
-
-    let body = br#"{"lock_resource":"pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/locks.app/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json"}"#;
-    let preimage = signature_preimage("POST", "/payment-request-drains", body);
-    let response = server
-        .router()
-        .oneshot(
-            Request::builder()
-                .method(Method::POST)
-                .uri("/payment-request-drains")
-                .header(
-                    "X-Paykit-Signature",
-                    URL_SAFE_NO_PAD.encode(signing_key.sign(&preimage).to_bytes()),
-                )
-                .body(Body::from(body.as_slice()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-
-    let cleanup_token = URL_SAFE_NO_PAD.encode([9; 32]);
-    let cleanup_body = format!(
-        r#"{{"cleanup_token":"{cleanup_token}","lock_resource":"pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/locks.app/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json"}}"#
-    )
-    .into_bytes();
-    let cleanup_preimage =
-        signature_preimage("POST", "/payment-request-drain-cleanups", &cleanup_body);
-    let cleanup = server
-        .router()
-        .oneshot(
-            Request::builder()
-                .method(Method::POST)
-                .uri("/payment-request-drain-cleanups")
-                .header(
-                    "X-Paykit-Signature",
-                    URL_SAFE_NO_PAD.encode(signing_key.sign(&cleanup_preimage).to_bytes()),
-                )
-                .body(Body::from(cleanup_body))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(cleanup.status(), StatusCode::CONFLICT);
-    assert_eq!(
-        to_bytes(cleanup.into_body(), 16 * 1024).await.unwrap(),
-        br#"{"error":{"code":"conflict","message":"request conflicts with persisted payment state"}}"#
-            .as_slice()
-    );
-
-    database.cleanup().await;
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn production_server_workers_process_two_creators_without_sdk_state_fallback() {
     let database = TestDatabase::create().await;
@@ -481,112 +190,56 @@ async fn production_server_workers_process_two_creators_without_sdk_state_fallba
     let crypto = Arc::new(Crypto::from_master_key(&[1; 32]).unwrap());
     let creators = CreatorStore::new(database.pool(), crypto.clone());
 
-    let peer_path = PaykitReceiverPath::new("bitkit/server").unwrap();
     let peer_account = bootstrap
         .sign_up(
             &PubkyLocalSecretKey::new(Keypair::random().secret_key()),
-            ReceiverNoiseSecretKey::random(),
             &homeserver,
             None,
-            &PaykitSdkConfig::new(peer_path.clone()).required_session_capabilities(),
+            paykit_sdk::PAYKIT_SESSION_CAPABILITIES,
         )
         .await
         .unwrap();
     let peer_key = peer_account.public_key.clone();
-    let peer_sdk = PaykitSdk::new(
-        InMemoryStorage::default(),
-        TestSessionProvider::new(peer_account.access),
-        TestPaymentAdapter,
-        PaykitSdkConfig::new(peer_path.clone()),
-    )
-    .unwrap();
-    peer_sdk.initialize().await.unwrap();
-    peer_sdk
-        .publish_paykit_receiver_marker(PaykitReceiverCapabilities {
-            private_payments: true,
-            payment_requests: true,
-            receipts: true,
-            outgoing_payments: true,
-        })
-        .await
-        .unwrap();
-    let marker = peer_sdk
-        .paykit_receiver_marker(peer_key.clone(), peer_path)
-        .await
-        .unwrap()
-        .unwrap();
+    let peer_sdk = sdk_fixtures::hosted_sdk(peer_account.access, "bitkit", 0).await;
     let reader = parse_reader(&format!("pubky{peer_key}")).unwrap();
 
-    let (creator_a, sdk_a) = create_creator(
-        &bootstrap,
-        &homeserver,
-        &creators,
-        database.pool(),
-        crypto.clone(),
-        100,
-    )
-    .await;
-    let (creator_b, sdk_b) = create_creator(
-        &bootstrap,
-        &homeserver,
-        &creators,
-        database.pool(),
-        crypto.clone(),
-        1000,
-    )
-    .await;
-    let (creator_c, _sdk_c) = create_creator(
-        &bootstrap,
-        &homeserver,
-        &creators,
-        database.pool(),
-        crypto.clone(),
-        10_000,
-    )
-    .await;
+    let (creator_a, sdk_a) = create_creator(&bootstrap, &homeserver, &creators, 100).await;
+    let (creator_b, sdk_b) = create_creator(&bootstrap, &homeserver, &creators, 1000).await;
+    let (creator_c, sdk_c) = create_creator(&bootstrap, &homeserver, &creators, 10_000).await;
     let creator_a_key = PubkyPublicKey::from_raw_or_app_key(creator_a.to_string()).unwrap();
     let creator_b_key = PubkyPublicKey::from_raw_or_app_key(creator_b.to_string()).unwrap();
-    link(&sdk_a, creator_a_key.clone(), &peer_sdk, peer_key.clone()).await;
-    link(&sdk_b, creator_b_key.clone(), &peer_sdk, peer_key.clone()).await;
+    link(&sdk_a, creator_a_key, &peer_sdk, peer_key.clone()).await;
+    link(&sdk_b, creator_b_key, &peer_sdk, peer_key).await;
 
-    let sdk_states = SdkStateStore::new(database.pool(), crypto.clone());
-    let before_a = sdk_states
-        .load(&creator_a)
+    let before_a = sdk_a
+        .export_backup_state()
         .await
         .unwrap()
         .next_outbound_private_message_id;
-    let before_b = sdk_states
-        .load(&creator_b)
+    let before_b = sdk_b
+        .export_backup_state()
         .await
         .unwrap()
         .next_outbound_private_message_id;
-    let before_c = sdk_states
-        .load(&creator_c)
+    let before_c = sdk_c
+        .export_backup_state()
         .await
         .unwrap()
         .next_outbound_private_message_id;
     assert_ne!(before_a, before_b);
 
-    let lock_resource_a = format!(
-        "{creator_a}/pub/locks.app/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json"
-    );
-    let lock_resource_b = format!(
-        "{creator_b}/pub/locks.app/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json"
-    );
-    let invoices = InvoiceStore::new(database.pool(), crypto.clone());
+    let invoices = InvoiceStore::new(database.pool(), crypto);
     let invoice_a = invoices
         .create_atomic(AtomicInvoiceInput {
             creator: &creator_a,
             reader: &reader,
-            bundle_binding: b"000G40R40M30E209185GR38E1W",
-            lock_resource_binding: lock_resource_a.as_bytes(),
+            bundle_binding: b"composition-bundle-a",
+            lock_resource_binding: b"composition-lock-a",
             payment_request_binding: b"composition-request-a",
-            new_reader_payloads: &Payloads {
+            invoice_payloads: &Payloads {
                 reader: reader.clone(),
-                marker: marker.clone(),
                 address_prefix: "creator-a-address",
             },
-            payment_request_intent: payment_intent(&reader, &marker),
             required_sats: 100,
             proposal_acceptance_seconds: 60 * 60,
             payment_window_seconds: 24 * 60 * 60,
@@ -598,14 +251,12 @@ async fn production_server_workers_process_two_creators_without_sdk_state_fallba
             creator: &creator_b,
             reader: &reader,
             bundle_binding: b"composition-bundle-b",
-            lock_resource_binding: lock_resource_b.as_bytes(),
+            lock_resource_binding: b"composition-lock-b",
             payment_request_binding: b"composition-request-b",
-            new_reader_payloads: &Payloads {
+            invoice_payloads: &Payloads {
                 reader: reader.clone(),
-                marker: marker.clone(),
                 address_prefix: "creator-b-address",
             },
-            payment_request_intent: payment_intent(&reader, &marker),
             required_sats: 200,
             proposal_acceptance_seconds: 60 * 60,
             payment_window_seconds: 24 * 60 * 60,
@@ -621,12 +272,10 @@ async fn production_server_workers_process_two_creators_without_sdk_state_fallba
             bundle_binding: b"composition-bundle-c",
             lock_resource_binding: b"composition-lock-c",
             payment_request_binding: b"composition-request-c",
-            new_reader_payloads: &Payloads {
+            invoice_payloads: &Payloads {
                 reader: unreachable_reader.clone(),
-                marker: marker.clone(),
                 address_prefix: "creator-c-address",
             },
-            payment_request_intent: payment_intent(&unreachable_reader, &marker),
             required_sats: 300,
             proposal_acceptance_seconds: 60 * 60,
             payment_window_seconds: 24 * 60 * 60,
@@ -649,34 +298,30 @@ async fn production_server_workers_process_two_creators_without_sdk_state_fallba
             .await
             .unwrap();
     assert_ne!(address_hash_a, address_hash_b);
-    let endpoint_a = invoice_a.endpoint_publication_outbox_id().unwrap();
-    let endpoint_b = invoice_b.endpoint_publication_outbox_id().unwrap();
-    let endpoint_c = invoice_c.endpoint_publication_outbox_id().unwrap();
+    let request_a = invoice_a.payment_request_outbox_id();
+    let request_b = invoice_b.payment_request_outbox_id();
+    let request_c = invoice_c.payment_request_outbox_id();
 
     let unavailable = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let electrum_endpoint = format!("tcp://{}", unavailable.local_addr().unwrap());
     drop(unavailable);
-    let signing_key = SigningKey::from_bytes(&[7; 32]);
-    let trusted_key = pubky::PublicKey::from(
-        pubky::pkarr::PublicKey::try_from(signing_key.verifying_key().as_bytes()).unwrap(),
-    )
-    .to_string();
     let server = Server::build_with_pubky(
-        config_with_trusted_key(database.database_url(), &electrum_endpoint, &trusted_key),
+        config(database.database_url(), &electrum_endpoint),
         database.pool().clone(),
-        pubky.clone(),
+        pubky,
     )
     .await
     .unwrap();
+    let runtime = server.runtime();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let mut server_task = tokio::spawn(server.run(listener));
+    let server_task = tokio::spawn(server.run(listener));
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     let (outbound_a, outbound_b) = loop {
         let rows: Vec<(Uuid, String, Option<String>)> = sqlx::query_as(
             "SELECT id, status, sdk_outbound_message_id FROM outbox WHERE id = ANY($1)",
         )
-        .bind(vec![endpoint_a, endpoint_b, endpoint_c])
+        .bind(vec![request_a, request_b, request_c])
         .fetch_all(database.pool())
         .await
         .unwrap();
@@ -688,13 +333,13 @@ async fn production_server_workers_process_two_creators_without_sdk_state_fallba
         };
         let retrying_c = rows
             .iter()
-            .any(|row| row.0 == endpoint_c && row.1 == "retryable");
-        if let (Some(a), Some(b), true) = (lookup(endpoint_a), lookup(endpoint_b), retrying_c) {
+            .any(|row| row.0 == request_c && row.1 == "retryable");
+        if let (Some(a), Some(b), true) = (lookup(request_a), lookup(request_b), retrying_c) {
             break (a, b);
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "production workers did not process both Creator-scoped endpoint intents"
+            "production workers did not process both Creator-scoped request intents"
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     };
@@ -702,334 +347,29 @@ async fn production_server_workers_process_two_creators_without_sdk_state_fallba
     assert_eq!(outbound_a, before_a);
     assert_eq!(outbound_b, before_b);
     assert_ne!(outbound_a, outbound_b);
-    let after_a = sdk_states.load(&creator_a).await.unwrap();
-    let after_b = sdk_states.load(&creator_b).await.unwrap();
-    let after_c = sdk_states.load(&creator_c).await.unwrap();
-    assert!(after_a.next_outbound_private_message_id > before_a);
-    assert!(after_b.next_outbound_private_message_id > before_b);
-    assert_eq!(after_c.next_outbound_private_message_id, before_c);
-
-    let payment_a = invoice_a.payment_request_outbox_id();
-    let payment_b = invoice_b.payment_request_outbox_id();
-    // Each Creator owns an independent SDK receive cycle. Under a loaded full
-    // workspace run, projecting both cycles can require more than one poll round.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    let (request_a, request_b) = loop {
-        let rows: Vec<(Uuid, String, Option<String>, Option<String>)> = sqlx::query_as(
-            "SELECT id, status, sdk_payment_request_id, error_class
-             FROM outbox
-             WHERE id = ANY($1)",
-        )
-        .bind(vec![payment_a, payment_b])
-        .fetch_all(database.pool())
-        .await
-        .unwrap();
-        let delivered = |id| {
-            rows.iter()
-                .find(|row| row.0 == id && row.1 == "delivered")
-                .and_then(|row| row.2.clone())
-        };
-        if let (Some(a), Some(b)) = (delivered(payment_a), delivered(payment_b)) {
-            let states: Vec<(Uuid, String)> = sqlx::query_as(
-                "SELECT invoice_id, request_state
-                 FROM payment_request_lifecycles
-                 WHERE invoice_id = ANY($1)",
-            )
-            .bind(vec![invoice_a.invoice_id(), invoice_b.invoice_id()])
-            .fetch_all(database.pool())
-            .await
-            .unwrap();
-            if states.len() == 2 && states.iter().all(|state| state.1 == "proposed") {
-                break (a, b);
+    let health = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let health = runtime.readiness().await;
+            if health.status != ComponentState::NotReady {
+                break health;
             }
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        if tokio::time::Instant::now() >= deadline {
-            let states: Vec<(Uuid, String, String)> = sqlx::query_as(
-                "SELECT invoice_id, sdk_payment_request_id, request_state
-                 FROM payment_request_lifecycles
-                 WHERE invoice_id = ANY($1)",
-            )
-            .bind(vec![invoice_a.invoice_id(), invoice_b.invoice_id()])
-            .fetch_all(database.pool())
-            .await
-            .unwrap();
-            panic!(
-                "production workers did not deliver and project both Payment Requests: outbox={rows:?}, lifecycles={states:?}"
-            );
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    };
-    assert_ne!(request_a, request_b);
-
-    server_task.abort();
-    let _ = server_task.await;
-    sqlx::query("DELETE FROM payment_request_lifecycles WHERE invoice_id = $1")
-        .bind(invoice_a.invoice_id())
-        .execute(database.pool())
-        .await
-        .unwrap();
-    let replacement = Server::build_with_pubky(
-        config_with_trusted_key(database.database_url(), &electrum_endpoint, &trusted_key),
-        database.pool().clone(),
-        pubky.clone(),
-    )
+    })
     .await
-    .unwrap();
-    let mut router = replacement.router();
-    let status_body =
-        format!(r#"{{"bundle_id":"000G40R40M30E209185GR38E1W","creator":"{creator_a}"}}"#)
-            .into_bytes();
-    let status_preimage = signature_preimage("POST", "/payment-requests/status", &status_body);
-    let status = router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method(Method::POST)
-                .uri("/payment-requests/status")
-                .header(
-                    "X-Paykit-Signature",
-                    URL_SAFE_NO_PAD.encode(signing_key.sign(&status_preimage).to_bytes()),
-                )
-                .body(Body::from(status_body))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let status_code = status.status();
-    let status_body = to_bytes(status.into_body(), 16 * 1024).await.unwrap();
-    assert_eq!(
-        status_code,
-        StatusCode::OK,
-        "status refresh failed: {}",
-        String::from_utf8_lossy(&status_body)
-    );
-    let status_json: serde_json::Value = serde_json::from_slice(&status_body).unwrap();
-    assert_eq!(status_json["request_state"], "proposed");
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    server_task = tokio::spawn(replacement.run(listener));
-
-    let intake = peer_sdk
-        .receive_private_messages_from_linked_peers()
-        .await
-        .unwrap();
-    assert!(intake.iter().all(|report| report.error.is_none()));
-    let peer_records = peer_sdk.payment_requests().await.unwrap();
-    assert!(
-        peer_records
-            .iter()
-            .any(|record| record.payment_request_id == request_a)
-    );
-    assert!(
-        peer_records
-            .iter()
-            .any(|record| record.payment_request_id == request_b)
-    );
-    let request_a_id = PaymentRequestId::new(request_a).unwrap();
-    let creator_path = PaykitReceiverPath::new("paykit/server").unwrap();
-    peer_sdk
-        .accept_payment_request(creator_a_key.clone(), creator_path.clone(), &request_a_id)
-        .await
-        .unwrap();
-    let acceptance = peer_sdk
-        .process_outbound_private_messages(creator_a_key, creator_path)
-        .await
-        .unwrap();
-    assert_eq!(acceptance.sent.len(), 1);
-    assert!(acceptance.failed.is_empty());
-
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-    loop {
-        let state: Option<String> = sqlx::query_scalar(
-            "SELECT request_state
-             FROM payment_request_lifecycles
-             WHERE invoice_id = $1",
-        )
-        .bind(invoice_a.invoice_id())
-        .fetch_optional(database.pool())
-        .await
-        .unwrap();
-        if state.as_deref() == Some("accepted") {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "production receive/query/projection did not persist acceptance"
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-
-    server_task.abort();
-    let _ = server_task.await;
-    sqlx::query("DELETE FROM payment_request_lifecycles WHERE invoice_id = $1")
-        .bind(invoice_a.invoice_id())
-        .execute(database.pool())
-        .await
-        .unwrap();
-    let restarted = Server::build_with_pubky(
-        config_with_trusted_key(database.database_url(), &electrum_endpoint, &trusted_key),
-        database.pool().clone(),
-        pubky.clone(),
-    )
-    .await
-    .unwrap();
-    let runtime = restarted.runtime();
-    router = restarted.router();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    server_task = tokio::spawn(restarted.run(listener));
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-    loop {
-        let state: Option<String> = sqlx::query_scalar(
-            "SELECT request_state
-             FROM payment_request_lifecycles
-             WHERE invoice_id = $1",
-        )
-        .bind(invoice_a.invoice_id())
-        .fetch_optional(database.pool())
-        .await
-        .unwrap();
-        if state.as_deref() == Some("accepted") {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "restart did not rebuild accepted lifecycle from canonical SDK state"
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-
-    let drain_body = format!(r#"{{"lock_resource":"{lock_resource_a}"}}"#).into_bytes();
-    let drain_request = || {
-        let preimage = signature_preimage("POST", "/payment-request-drains", &drain_body);
-        Request::builder()
-            .method(Method::POST)
-            .uri("/payment-request-drains")
-            .header(
-                "X-Paykit-Signature",
-                URL_SAFE_NO_PAD.encode(signing_key.sign(&preimage).to_bytes()),
-            )
-            .body(Body::from(drain_body.clone()))
-            .unwrap()
-    };
-    let first = router.clone().oneshot(drain_request()).await.unwrap();
-    assert_eq!(first.status(), StatusCode::OK);
-    let first_body = to_bytes(first.into_body(), 16 * 1024).await.unwrap();
-    let first_json: serde_json::Value = serde_json::from_slice(&first_body).unwrap();
-    assert_eq!(first_json["status"], "active");
-    assert_eq!(first_json["accepted_count"], 1);
-    assert_eq!(first_json["terminal_count"], 0);
-    assert_eq!(first_json["cancellation_enqueued_count"], 0);
-    assert_eq!(first_json["cleanup_token"].as_str().unwrap().len(), 43);
-    assert_eq!(first_json.as_object().unwrap().len(), 5);
-
-    let creator_id: Uuid = sqlx::query_scalar("SELECT creator_id FROM invoices WHERE id = $1")
-        .bind(invoice_a.invoice_id())
-        .fetch_one(database.pool())
-        .await
-        .unwrap();
-    let credential_envelope: Vec<u8> =
-        sqlx::query_scalar("SELECT credential_envelope FROM creators WHERE id = $1")
-            .bind(creator_id)
-            .fetch_one(database.pool())
-            .await
-            .unwrap();
-    let state_envelope: Vec<u8> =
-        sqlx::query_scalar("SELECT state_envelope FROM sdk_states WHERE creator_id = $1")
-            .bind(creator_id)
-            .fetch_one(database.pool())
-            .await
-            .unwrap();
-    sqlx::query("UPDATE creators SET credential_envelope = $1 WHERE id = $2")
-        .bind(b"corrupt".as_slice())
-        .bind(creator_id)
-        .execute(database.pool())
-        .await
-        .unwrap();
-    sqlx::query("UPDATE sdk_states SET state_envelope = $1 WHERE creator_id = $2")
-        .bind(b"corrupt".as_slice())
-        .bind(creator_id)
-        .execute(database.pool())
-        .await
-        .unwrap();
-    let replay = router.clone().oneshot(drain_request()).await.unwrap();
-    assert_eq!(replay.status(), StatusCode::OK);
-    let replay_body = to_bytes(replay.into_body(), 16 * 1024).await.unwrap();
-    assert_eq!(replay_body, first_body);
-    sqlx::query("UPDATE creators SET credential_envelope = $1 WHERE id = $2")
-        .bind(credential_envelope)
-        .bind(creator_id)
-        .execute(database.pool())
-        .await
-        .unwrap();
-    sqlx::query("UPDATE sdk_states SET state_envelope = $1 WHERE creator_id = $2")
-        .bind(state_envelope)
-        .bind(creator_id)
-        .execute(database.pool())
-        .await
-        .unwrap();
-
-    let drain_b_body = format!(r#"{{"lock_resource":"{lock_resource_b}"}}"#).into_bytes();
-    let request_b = |path: &'static str, body: Vec<u8>| {
-        let preimage = signature_preimage("POST", path, &body);
-        Request::builder()
-            .method(Method::POST)
-            .uri(path)
-            .header(
-                "X-Paykit-Signature",
-                URL_SAFE_NO_PAD.encode(signing_key.sign(&preimage).to_bytes()),
-            )
-            .body(Body::from(body))
-            .unwrap()
-    };
-    let completed = router
-        .clone()
-        .oneshot(request_b("/payment-request-drains", drain_b_body.clone()))
-        .await
-        .unwrap();
-    assert_eq!(completed.status(), StatusCode::OK);
-    let completed_body = to_bytes(completed.into_body(), 16 * 1024).await.unwrap();
-    let completed_json: serde_json::Value = serde_json::from_slice(&completed_body).unwrap();
-    assert_eq!(completed_json["status"], "completed");
-    assert_eq!(completed_json["accepted_count"], 0);
-    assert_eq!(completed_json["terminal_count"], 0);
-    assert_eq!(completed_json["cancellation_enqueued_count"], 1);
-    let cleanup_token = completed_json["cleanup_token"].as_str().unwrap();
-    assert_eq!(cleanup_token.len(), 43);
-    assert_eq!(completed_json.as_object().unwrap().len(), 5);
-    let cleanup_body =
-        format!(r#"{{"cleanup_token":"{cleanup_token}","lock_resource":"{lock_resource_b}"}}"#)
-            .into_bytes();
-    for _ in 0..2 {
-        let cleanup = router
-            .clone()
-            .oneshot(request_b(
-                "/payment-request-drain-cleanups",
-                cleanup_body.clone(),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(cleanup.status(), StatusCode::OK);
-        assert_eq!(
-            to_bytes(cleanup.into_body(), 16 * 1024).await.unwrap(),
-            br#"{"status":"removed"}"#.as_slice()
-        );
-    }
-    let absent = router
-        .clone()
-        .oneshot(request_b(
-            "/payment-request-drain-lookups",
-            drain_b_body.clone(),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(absent.status(), StatusCode::NOT_FOUND);
-
-    tokio::time::sleep(Duration::from_millis(1_100)).await;
-    let health = runtime.readiness().await;
+    .expect("all workers must publish startup health");
     assert_eq!(health.status, ComponentState::Degraded);
     assert_eq!(health.paykit_delivery, ComponentState::Degraded);
     assert_eq!(health.outbox, ComponentState::Ready);
 
-    server_task.abort();
-    let _ = server_task.await;
+    runtime.begin_shutdown();
+    server_task.await.unwrap().unwrap();
+    let after_a = sdk_a.export_backup_state().await.unwrap();
+    let after_b = sdk_b.export_backup_state().await.unwrap();
+    let after_c = sdk_c.export_backup_state().await.unwrap();
+    assert!(after_a.next_outbound_private_message_id > before_a);
+    assert!(after_b.next_outbound_private_message_id > before_b);
+    assert_eq!(after_c.next_outbound_private_message_id, before_c);
+
     database.cleanup().await;
 }

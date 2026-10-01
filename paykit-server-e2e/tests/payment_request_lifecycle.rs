@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use paykit_lib::{
-    PaykitReceiverCapabilities, PaykitReceiverMarker, PaykitReceiverPath, PaymentAmount,
-    PaymentEndpointIdentifier, PaymentReference, PaymentRequestTerms, PublicKey,
+    PaykitAppId, PaymentAmount, PaymentEndpointIdentifier, PaymentEndpointPayload,
+    PaymentReference, PaymentRequestTerms,
 };
 use paykit_server::{
     application::semantic_intent::{DeliveryIntentV1, PaymentTermsV1},
@@ -19,6 +19,7 @@ use paykit_server::{
     },
 };
 use paykit_server_e2e::postgres::TestDatabase;
+use std::collections::HashMap;
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
@@ -29,25 +30,20 @@ fn creator() -> CreatorPubky {
 }
 
 fn proposal_intent(payment_reference: &str) -> DeliveryIntentV1 {
-    let marker = PaykitReceiverMarker::new(
-        PaykitReceiverPath::new("bitkit/wallet").unwrap(),
-        PaykitReceiverCapabilities {
-            private_payments: true,
-            payment_requests: true,
-            receipts: false,
-            outgoing_payments: false,
-        },
-        PublicKey::try_from_z32("tkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy").unwrap(),
-    );
+    let app_id = PaykitAppId::new("paykit-server").unwrap();
     DeliveryIntentV1::payment_request(
         CREATOR.into(),
-        &marker,
-        PaykitReceiverPath::new("paykit/server").unwrap(),
+        app_id.clone(),
         &PaymentRequestTerms::builder(
             PaymentAmount::new("1", "btc").unwrap(),
             PaymentReference::new(payment_reference.to_owned()).unwrap(),
             vec![PaymentEndpointIdentifier::new("btc-bitcoin-p2wpkh").unwrap()],
         )
+        .required_app_id(Some(app_id))
+        .payment_endpoints(Some(HashMap::from([(
+            PaymentEndpointIdentifier::new("btc-bitcoin-p2wpkh").unwrap(),
+            PaymentEndpointPayload::new("payload"),
+        )])))
         .build()
         .unwrap(),
     )
@@ -190,7 +186,7 @@ fn projection(
     PaymentRequestLifecycleProjection {
         proposal: ProposalCorrelation {
             reader_pubky: CREATOR.into(),
-            selected_reader_path: "bitkit/wallet".into(),
+            proposal_app_id: "paykit-server".into(),
             terms: PaymentTermsV1 {
                 amount: "1".into(),
                 asset: "btc".into(),
@@ -198,6 +194,9 @@ fn projection(
                 proposal_expires_at: None,
                 payment_deadline: None,
                 accepted_endpoint_identifiers: vec!["btc-bitcoin-p2wpkh".into()],
+                payment_endpoints: [("btc-bitcoin-p2wpkh".into(), "payload".into())]
+                    .into_iter()
+                    .collect(),
                 metadata: serde_json::Map::new(),
             },
         },

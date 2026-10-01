@@ -2,7 +2,6 @@
 
 use std::sync::Arc;
 
-use paykit_lib::PaykitReceiverPath;
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
@@ -36,7 +35,6 @@ pub enum PaymentRequestLifecycleApply {
 #[derive(Clone, PartialEq, Eq)]
 pub struct RequiredReceiveTarget {
     counterparty: String,
-    receiver_path: PaykitReceiverPath,
 }
 
 impl std::fmt::Debug for RequiredReceiveTarget {
@@ -48,10 +46,6 @@ impl std::fmt::Debug for RequiredReceiveTarget {
 impl RequiredReceiveTarget {
     pub fn counterparty(&self) -> &str {
         &self.counterparty
-    }
-
-    pub fn receiver_path(&self) -> &PaykitReceiverPath {
-        &self.receiver_path
     }
 }
 
@@ -294,9 +288,6 @@ impl PaymentRequestLifecycleStore {
             }
             let target = RequiredReceiveTarget {
                 counterparty: intent.reader_pubky().to_owned(),
-                receiver_path: intent
-                    .selected_reader_path()
-                    .map_err(|_| PersistenceError::CorruptOrMissing)?,
             };
             if !targets.contains(&target) {
                 targets.push(target);
@@ -371,7 +362,7 @@ impl PaymentRequestLifecycleStore {
                 .map_err(|_| PersistenceError::CorruptOrMissing)?;
             if intent.matches_proposal(
                 &projection.proposal.reader_pubky,
-                &projection.proposal.selected_reader_path,
+                &projection.proposal.proposal_app_id,
                 &projection.proposal.terms,
             ) && !semantic_invoice_ids.contains(&row.invoice_id)
             {

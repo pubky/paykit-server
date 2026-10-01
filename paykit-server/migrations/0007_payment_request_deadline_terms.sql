@@ -1,6 +1,6 @@
 -- Staging-only hard cutover to rc56 immutable Payment Request terms.
 --
--- Existing invoice, SDK, outbox, lifecycle, and drain rows encode rc48/rc55
+-- Existing invoice, outbox, lifecycle, and drain rows encode rc48/rc55
 -- semantics and cannot be reinterpreted safely. Paykit Server has not reached
 -- production, so reset all dependent staging state before installing the new
 -- closed deadline schema. SQLx records this migration transactionally.
@@ -15,7 +15,6 @@ TRUNCATE TABLE
     invoices,
     lock_payment_generations,
     reader_assignments,
-    sdk_states,
     creators,
     deployment_metadata;
 

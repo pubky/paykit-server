@@ -1,26 +1,18 @@
-use std::{borrow::Cow, str::FromStr, sync::OnceLock, time::Duration};
+use std::{str::FromStr, sync::OnceLock, time::Duration};
 
 use paykit_server::persistence::{MIGRATION_ADVISORY_LOCK_KEY, run_migrations};
 use paykit_server_e2e::postgres::TestDatabase;
-use sqlx::{Connection, PgConnection, PgPool, Row, migrate::Migrator, postgres::PgConnectOptions};
+use sqlx::{Connection, PgConnection, PgPool, Row, postgres::PgConnectOptions};
 use uuid::Uuid;
 
-const REQUIRED_TABLES: [&str; 12] = [
+const REQUIRED_TABLES: [&str; 6] = [
     "deployment_metadata",
     "creators",
-    "sdk_states",
     "reader_assignments",
     "invoices",
-    "lock_payment_generations",
     "outbox",
     "bitcoin_observations",
-    "payment_request_lifecycles",
-    "payment_drains",
-    "payment_drain_items",
-    "payment_drain_cancellations",
 ];
-
-static ALL_MIGRATIONS: Migrator = sqlx::migrate!("../paykit-server/migrations");
 
 /// PostgreSQL advisory locks are server-wide, not database-scoped. These
 /// migration tests deliberately use the production migration lock key, so
@@ -50,7 +42,7 @@ async fn migrations_create_the_required_schema_and_are_restart_safe() {
     for table in REQUIRED_TABLES {
         assert!(tables.iter().any(|name| name == table), "missing {table}");
     }
-    for retired_table in ["inbox_events", "peer_work_leases"] {
+    for retired_table in ["inbox_events", "peer_work_leases", "sdk_states"] {
         assert!(
             !tables.iter().any(|name| name == retired_table),
             "retired table remains: {retired_table}"
@@ -62,107 +54,7 @@ async fn migrations_create_the_required_schema_and_are_restart_safe() {
             .fetch_all(pool)
             .await
             .unwrap();
-    assert_eq!(applied_versions, vec![1, 2, 3, 4, 5, 6, 7]);
-
-    let cleanup_receipt_nullable: String = sqlx::query_scalar(
-        "SELECT is_nullable FROM information_schema.columns
-         WHERE table_schema = 'public' AND table_name = 'lock_payment_generations'
-           AND column_name = 'last_cleanup_token'",
-    )
-    .fetch_one(pool)
-    .await
-    .unwrap();
-    assert_eq!(cleanup_receipt_nullable, "YES");
-    let cleanup_receipt_constraint: bool = sqlx::query_scalar(
-        "SELECT EXISTS (
-             SELECT 1 FROM pg_constraint
-             WHERE conrelid = 'lock_payment_generations'::regclass
-               AND conname = 'lock_payment_generations_cleanup_token_length'
-         )",
-    )
-    .fetch_one(pool)
-    .await
-    .unwrap();
-    assert!(cleanup_receipt_constraint);
-
-    let lock_lookup_nullable: String = sqlx::query_scalar(
-        "SELECT is_nullable FROM information_schema.columns
-         WHERE table_schema = 'public' AND table_name = 'invoices'
-           AND column_name = 'lock_resource_lookup_hash'",
-    )
-    .fetch_one(pool)
-    .await
-    .unwrap();
-    assert_eq!(lock_lookup_nullable, "NO");
-
-    let proposal_lookup_nullable: String = sqlx::query_scalar(
-        "SELECT is_nullable FROM information_schema.columns
-         WHERE table_schema = 'public' AND table_name = 'outbox'
-           AND column_name = 'proposal_lookup_hash'",
-    )
-    .fetch_one(pool)
-    .await
-    .unwrap();
-    assert_eq!(proposal_lookup_nullable, "YES");
-    let proposal_lookup_index_exists: bool = sqlx::query_scalar(
-        "SELECT EXISTS (
-             SELECT 1 FROM pg_indexes
-             WHERE schemaname = 'public'
-               AND tablename = 'outbox'
-               AND indexname = 'outbox_proposal_lookup_index'
-         )",
-    )
-    .fetch_one(pool)
-    .await
-    .unwrap();
-    assert!(proposal_lookup_index_exists);
-
-    let observation_lifecycle_columns: Vec<(String, String)> = sqlx::query_as(
-        "SELECT column_name, is_nullable
-         FROM information_schema.columns
-         WHERE table_schema = 'public' AND table_name = 'invoices'
-           AND column_name IN (
-               'first_amount_matched_observed_at',
-               'first_amount_matched_outpoint_lookup_hash',
-               'payment_expired_at'
-           )
-         ORDER BY column_name",
-    )
-    .fetch_all(pool)
-    .await
-    .unwrap();
-    assert_eq!(
-        observation_lifecycle_columns,
-        vec![
-            ("first_amount_matched_observed_at".into(), "YES".into()),
-            (
-                "first_amount_matched_outpoint_lookup_hash".into(),
-                "YES".into()
-            ),
-            ("payment_expired_at".into(), "YES".into()),
-        ]
-    );
-    let lifecycle_constraints: Vec<String> = sqlx::query_scalar(
-        "SELECT conname FROM pg_constraint
-         WHERE conrelid = 'invoices'::regclass
-           AND conname IN (
-               'invoices_first_amount_matched_window_check',
-               'invoices_first_amount_matched_outpoint_pair',
-               'invoices_payment_expired_deadline_check'
-           )
-         ORDER BY conname",
-    )
-    .fetch_all(pool)
-    .await
-    .unwrap();
-    assert_eq!(
-        lifecycle_constraints,
-        vec![
-            "invoices_first_amount_matched_outpoint_pair",
-            "invoices_first_amount_matched_window_check",
-            "invoices_payment_expired_deadline_check",
-        ]
-    );
+    assert_eq!(applied_versions, vec![1]);
 
     let plaintext_creator_pubky_columns: Vec<String> = sqlx::query_scalar(
         "SELECT table_name \
@@ -201,9 +93,7 @@ async fn migrations_create_the_required_schema_and_are_restart_safe() {
                ('payment_record_envelope', 'bitcoin_address_lookup_hash',
                 'derivation_index_lookup_hash',
                 'observation_envelope', 'outpoint_lookup_hash',
-                'reader_lookup_hash', 'bundle_lookup_hash',
-                'invoice_created_at', 'proposal_expires_at', 'payment_deadline',
-                'proposal_acceptance_seconds', 'payment_window_seconds')
+                'reader_lookup_hash', 'bundle_lookup_hash')
            AND is_nullable <> 'NO'",
     )
     .fetch_all(pool)
@@ -506,8 +396,8 @@ async fn outbox_sdk_identifier_constraints_reject_unattributable_terminal_rows()
 
     assert_check_violation(
         sqlx::query(
-            "INSERT INTO outbox (creator_id, intent_envelope, intent_kind, status)
-             VALUES ($1, $2, 'endpoint_publication', 'handed_off')",
+            "INSERT INTO outbox (creator_id, intent_envelope, status)
+             VALUES ($1, $2, 'handed_off')",
         )
         .bind(creator_id)
         .bind(b"encrypted-intent".as_slice())
@@ -517,8 +407,8 @@ async fn outbox_sdk_identifier_constraints_reject_unattributable_terminal_rows()
     assert_check_violation(
         sqlx::query(
             "INSERT INTO outbox
-             (creator_id, intent_envelope, intent_kind, status, sdk_outbound_message_id)
-             VALUES ($1, $2, 'endpoint_publication', 'delivered', '01')",
+             (creator_id, intent_envelope, status, sdk_outbound_message_id)
+             VALUES ($1, $2, 'delivered', '01')",
         )
         .bind(creator_id)
         .bind(b"encrypted-intent".as_slice())
@@ -528,8 +418,8 @@ async fn outbox_sdk_identifier_constraints_reject_unattributable_terminal_rows()
     assert_check_violation(
         sqlx::query(
             "INSERT INTO outbox
-             (creator_id, intent_envelope, intent_kind, status, sdk_event_id)
-             VALUES ($1, $2, 'payment_request_proposal', 'queued', 'event-id')",
+             (creator_id, intent_envelope, status, sdk_event_id)
+             VALUES ($1, $2, 'queued', 'event-id')",
         )
         .bind(creator_id)
         .bind(b"encrypted-intent".as_slice())
@@ -604,19 +494,13 @@ async fn insert_invoice_result_with_reader(
     let derivation_index_hash = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO invoices \
-         (creator_id, reader_lookup_hash, bundle_lookup_hash, lock_resource_lookup_hash,
-          payment_request_lookup_hash, \
+         (creator_id, reader_lookup_hash, bundle_lookup_hash, payment_request_lookup_hash, \
           invoice_envelope, payment_record_envelope, bitcoin_address_lookup_hash,
-          derivation_index_lookup_hash, payment_status, invoice_created_at,
-          proposal_expires_at, payment_deadline,
-          proposal_acceptance_seconds, payment_window_seconds) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                 NOW(), NOW() + INTERVAL '30 minutes', NOW() + INTERVAL '1 hour',
-                 1800, 3600)",
+          derivation_index_lookup_hash, payment_status) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
     )
     .bind(creator_id)
     .bind(reader_hash)
-    .bind(bundle_hash)
     .bind(bundle_hash)
     .bind(request_hash)
     .bind(b"encrypted-invoice".as_slice())
@@ -688,233 +572,4 @@ async fn acquire_and_release_advisory_lock(connection: &mut PgConnection) {
     })
     .await
     .expect("cancelled migration left the advisory lock held");
-}
-
-#[tokio::test]
-async fn reset_only_upgrade_clears_prototype_state_once() {
-    let _migration_test_guard = migration_test_lock().lock().await;
-    let database = TestDatabase::create().await;
-    let pool = database.pool();
-    let migrator = Migrator {
-        migrations: Cow::Owned(ALL_MIGRATIONS.iter().take(6).cloned().collect()),
-        ignore_missing: false,
-        locking: false,
-        no_tx: false,
-    };
-    migrator.run(pool).await.unwrap();
-
-    sqlx::query(
-        "INSERT INTO deployment_metadata (
-             bitcoin_network, paykit_client_id, receiver_path, locks_key_fingerprint
-         ) VALUES ('regtest', 'app.paykit.server', 'paykit/server', $1)",
-    )
-    .bind(b"prototype-locks-key".as_slice())
-    .execute(pool)
-    .await
-    .unwrap();
-
-    let creator_id: Uuid = sqlx::query_scalar(
-        "INSERT INTO creators (creator_lookup_hash, credential_envelope)
-         VALUES ($1, $2) RETURNING id",
-    )
-    .bind(b"historical-creator".as_slice())
-    .bind(b"encrypted-creator".as_slice())
-    .fetch_one(pool)
-    .await
-    .unwrap();
-
-    sqlx::query("INSERT INTO sdk_states (creator_id, state_envelope) VALUES ($1, $2)")
-        .bind(creator_id)
-        .bind(b"prototype-sdk-state".as_slice())
-        .execute(pool)
-        .await
-        .unwrap();
-
-    let reader_assignment_id: Uuid = sqlx::query_scalar(
-        "INSERT INTO reader_assignments (
-             creator_id, reader_lookup_hash, bundle_lookup_hash, assignment_envelope
-         ) VALUES ($1, $2, $3, $4) RETURNING id",
-    )
-    .bind(creator_id)
-    .bind(b"prototype-assignment-reader".as_slice())
-    .bind(b"prototype-assignment-bundle".as_slice())
-    .bind(b"prototype-assignment-envelope".as_slice())
-    .fetch_one(pool)
-    .await
-    .unwrap();
-
-    let invoice_id: Uuid = sqlx::query_scalar(
-        "INSERT INTO invoices (
-             creator_id, reader_lookup_hash, bundle_lookup_hash,
-             payment_request_lookup_hash, invoice_envelope, payment_record_envelope,
-             bitcoin_address_lookup_hash, derivation_index_lookup_hash,
-             payment_status, invoice_created_at, payment_deadline, payment_in_hours,
-             lock_resource_lookup_hash
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'undetected',
-                   NOW(), NOW() + INTERVAL '24 hours', 24, $9) RETURNING id",
-    )
-    .bind(creator_id)
-    .bind(b"historical-reader".as_slice())
-    .bind(b"historical-bundle".as_slice())
-    .bind(b"historical-request".as_slice())
-    .bind(b"encrypted-invoice".as_slice())
-    .bind(b"encrypted-payment".as_slice())
-    .bind(b"historical-address".as_slice())
-    .bind(b"historical-index".as_slice())
-    .bind(b"historical-lock".as_slice())
-    .fetch_one(pool)
-    .await
-    .unwrap();
-
-    sqlx::query(
-        "INSERT INTO outbox (
-             creator_id, invoice_id, reader_assignment_id, intent_envelope, status,
-             intent_kind
-         ) VALUES ($1, $2, $3, $4, 'pending', 'endpoint_publication')",
-    )
-    .bind(creator_id)
-    .bind(invoice_id)
-    .bind(reader_assignment_id)
-    .bind(b"prototype-intent".as_slice())
-    .execute(pool)
-    .await
-    .unwrap();
-
-    sqlx::query(
-        "INSERT INTO bitcoin_observations (
-             invoice_id, observation_envelope, outpoint_lookup_hash, confirmations
-         ) VALUES ($1, $2, $3, 0)",
-    )
-    .bind(invoice_id)
-    .bind(b"prototype-observation".as_slice())
-    .bind(b"prototype-outpoint".as_slice())
-    .execute(pool)
-    .await
-    .unwrap();
-
-    let sdk_payment_request_id = "historical-payment-request";
-    sqlx::query(
-        "INSERT INTO payment_request_lifecycles (
-             sdk_payment_request_id, invoice_id, request_state,
-             last_stream_item_id, last_event_at
-         ) VALUES ($1, $2, 'accepted', 1, NOW())",
-    )
-    .bind(sdk_payment_request_id)
-    .bind(invoice_id)
-    .execute(pool)
-    .await
-    .unwrap();
-
-    let drain_id = Uuid::new_v4();
-    sqlx::query(
-        "INSERT INTO payment_drains (
-             id, creator_id, lock_resource_lookup_hash, lock_resource_generation,
-             lock_resource_envelope, accepted_count, terminal_count,
-             cancellation_enqueued_count, cancellation_set_hash, item_set_hash
-         ) VALUES ($1, $2, $3, 0, $4, 1, 0, 1, $5, $6)",
-    )
-    .bind(drain_id)
-    .bind(creator_id)
-    .bind(b"historical-lock".as_slice())
-    .bind(b"historical-lock-envelope".as_slice())
-    .bind([5_u8; 32].as_slice())
-    .bind([6_u8; 32].as_slice())
-    .execute(pool)
-    .await
-    .unwrap();
-    sqlx::query(
-        "INSERT INTO lock_payment_generations (
-             creator_id, lock_resource_lookup_hash, active_drain_id, last_cleanup_token
-         ) VALUES ($1, $2, $3, $4)",
-    )
-    .bind(creator_id)
-    .bind(b"historical-lock".as_slice())
-    .bind(drain_id)
-    .bind([7_u8; 32].as_slice())
-    .execute(pool)
-    .await
-    .unwrap();
-    sqlx::query(
-        "INSERT INTO payment_drain_items (drain_id, invoice_id, classification)
-         VALUES ($1, $2, 'accepted')",
-    )
-    .bind(drain_id)
-    .bind(invoice_id)
-    .execute(pool)
-    .await
-    .unwrap();
-    let cancellation_outbox_id: Uuid = sqlx::query_scalar(
-        "INSERT INTO outbox (
-             creator_id, invoice_id, intent_envelope, status, intent_kind,
-             cancellation_target_payment_request_id
-         ) VALUES ($1, $2, $3, 'pending', 'payment_request_cancellation', $4)
-         RETURNING id",
-    )
-    .bind(creator_id)
-    .bind(invoice_id)
-    .bind(b"historical-cancellation-intent".as_slice())
-    .bind(sdk_payment_request_id)
-    .fetch_one(pool)
-    .await
-    .unwrap();
-    sqlx::query(
-        "INSERT INTO payment_drain_cancellations (
-             drain_id, invoice_id, sdk_payment_request_id, cancellation_outbox_id
-         ) VALUES ($1, $2, $3, $4)",
-    )
-    .bind(drain_id)
-    .bind(invoice_id)
-    .bind(sdk_payment_request_id)
-    .bind(cancellation_outbox_id)
-    .execute(pool)
-    .await
-    .unwrap();
-
-    run_migrations(pool).await.unwrap();
-
-    for table in [
-        "deployment_metadata",
-        "creators",
-        "sdk_states",
-        "reader_assignments",
-        "invoices",
-        "outbox",
-        "bitcoin_observations",
-        "payment_request_lifecycles",
-        "lock_payment_generations",
-        "payment_drains",
-        "payment_drain_items",
-        "payment_drain_cancellations",
-    ] {
-        let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
-            .fetch_one(pool)
-            .await
-            .unwrap();
-        assert_eq!(count, 0, "prototype rows remain in {table}");
-    }
-
-    let applied_versions: Vec<i64> =
-        sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
-            .fetch_all(pool)
-            .await
-            .unwrap();
-    assert_eq!(applied_versions, vec![1, 2, 3, 4, 5, 6, 7]);
-
-    sqlx::query(
-        "INSERT INTO creators (creator_lookup_hash, credential_envelope)
-         VALUES ($1, $2)",
-    )
-    .bind(b"post-upgrade-creator".as_slice())
-    .bind(b"post-upgrade-envelope".as_slice())
-    .execute(pool)
-    .await
-    .unwrap();
-    run_migrations(pool).await.unwrap();
-    let creator_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM creators")
-        .fetch_one(pool)
-        .await
-        .unwrap();
-    assert_eq!(creator_count, 1, "restart repeated the destructive reset");
-
-    database.cleanup().await;
 }

@@ -17,7 +17,7 @@ trusted_public_key = "{KEY}"
 [setup]
 allowed_origins = ["http://127.0.0.1:8080"]
 [paykit]
-{}receiver_path = "bitkit/server"
+{}app_id = "paykit-server"
 network = "mainnet"
 [bitcoin]
 network = "regtest"
@@ -64,6 +64,20 @@ fn check_config_validates_without_connecting_to_postgres() {
     assert_eq!(
         String::from_utf8_lossy(&output.stdout).trim(),
         "configuration valid"
+    );
+}
+
+#[test]
+fn checked_in_example_config_is_valid() {
+    let source = include_str!("../../config/paykit-server.example.toml").replace(
+        "# trusted_public_key = \"pubky<pubky-key>\"",
+        &format!("trusted_public_key = \"{KEY}\""),
+    );
+    let output = run_check(&source, &[]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 

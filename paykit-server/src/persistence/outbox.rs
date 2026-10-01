@@ -13,11 +13,11 @@ use uuid::Uuid;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OutboxRetryClass {
     AdapterUnavailable,
-    MarkerFetch,
-    MarkerMissing,
-    MarkerChanged,
+    RegistryFetch,
+    RegistryMissing,
+    RegistryIncapable,
+    RecoveryMarkerObservation,
     LinkEstablishment,
-    EndpointPublication,
     PaymentRequestProposal,
     PaymentRequestCancellation,
     ReconciliationPending,
@@ -28,11 +28,11 @@ impl OutboxRetryClass {
     const fn as_str(self) -> &'static str {
         match self {
             Self::AdapterUnavailable => "adapter_unavailable",
-            Self::MarkerFetch => "marker_fetch",
-            Self::MarkerMissing => "marker_missing",
-            Self::MarkerChanged => "marker_changed",
+            Self::RegistryFetch => "registry_fetch",
+            Self::RegistryMissing => "registry_missing",
+            Self::RegistryIncapable => "registry_incapable",
+            Self::RecoveryMarkerObservation => "recovery_marker_observation",
             Self::LinkEstablishment => "link_establishment",
-            Self::EndpointPublication => "endpoint_publication",
             Self::PaymentRequestProposal => "payment_request_proposal",
             Self::PaymentRequestCancellation => "payment_request_cancellation",
             Self::ReconciliationPending => "reconciliation_pending",
@@ -199,7 +199,7 @@ impl OutboxStore {
         .map_err(|_| PersistenceError::Unavailable)
     }
 
-    /// Claims eligible rows while preserving endpoint-publication dependencies.
+    /// Claims eligible Payment Request intents under a fresh lease fence.
     pub async fn claim(
         &self,
         owner: Uuid,
@@ -211,7 +211,6 @@ impl OutboxStore {
             "WITH candidates AS ( \
                  SELECT o.id \
                  FROM outbox o \
-                 LEFT JOIN outbox dependency ON dependency.id = o.depends_on_id \
                  WHERE ( \
                      (o.status = 'queued' AND o.next_attempt_at <= clock_timestamp()) \
                      OR (o.status = 'leased' AND o.lease_expires_at <= clock_timestamp()) \
@@ -335,7 +334,7 @@ impl OutboxStore {
         DeliveryIntentV1::decode(&plaintext).map_err(|_| PersistenceError::CorruptOrMissing)
     }
 
-    /// Atomically associates the exact public-SDK result while the enqueue fence is live.
+    /// Records the exact SDK enqueue result while the enqueue fence is live.
     pub async fn mark_handed_off(
         &self,
         claim: &ClaimedOutbox,
@@ -552,11 +551,11 @@ mod tests {
         assert_eq!(
             [
                 OutboxRetryClass::AdapterUnavailable,
-                OutboxRetryClass::MarkerFetch,
-                OutboxRetryClass::MarkerMissing,
-                OutboxRetryClass::MarkerChanged,
+                OutboxRetryClass::RegistryFetch,
+                OutboxRetryClass::RegistryMissing,
+                OutboxRetryClass::RegistryIncapable,
+                OutboxRetryClass::RecoveryMarkerObservation,
                 OutboxRetryClass::LinkEstablishment,
-                OutboxRetryClass::EndpointPublication,
                 OutboxRetryClass::PaymentRequestProposal,
                 OutboxRetryClass::PaymentRequestCancellation,
                 OutboxRetryClass::ReconciliationPending,
@@ -565,11 +564,11 @@ mod tests {
             .map(OutboxRetryClass::as_str),
             [
                 "adapter_unavailable",
-                "marker_fetch",
-                "marker_missing",
-                "marker_changed",
+                "registry_fetch",
+                "registry_missing",
+                "registry_incapable",
+                "recovery_marker_observation",
                 "link_establishment",
-                "endpoint_publication",
                 "payment_request_proposal",
                 "payment_request_cancellation",
                 "reconciliation_pending",

@@ -2,68 +2,75 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use paykit_lib::{
-    PaykitReceiverCapabilities, PaykitReceiverMarker, PaykitReceiverPath, PaymentAmount,
-    PaymentEndpointIdentifier, PaymentReference, PaymentRequestTerms, PublicKey,
+    PaykitApp, PaykitAppCapabilities, PaykitAppId, PaykitAppRegistry, PaymentAmount,
+    PaymentEndpointIdentifier, PaymentEndpointPayload, PaymentReference, PaymentRequestTerms,
+    PublicKey,
 };
 use paykit_sdk::OutboundPrivateMessageStatus;
 use paykit_server::{
-    application::semantic_intent::{DeliveryIntentV1, PaymentTermsV1, ReceivingDetailV1},
+    application::semantic_intent::{DeliveryIntentV1, PaymentTermsV1},
     workers::outbox::{
         Adapter, HandoffError, HandoffFailure, HandoffResult, RetryableHandoffCause,
         RetryableHandoffStage, handoff,
     },
 };
 
-fn marker(path: &str) -> PaykitReceiverMarker {
-    PaykitReceiverMarker::new(
-        PaykitReceiverPath::new(path).unwrap(),
-        PaykitReceiverCapabilities {
-            private_payments: true,
-            payment_requests: true,
-            receipts: false,
-            outgoing_payments: true,
-        },
+fn registry(capable: bool) -> PaykitAppRegistry {
+    let mut registry = PaykitAppRegistry::new(Some(
         PublicKey::try_from_z32("tkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy").unwrap(),
-    )
+    ));
+    registry
+        .register_app(
+            PaykitAppId::new("reader").unwrap(),
+            PaykitApp::new(
+                "Reader",
+                PaykitAppCapabilities {
+                    private_payments: true,
+                    payment_requests: true,
+                    receipts: false,
+                    outgoing_payments: capable,
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    registry
 }
 
 struct FakeAdapter {
-    marker: PaykitReceiverMarker,
+    registry: PaykitAppRegistry,
+    recovery_marker_error: Option<HandoffError>,
     link_error: Option<HandoffError>,
     payment_request_calls: Mutex<usize>,
+    calls: Mutex<Vec<&'static str>>,
 }
 
 #[async_trait]
 impl Adapter for FakeAdapter {
-    async fn fetch_marker(
+    async fn fetch_registry(
         &self,
         _reader: &str,
-        _path: &str,
-    ) -> Result<Option<PaykitReceiverMarker>, HandoffError> {
-        Ok(Some(self.marker.clone()))
+    ) -> Result<Option<PaykitAppRegistry>, HandoffError> {
+        self.calls.lock().unwrap().push("fetch_registry");
+        Ok(Some(self.registry.clone()))
     }
 
-    async fn ensure_link_with_peer(&self, _reader: &str, _path: &str) -> Result<(), HandoffError> {
+    async fn observe_recovery_marker(&self, _reader: &str) -> Result<(), HandoffError> {
+        self.calls.lock().unwrap().push("observe_recovery_marker");
+        self.recovery_marker_error.map_or(Ok(()), Err)
+    }
+
+    async fn ensure_link_with_peer(&self, _reader: &str) -> Result<(), HandoffError> {
+        self.calls.lock().unwrap().push("ensure_link_with_peer");
         self.link_error.map_or(Ok(()), Err)
-    }
-
-    async fn enqueue_private_payment_list_with_receiving_details(
-        &self,
-        _reader: &str,
-        _path: &str,
-        _details: &[ReceivingDetailV1],
-    ) -> Result<HandoffResult, HandoffError> {
-        Ok(HandoffResult::EndpointPublication {
-            outbound_message_id: 41,
-        })
     }
 
     async fn propose_payment_request(
         &self,
         _reader: &str,
-        _path: &str,
         _terms: &PaymentTermsV1,
     ) -> Result<HandoffResult, HandoffError> {
+        self.calls.lock().unwrap().push("propose_payment_request");
         *self.payment_request_calls.lock().unwrap() += 1;
         Ok(HandoffResult::PaymentRequestProposal {
             outbound_message_id: 42,
@@ -75,14 +82,9 @@ impl Adapter for FakeAdapter {
     async fn cancel_payment_request(
         &self,
         _reader: &str,
-        _path: &str,
-        payment_request_id: &str,
+        _payment_request_id: &str,
     ) -> Result<HandoffResult, HandoffError> {
-        Ok(HandoffResult::PaymentRequestCancellation {
-            outbound_message_id: 43,
-            event_id: "event-43".into(),
-            payment_request_id: payment_request_id.into(),
-        })
+        Err(HandoffError::Permanent)
     }
 
     async fn outbound_status(
@@ -93,16 +95,20 @@ impl Adapter for FakeAdapter {
     }
 }
 
-fn payment_intent(marker: &PaykitReceiverMarker) -> DeliveryIntentV1 {
+fn payment_intent() -> DeliveryIntentV1 {
     DeliveryIntentV1::payment_request(
         "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy".into(),
-        marker,
-        PaykitReceiverPath::new("paykit/server").unwrap(),
+        PaykitAppId::new("paykit-server").unwrap(),
         &PaymentRequestTerms::builder(
             PaymentAmount::new("0.00050000", "btc").unwrap(),
             PaymentReference::new(uuid::Uuid::new_v4().to_string()).unwrap(),
             vec![PaymentEndpointIdentifier::new("btc-bitcoin-p2wpkh").unwrap()],
         )
+        .required_app_id(Some(PaykitAppId::new("paykit-server").unwrap()))
+        .payment_endpoints(Some(std::collections::HashMap::from([(
+            PaymentEndpointIdentifier::new("btc-bitcoin-p2wpkh").unwrap(),
+            PaymentEndpointPayload::new("private-address"),
+        )])))
         .build()
         .unwrap(),
     )
@@ -110,19 +116,20 @@ fn payment_intent(marker: &PaykitReceiverMarker) -> DeliveryIntentV1 {
 }
 
 #[tokio::test]
-async fn changed_selected_marker_is_retryable_without_a_reselection() {
-    let selected = marker("bitkit/wallet");
-    let changed = marker("other/wallet");
+async fn incapable_registry_is_retryable_without_handoff() {
+    let changed = registry(false);
     let adapter = FakeAdapter {
-        marker: changed,
+        registry: changed,
+        recovery_marker_error: None,
         link_error: None,
         payment_request_calls: Mutex::new(0),
+        calls: Mutex::new(Vec::new()),
     };
 
     assert_eq!(
-        handoff(&adapter, &payment_intent(&selected)).await,
+        handoff(&adapter, &payment_intent()).await,
         Err(HandoffFailure::Retryable(
-            RetryableHandoffStage::MarkerChanged
+            RetryableHandoffStage::RegistryIncapable
         ))
     );
     assert_eq!(*adapter.payment_request_calls.lock().unwrap(), 0);
@@ -130,15 +137,17 @@ async fn changed_selected_marker_is_retryable_without_a_reselection() {
 
 #[tokio::test]
 async fn link_failure_has_one_durable_diagnostic_stage() {
-    let selected = marker("bitkit/wallet");
+    let selected = registry(true);
     let adapter = FakeAdapter {
-        marker: selected.clone(),
+        registry: selected.clone(),
+        recovery_marker_error: None,
         link_error: Some(HandoffError::Retryable(RetryableHandoffCause::Transport)),
         payment_request_calls: Mutex::new(0),
+        calls: Mutex::new(Vec::new()),
     };
 
     assert_eq!(
-        handoff(&adapter, &payment_intent(&selected)).await,
+        handoff(&adapter, &payment_intent()).await,
         Err(HandoffFailure::Retryable(
             RetryableHandoffStage::LinkEstablishment
         ))
@@ -147,13 +156,15 @@ async fn link_failure_has_one_durable_diagnostic_stage() {
 
 #[tokio::test]
 async fn retry_after_an_ambiguous_handoff_can_propose_twice() {
-    let selected = marker("bitkit/wallet");
+    let selected = registry(true);
     let adapter = Arc::new(FakeAdapter {
-        marker: selected.clone(),
+        registry: selected.clone(),
+        recovery_marker_error: None,
         link_error: None,
         payment_request_calls: Mutex::new(0),
+        calls: Mutex::new(Vec::new()),
     });
-    let intent = payment_intent(&selected);
+    let intent = payment_intent();
 
     // A database worker may be reclaimed after the public SDK queued the first
     // proposal but before its fenced state transition; repeating the public API
@@ -171,27 +182,73 @@ async fn retry_after_an_ambiguous_handoff_can_propose_twice() {
 }
 
 #[tokio::test]
-async fn cancellation_intent_routes_the_exact_payment_request_id() {
-    let selected = marker("bitkit/wallet");
+async fn recovery_marker_observation_precedes_link_ensure_and_enqueue() {
+    let selected = registry(true);
     let adapter = FakeAdapter {
-        marker: selected.clone(),
+        registry: selected,
+        recovery_marker_error: None,
         link_error: None,
         payment_request_calls: Mutex::new(0),
+        calls: Mutex::new(Vec::new()),
     };
-    let payment_request_id = uuid::Uuid::new_v4().hyphenated().to_string();
-    let cancellation = DeliveryIntentV1::payment_request_cancellation(
-        &payment_intent(&selected),
-        payment_request_id.clone(),
-    )
-    .unwrap();
+
+    handoff(&adapter, &payment_intent()).await.unwrap();
 
     assert_eq!(
-        handoff(&adapter, &cancellation).await,
-        Ok(HandoffResult::PaymentRequestCancellation {
-            outbound_message_id: 43,
-            event_id: "event-43".into(),
-            payment_request_id,
-        })
+        *adapter.calls.lock().unwrap(),
+        [
+            "fetch_registry",
+            "observe_recovery_marker",
+            "ensure_link_with_peer",
+            "propose_payment_request",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn recovery_marker_lookup_failure_never_ensures_or_enqueues() {
+    let selected = registry(true);
+    let adapter = FakeAdapter {
+        registry: selected,
+        recovery_marker_error: Some(HandoffError::Retryable(RetryableHandoffCause::Transport)),
+        link_error: None,
+        payment_request_calls: Mutex::new(0),
+        calls: Mutex::new(Vec::new()),
+    };
+
+    assert_eq!(
+        handoff(&adapter, &payment_intent()).await,
+        Err(HandoffFailure::Retryable(
+            RetryableHandoffStage::RecoveryMarkerObservation
+        ))
+    );
+    assert_eq!(
+        *adapter.calls.lock().unwrap(),
+        ["fetch_registry", "observe_recovery_marker"]
     );
     assert_eq!(*adapter.payment_request_calls.lock().unwrap(), 0);
+}
+
+#[tokio::test]
+async fn confirmed_absent_recovery_marker_continues_to_link_ensure() {
+    let selected = registry(true);
+    let adapter = FakeAdapter {
+        registry: selected,
+        recovery_marker_error: None,
+        link_error: None,
+        payment_request_calls: Mutex::new(0),
+        calls: Mutex::new(Vec::new()),
+    };
+
+    handoff(&adapter, &payment_intent()).await.unwrap();
+
+    assert_eq!(*adapter.payment_request_calls.lock().unwrap(), 1);
+    assert!(
+        adapter
+            .calls
+            .lock()
+            .unwrap()
+            .windows(2)
+            .any(|calls| calls == ["observe_recovery_marker", "ensure_link_with_peer"])
+    );
 }

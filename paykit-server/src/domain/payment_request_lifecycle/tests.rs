@@ -56,7 +56,7 @@ fn lifecycle_projection_debug_redacts_correlation_metadata() {
         payment_request_id: "request-secret".into(),
         proposal: ProposalCorrelation {
             reader_pubky: "reader-secret".into(),
-            selected_reader_path: "path-secret".into(),
+            proposal_app_id: "paykit-server".into(),
             terms: PaymentTermsV1 {
                 amount: "1".into(),
                 asset: "btc".into(),
@@ -64,6 +64,9 @@ fn lifecycle_projection_debug_redacts_correlation_metadata() {
                 proposal_expires_at: None,
                 payment_deadline: None,
                 accepted_endpoint_identifiers: vec!["endpoint-secret".into()],
+                payment_endpoints: [("endpoint-secret".into(), "payload-secret".into())]
+                    .into_iter()
+                    .collect(),
                 metadata: serde_json::Map::new(),
             },
         },
