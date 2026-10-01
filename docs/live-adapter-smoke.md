@@ -73,6 +73,8 @@ Observed result: passed in 9.16 seconds against the separate local relay/homeser
 
 The test requires one known output and verifies that the production BDK Electrum adapter returns the exact outpoint and satoshi value as present with at least the requested confirmation count. The address may have other history; the adapter correctly returns all matching outputs, and the test locates the exact outpoint.
 
+`PAYKIT_LIVE_BITCOIN_NETWORK` accepts `mainnet`, `testnet`, `signet`, or `regtest`. The evidence command below uses a public mainnet endpoint; `regtest` targets a private chain and needs an output funded on that chain, so its endpoint, address, and txid are deployment-specific.
+
 Evidence command:
 
 ```bash
