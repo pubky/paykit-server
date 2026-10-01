@@ -226,6 +226,10 @@ The canonical persisted `request_state` is one of these exact closed snake-case 
 
 `expired` is returned when the invoice has a durable `payment_expired_at`; otherwise the persisted observation state maps one-to-one to `undetected`, `detected`, or `confirmed`. `confirmations` and `amount_matched` remain orthogonal factual fields.
 
+Exact terminal success fixtures for Locks are published under
+`docs/fixtures/payment-request-status/` and are checked byte-for-byte against the
+HTTP serializer.
+
 Locks maps `rejected`, `canceled`, and `proposal_expired` requests to `VerificationTaskStatus::Expired`. An `accepted` request whose `payment_state` is `expired` also maps to `Expired`. These terminal outcomes carry no failure message and never map to `Failed`.
 
 Drain classification uses the persisted state without inference from invoice delivery or Bitcoin observation:
@@ -432,7 +436,7 @@ including late and underpaid evidence, to existing factual finality.
 - `POST /payment-request-drain-lookups`
 - `POST /payment-requests/status`
 
-Keep `/transactions/status` factual and backward-compatible.
+Keep `/transactions/status` factual and backward-compatible. New lifecycle consumers use `/payment-requests/status` exclusively.
 
 **Implementation-contract gate:** Exact response enums/fields must first be patched identically into both plans.
 

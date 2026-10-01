@@ -1007,8 +1007,11 @@ git status --short
   context, and their obsolete repository tests. Dedicated invoice/outbox tests retain
   supported allocation, same-Creator serialization, encryption, replay, dependency,
   and lease-fencing coverage.
-- Removed unreachable `Cancelled` and `Rejected` persisted payment-status variants;
-  direct observation retains only undetected, detected, and confirmed states.
+- Removed unreachable `Cancelled` and `Rejected` variants from persisted Bitcoin
+  observation state; direct observation retains only undetected, detected, and
+  confirmed facts. Payment Request lifecycle is persisted separately and exposed
+  only through the canonical `/payment-requests/status` contract; legacy
+  `/transactions/status` retains its factual closed vocabulary.
 - Squashed the unreleased migration chain into one live-schema baseline. Historical
   `inbox_events` and `peer_work_leases` tables are absent, and earlier databases
   must be reset rather than upgraded.

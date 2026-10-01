@@ -120,7 +120,7 @@ Immutable deployment values are:
 
 Changing any of them after database initialization requires resetting the database.
 
-Persisted application and schema compatibility across releases is intentionally unsupported during this pre-production phase. The `0.1.0-rc5` Paykit Server and `0.1.0-rc6` Locks rollout is coordinated: stop both services, deploy both versions, then start each service and let its one-time SQLx reset migration clear only its dedicated disposable prototype database while preserving `_sqlx_migrations`. Verify both migrations and services before allowing new invoice or verification work, then reacquire any required prototype state. Do not manually drop/recreate either database. Never run these reset migrations against production, staging, an unidentified database, or a database shared with unrelated applications.
+Persisted application and schema compatibility across releases is intentionally unsupported during this pre-production phase. The `0.1.0-rc6` Paykit Server and `0.1.0-rc6` Locks rollout is coordinated: stop both services, deploy both versions, then start each service and let its one-time SQLx reset migration clear only its dedicated disposable prototype database while preserving `_sqlx_migrations`. Verify both migrations and services before allowing new invoice or verification work, then reacquire any required prototype state. Do not manually drop/recreate either database. Never run these reset migrations against production, staging, an unidentified database, or a database shared with unrelated applications.
 
 The cryptographic envelope version, domain-separated KDF/AAD labels, and private payload format discriminators remain enforced. They detect unsupported or corrupt bytes; they are not compatibility readers.
 
@@ -254,6 +254,19 @@ Each invoice receives a unique BIP84 external-chain address. Observation uses th
 - Reorg handling is supported before finality; uncommon repair after six-confirmation finality is unsupported.
 
 The server has no Bitcoin spending keys and cannot spend, refund, or create change.
+
+`POST /transactions/status` remains the legacy Bitcoin-only compatibility
+endpoint. Its closed `status` vocabulary is `undetected`, `detected`, and
+`confirmed`; Payment Request lifecycle never changes those labels.
+
+`POST /payment-requests/status` is the canonical Locks lifecycle contract. It
+exposes request lifecycle, payment state, invoice timestamps, confirmations, and
+amount matching as separate facts. Before returning them, it performs linked-peer
+receive, exact required-target freshness checks, Creator-local SDK mutation
+serialization, and transactional target revalidation. Missing, partial,
+unrelated, or failed required-peer intake returns unavailable. Exact terminal
+response fixtures for Locks are published under
+`docs/fixtures/payment-request-status/`.
 
 ## Payer, proof, and receipt exclusions
 

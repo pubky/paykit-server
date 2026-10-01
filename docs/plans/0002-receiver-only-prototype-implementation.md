@@ -363,6 +363,8 @@ cargo test --workspace
 **RED tests:**
 - Unknown creator/bundle returns 404.
 - Known invoice without an observed output returns exact undetected zero/false response.
+- Legacy status remains limited to factual `undetected`, `detected`, and
+  `confirmed` Bitcoin labels regardless of Payment Request lifecycle.
 - Status never triggers creator-session validation or lock refetch.
 - Status serialization contains only `status`, `confirmations`, and `amount_matched`.
 
@@ -414,9 +416,11 @@ cargo test --workspace
 
 **Suggested user commit:** `feat: deliver Paykit endpoint and payment intents`
 
-### Task 13: Removed — payer event intake and state transitions
+### Task 13: Internal Payment Request lifecycle projection
 
-Removed by product decision. The server has no payer-facing inbox or proof/event intake; Task 14 observes the invoice-specific address directly.
+There is no payer-facing inbox or proof/event API. The composed SDK receive path
+durably projects canonical Payment Request lifecycle for status and drain
+decisions. Task 14 remains the only payment-attribution path.
 
 ### Task 14: Implement direct Electrum observation and finality policy
 
@@ -511,7 +515,7 @@ git status --short
 
 ## Execution order and gates
 
-1. Tasks 0, 13, and 16 are removed by product decision and must not be reintroduced without a new product decision.
+1. Tasks 0 and 16 are removed by product decision and must not be reintroduced without a new product decision.
 2. Execute implemented tasks in order, using RED → GREEN → refactor for every behavioral task.
 3. After every task: spec-compliance review first, code-quality review second, user review/commit third.
 4. If a task discovers a missing public/persistence/security contract, stop, notify and ask about adding it to the design ledger before choosing behavior.
@@ -533,7 +537,7 @@ Mitigation Task 12 completed the retired-surface cleanup.
 | 0 | Removed by product decision | No upstream SDK deletion API gate applies. |
 | 1–11 | Implemented | Workspace, config, PostgreSQL/encryption, setup/signed-route, invoice/status seams are present and covered by unit/PostgreSQL tests. |
 | 12 | Implemented, composed, and live-smoke verified | Outbox behavior is composed through the public SDK. A separate local Pubky relay/homeserver delivered one live-smoke Payment Request. Delivery remains at least once, not a strict end-to-end idempotence guarantee. |
-| 13 | Removed by product decision | No payer inbox, proof, acceptance, cancellation, or rejection intake. |
+| 13 | Implemented internally | No payer-facing inbox/API; canonical SDK lifecycle is durably projected independently from Bitcoin payment facts. |
 | 14 | Implemented, composed, and live-smoke verified | Direct invoice-specific address observation is PostgreSQL-tested and one exact mainnet output/confirmation result passed through the production BDK adapter against Fulcrum. |
 | 15 | Implemented | Operational health, metrics, capacity, and drain behavior are composed by the binary. |
 | 16 | Removed by product decision | No payload-deletion worker or config/API contract. |

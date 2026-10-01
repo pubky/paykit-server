@@ -582,15 +582,11 @@ impl InvoiceStore {
         })
     }
 
-    /// Reads only the durable payment facts for one creator-scoped bundle.
-    ///
-    /// Invoice envelopes are deliberately not selected or decrypted. A row with
-    /// an unknown status or invalid confirmation count is a safe persistence
-    /// failure rather than a value exposed to the caller.
+    /// Reads only durable Bitcoin facts for one creator-scoped bundle.
     pub async fn payment_status(
         &self,
         creator: &CreatorPubky,
-        bundle_id: &crate::domain::locks::BundleId,
+        bundle_id: &BundleId,
     ) -> Result<Option<PersistedPaymentStatus>, PersistenceError> {
         let creator_hash = self.crypto.lookup_hash(creator.to_string().as_bytes());
         let bundle_hash = self.crypto.lookup_hash(bundle_id.to_string().as_bytes());
@@ -702,37 +698,9 @@ impl InvoiceStore {
         if !PaymentRequestLifecycleStore::receive_evidence_covers(&current, evidence) {
             return Err(PersistenceError::Unavailable);
         }
-        let row = sqlx::query_as::<_, PaymentRequestStatusRow>(
-            "SELECT lifecycle.request_state, invoices.payment_status,
-                    invoices.confirmation_count, invoices.amount_matched,
-                    invoices.invoice_created_at, invoices.payment_deadline,
-                    invoices.payment_expired_at
-             FROM invoices
-             LEFT JOIN LATERAL (
-                 SELECT request_state
-                 FROM payment_request_lifecycles
-                 WHERE invoice_id = invoices.id
-                 ORDER BY CASE request_state
-                     WHEN 'invalid_conflict' THEN 9
-                     WHEN 'recovery_required' THEN 8
-                     WHEN 'proof_submitted' THEN 7
-                     WHEN 'active_recurring' THEN 6
-                     WHEN 'accepted' THEN 5
-                     WHEN 'proposed' THEN 4
-                     WHEN 'proposal_expired' THEN 0
-                     WHEN 'rejected' THEN 0
-                     WHEN 'canceled' THEN 0
-                     ELSE -1
-                 END DESC, last_event_at DESC, request_state DESC
-                 LIMIT 1
-             ) AS lifecycle ON TRUE
-             WHERE invoices.id = $1",
-        )
-        .bind(invoice_id)
-        .fetch_optional(&mut *transaction)
-        .await
-        .map_err(|_| PersistenceError::Unavailable)?;
-        let summary = row.map(PaymentRequestStatusSummary::try_from).transpose()?;
+        let summary = self
+            .payment_request_status_by_invoice(&mut transaction, invoice_id)
+            .await?;
         transaction
             .commit()
             .await
@@ -747,6 +715,41 @@ impl InvoiceStore {
     ) -> Result<Option<PaymentRequestStatusSummary>, PersistenceError> {
         let creator_hash = self.crypto.lookup_hash(creator.to_string().as_bytes());
         let bundle_hash = self.crypto.lookup_hash(bundle_id.to_string().as_bytes());
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        let invoice_id: Option<Uuid> = sqlx::query_scalar(
+            "SELECT invoices.id
+             FROM invoices
+             JOIN creators ON creators.id = invoices.creator_id
+             WHERE creators.creator_lookup_hash = $1 AND invoices.bundle_lookup_hash = $2",
+        )
+        .bind(creator_hash.as_bytes().as_slice())
+        .bind(bundle_hash.as_bytes().as_slice())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        let summary = match invoice_id {
+            Some(invoice_id) => {
+                self.payment_request_status_by_invoice(&mut transaction, invoice_id)
+                    .await?
+            }
+            None => None,
+        };
+        transaction
+            .commit()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        Ok(summary)
+    }
+
+    async fn payment_request_status_by_invoice(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        invoice_id: Uuid,
+    ) -> Result<Option<PaymentRequestStatusSummary>, PersistenceError> {
         let row = sqlx::query_as::<_, PaymentRequestStatusRow>(
             "SELECT lifecycle.request_state, invoices.payment_status,
                     invoices.confirmation_count, invoices.amount_matched,
@@ -772,11 +775,10 @@ impl InvoiceStore {
                  END DESC, last_event_at DESC, request_state DESC
                  LIMIT 1
              ) AS lifecycle ON TRUE
-             WHERE creators.creator_lookup_hash = $1 AND invoices.bundle_lookup_hash = $2",
+             WHERE invoices.id = $1",
         )
-        .bind(creator_hash.as_bytes().as_slice())
-        .bind(bundle_hash.as_bytes().as_slice())
-        .fetch_optional(&self.pool)
+        .bind(invoice_id)
+        .fetch_optional(&mut **transaction)
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
         row.map(PaymentRequestStatusSummary::try_from).transpose()

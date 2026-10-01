@@ -181,6 +181,43 @@ async fn request_and_payment_state_wire_values_are_closed_and_complete() {
 }
 
 #[tokio::test]
+async fn locks_fixtures_match_terminal_status_responses_exactly() {
+    let key = SigningKey::from_bytes(&[7; 32]);
+    for (request_state, payment_state, fixture) in [
+        (
+            PaymentRequestLifecycleState::Rejected,
+            PaymentState::Confirmed,
+            include_str!("../../docs/fixtures/payment-request-status/rejected-confirmed.json"),
+        ),
+        (
+            PaymentRequestLifecycleState::Canceled,
+            PaymentState::Confirmed,
+            include_str!("../../docs/fixtures/payment-request-status/canceled-confirmed.json"),
+        ),
+        (
+            PaymentRequestLifecycleState::ProposalExpired,
+            PaymentState::Expired,
+            include_str!("../../docs/fixtures/payment-request-status/proposal-expired.json"),
+        ),
+        (
+            PaymentRequestLifecycleState::Accepted,
+            PaymentState::Expired,
+            include_str!(
+                "../../docs/fixtures/payment-request-status/payment-deadline-expired.json"
+            ),
+        ),
+    ] {
+        let response = router(&key, Ok(Some(summary(request_state, payment_state))))
+            .oneshot(signed_request(&key, body()))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response_body(response).await, fixture.trim_end());
+    }
+}
+
+#[tokio::test]
 async fn per_bundle_status_requires_signature_and_a_closed_body() {
     let key = SigningKey::from_bytes(&[7; 32]);
     let result = Ok(Some(summary(

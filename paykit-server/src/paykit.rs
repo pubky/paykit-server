@@ -974,6 +974,22 @@ mod tests {
     }
 
     #[test]
+    fn successful_required_report_ignores_unrelated_report_failure() {
+        let required = vec![receive_target(CREATOR, "bitkit/wallet")];
+
+        assert_eq!(
+            receive_health_for_required_targets(
+                &[
+                    intake_report(CREATOR, "bitkit/wallet", None),
+                    intake_report(CREATOR, "other/wallet", Some("offline")),
+                ],
+                &required,
+            ),
+            ReceiveHealth::Available
+        );
+    }
+
+    #[test]
     fn every_required_receive_target_must_have_a_successful_exact_sdk_report() {
         let required = vec![
             receive_target(CREATOR, "bitkit/wallet"),
