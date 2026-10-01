@@ -25,6 +25,11 @@ TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres \
 
 The two live-adapter tests remain ignored by default because they require either a local Pubky static testnet or a recorded public Electrum fixture. See [`docs/live-adapter-smoke.md`](docs/live-adapter-smoke.md) before running them explicitly.
 
+For a complete local SDK payment without a frontend or Bitkit, run
+[`sdk-example/run.sh`](sdk-example/README.md). It starts disposable Docker
+infrastructure, authorizes a Creator, delivers an invoice over Paykit, and pays
+it with regtest Bitcoin.
+
 Before submitting changes, read [`CONTRIBUTING.md`](CONTRIBUTING.md). Report security problems through the private process in [`SECURITY.md`](SECURITY.md), not a public issue.
 
 The [architecture contract](docs/architecture.md) describes shared identity,
@@ -62,7 +67,7 @@ invoices return `404`; authentication, storage, malformed-state, and dependency
 failures remain typed errors. `connected` is the identity's shared Noise state,
 not payment or verification completion.
 
-`POST /setup/status` is the Locks-only readiness check for an authenticated Creator. Its closed canonical body is `{"creator":"pubky..."}`; the signature covers the exact compact canonical JSON bytes. It returns exactly one coarse state: `ready` when the persisted session, delegated key, App Registry entry, and hosted state are usable; `setup_required` when authority is absent, invalid, or revoked; and `unavailable` for validation timeouts and transient storage, rate-limit, server, DNS, or transport failures. Callers must not convert `unavailable` into a new authorization flow.
+`POST /setup/status` is the Locks-only readiness check for an authenticated Creator. Its closed canonical body is `{"creator":"pubky..."}`; the signature covers the exact compact canonical JSON bytes. It returns exactly one coarse state: `ready` when the persisted session, delegated key, App Registry entry, and hosted state are usable; `setup_required` when authority is absent or confirmed invalid; and `unavailable` for validation timeouts and storage, rate-limit, server, DNS, or transport failures. Untyped Pubky 401 responses are also `unavailable`: they cannot distinguish revoked grants from recoverable PoP failures. A revoked grant reported this way requires explicit reconnect. Callers must not convert `unavailable` into a new authorization flow.
 
 ### Setup iframe
 

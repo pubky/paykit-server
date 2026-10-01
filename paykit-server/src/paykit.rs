@@ -406,6 +406,13 @@ fn awaits_allowee_acceptance(record: &AllowanceRecord) -> bool {
         && record.proposal_outbound_message_id.is_none()
 }
 
+fn retryable_recovery_observation(error: HandoffError) -> HandoffError {
+    match error {
+        HandoffError::Retryable(cause) => HandoffError::Retryable(cause),
+        HandoffError::Permanent => HandoffError::Retryable(RetryableHandoffCause::Other),
+    }
+}
+
 fn payment_terms(terms: &PaymentTermsV1) -> Result<PaymentRequestTerms, HandoffError> {
     let amount = PaymentAmount::new(terms.amount.clone(), terms.asset.clone())
         .map_err(|_| HandoffError::Permanent)?;
@@ -462,6 +469,16 @@ impl Adapter for PaykitAdapter {
     ) -> Result<Option<paykit_lib::PaykitAppRegistry>, HandoffError> {
         let reader = parse_peer(reader)?;
         self.sdk.paykit_app_registry(reader).await.map_err(classify)
+    }
+
+    async fn observe_recovery_marker(&self, reader: &str) -> Result<(), HandoffError> {
+        let reader = parse_peer(reader)?;
+        self.sdk
+            .observe_encrypted_link_recovery_marker(reader)
+            .await
+            .map(|_| ())
+            .map_err(classify)
+            .map_err(retryable_recovery_observation)
     }
 
     async fn ensure_link_with_peer(&self, reader: &str) -> Result<(), HandoffError> {
@@ -782,6 +799,14 @@ mod tests {
         assert_eq!(
             classify(error),
             HandoffError::Retryable(RetryableHandoffCause::Policy)
+        );
+    }
+
+    #[test]
+    fn recovery_marker_observation_normalizes_permanent_sdk_errors_to_retryable() {
+        assert_eq!(
+            retryable_recovery_observation(HandoffError::Permanent),
+            HandoffError::Retryable(RetryableHandoffCause::Other)
         );
     }
 

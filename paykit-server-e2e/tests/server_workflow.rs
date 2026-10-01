@@ -26,8 +26,9 @@ use locks_core::{
         VerifierType,
     },
 };
-
-use paykit_sdk::{LinkedPeerState, PubkyLocalSecretKey, PubkyPublicKey, PubkySessionBootstrap};
+use paykit_sdk::{
+    LinkedPeerState, PubkyLocalSecretKey, PubkyPublicKey, PubkySessionAccess, PubkySessionBootstrap,
+};
 use paykit_server::{
     Server,
     application::create_invoice::derive_bip84_p2wpkh_address,
@@ -45,6 +46,7 @@ use pubky_testnet::{EphemeralTestnet, pubky::Keypair};
 use sqlx::PgPool;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tower::ServiceExt;
+use uuid::Uuid;
 
 #[path = "fixtures/sdk.rs"]
 mod sdk_fixtures;
@@ -262,6 +264,14 @@ async fn create_peer(
     bootstrap: &PubkySessionBootstrap,
     homeserver: &PubkyPublicKey,
 ) -> (ReaderPubky, PubkyPublicKey, PeerSdk) {
+    let (reader, key, sdk, _access) = create_peer_with_access(bootstrap, homeserver).await;
+    (reader, key, sdk)
+}
+
+async fn create_peer_with_access(
+    bootstrap: &PubkySessionBootstrap,
+    homeserver: &PubkyPublicKey,
+) -> (ReaderPubky, PubkyPublicKey, PeerSdk, PubkySessionAccess) {
     let account = bootstrap
         .sign_up(
             &PubkyLocalSecretKey::new(Keypair::random().secret_key()),
@@ -272,8 +282,14 @@ async fn create_peer(
         .await
         .unwrap();
     let key = account.public_key.clone();
+    let access = account.access.clone();
     let sdk = sdk_fixtures::hosted_sdk(account.access, "bitkit", 0).await;
-    (parse_reader(&format!("pubky{key}")).unwrap(), key, sdk)
+    (
+        parse_reader(&format!("pubky{key}")).unwrap(),
+        key,
+        sdk,
+        access,
+    )
 }
 
 async fn link(
@@ -1021,5 +1037,449 @@ async fn composed_two_creator_receiver_workflow_survives_restart() {
 
     first_pool.close().await;
     second_pool.close().await;
+    database.cleanup().await;
+}
+
+async fn outbox_ids(pool: &PgPool) -> HashSet<Uuid> {
+    sqlx::query_scalar("SELECT id FROM outbox")
+        .fetch_all(pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .collect()
+}
+
+async fn outbox_row_is_delivered(pool: &PgPool, id: Uuid, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let status: String = sqlx::query_scalar("SELECT status FROM outbox WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        if status == "delivered" {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Opens one Locks invoice and returns its exact Payment Request row.
+async fn open_invoice(
+    pool: &PgPool,
+    address: SocketAddr,
+    signing_key: &SigningKey,
+    fixture: &CreatorFixture,
+    reader: &ReaderPubky,
+    bundle: &str,
+) -> Uuid {
+    let before = outbox_ids(pool).await;
+    let response = send_http(
+        address,
+        invoice_request(signing_key, fixture, reader, bundle),
+    )
+    .await;
+    assert_eq!(
+        response.status,
+        StatusCode::NO_CONTENT,
+        "invoice creation failed"
+    );
+    let created: Vec<_> = outbox_ids(pool)
+        .await
+        .difference(&before)
+        .copied()
+        .collect();
+    assert_eq!(
+        created.len(),
+        1,
+        "invoice must create exactly one outbox row"
+    );
+    created[0]
+}
+
+fn connection_status_request(
+    signing_key: &SigningKey,
+    fixture: &CreatorFixture,
+    bundle: &str,
+) -> Request<Body> {
+    signed_request(
+        signing_key,
+        Method::POST,
+        "/connections/status",
+        format!(
+            r#"{{"bundle_id":"{bundle}","creator":"{}"}}"#,
+            fixture.creator
+        ),
+    )
+}
+
+struct FreshServerLinkExpectation<'a> {
+    signing_key: &'a SigningKey,
+    fixture: &'a CreatorFixture,
+    bundle: &'a str,
+    reader_key: &'a PubkyPublicKey,
+    old_generation: u64,
+}
+
+async fn wait_for_fresh_server_link_state(
+    address: SocketAddr,
+    expected: FreshServerLinkExpectation<'_>,
+) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let response = send_http(
+            address,
+            connection_status_request(expected.signing_key, expected.fixture, expected.bundle),
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::OK);
+        let state = serde_json::from_slice::<serde_json::Value>(&response.body).unwrap();
+        let public_state = state["state"].as_str().unwrap();
+        let storage = expected.fixture.sdk.export_backup_state().await.unwrap();
+        let fresh_generation = storage.encrypted_link_states.iter().any(|link| {
+            &link.counterparty == expected.reader_key && link.generation > expected.old_generation
+        });
+        if public_state != "connected" && fresh_generation {
+            assert!(matches!(public_state, "recovery_required" | "handshake"));
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "server did not leave old connected generation"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// The reader's wallet: keeps its side of the handshake moving, reads the
+/// link and returns once the request for `bundle` has arrived.
+async fn wait_for_request(
+    peer: &PeerSdk,
+    creator_key: &PubkyPublicKey,
+    bundle: &str,
+    pool: &PgPool,
+) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let state = peer
+            .ensure_link_with_peer(creator_key.clone(), 1)
+            .await
+            .map(|report| report.state);
+        if matches!(state, Ok(LinkedPeerState::Linked)) {
+            peer.receive_private_messages(creator_key.clone())
+                .await
+                .unwrap();
+            if peer
+                .payment_requests_with(creator_key)
+                .await
+                .unwrap()
+                .iter()
+                .any(|request| {
+                    request.terms.as_ref().is_some_and(|terms| {
+                        terms.metadata.get("bundle_id") == Some(&serde_json::json!(bundle))
+                    })
+                })
+            {
+                return;
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let unsettled: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM outbox WHERE status <> 'delivered'")
+                    .fetch_one(pool)
+                    .await
+                    .unwrap();
+            panic!("request did not arrive; unsettled_rows={unsettled}");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// A wallet that dropped its side of the server link publishes a recovery
+/// marker and waits for a new handshake. The server must not hand the next
+/// request to the abandoned link (and mark it `delivered`); it relinks, and
+/// the request arrives once the wallet is back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn server_relinks_when_the_reader_publishes_a_recovery_marker() {
+    let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
+    let database = TestDatabase::create().await;
+    let signing_key = SigningKey::from_bytes(&[72; 32]);
+    let server_config = config(database.database_url(), &signing_key, "100ms");
+    let pool = initialize_database(&server_config).await.unwrap();
+    let testnet = build_pubky_testnet().await;
+    let pubky = testnet.sdk().unwrap();
+    let bootstrap = PubkySessionBootstrap::with_pubky(pubky.clone(), "app.paykit.server").unwrap();
+    let homeserver = PubkyPublicKey::from_public_key(&testnet.homeserver_app().public_key());
+    let crypto = Arc::new(Crypto::from_master_key(&[1; 32]).unwrap());
+    let creators = CreatorStore::new(&pool, crypto.clone());
+    let (reader, _peer_key, peer_sdk) = create_peer(&bootstrap, &homeserver).await;
+    let creator = create_creator(
+        &bootstrap,
+        &homeserver,
+        &creators,
+        CreatorSpec {
+            seed: 72,
+            account_index: 0,
+            amount_sats: 2_000,
+            counter_seed: 100,
+        },
+    )
+    .await;
+    let creator_key = PubkyPublicKey::from_raw_or_app_key(creator.creator.to_string()).unwrap();
+
+    let observer = Arc::new(DeterministicElectrum::new(&[&creator]));
+    let server = Server::build_with_transports(server_config, pool.clone(), pubky, observer)
+        .await
+        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let running = tokio::spawn(server.run_until(listener, async move {
+        let _ = shutdown_rx.await;
+    }));
+    wait_until_listening(address).await;
+    wait_until_ready(address).await;
+
+    // The first unlock links the reader's wallet to the creator's server link.
+    let first_payment =
+        open_invoice(&pool, address, &signing_key, &creator, &reader, BUNDLE_A).await;
+    wait_for_request(&peer_sdk, &creator_key, BUNDLE_A, &pool).await;
+    assert!(
+        outbox_row_is_delivered(&pool, first_payment, Duration::from_secs(10)).await,
+        "first Payment Request row never settled"
+    );
+    let reader_key = PubkyPublicKey::from_raw_or_app_key(reader.to_string()).unwrap();
+    let linked_state = creator.sdk.export_backup_state().await.unwrap();
+    let old_generation = linked_state
+        .encrypted_link_states
+        .iter()
+        .find(|link| link.counterparty == reader_key)
+        .expect("initial linked generation")
+        .generation;
+
+    // The wallet drops its side of the link and asks for a new handshake, as
+    // Bitkit does after a failed link restore. Marker times have second
+    // precision; one from the second of the server's last link checkpoint
+    // counts as stale.
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    peer_sdk
+        .publish_encrypted_link_recovery_marker(creator_key.clone())
+        .await
+        .unwrap();
+
+    // The next unlock, while the wallet is away: the server must not hand
+    // the request to the link the wallet abandoned.
+    let second_payment =
+        open_invoice(&pool, address, &signing_key, &creator, &reader, BUNDLE_B).await;
+    wait_for_fresh_server_link_state(
+        address,
+        FreshServerLinkExpectation {
+            signing_key: &signing_key,
+            fixture: &creator,
+            bundle: BUNDLE_B,
+            reader_key: &reader_key,
+            old_generation,
+        },
+    )
+    .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let pending_payment: (String, Option<String>, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT status, sdk_outbound_message_id, sdk_event_id, sdk_payment_request_id \
+             FROM outbox WHERE id = $1",
+    )
+    .bind(second_payment)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(!matches!(
+        pending_payment.0.as_str(),
+        "handed_off" | "delivered"
+    ));
+    assert!(pending_payment.1.is_none());
+    assert!(pending_payment.2.is_none());
+    assert!(pending_payment.3.is_none());
+
+    // Once the wallet is back, the new link carries the request.
+    wait_for_request(&peer_sdk, &creator_key, BUNDLE_B, &pool).await;
+    assert!(
+        outbox_row_is_delivered(&pool, second_payment, Duration::from_secs(10)).await,
+        "second Payment Request row never settled"
+    );
+    let received = peer_sdk
+        .payment_requests_with(&creator_key)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|request| {
+            request.terms.as_ref().is_some_and(|terms| {
+                terms.metadata.get("bundle_id") == Some(&serde_json::json!(BUNDLE_B))
+            })
+        })
+        .count();
+    assert_eq!(
+        received, 1,
+        "fresh link delivered duplicate logical requests"
+    );
+
+    let _ = shutdown_tx.send(());
+    running.await.unwrap().unwrap();
+    pool.close().await;
+    database.cleanup().await;
+}
+
+async fn publish_unreadable_recovery_marker(
+    peer: &PeerSdk,
+    access: &PubkySessionAccess,
+    reader_key: &PubkyPublicKey,
+    creator_key: &PubkyPublicKey,
+) {
+    let registry = peer
+        .paykit_app_registry(creator_key.clone())
+        .await
+        .unwrap()
+        .expect("the creator publishes an App Registry");
+    let key = access
+        .local_secret_key
+        .as_ref()
+        .unwrap()
+        .derive_paykit_identity_secret_key(1)
+        .unwrap();
+    let (write_path, _) = paykit_lib::encrypted_link_recovery_marker_paths(
+        &paykit_lib::derive_paykit_noise_secret_key(key.as_bytes()),
+        &reader_key.to_public_key().unwrap(),
+        &creator_key.to_public_key().unwrap(),
+        registry.noise_public_key().unwrap(),
+    );
+    access
+        .session
+        .storage()
+        .put(write_path, String::from(r#"{"version":1}"#))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn malformed_recovery_marker_keeps_exact_handoff_retryable_until_repaired() {
+    let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
+    let database = TestDatabase::create().await;
+    let signing_key = SigningKey::from_bytes(&[73; 32]);
+    let server_config = config(database.database_url(), &signing_key, "100ms");
+    let pool = initialize_database(&server_config).await.unwrap();
+    let testnet = build_pubky_testnet().await;
+    let pubky = testnet.sdk().unwrap();
+    let bootstrap = PubkySessionBootstrap::with_pubky(pubky.clone(), "app.paykit.server").unwrap();
+    let homeserver = PubkyPublicKey::from_public_key(&testnet.homeserver_app().public_key());
+    let crypto = Arc::new(Crypto::from_master_key(&[1; 32]).unwrap());
+    let creators = CreatorStore::new(&pool, crypto.clone());
+    let (reader, reader_key, peer_sdk, peer_access) =
+        create_peer_with_access(&bootstrap, &homeserver).await;
+    let creator = create_creator(
+        &bootstrap,
+        &homeserver,
+        &creators,
+        CreatorSpec {
+            seed: 73,
+            account_index: 0,
+            amount_sats: 2_000,
+            counter_seed: 100,
+        },
+    )
+    .await;
+    let creator_key = PubkyPublicKey::from_raw_or_app_key(creator.creator.to_string()).unwrap();
+
+    let observer = Arc::new(DeterministicElectrum::new(&[&creator]));
+    let server = Server::build_with_transports(server_config, pool.clone(), pubky, observer)
+        .await
+        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let running = tokio::spawn(server.run_until(listener, async move {
+        let _ = shutdown_rx.await;
+    }));
+    wait_until_listening(address).await;
+    wait_until_ready(address).await;
+
+    let first_payment =
+        open_invoice(&pool, address, &signing_key, &creator, &reader, BUNDLE_A).await;
+    wait_for_request(&peer_sdk, &creator_key, BUNDLE_A, &pool).await;
+    assert!(
+        outbox_row_is_delivered(&pool, first_payment, Duration::from_secs(10)).await,
+        "first Payment Request row never settled"
+    );
+    let next_outbound_before = creator
+        .sdk
+        .export_backup_state()
+        .await
+        .unwrap()
+        .next_outbound_private_message_id;
+
+    publish_unreadable_recovery_marker(&peer_sdk, &peer_access, &reader_key, &creator_key).await;
+    let second_payment =
+        open_invoice(&pool, address, &signing_key, &creator, &reader, BUNDLE_B).await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let payment: (String, i32, Option<String>) =
+            sqlx::query_as("SELECT status, attempt_count, error_class FROM outbox WHERE id = $1")
+                .bind(second_payment)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            !matches!(payment.0.as_str(), "handed_off" | "delivered"),
+            "Payment Request was handed off while marker lookup failed"
+        );
+        if payment.0 == "retryable"
+            && payment.1 >= 2
+            && payment.2.as_deref() == Some("recovery_marker_observation")
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "handoff did not retry at recovery marker observation: {payment:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        creator
+            .sdk
+            .export_backup_state()
+            .await
+            .unwrap()
+            .next_outbound_private_message_id,
+        next_outbound_before,
+        "request was enqueued while recovery marker lookup failed"
+    );
+
+    peer_sdk
+        .publish_encrypted_link_recovery_marker(creator_key.clone())
+        .await
+        .unwrap();
+    wait_for_request(&peer_sdk, &creator_key, BUNDLE_B, &pool).await;
+    assert!(
+        outbox_row_is_delivered(&pool, second_payment, Duration::from_secs(10)).await,
+        "repaired handoff never settled"
+    );
+    let received = peer_sdk
+        .payment_requests_with(&creator_key)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|request| {
+            request.terms.as_ref().is_some_and(|terms| {
+                terms.metadata.get("bundle_id") == Some(&serde_json::json!(BUNDLE_B))
+            })
+        })
+        .count();
+    assert_eq!(received, 1, "repaired handoff delivered duplicate requests");
+
+    let _ = shutdown_tx.send(());
+    running.await.unwrap().unwrap();
+    pool.close().await;
     database.cleanup().await;
 }

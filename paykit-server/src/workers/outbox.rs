@@ -124,6 +124,7 @@ pub trait Adapter: Send + Sync {
 
     async fn fetch_registry(&self, reader: &str)
     -> Result<Option<PaykitAppRegistry>, HandoffError>;
+    async fn observe_recovery_marker(&self, reader: &str) -> Result<(), HandoffError>;
     async fn ensure_link_with_peer(&self, reader: &str) -> Result<(), HandoffError>;
     /// Reads the reader's private messages and accepts every Allowance
     /// proposal in which this identity is the Allowee. Returns how many were
@@ -167,6 +168,10 @@ pub(crate) async fn handoff_steps<A: Adapter + ?Sized>(
             RetryableHandoffStage::RegistryIncapable,
         ));
     }
+    adapter
+        .observe_recovery_marker(intent.reader_pubky())
+        .await
+        .map_err(|error| at_stage(error, RetryableHandoffStage::RecoveryMarkerObservation))?;
     adapter
         .ensure_link_with_peer(intent.reader_pubky())
         .await

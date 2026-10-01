@@ -39,6 +39,7 @@ fn registry(capable: bool) -> PaykitAppRegistry {
 
 struct FakeAdapter {
     registry: PaykitAppRegistry,
+    recovery_marker_error: Option<HandoffError>,
     link_error: Option<HandoffError>,
     payment_request_calls: Mutex<usize>,
     allowance_error: Option<HandoffError>,
@@ -49,6 +50,7 @@ impl FakeAdapter {
     fn new(registry: PaykitAppRegistry) -> Self {
         Self {
             registry,
+            recovery_marker_error: None,
             link_error: None,
             payment_request_calls: Mutex::new(0),
             allowance_error: None,
@@ -73,6 +75,11 @@ impl Adapter for FakeAdapter {
     ) -> Result<Option<PaykitAppRegistry>, HandoffError> {
         self.record("fetch_registry");
         Ok(Some(self.registry.clone()))
+    }
+
+    async fn observe_recovery_marker(&self, _reader: &str) -> Result<(), HandoffError> {
+        self.record("observe_recovery_marker");
+        self.recovery_marker_error.map_or(Ok(()), Err)
     }
 
     async fn ensure_link_with_peer(&self, _reader: &str) -> Result<(), HandoffError> {
@@ -155,7 +162,14 @@ async fn link_failure_has_one_durable_diagnostic_stage() {
             RetryableHandoffStage::LinkEstablishment
         ))
     );
-    assert_eq!(adapter.calls(), ["fetch_registry", "ensure_link_with_peer"]);
+    assert_eq!(
+        adapter.calls(),
+        [
+            "fetch_registry",
+            "observe_recovery_marker",
+            "ensure_link_with_peer"
+        ]
+    );
 }
 
 #[tokio::test]
@@ -166,6 +180,7 @@ async fn allowance_intake_runs_on_the_link_before_the_request() {
         adapter.calls(),
         [
             "fetch_registry",
+            "observe_recovery_marker",
             "ensure_link_with_peer",
             "accept_allowance_proposals",
             "propose_payment_request",
@@ -214,4 +229,68 @@ async fn retry_after_an_ambiguous_handoff_can_propose_twice() {
         ) if event_id == "event-42" && payment_request_id == "request-42" && second_event == event_id && second_request == payment_request_id
     ));
     assert_eq!(*adapter.payment_request_calls.lock().unwrap(), 2);
+}
+
+#[tokio::test]
+async fn recovery_marker_observation_precedes_link_ensure_and_enqueue() {
+    let selected = registry(true);
+    let adapter = FakeAdapter {
+        recovery_marker_error: None,
+        ..FakeAdapter::new(selected)
+    };
+
+    handoff(&adapter, &payment_intent()).await.unwrap();
+
+    assert_eq!(
+        *adapter.calls.lock().unwrap(),
+        [
+            "fetch_registry",
+            "observe_recovery_marker",
+            "ensure_link_with_peer",
+            "accept_allowance_proposals",
+            "propose_payment_request",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn recovery_marker_lookup_failure_never_ensures_or_enqueues() {
+    let selected = registry(true);
+    let adapter = FakeAdapter {
+        recovery_marker_error: Some(HandoffError::Retryable(RetryableHandoffCause::Transport)),
+        ..FakeAdapter::new(selected)
+    };
+
+    assert_eq!(
+        handoff(&adapter, &payment_intent()).await,
+        Err(HandoffFailure::Retryable(
+            RetryableHandoffStage::RecoveryMarkerObservation
+        ))
+    );
+    assert_eq!(
+        *adapter.calls.lock().unwrap(),
+        ["fetch_registry", "observe_recovery_marker"]
+    );
+    assert_eq!(*adapter.payment_request_calls.lock().unwrap(), 0);
+}
+
+#[tokio::test]
+async fn confirmed_absent_recovery_marker_continues_to_link_ensure() {
+    let selected = registry(true);
+    let adapter = FakeAdapter {
+        recovery_marker_error: None,
+        ..FakeAdapter::new(selected)
+    };
+
+    handoff(&adapter, &payment_intent()).await.unwrap();
+
+    assert_eq!(*adapter.payment_request_calls.lock().unwrap(), 1);
+    assert!(
+        adapter
+            .calls
+            .lock()
+            .unwrap()
+            .windows(2)
+            .any(|calls| calls == ["observe_recovery_marker", "ensure_link_with_peer"])
+    );
 }

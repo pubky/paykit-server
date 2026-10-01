@@ -88,6 +88,10 @@ impl Adapter for ReconciliationAdapter {
         Ok(None)
     }
 
+    async fn observe_recovery_marker(&self, _reader: &str) -> Result<(), HandoffError> {
+        Err(HandoffError::Permanent)
+    }
+
     async fn ensure_link_with_peer(&self, _reader: &str) -> Result<(), HandoffError> {
         Err(HandoffError::Permanent)
     }
