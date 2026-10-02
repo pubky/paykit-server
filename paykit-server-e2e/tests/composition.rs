@@ -344,8 +344,14 @@ async fn production_server_workers_process_two_creators_without_sdk_state_fallba
         tokio::time::sleep(Duration::from_millis(25)).await;
     };
 
-    assert_eq!(outbound_a, before_a);
-    assert_eq!(outbound_b, before_b);
+    assert!(
+        (before_a..before_b).contains(&outbound_a),
+        "Creator A must allocate from its own seeded outbound counter range"
+    );
+    assert!(
+        (before_b..before_c).contains(&outbound_b),
+        "Creator B must allocate from its own seeded outbound counter range"
+    );
     assert_ne!(outbound_a, outbound_b);
     let health = tokio::time::timeout(Duration::from_secs(15), async {
         loop {

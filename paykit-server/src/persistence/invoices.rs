@@ -523,7 +523,8 @@ impl InvoiceStore {
             .await?
             .ok_or(PersistenceError::CorruptOrMissing)?;
         let payment_outbox = sqlx::query_as::<_, ExistingPaymentOutbox>(
-            "SELECT id FROM outbox WHERE invoice_id = $1",
+            "SELECT id FROM outbox
+             WHERE invoice_id = $1 AND intent_kind = 'payment_request_proposal'",
         )
         .bind(existing.id)
         .fetch_optional(&mut *tx)
@@ -1278,7 +1279,8 @@ impl InvoiceStore {
                 .await?
                 .ok_or(PersistenceError::CorruptOrMissing)?;
             let payment_request_outbox = sqlx::query_as::<_, ExistingPaymentOutbox>(
-                "SELECT id FROM outbox WHERE invoice_id = $1",
+                "SELECT id FROM outbox
+                 WHERE invoice_id = $1 AND intent_kind = 'payment_request_proposal'",
             )
             .bind(existing.id)
             .fetch_optional(&mut *tx)
@@ -1486,8 +1488,6 @@ impl InvoiceStore {
                 invoice_id,
                 intent_envelope: payment_request_envelope.as_bytes(),
                 intent_kind: "payment_request_proposal",
-                depends_on_id: None,
-                reader_assignment_id: None,
                 proposal_lookup_hash: Some(proposal_lookup_hash.as_bytes()),
             },
         )
@@ -1607,8 +1607,6 @@ struct OutboxInsert<'a> {
     invoice_id: Uuid,
     intent_envelope: &'a [u8],
     intent_kind: &'static str,
-    depends_on_id: Option<Uuid>,
-    reader_assignment_id: Option<Uuid>,
     proposal_lookup_hash: Option<&'a [u8; 32]>,
 }
 
@@ -1618,16 +1616,14 @@ async fn insert_outbox(
 ) -> Result<(), PersistenceError> {
     sqlx::query(
         "INSERT INTO outbox \
-         (id, creator_id, invoice_id, intent_envelope, intent_kind, status, depends_on_id, reader_assignment_id, proposal_lookup_hash) \
-         VALUES ($1, $2, $3, $4, $5, 'queued', $6, $7, $8)",
+         (id, creator_id, invoice_id, intent_envelope, intent_kind, status, proposal_lookup_hash) \
+         VALUES ($1, $2, $3, $4, $5, 'queued', $6)",
     )
     .bind(row.id)
     .bind(row.creator_id)
     .bind(row.invoice_id)
     .bind(row.intent_envelope)
     .bind(row.intent_kind)
-    .bind(row.depends_on_id)
-    .bind(row.reader_assignment_id)
     .bind(row.proposal_lookup_hash.map(<[u8; 32]>::as_slice))
     .execute(&mut **tx)
     .await

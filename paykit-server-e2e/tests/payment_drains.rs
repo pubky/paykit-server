@@ -39,10 +39,18 @@ fn lock_resource() -> PubkyLockResource {
 }
 
 fn proposal_intent(receiver_path: &str) -> DeliveryIntentV1 {
-    proposal_intent_for_reference(receiver_path, &Uuid::new_v4().hyphenated().to_string())
+    proposal_intent_for_reference(
+        receiver_path,
+        &Uuid::new_v4().hyphenated().to_string(),
+        "payload",
+    )
 }
 
-fn proposal_intent_for_reference(receiver_path: &str, payment_reference: &str) -> DeliveryIntentV1 {
+fn proposal_intent_for_reference(
+    receiver_path: &str,
+    payment_reference: &str,
+    endpoint_payload: &str,
+) -> DeliveryIntentV1 {
     let _ = receiver_path;
     let app_id = PaykitAppId::new("paykit-server").unwrap();
     DeliveryIntentV1::payment_request(
@@ -60,7 +68,7 @@ fn proposal_intent_for_reference(receiver_path: &str, payment_reference: &str) -
         .required_app_id(Some(app_id))
         .payment_endpoints(Some(HashMap::from([(
             PaymentEndpointIdentifier::new("btc-bitcoin-p2wpkh").unwrap(),
-            PaymentEndpointPayload::new("payload"),
+            PaymentEndpointPayload::new(endpoint_payload),
         )])))
         .build()
         .unwrap(),
@@ -77,6 +85,7 @@ impl InvoicePayloadFactory for RacePayloads {
             payment_request_intent: proposal_intent_for_reference(
                 "new/wallet",
                 "00000000-0000-4000-8000-000000000001",
+                &serde_json::json!({ "value": address }).to_string(),
             ),
             bitcoin_address: address,
         })
@@ -289,7 +298,7 @@ async fn insert_projectable_attempt(
     let request_id = Uuid::new_v4().to_string();
     let event_id = Uuid::new_v4().to_string();
     let outbox_id = Uuid::new_v4();
-    let intent = proposal_intent_for_reference("new/wallet", &request_id);
+    let intent = proposal_intent_for_reference("new/wallet", &request_id, "payload");
     let plaintext = postcard::to_allocvec(&intent).unwrap();
     let creator_hash = crypto.lookup_hash(CREATOR.as_bytes());
     let envelope = crypto
@@ -1026,7 +1035,7 @@ async fn drain_atomically_freezes_classification_and_cancellation_intent_for_exa
     );
 
     let cancellation_row = sqlx::query(
-        "SELECT intent_envelope, invoice_id, depends_on_id, status
+        "SELECT intent_envelope, invoice_id, status
          FROM outbox WHERE id = $1",
     )
     .bind(cancellation_outbox_id)
@@ -1036,10 +1045,6 @@ async fn drain_atomically_freezes_classification_and_cancellation_intent_for_exa
     assert_eq!(
         cancellation_row.get::<Option<Uuid>, _>("invoice_id"),
         Some(proposed_invoice)
-    );
-    assert_eq!(
-        cancellation_row.get::<Option<Uuid>, _>("depends_on_id"),
-        None
     );
     assert_eq!(cancellation_row.get::<String, _>("status"), "queued");
     let plaintext = crypto

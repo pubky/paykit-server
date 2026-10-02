@@ -216,7 +216,6 @@ impl OutboxStore {
                      OR (o.status = 'leased' AND o.lease_expires_at <= clock_timestamp()) \
                      OR (o.status = 'retryable' AND o.next_attempt_at <= clock_timestamp()) \
                  ) \
-                 AND (o.depends_on_id IS NULL OR dependency.status = 'delivered') \
                  AND (o.intent_kind <> 'payment_request_proposal' OR ( \
                      o.proposal_lookup_hash IS NOT NULL AND EXISTS ( \
                      SELECT 1 \

@@ -130,8 +130,9 @@ async fn assert_reconciliation_status(
 ) {
     let row_id: Uuid = sqlx::query_scalar(
         "INSERT INTO outbox \
-         (creator_id, intent_envelope, status, sdk_outbound_message_id) \
-         SELECT id, decode('00', 'hex'), 'handed_off', $1 FROM creators LIMIT 1 \
+         (creator_id, intent_envelope, intent_kind, status, sdk_outbound_message_id) \
+         SELECT id, decode('00', 'hex'), 'endpoint_publication', 'handed_off', $1 \
+         FROM creators LIMIT 1 \
          RETURNING id",
     )
     .bind(outbound_id.to_string())
@@ -462,8 +463,9 @@ async fn invoice_request_is_claimable_directly_and_preserves_delivery_fences() {
     .await;
 
     let corrupt_id: Uuid = sqlx::query_scalar(
-        "INSERT INTO outbox (creator_id, intent_envelope, status) \
-         SELECT id, decode('00', 'hex'), 'queued' FROM creators LIMIT 1 RETURNING id",
+        "INSERT INTO outbox (creator_id, intent_envelope, intent_kind, status) \
+         SELECT id, decode('00', 'hex'), 'endpoint_publication', 'queued' \
+         FROM creators LIMIT 1 RETURNING id",
     )
     .fetch_one(database.pool())
     .await
@@ -496,7 +498,8 @@ async fn invoice_request_is_claimable_directly_and_preserves_delivery_fences() {
     );
 
     let missing_intent_insert = sqlx::query(
-        "INSERT INTO outbox (creator_id, status) SELECT id, 'queued' FROM creators LIMIT 1",
+        "INSERT INTO outbox (creator_id, intent_kind, status) \
+         SELECT id, 'endpoint_publication', 'queued' FROM creators LIMIT 1",
     )
     .execute(database.pool())
     .await;
@@ -505,8 +508,9 @@ async fn invoice_request_is_claimable_directly_and_preserves_delivery_fences() {
         "schema accepted a claimable row without an intent"
     );
     let unattributed_handoff = sqlx::query(
-        "INSERT INTO outbox (creator_id, intent_envelope, status) \
-         SELECT id, decode('00', 'hex'), 'handed_off' FROM creators LIMIT 1",
+        "INSERT INTO outbox (creator_id, intent_envelope, intent_kind, status) \
+         SELECT id, decode('00', 'hex'), 'endpoint_publication', 'handed_off' \
+         FROM creators LIMIT 1",
     )
     .execute(database.pool())
     .await;
@@ -515,8 +519,10 @@ async fn invoice_request_is_claimable_directly_and_preserves_delivery_fences() {
         "schema accepted handed_off without an SDK outbound ID"
     );
     let unpaired_payment_ids = sqlx::query(
-        "INSERT INTO outbox (creator_id, intent_envelope, status, sdk_event_id) \
-         SELECT id, decode('00', 'hex'), 'queued', 'event-only' FROM creators LIMIT 1",
+        "INSERT INTO outbox \
+         (creator_id, intent_envelope, intent_kind, status, sdk_event_id) \
+         SELECT id, decode('00', 'hex'), 'endpoint_publication', 'queued', 'event-only' \
+         FROM creators LIMIT 1",
     )
     .execute(database.pool())
     .await;
