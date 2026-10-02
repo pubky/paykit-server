@@ -10,7 +10,7 @@ use paykit_lib::PaykitAppRegistry;
 use paykit_sdk::OutboundPrivateMessageStatus;
 
 use crate::{
-    application::semantic_intent::DeliveryIntentV1,
+    application::semantic_intent::{DeliveryIntentV1, DeliveryOperationV1},
     persistence::{ClaimedHandoff, ClaimedOutbox, OutboxStore, PersistenceError},
 };
 use std::time::Duration;
@@ -113,6 +113,23 @@ impl RetrySchedule {
 /// through identity-wide Pubky shared storage; an in-memory runtime is test-only.
 #[async_trait]
 pub trait Adapter: Send + Sync {
+    /// Revalidates a claimed row immediately before its external SDK effect.
+    /// Production overrides hold the same Creator mutation fence as drain creation.
+    async fn execute_claimed_handoff(
+        &self,
+        store: &OutboxStore,
+        claim: &ClaimedOutbox,
+        intent: &DeliveryIntentV1,
+    ) -> Result<HandoffResult, HandoffFailure> {
+        match store.claim_handoff_eligible(claim).await {
+            Ok(true) => self.execute_handoff(intent).await,
+            Ok(false) => Err(HandoffFailure::Permanent),
+            Err(_) => Err(HandoffFailure::Retryable(
+                RetryableHandoffStage::AdapterUnavailable,
+            )),
+        }
+    }
+
     /// Executes one complete semantic handoff. Concrete adapters may override
     /// this to serialize a multi-call SDK operation under one Creator lock.
     async fn execute_handoff(
@@ -136,6 +153,11 @@ pub trait Adapter: Send + Sync {
         &self,
         reader: &str,
         terms: &crate::application::semantic_intent::PaymentTermsV1,
+    ) -> Result<HandoffResult, HandoffError>;
+    async fn cancel_payment_request(
+        &self,
+        reader: &str,
+        payment_request_id: &str,
     ) -> Result<HandoffResult, HandoffError>;
     async fn outbound_status(
         &self,
@@ -176,27 +198,35 @@ pub(crate) async fn handoff_steps<A: Adapter + ?Sized>(
         .ensure_link_with_peer(intent.reader_pubky())
         .await
         .map_err(|error| at_stage(error, RetryableHandoffStage::LinkEstablishment))?;
-    // An accepted Allowance lets the reader's wallet pay this receiver's
-    // requests on this link without asking. The acceptance is queued before
-    // the request, so the reader loads it first. Accepting as the Allowee
-    // costs the receiver nothing. Intake is best effort: when it fails, the
-    // request is still proposed for manual payment.
-    match adapter
-        .accept_allowance_proposals(intent.reader_pubky())
-        .await
-    {
-        Ok(0) => {}
-        Ok(accepted) => info!(accepted, "accepted Paykit Allowance proposals"),
-        Err(error) => warn!(
-            stage = "allowance_intake",
-            cause = error.diagnostic_label(),
-            "Paykit Allowance intake failed; the handoff continues"
-        ),
+    match intent.operation() {
+        DeliveryOperationV1::PaymentRequestProposal { terms } => {
+            // An accepted Allowance lets the reader's wallet pay this receiver's
+            // requests on this link without asking. The acceptance is queued before
+            // the request, so the reader loads it first. Accepting as the Allowee
+            // costs the receiver nothing. Intake is best effort: when it fails, the
+            // request is still proposed for manual payment.
+            match adapter
+                .accept_allowance_proposals(intent.reader_pubky())
+                .await
+            {
+                Ok(0) => {}
+                Ok(accepted) => info!(accepted, "accepted Paykit Allowance proposals"),
+                Err(error) => warn!(
+                    stage = "allowance_intake",
+                    cause = error.diagnostic_label(),
+                    "Paykit Allowance intake failed; the handoff continues"
+                ),
+            }
+            adapter
+                .propose_payment_request(intent.reader_pubky(), terms)
+                .await
+                .map_err(|error| at_stage(error, RetryableHandoffStage::PaymentRequestProposal))
+        }
+        DeliveryOperationV1::PaymentRequestCancellation { payment_request_id } => adapter
+            .cancel_payment_request(intent.reader_pubky(), payment_request_id)
+            .await
+            .map_err(|error| at_stage(error, RetryableHandoffStage::PaymentRequestCancellation)),
     }
-    adapter
-        .propose_payment_request(intent.reader_pubky(), intent.terms())
-        .await
-        .map_err(|error| at_stage(error, RetryableHandoffStage::PaymentRequestProposal))
 }
 
 /// Executes one already-fenced claim. Enqueue is only `handed_off`; the SDK
@@ -234,7 +264,7 @@ pub async fn process_claim_with_health(
                 .map(|transitioned| (transitioned, ProcessingHealth::PermanentFailure));
         }
     };
-    match handoff(adapter, &intent).await {
+    match adapter.execute_claimed_handoff(store, claim, &intent).await {
         Ok(result) => store
             .mark_handed_off(claim, &result)
             .await

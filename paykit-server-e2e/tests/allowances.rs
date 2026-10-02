@@ -53,6 +53,7 @@ use paykit_server::{
     config::{Config, ConfigEnvironment},
     crypto::Crypto,
     domain::locks::{CreatorPubky, ReaderPubky, parse_creator, parse_reader},
+    http::auth::signature_preimage,
     persistence::{CreatorCredentials, CreatorStore},
     startup::initialize_database,
     workers::observer::{ElectrumPort, ObserverError},
@@ -389,6 +390,7 @@ async fn post_locks_invoice(stack: &Stack, bundle: &str) {
         r#"{{"bundle_id":"{bundle}","lock_resource":"{}","reader":"{}"}}"#,
         stack.lock_resource, stack.reader
     );
+    let preimage = signature_preimage("POST", "/invoices", body.as_bytes());
     let mut attempt = 1;
     loop {
         let request = Request::builder()
@@ -396,7 +398,7 @@ async fn post_locks_invoice(stack: &Stack, bundle: &str) {
             .uri("/invoices")
             .header(
                 "X-Paykit-Signature",
-                URL_SAFE_NO_PAD.encode(stack.signing_key.sign(body.as_bytes()).to_bytes()),
+                URL_SAFE_NO_PAD.encode(stack.signing_key.sign(&preimage).to_bytes()),
             )
             .body(Body::from(body.clone()))
             .unwrap();
@@ -408,7 +410,7 @@ async fn post_locks_invoice(stack: &Stack, bundle: &str) {
         }
         assert_eq!(
             status,
-            StatusCode::NO_CONTENT,
+            StatusCode::OK,
             "Locks invoice, attempt {attempt}: {response}"
         );
         return;

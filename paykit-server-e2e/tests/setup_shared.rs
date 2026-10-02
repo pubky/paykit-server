@@ -35,6 +35,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
+use std::time::Duration;
 
 mod common;
 #[path = "fixtures/sdk.rs"]
@@ -69,9 +70,12 @@ async fn allocate_invoice(
             creator,
             reader,
             bundle_binding: binding,
+            lock_resource_binding: binding,
             payment_request_binding: binding,
             invoice_payloads: &AccountPayloads(reader),
             required_sats: 100,
+            proposal_acceptance_seconds: 60 * 60,
+            payment_window_seconds: 24 * 60 * 60,
         })
         .await
         .unwrap()
@@ -324,6 +328,8 @@ async fn real_setup_reconnect_preserves_pending_invoices_and_hosted_state() {
             client_id: pubky::ClientId::new("app.paykit.server").unwrap(),
             app_id: paykit_lib::PaykitAppId::new("paykit-server").unwrap(),
             network: paykit_server::config::PaykitNetwork::Testnet,
+            proposal_acceptance_window: Duration::from_secs(60 * 60),
+            payment_window: Duration::from_secs(24 * 60 * 60),
         },
     );
     let publisher = Arc::new(FailAfterPublication {
@@ -457,7 +463,7 @@ async fn real_setup_reconnect_preserves_pending_invoices_and_hosted_state() {
         )
         .await
         .unwrap();
-    // No wallet approval: cancelling the wait must not replace existing credentials.
+    // No wallet approval: a dropped wait must not replace existing credentials.
     assert!(
         tokio::time::timeout(
             std::time::Duration::from_millis(50),
@@ -466,9 +472,10 @@ async fn real_setup_reconnect_preserves_pending_invoices_and_hosted_state() {
         .await
         .is_err()
     );
+    // The dropped request leaves completion running in its own task.
     assert_eq!(
         service.trigger_completion(&cancelled.flow_id).await,
-        PollResult::Failed
+        PollResult::PendingTimeout
     );
     assert_eq!(publisher.calls.load(Ordering::SeqCst), publication_calls);
     let unchanged = creators.load(&creator).await.unwrap();
