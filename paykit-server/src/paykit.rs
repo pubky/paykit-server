@@ -8,7 +8,7 @@ use std::{
 
 use async_trait::async_trait;
 use paykit_lib::{
-    PaymentAmount, PaymentDeadline, PaymentEndpointIdentifier, PaymentEndpointPayload,
+    PaykitAppId, PaymentAmount, PaymentDeadline, PaymentEndpointIdentifier, PaymentEndpointPayload,
     PaymentReference, PaymentRequestId, PaymentRequestTerms,
 };
 use paykit_sdk::{
@@ -268,6 +268,7 @@ pub struct PaykitAdapter {
     storage: PubkySharedStateStorage,
     creator_id: Uuid,
     creator: CreatorPubky,
+    app_id: PaykitAppId,
     mutation_lock: Arc<TokioMutex<()>>,
 }
 
@@ -341,6 +342,7 @@ impl PaykitAdapter {
             storage,
             creator_id,
             creator,
+            app_id: config.app_id.clone(),
         })
     }
 
@@ -367,7 +369,7 @@ impl PaykitAdapter {
             .payment_requests()
             .await
             .map_err(|_| LifecycleSyncError::Sdk)?;
-        let projections = lifecycle_projections(&records);
+        let projections = lifecycle_projections(&records, &self.app_id);
         let creator_id = self.creator_id;
         project_lifecycles_after_receive(projections, receive_health, |projection| async move {
             lifecycles
@@ -730,10 +732,17 @@ fn lifecycle_projection(
 
 fn lifecycle_projections(
     records: &[PaymentRequestRecord],
+    app_id: &PaykitAppId,
 ) -> Vec<Result<PaymentRequestLifecycleProjection, LifecycleSyncError>> {
     records
         .iter()
         .filter(|record| record.local_role != Some(PaymentRequestLocalRole::Payer))
+        .filter(|record| {
+            record
+                .proposal_app_id
+                .as_ref()
+                .is_none_or(|proposal_app_id| proposal_app_id == app_id)
+        })
         .map(lifecycle_projection)
         .collect()
 }
@@ -1087,7 +1096,6 @@ fn require_linked(state: LinkedPeerState) -> Result<(), HandoffError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use paykit_lib::PaykitAppId;
     use paykit_sdk::{
         AmountRecord, OutboundPrivateSendFailure, PaymentRequestTermsRecord,
         RecoveryMarkerPublishFailure, ReservationCleanupFailure,
@@ -1096,10 +1104,14 @@ mod tests {
 
     const CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
 
+    fn server_app_id() -> PaykitAppId {
+        PaykitAppId::new("paykit-server").unwrap()
+    }
+
     fn canonical_record(local_role: Option<PaymentRequestLocalRole>) -> PaymentRequestRecord {
         PaymentRequestRecord {
             counterparty: PubkyPublicKey::from_raw_or_app_key(CREATOR).unwrap(),
-            proposal_app_id: Some(PaykitAppId::new("paykit-server").unwrap()),
+            proposal_app_id: Some(server_app_id()),
             payer_app_id: None,
             execution_claim_app_id: None,
             conversion_quotes: Vec::new(),
@@ -1118,7 +1130,7 @@ mod tests {
                 payment_reference: Uuid::new_v4().to_string(),
                 proposal_expires_at: Some("2027-01-15T08:00:00Z".into()),
                 recurrence: None,
-                required_app_id: Some(PaykitAppId::new("paykit-server").unwrap()),
+                required_app_id: Some(server_app_id()),
                 conversion: None,
                 payment_deadline: None,
                 accepted_payment_endpoint_identifiers: vec!["btc-bitcoin-p2wpkh".into()],
@@ -1154,7 +1166,7 @@ mod tests {
         let payee = canonical_record(Some(PaymentRequestLocalRole::Payee));
         let payee_id = payee.payment_request_id.clone();
 
-        let projections = lifecycle_projections(&[payer, payee]);
+        let projections = lifecycle_projections(&[payer, payee], &server_app_id());
 
         assert_eq!(projections.len(), 1);
         assert_eq!(
@@ -1164,14 +1176,33 @@ mod tests {
     }
 
     #[test]
-    fn malformed_or_unknown_payee_side_records_still_fail_projection() {
+    fn foreign_payee_records_do_not_poison_server_lifecycle_projection() {
+        let mut foreign_payee = canonical_record(Some(PaymentRequestLocalRole::Payee));
+        foreign_payee.proposal_app_id = Some(PaykitAppId::new("bitkit").unwrap());
+        foreign_payee.terms.as_mut().unwrap().payment_endpoints = None;
+        let server_payee = canonical_record(Some(PaymentRequestLocalRole::Payee));
+        let server_payment_request_id = server_payee.payment_request_id.clone();
+
+        let projections = lifecycle_projections(&[foreign_payee, server_payee], &server_app_id());
+
+        assert_eq!(projections.len(), 1);
+        assert_eq!(
+            projections[0].as_ref().unwrap().payment_request_id,
+            server_payment_request_id
+        );
+    }
+
+    #[test]
+    fn server_owned_malformed_and_unknown_records_still_fail_projection() {
         let mut malformed_payee = canonical_record(Some(PaymentRequestLocalRole::Payee));
         malformed_payee.terms = None;
+        let mut missing_app_id = canonical_record(Some(PaymentRequestLocalRole::Payee));
+        missing_app_id.proposal_app_id = None;
         let unknown_role = canonical_record(None);
 
-        for record in [malformed_payee, unknown_role] {
+        for record in [malformed_payee, missing_app_id, unknown_role] {
             assert_eq!(
-                lifecycle_projections(&[record]),
+                lifecycle_projections(&[record], &server_app_id()),
                 vec![Err(LifecycleSyncError::InvalidProjection)]
             );
         }

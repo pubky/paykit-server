@@ -5,8 +5,8 @@ use paykit_lib::{
     PaymentReference, PaymentRequestTerms,
 };
 use paykit_sdk::{
-    LinkedPeerState, PAYKIT_SESSION_CAPABILITIES, PubkyLocalSecretKey, PubkyPublicKey,
-    PubkySessionBootstrap,
+    LinkedPeerState, PAYKIT_SESSION_CAPABILITIES, PaykitSdk, PaykitSdkConfig, PubkyLocalSecretKey,
+    PubkyPublicKey, PubkySessionAccess, PubkySessionBootstrap, PubkySharedStateStorage,
 };
 use paykit_server::{
     application::semantic_intent::{DeliveryIntentV1, DeliveryOperationV1, PaymentTermsV1},
@@ -57,6 +57,32 @@ async fn build_pubky_testnet() -> EphemeralTestnet {
         .build()
         .await
         .unwrap()
+}
+
+async fn shared_hosted_sdk(access: PubkySessionAccess, app_id: &str) -> sdk_fixtures::HostedSdk {
+    let provider = sdk_fixtures::TestSessionProvider::new(access);
+    let sdk = PaykitSdk::new(
+        PubkySharedStateStorage::new(provider.clone()),
+        provider,
+        sdk_fixtures::TestPaymentAdapter,
+        PaykitSdkConfig::new(app_id).unwrap(),
+    );
+    sdk.initialize().await.unwrap();
+    sdk.publish_paykit_app(
+        paykit_lib::PaykitApp::new(
+            "Test App",
+            paykit_lib::PaykitAppCapabilities {
+                private_payments: true,
+                payment_requests: true,
+                receipts: true,
+                outgoing_payments: true,
+            },
+        )
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    sdk
 }
 
 fn proposal_intent(receiver_path: &str) -> DeliveryIntentV1 {
@@ -564,7 +590,7 @@ async fn missing_required_intake_blocks_drain_snapshot_and_status_lookup() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn incoming_payer_proposal_does_not_poison_existing_invoice_refresh_or_new_drain() {
+async fn shared_foreign_app_records_do_not_poison_existing_invoice_refresh_or_new_drain() {
     let database = TestDatabase::create().await;
     run_migrations(database.pool()).await.unwrap();
     let testnet = build_pubky_testnet().await;
@@ -601,6 +627,7 @@ async fn incoming_payer_proposal_does_not_poison_existing_invoice_refresh_or_new
         .unwrap();
     let creator_sdk =
         sdk_fixtures::hosted_sdk(creator_account.access.clone(), "paykit-server", 0).await;
+    let foreign_creator_sdk = shared_hosted_sdk(creator_account.access.clone(), "bitkit").await;
 
     let payer_account = bootstrap
         .sign_up(
@@ -674,6 +701,54 @@ async fn incoming_payer_proposal_does_not_poison_existing_invoice_refresh_or_new
         Some(paykit_sdk::PaymentRequestLocalRole::Payer)
     );
 
+    let foreign_proposal = foreign_creator_sdk
+        .propose_payment_request(
+            payer_account.public_key.clone(),
+            PaymentRequestTerms::builder(
+                PaymentAmount::new("0.00001000", "BTC").unwrap(),
+                PaymentReference::new(Uuid::new_v4().to_string()).unwrap(),
+                vec![PaymentEndpointIdentifier::new("btc-bitcoin-p2wpkh").unwrap()],
+            )
+            .build()
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    foreign_creator_sdk
+        .process_outbound_private_messages(payer_account.public_key.clone())
+        .await
+        .unwrap();
+    payer_sdk
+        .receive_private_messages_from_linked_peers()
+        .await
+        .unwrap();
+    let foreign_record = foreign_creator_sdk
+        .payment_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|record| record.payment_request_id == foreign_proposal.payment_request_id)
+        .unwrap();
+    assert_eq!(
+        foreign_record.local_role,
+        Some(paykit_sdk::PaymentRequestLocalRole::Payee)
+    );
+    assert_eq!(
+        foreign_record
+            .proposal_app_id
+            .as_ref()
+            .map(PaykitAppId::as_str),
+        Some("bitkit")
+    );
+    assert!(
+        foreign_record
+            .terms
+            .as_ref()
+            .unwrap()
+            .payment_endpoints
+            .is_none()
+    );
+
     let dynamic_lock = parse_addressed_lock_resource(&format!(
         "{creator}/pub/locks.app/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json"
     ))
@@ -736,6 +811,12 @@ async fn incoming_payer_proposal_does_not_poison_existing_invoice_refresh_or_new
             PaymentRequestLifecycleState::Rejected
         );
     }
+    let projected_lifecycle_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM payment_request_lifecycles")
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(projected_lifecycle_count, 1);
 
     let drain = adapter
         .reconcile_and_create_payment_drain(
