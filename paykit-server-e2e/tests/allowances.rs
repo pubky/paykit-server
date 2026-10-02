@@ -8,7 +8,13 @@
 //! ephemeral Pubky testnet) against a reader on the same SDK, and checks the
 //! payer's admission.
 
-use std::{collections::BTreeMap, net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    net::SocketAddr,
+    str::FromStr,
+    sync::Arc,
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use axum::{
@@ -85,8 +91,10 @@ impl ElectrumPort for EmptyElectrum {
 }
 
 /// The server settings that matter here: the `paykit-server` App and regtest
-/// endpoints. The outbox polls fast so handoffs run within the
-/// test.
+/// endpoints. The outbox polls fast so handoffs run within the test. The lease
+/// is the production default: a handoff here is a link handshake with the
+/// wallet, an intake and a send over an in-process Pubky testnet, and under
+/// load it outlasts a short lease, which makes the outbox claim the row again.
 fn config(database_url: &str, signing_key: &SigningKey) -> Config {
     let trusted_key = pubky::PublicKey::from(
         pubky::pkarr::PublicKey::try_from(signing_key.verifying_key().as_bytes()).unwrap(),
@@ -115,7 +123,7 @@ connect_retries = 0
 [outbox]
 poll_interval = "100ms"
 batch_size = 16
-lease_duration = "5s"
+lease_duration = "30s"
 retry_initial = "1s"
 retry_max = "2s"
 [shutdown]
@@ -372,23 +380,39 @@ async fn wait_until_ready(address: SocketAddr) {
 }
 
 /// What the Lock Server sends when Pubky App opens the unlock:
-/// `{bundle_id, lock_resource, reader}`, signed.
+/// `{bundle_id, lock_resource, reader}`, signed. The Lock Server retries a
+/// `503`: the server answers it when validating the creator's session fails
+/// in a way it cannot tell from an outage, which an ambiguous Pubky request
+/// failure under load does, and an exact replay of the invoice changes nothing.
 async fn post_locks_invoice(stack: &Stack, bundle: &str) {
     let body = format!(
         r#"{{"bundle_id":"{bundle}","lock_resource":"{}","reader":"{}"}}"#,
         stack.lock_resource, stack.reader
     );
-    let request = Request::builder()
-        .method(Method::POST)
-        .uri("/invoices")
-        .header(
-            "X-Paykit-Signature",
-            URL_SAFE_NO_PAD.encode(stack.signing_key.sign(body.as_bytes()).to_bytes()),
-        )
-        .body(Body::from(body))
-        .unwrap();
-    let (status, response) = send_http(stack.address, request).await;
-    assert_eq!(status, StatusCode::NO_CONTENT, "Locks invoice: {response}");
+    let mut attempt = 1;
+    loop {
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/invoices")
+            .header(
+                "X-Paykit-Signature",
+                URL_SAFE_NO_PAD.encode(stack.signing_key.sign(body.as_bytes()).to_bytes()),
+            )
+            .body(Body::from(body.clone()))
+            .unwrap();
+        let (status, response) = send_http(stack.address, request).await;
+        if status == StatusCode::SERVICE_UNAVAILABLE && attempt < 5 {
+            attempt += 1;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        }
+        assert_eq!(
+            status,
+            StatusCode::NO_CONTENT,
+            "Locks invoice, attempt {attempt}: {response}"
+        );
+        return;
+    }
 }
 
 /// The reader's Bitkit: keeps its side of the handshake moving, reads the
@@ -636,7 +660,6 @@ async fn allowance_proposed_on_the_server_link_covers_the_next_locks_invoice() {
             .outbound_private_messages
             .iter()
             .filter(|record| record.kind == kind)
-            .map(|record| (record.outbound_message_id, record.status.clone()))
             .collect::<Vec<_>>()
     };
     let acceptances = outbound("paykit.allowance_acceptance");
@@ -644,11 +667,48 @@ async fn allowance_proposed_on_the_server_link_covers_the_next_locks_invoice() {
     assert!(
         acceptances
             .iter()
-            .all(|(_, status)| *status == OutboundPrivateMessageStatus::Sent)
+            .all(|record| record.status == OutboundPrivateMessageStatus::Sent)
     );
-    let requests = outbound("paykit.payment_request");
-    assert_eq!(requests.len(), 2);
-    assert!(acceptances.iter().all(|(id, _)| *id < requests[1].0));
+
+    // The outbox hands a row off at least once: a handoff that outlives its
+    // lease is claimed again and queues the same Payment Request once more.
+    // What the feature promises is one logical request per Locks invoice, so
+    // group the queued requests by invoice and compare their references.
+    let mut references_by_bundle: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut first_request_by_bundle: BTreeMap<String, u64> = BTreeMap::new();
+    for record in outbound("paykit.payment_request") {
+        let json: serde_json::Value = serde_json::from_str(&record.raw_json).unwrap();
+        let bundle = json["request"]["metadata"]["bundle_id"].as_str().unwrap();
+        let reference = json["request"]["payment_reference"].as_str().unwrap();
+        references_by_bundle
+            .entry(bundle.to_owned())
+            .or_default()
+            .insert(reference.to_owned());
+        first_request_by_bundle
+            .entry(bundle.to_owned())
+            .and_modify(|id| *id = (*id).min(record.outbound_message_id))
+            .or_insert(record.outbound_message_id);
+    }
+    assert_eq!(
+        references_by_bundle
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        [BUNDLE_BEFORE_GRANT, BUNDLE_AFTER_GRANT],
+        "one invoice per unlock"
+    );
+    for (bundle, references) in &references_by_bundle {
+        assert_eq!(
+            references.len(),
+            1,
+            "{bundle} was proposed under {references:?}"
+        );
+    }
+    assert!(
+        acceptances
+            .iter()
+            .all(|record| record.outbound_message_id < first_request_by_bundle[BUNDLE_AFTER_GRANT])
+    );
 
     stack.shutdown().await;
 }
