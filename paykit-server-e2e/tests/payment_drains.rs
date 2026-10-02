@@ -4,9 +4,13 @@ use paykit_lib::{
     PaykitAppId, PaymentAmount, PaymentDeadline, PaymentEndpointIdentifier, PaymentEndpointPayload,
     PaymentReference, PaymentRequestTerms,
 };
-use paykit_sdk::PubkyPublicKey;
+use paykit_sdk::{
+    LinkedPeerState, PAYKIT_SESSION_CAPABILITIES, PubkyLocalSecretKey, PubkyPublicKey,
+    PubkySessionBootstrap,
+};
 use paykit_server::{
     application::semantic_intent::{DeliveryIntentV1, DeliveryOperationV1, PaymentTermsV1},
+    config::{PaykitConfig, PaykitNetwork},
     crypto::{Crypto, EncryptedEnvelope, EnvelopeContext},
     domain::{
         locks::{
@@ -17,17 +21,24 @@ use paykit_server::{
             PaymentRequestLifecycleProjection, PaymentRequestLifecycleState, ProposalCorrelation,
         },
     },
+    paykit::{CreatorSessionProvider, PaykitAdapter},
     persistence::{
-        AtomicInvoiceInput, InvoicePayloadFactory, InvoicePayloads, InvoiceStore, OutboxStore,
-        PaymentDrainStore, PaymentRequestLifecycleApply, PaymentRequestLifecycleStore,
-        PersistenceError, run_migrations,
+        AtomicInvoiceInput, CreatorCredentials, CreatorStore, InvoicePayloadFactory,
+        InvoicePayloads, InvoiceStore, OutboxStore, PaymentDrainStore,
+        PaymentRequestLifecycleApply, PaymentRequestLifecycleStore, PersistenceError,
+        run_migrations,
     },
 };
 use paykit_server_e2e::postgres::TestDatabase;
+use pubky::ClientId;
+use pubky_testnet::{EphemeralTestnet, pubky::Keypair};
 use sqlx::Row;
 use std::collections::HashMap;
 use time::OffsetDateTime;
 use uuid::Uuid;
+
+#[path = "fixtures/sdk.rs"]
+mod sdk_fixtures;
 
 const CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
 const READER: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
@@ -36,6 +47,16 @@ const LOCK_RESOURCE: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydp
 
 fn lock_resource() -> PubkyLockResource {
     parse_addressed_lock_resource(LOCK_RESOURCE).unwrap()
+}
+
+async fn build_pubky_testnet() -> EphemeralTestnet {
+    let postgres = std::env::var("TEST_DATABASE_URL").unwrap();
+    let postgres = pubky_testnet::pubky_homeserver::ConnectionString::new(&postgres).unwrap();
+    EphemeralTestnet::builder()
+        .postgres(postgres)
+        .build()
+        .await
+        .unwrap()
 }
 
 fn proposal_intent(receiver_path: &str) -> DeliveryIntentV1 {
@@ -540,6 +561,197 @@ async fn missing_required_intake_blocks_drain_snapshot_and_status_lookup() {
         )
         .await;
     assert_eq!(status_result, Err(PersistenceError::Unavailable));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn incoming_payer_proposal_does_not_poison_existing_invoice_refresh_or_new_drain() {
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let testnet = build_pubky_testnet().await;
+    let pubky = testnet.sdk().unwrap();
+    let bootstrap = PubkySessionBootstrap::with_pubky(pubky.clone(), "app.paykit.server").unwrap();
+    let homeserver = PubkyPublicKey::from_public_key(&testnet.homeserver_app().public_key());
+    let crypto = Arc::new(Crypto::from_master_key(&[51; 32]).unwrap());
+
+    let creator_root = PubkyLocalSecretKey::new(Keypair::random().secret_key());
+    let creator_account = bootstrap
+        .sign_up(
+            &creator_root,
+            &homeserver,
+            None,
+            PAYKIT_SESSION_CAPABILITIES,
+        )
+        .await
+        .unwrap();
+    let creator = parse_creator(&format!("pubky{}", creator_account.public_key)).unwrap();
+    let creators = CreatorStore::new(database.pool(), crypto.clone());
+    let creator_row = creators
+        .create(&CreatorCredentials::new(
+            creator.clone(),
+            creator_account
+                .export_session_secret()
+                .await
+                .unwrap()
+                .into_inner(),
+            creator_root.derive_paykit_identity_secret_key(1).unwrap(),
+            "unused-test-xpub".into(),
+            0,
+        ))
+        .await
+        .unwrap();
+    let creator_sdk =
+        sdk_fixtures::hosted_sdk(creator_account.access.clone(), "paykit-server", 0).await;
+
+    let payer_account = bootstrap
+        .sign_up(
+            &PubkyLocalSecretKey::new(Keypair::random().secret_key()),
+            &homeserver,
+            None,
+            PAYKIT_SESSION_CAPABILITIES,
+        )
+        .await
+        .unwrap();
+    let payer_sdk = sdk_fixtures::hosted_sdk(payer_account.access, "bitkit", 0).await;
+
+    creator_sdk
+        .initiate_link_with_peer(payer_account.public_key.clone())
+        .await
+        .unwrap();
+    payer_sdk
+        .accept_link_with_peer(creator_account.public_key.clone())
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let mut creator_link = LinkedPeerState::Linking;
+    let mut payer_link = LinkedPeerState::Linking;
+    while creator_link != LinkedPeerState::Linked || payer_link != LinkedPeerState::Linked {
+        assert!(tokio::time::Instant::now() < deadline, "link timed out");
+        if creator_link != LinkedPeerState::Linked {
+            creator_link = creator_sdk
+                .advance_link_handshake(payer_account.public_key.clone())
+                .await
+                .unwrap()
+                .state;
+        }
+        if payer_link != LinkedPeerState::Linked {
+            payer_link = payer_sdk
+                .advance_link_handshake(creator_account.public_key.clone())
+                .await
+                .unwrap()
+                .state;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    payer_sdk
+        .propose_payment_request(
+            creator_account.public_key.clone(),
+            PaymentRequestTerms::builder(
+                PaymentAmount::new("0.00001000", "BTC").unwrap(),
+                PaymentReference::new(Uuid::new_v4().to_string()).unwrap(),
+                vec![PaymentEndpointIdentifier::new("btc-bitcoin-p2wpkh").unwrap()],
+            )
+            .build()
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    payer_sdk
+        .process_outbound_private_messages(creator_account.public_key.clone())
+        .await
+        .unwrap();
+    creator_sdk
+        .receive_private_messages_from_linked_peers()
+        .await
+        .unwrap();
+    let incoming = creator_sdk
+        .actionable_received_payment_requests()
+        .await
+        .unwrap();
+    assert_eq!(incoming.len(), 1);
+    assert_eq!(
+        incoming[0].local_role,
+        Some(paykit_sdk::PaymentRequestLocalRole::Payer)
+    );
+
+    let dynamic_lock = parse_addressed_lock_resource(&format!(
+        "{creator}/pub/locks.app/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json"
+    ))
+    .unwrap();
+    let (invoice_id, _) = insert_invoice(
+        &database,
+        &crypto,
+        creator_row.id(),
+        0,
+        0,
+        PaymentRequestLifecycleState::Rejected,
+    )
+    .await;
+    let lock_hash = crypto.lookup_hash(dynamic_lock.to_string().as_bytes());
+    sqlx::query(
+        "UPDATE invoices
+         SET bundle_lookup_hash = $1, lock_resource_lookup_hash = $2
+         WHERE id = $3",
+    )
+    .bind(crypto.lookup_hash(BUNDLE.as_bytes()).as_bytes().as_slice())
+    .bind(lock_hash.as_bytes().as_slice())
+    .bind(invoice_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO lock_payment_generations
+             (creator_id, lock_resource_lookup_hash, current_generation)
+         VALUES ($1, $2, 0)",
+    )
+    .bind(creator_row.id())
+    .bind(lock_hash.as_bytes().as_slice())
+    .execute(database.pool())
+    .await
+    .unwrap();
+
+    let paykit = PaykitConfig {
+        client_id: ClientId::new("app.paykit.server").unwrap(),
+        app_id: PaykitAppId::new("paykit-server").unwrap(),
+        network: PaykitNetwork::Testnet,
+        proposal_acceptance_window: Duration::from_secs(60 * 60),
+        payment_window: Duration::from_secs(24 * 60 * 60),
+    };
+    let sessions = CreatorSessionProvider::with_pubky(creators, creator.clone(), pubky, &paykit);
+    let adapter = PaykitAdapter::new(creator_row.id(), sessions, &paykit).unwrap();
+    let lifecycles = PaymentRequestLifecycleStore::new(database.pool(), crypto.clone());
+    let invoices = InvoiceStore::new(database.pool(), crypto.clone());
+    for _ in 0..2 {
+        let status = adapter
+            .reconcile_and_lookup_payment_request_status(
+                &lifecycles,
+                &invoices,
+                &parse_bundle_id(BUNDLE).unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            status.request_state(),
+            PaymentRequestLifecycleState::Rejected
+        );
+    }
+
+    let drain = adapter
+        .reconcile_and_create_payment_drain(
+            &lifecycles,
+            &PaymentDrainStore::new(database.pool(), crypto),
+            &dynamic_lock,
+        )
+        .await
+        .unwrap();
+    assert!(drain.completed());
+    assert_eq!(drain.accepted_count(), 0);
+    assert_eq!(drain.terminal_count(), 1);
+    assert_eq!(drain.cancellation_enqueued_count(), 0);
+
+    drop(testnet);
+    database.cleanup().await;
 }
 
 #[tokio::test]

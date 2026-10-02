@@ -367,7 +367,7 @@ impl PaykitAdapter {
             .payment_requests()
             .await
             .map_err(|_| LifecycleSyncError::Sdk)?;
-        let projections = records.iter().map(lifecycle_projection).collect();
+        let projections = lifecycle_projections(&records);
         let creator_id = self.creator_id;
         project_lifecycles_after_receive(projections, receive_health, |projection| async move {
             lifecycles
@@ -728,6 +728,16 @@ fn lifecycle_projection(
     })
 }
 
+fn lifecycle_projections(
+    records: &[PaymentRequestRecord],
+) -> Vec<Result<PaymentRequestLifecycleProjection, LifecycleSyncError>> {
+    records
+        .iter()
+        .filter(|record| record.local_role != Some(PaymentRequestLocalRole::Payer))
+        .map(lifecycle_projection)
+        .collect()
+}
+
 fn persisted_lifecycle_state(
     state: SdkPaymentRequestLifecycleState,
 ) -> Result<PersistedPaymentRequestLifecycleState, LifecycleSyncError> {
@@ -1077,11 +1087,95 @@ fn require_linked(state: LinkedPeerState) -> Result<(), HandoffError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use paykit_lib::PaykitAppId;
     use paykit_sdk::{
-        OutboundPrivateSendFailure, RecoveryMarkerPublishFailure, ReservationCleanupFailure,
+        AmountRecord, OutboundPrivateSendFailure, PaymentRequestTermsRecord,
+        RecoveryMarkerPublishFailure, ReservationCleanupFailure,
     };
+    use serde_json::Map;
 
     const CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
+
+    fn canonical_record(local_role: Option<PaymentRequestLocalRole>) -> PaymentRequestRecord {
+        PaymentRequestRecord {
+            counterparty: PubkyPublicKey::from_raw_or_app_key(CREATOR).unwrap(),
+            proposal_app_id: Some(PaykitAppId::new("paykit-server").unwrap()),
+            payer_app_id: None,
+            execution_claim_app_id: None,
+            conversion_quotes: Vec::new(),
+            payment_request_id: Uuid::new_v4().to_string(),
+            local_role,
+            state: SdkPaymentRequestLifecycleState::Proposed,
+            proposal_stream_item_id: Some(1),
+            proposal_outbound_message_id: None,
+            proposal_outbound_status: None,
+            proposal_event_id: Some(Uuid::new_v4().to_string()),
+            terms: Some(PaymentRequestTermsRecord {
+                amount: AmountRecord {
+                    asset: "BTC".into(),
+                    value: "0.00001000".into(),
+                },
+                payment_reference: Uuid::new_v4().to_string(),
+                proposal_expires_at: Some("2027-01-15T08:00:00Z".into()),
+                recurrence: None,
+                required_app_id: Some(PaykitAppId::new("paykit-server").unwrap()),
+                conversion: None,
+                payment_deadline: None,
+                accepted_payment_endpoint_identifiers: vec!["btc-bitcoin-p2wpkh".into()],
+                payment_endpoints: Some(HashMap::from([(
+                    "btc-bitcoin-p2wpkh".into(),
+                    "payload".into(),
+                )])),
+                metadata: Map::new(),
+            }),
+            accepted_event_id: None,
+            accepted_outbound_status: None,
+            rejected_event_id: None,
+            rejected_outbound_status: None,
+            canceled_event_id: None,
+            canceled_outbound_status: None,
+            payment_proofs: Vec::new(),
+            last_stream_item_id: Some(1),
+            last_outbound_message_id: None,
+            last_outbound_status: None,
+            last_event_at: Some(
+                (std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000))
+                    .into(),
+            ),
+            invalid_reason: None,
+        }
+    }
+
+    #[test]
+    fn payer_records_do_not_poison_shared_status_and_drain_refresh_projection() {
+        let mut payer = canonical_record(Some(PaymentRequestLocalRole::Payer));
+        payer.terms = None;
+        payer.last_event_at = None;
+        let payee = canonical_record(Some(PaymentRequestLocalRole::Payee));
+        let payee_id = payee.payment_request_id.clone();
+
+        let projections = lifecycle_projections(&[payer, payee]);
+
+        assert_eq!(projections.len(), 1);
+        assert_eq!(
+            projections[0].as_ref().unwrap().payment_request_id,
+            payee_id
+        );
+    }
+
+    #[test]
+    fn malformed_or_unknown_payee_side_records_still_fail_projection() {
+        let mut malformed_payee = canonical_record(Some(PaymentRequestLocalRole::Payee));
+        malformed_payee.terms = None;
+        let unknown_role = canonical_record(None);
+
+        for record in [malformed_payee, unknown_role] {
+            assert_eq!(
+                lifecycle_projections(&[record]),
+                vec![Err(LifecycleSyncError::InvalidProjection)]
+            );
+        }
+    }
 
     fn receive_target(counterparty: &str) -> ReceiveTarget {
         ReceiveTarget {
