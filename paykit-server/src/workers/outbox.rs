@@ -14,6 +14,7 @@ use crate::{
     persistence::{ClaimedHandoff, ClaimedOutbox, OutboxStore, PersistenceError},
 };
 use std::time::Duration;
+use tracing::{info, warn};
 
 pub use crate::persistence::{HandoffResult, OutboxRetryClass as RetryableHandoffStage};
 
@@ -142,6 +143,12 @@ pub trait Adapter: Send + Sync {
     -> Result<Option<PaykitAppRegistry>, HandoffError>;
     async fn observe_recovery_marker(&self, reader: &str) -> Result<(), HandoffError>;
     async fn ensure_link_with_peer(&self, reader: &str) -> Result<(), HandoffError>;
+    /// Reads the reader's private messages and accepts every Allowance
+    /// proposal in which this identity is the Allowee. Returns how many were
+    /// accepted. Test-only adapters keep the default, which reads nothing.
+    async fn accept_allowance_proposals(&self, _reader: &str) -> Result<usize, HandoffError> {
+        Ok(0)
+    }
     async fn propose_payment_request(
         &self,
         reader: &str,
@@ -192,10 +199,29 @@ pub(crate) async fn handoff_steps<A: Adapter + ?Sized>(
         .await
         .map_err(|error| at_stage(error, RetryableHandoffStage::LinkEstablishment))?;
     match intent.operation() {
-        DeliveryOperationV1::PaymentRequestProposal { terms } => adapter
-            .propose_payment_request(intent.reader_pubky(), terms)
-            .await
-            .map_err(|error| at_stage(error, RetryableHandoffStage::PaymentRequestProposal)),
+        DeliveryOperationV1::PaymentRequestProposal { terms } => {
+            // An accepted Allowance lets the reader's wallet pay this receiver's
+            // requests on this link without asking. The acceptance is queued before
+            // the request, so the reader loads it first. Accepting as the Allowee
+            // costs the receiver nothing. Intake is best effort: when it fails, the
+            // request is still proposed for manual payment.
+            match adapter
+                .accept_allowance_proposals(intent.reader_pubky())
+                .await
+            {
+                Ok(0) => {}
+                Ok(accepted) => info!(accepted, "accepted Paykit Allowance proposals"),
+                Err(error) => warn!(
+                    stage = "allowance_intake",
+                    cause = error.diagnostic_label(),
+                    "Paykit Allowance intake failed; the handoff continues"
+                ),
+            }
+            adapter
+                .propose_payment_request(intent.reader_pubky(), terms)
+                .await
+                .map_err(|error| at_stage(error, RetryableHandoffStage::PaymentRequestProposal))
+        }
         DeliveryOperationV1::PaymentRequestCancellation { payment_request_id } => adapter
             .cancel_payment_request(intent.reader_pubky(), payment_request_id)
             .await

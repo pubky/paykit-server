@@ -42,7 +42,29 @@ struct FakeAdapter {
     recovery_marker_error: Option<HandoffError>,
     link_error: Option<HandoffError>,
     payment_request_calls: Mutex<usize>,
+    allowance_error: Option<HandoffError>,
     calls: Mutex<Vec<&'static str>>,
+}
+
+impl FakeAdapter {
+    fn new(registry: PaykitAppRegistry) -> Self {
+        Self {
+            registry,
+            recovery_marker_error: None,
+            link_error: None,
+            payment_request_calls: Mutex::new(0),
+            allowance_error: None,
+            calls: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn record(&self, call: &'static str) {
+        self.calls.lock().unwrap().push(call);
+    }
+
+    fn calls(&self) -> Vec<&'static str> {
+        self.calls.lock().unwrap().clone()
+    }
 }
 
 #[async_trait]
@@ -51,18 +73,23 @@ impl Adapter for FakeAdapter {
         &self,
         _reader: &str,
     ) -> Result<Option<PaykitAppRegistry>, HandoffError> {
-        self.calls.lock().unwrap().push("fetch_registry");
+        self.record("fetch_registry");
         Ok(Some(self.registry.clone()))
     }
 
     async fn observe_recovery_marker(&self, _reader: &str) -> Result<(), HandoffError> {
-        self.calls.lock().unwrap().push("observe_recovery_marker");
+        self.record("observe_recovery_marker");
         self.recovery_marker_error.map_or(Ok(()), Err)
     }
 
     async fn ensure_link_with_peer(&self, _reader: &str) -> Result<(), HandoffError> {
-        self.calls.lock().unwrap().push("ensure_link_with_peer");
+        self.record("ensure_link_with_peer");
         self.link_error.map_or(Ok(()), Err)
+    }
+
+    async fn accept_allowance_proposals(&self, _reader: &str) -> Result<usize, HandoffError> {
+        self.record("accept_allowance_proposals");
+        self.allowance_error.map_or(Ok(1), Err)
     }
 
     async fn propose_payment_request(
@@ -70,7 +97,7 @@ impl Adapter for FakeAdapter {
         _reader: &str,
         _terms: &PaymentTermsV1,
     ) -> Result<HandoffResult, HandoffError> {
-        self.calls.lock().unwrap().push("propose_payment_request");
+        self.record("propose_payment_request");
         *self.payment_request_calls.lock().unwrap() += 1;
         Ok(HandoffResult::PaymentRequestProposal {
             outbound_message_id: 42,
@@ -118,13 +145,7 @@ fn payment_intent() -> DeliveryIntentV1 {
 #[tokio::test]
 async fn incapable_registry_is_retryable_without_handoff() {
     let changed = registry(false);
-    let adapter = FakeAdapter {
-        registry: changed,
-        recovery_marker_error: None,
-        link_error: None,
-        payment_request_calls: Mutex::new(0),
-        calls: Mutex::new(Vec::new()),
-    };
+    let adapter = FakeAdapter::new(changed);
 
     assert_eq!(
         handoff(&adapter, &payment_intent()).await,
@@ -139,11 +160,8 @@ async fn incapable_registry_is_retryable_without_handoff() {
 async fn link_failure_has_one_durable_diagnostic_stage() {
     let selected = registry(true);
     let adapter = FakeAdapter {
-        registry: selected.clone(),
-        recovery_marker_error: None,
         link_error: Some(HandoffError::Retryable(RetryableHandoffCause::Transport)),
-        payment_request_calls: Mutex::new(0),
-        calls: Mutex::new(Vec::new()),
+        ..FakeAdapter::new(selected.clone())
     };
 
     assert_eq!(
@@ -152,18 +170,58 @@ async fn link_failure_has_one_durable_diagnostic_stage() {
             RetryableHandoffStage::LinkEstablishment
         ))
     );
+    assert_eq!(
+        adapter.calls(),
+        [
+            "fetch_registry",
+            "observe_recovery_marker",
+            "ensure_link_with_peer"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn allowance_intake_runs_on_the_link_before_the_request() {
+    let adapter = FakeAdapter::new(registry(true));
+    handoff(&adapter, &payment_intent()).await.unwrap();
+    assert_eq!(
+        adapter.calls(),
+        [
+            "fetch_registry",
+            "observe_recovery_marker",
+            "ensure_link_with_peer",
+            "accept_allowance_proposals",
+            "propose_payment_request",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn failed_allowance_intake_still_proposes_the_request() {
+    for error in [
+        HandoffError::Retryable(RetryableHandoffCause::Transport),
+        HandoffError::Retryable(RetryableHandoffCause::RecoveryRequired),
+        HandoffError::Permanent,
+    ] {
+        let adapter = FakeAdapter {
+            allowance_error: Some(error),
+            ..FakeAdapter::new(registry(true))
+        };
+        assert!(matches!(
+            handoff(&adapter, &payment_intent()).await,
+            Ok(HandoffResult::PaymentRequestProposal {
+                outbound_message_id: 42,
+                ..
+            })
+        ));
+        assert_eq!(*adapter.payment_request_calls.lock().unwrap(), 1);
+    }
 }
 
 #[tokio::test]
 async fn retry_after_an_ambiguous_handoff_can_propose_twice() {
     let selected = registry(true);
-    let adapter = Arc::new(FakeAdapter {
-        registry: selected.clone(),
-        recovery_marker_error: None,
-        link_error: None,
-        payment_request_calls: Mutex::new(0),
-        calls: Mutex::new(Vec::new()),
-    });
+    let adapter = Arc::new(FakeAdapter::new(selected.clone()));
     let intent = payment_intent();
 
     // A database worker may be reclaimed after the public SDK queued the first
@@ -185,11 +243,8 @@ async fn retry_after_an_ambiguous_handoff_can_propose_twice() {
 async fn recovery_marker_observation_precedes_link_ensure_and_enqueue() {
     let selected = registry(true);
     let adapter = FakeAdapter {
-        registry: selected,
         recovery_marker_error: None,
-        link_error: None,
-        payment_request_calls: Mutex::new(0),
-        calls: Mutex::new(Vec::new()),
+        ..FakeAdapter::new(selected)
     };
 
     handoff(&adapter, &payment_intent()).await.unwrap();
@@ -200,6 +255,7 @@ async fn recovery_marker_observation_precedes_link_ensure_and_enqueue() {
             "fetch_registry",
             "observe_recovery_marker",
             "ensure_link_with_peer",
+            "accept_allowance_proposals",
             "propose_payment_request",
         ]
     );
@@ -209,11 +265,8 @@ async fn recovery_marker_observation_precedes_link_ensure_and_enqueue() {
 async fn recovery_marker_lookup_failure_never_ensures_or_enqueues() {
     let selected = registry(true);
     let adapter = FakeAdapter {
-        registry: selected,
         recovery_marker_error: Some(HandoffError::Retryable(RetryableHandoffCause::Transport)),
-        link_error: None,
-        payment_request_calls: Mutex::new(0),
-        calls: Mutex::new(Vec::new()),
+        ..FakeAdapter::new(selected)
     };
 
     assert_eq!(
@@ -233,11 +286,8 @@ async fn recovery_marker_lookup_failure_never_ensures_or_enqueues() {
 async fn confirmed_absent_recovery_marker_continues_to_link_ensure() {
     let selected = registry(true);
     let adapter = FakeAdapter {
-        registry: selected,
         recovery_marker_error: None,
-        link_error: None,
-        payment_request_calls: Mutex::new(0),
-        calls: Mutex::new(Vec::new()),
+        ..FakeAdapter::new(selected)
     };
 
     handoff(&adapter, &payment_intent()).await.unwrap();
