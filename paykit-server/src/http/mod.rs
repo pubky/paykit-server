@@ -2,6 +2,7 @@ pub mod auth;
 pub mod connection_status;
 pub mod error;
 pub mod health;
+pub(crate) mod invoice_diagnostics;
 pub mod invoices;
 pub mod payment_drains;
 pub mod payment_requests;

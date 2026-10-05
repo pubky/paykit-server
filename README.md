@@ -190,6 +190,15 @@ Do not put database credentials or the master key in TOML, logs, shell history, 
 
 Production logging allowlists only the `paykit_server` target at INFO and above. Dependency targets are disabled because upstream diagnostics may contain identities, URLs, or response text.
 
+`POST /invoices` emits one coarse outcome event for each request reaching the
+application, including admission rejections. Fields are HTTP status, elapsed
+milliseconds, a closed failure class, and an opaque request ID.
+Locks may supply `X-Request-ID` only as a canonical UUIDv4; other values are ignored
+without being echoed or logged, and Paykit Server generates a replacement UUIDv4.
+Successful outcomes remain DEBUG-only. A `503` produced by a reverse proxy before the
+request reaches Paykit Server cannot produce this application event and must be
+diagnosed from proxy telemetry.
+
 `setup.log_authorization_url` defaults to `false` and must remain false for
 production. When explicitly enabled in the generated local-demo config, each
 new setup flow emits one labeled authorization URL log line for operator
