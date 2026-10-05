@@ -180,3 +180,13 @@ async fn payment_request_status_typed_failure_emits_one_safe_event_without_seman
 async fn payment_request_status_shutdown_rejects_unsafe_request_id_without_echo_or_log() {
     assert_shutdown_redaction("/payment-requests/status", "payment_request_status").await;
 }
+
+#[tokio::test]
+async fn connection_status_typed_failure_emits_one_safe_event_without_semantic_drift() {
+    assert_typed_failure("/connections/status", "connection_status").await;
+}
+
+#[tokio::test]
+async fn connection_status_shutdown_rejects_unsafe_request_id_without_echo_or_log() {
+    assert_shutdown_redaction("/connections/status", "connection_status").await;
+}
