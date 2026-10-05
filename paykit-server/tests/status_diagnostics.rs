@@ -190,3 +190,13 @@ async fn connection_status_typed_failure_emits_one_safe_event_without_semantic_d
 async fn connection_status_shutdown_rejects_unsafe_request_id_without_echo_or_log() {
     assert_shutdown_redaction("/connections/status", "connection_status").await;
 }
+
+#[tokio::test]
+async fn setup_status_typed_failure_emits_one_safe_event_without_semantic_drift() {
+    assert_typed_failure("/setup/status", "setup_status").await;
+}
+
+#[tokio::test]
+async fn setup_status_shutdown_rejects_unsafe_request_id_without_echo_or_log() {
+    assert_shutdown_redaction("/setup/status", "setup_status").await;
+}

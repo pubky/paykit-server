@@ -59,6 +59,11 @@ fn diagnosed_route(request: &Request<Body>) -> Option<DiagnosedRoute> {
             operation: Some("connection_status"),
             frequent_poll: true,
         }),
+        "/setup/status" => Some(DiagnosedRoute {
+            event: "paykit_locks_status_outcome",
+            operation: Some("setup_status"),
+            frequent_poll: true,
+        }),
         _ => None,
     }
 }
