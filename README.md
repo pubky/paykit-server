@@ -190,9 +190,13 @@ Do not put database credentials or the master key in TOML, logs, shell history, 
 
 Production logging allowlists only the `paykit_server` target at INFO and above. Dependency targets are disabled because upstream diagnostics may contain identities, URLs, or response text.
 
-`POST /invoices` emits one coarse outcome event for each request reaching the
-application, including admission rejections. Fields are HTTP status, elapsed
-milliseconds, a closed failure class, and an opaque request ID.
+`POST /invoices` and the Locks-facing `POST /payment-requests/status` poll emit
+one coarse outcome event for each request reaching the application, including
+admission rejections. Fields are HTTP status, elapsed milliseconds, a closed
+failure class, and an opaque request ID. Status events also carry the closed
+`payment_request_status` operation label. Expected status-poll outcomes,
+including typed dependency failures, remain DEBUG-only; only an unclassified
+server error is WARN to avoid outage-driven INFO/WARN log storms.
 Locks may supply `X-Request-ID` only as a canonical UUIDv4; other values are ignored
 without being echoed or logged, and Paykit Server generates a replacement UUIDv4.
 Successful outcomes remain DEBUG-only. A `503` produced by a reverse proxy before the

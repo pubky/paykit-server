@@ -21,7 +21,7 @@ use sqlx::PgPool;
 use tokio::{sync::Notify, time::timeout};
 
 use crate::{
-    http::{health, invoice_diagnostics},
+    http::{health, request_diagnostics},
     metrics::Metrics,
 };
 
@@ -291,7 +291,7 @@ pub fn operational_router(public_routes: Router, runtime: Arc<Runtime>) -> Route
         .merge(health::router(runtime.clone()))
         .route("/metrics", get(move || metrics(metrics_runtime.clone())))
         .layer(middleware::from_fn_with_state(runtime, capacity_middleware))
-        .layer(middleware::from_fn(invoice_diagnostics::middleware))
+        .layer(middleware::from_fn(request_diagnostics::middleware))
 }
 
 async fn metrics(runtime: Arc<Runtime>) -> Response {
@@ -316,7 +316,7 @@ async fn capacity_middleware(
 ) -> Response {
     let exempt = matches!(request.uri().path(), "/health/live" | "/health/ready");
     if !exempt && runtime.stopping() {
-        return unavailable(invoice_diagnostics::InvoiceFailureClass::SHUTDOWN);
+        return unavailable(request_diagnostics::OutcomeFailureClass::SHUTDOWN);
     }
     let permit = if exempt {
         None
@@ -324,7 +324,7 @@ async fn capacity_middleware(
         match runtime.capacity.clone().try_acquire_owned() {
             Ok(permit) => Some(permit),
             Err(_) => {
-                return unavailable(invoice_diagnostics::InvoiceFailureClass::OVERLOAD);
+                return unavailable(request_diagnostics::OutcomeFailureClass::OVERLOAD);
             }
         }
     };
@@ -340,13 +340,13 @@ async fn capacity_middleware(
     next.run(request).await
 }
 
-fn unavailable(class: invoice_diagnostics::InvoiceFailureClass) -> Response {
+fn unavailable(class: request_diagnostics::OutcomeFailureClass) -> Response {
     let mut response = (
         StatusCode::SERVICE_UNAVAILABLE,
         [(header::RETRY_AFTER, "1")],
     )
         .into_response();
-    invoice_diagnostics::annotate(&mut response, class);
+    request_diagnostics::annotate(&mut response, class);
     response
 }
 

@@ -137,9 +137,9 @@ impl IntoResponse for ApiError {
                 "1".parse().expect("static header value"),
             );
         }
-        super::invoice_diagnostics::annotate(
+        super::request_diagnostics::annotate(
             &mut response,
-            super::invoice_diagnostics::InvoiceFailureClass::api(self),
+            super::request_diagnostics::OutcomeFailureClass::api(self),
         );
         response
     }
