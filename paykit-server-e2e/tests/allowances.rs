@@ -259,7 +259,7 @@ async fn boot(seed: u8) -> Stack {
     bootstrap
         .sign_in(
             &PubkyLocalSecretKey::new(creator_keypair.secret_key()),
-            "/pub/locks.app/:rw",
+            "/pub/app.locks/:rw",
         )
         .await
         .unwrap()
