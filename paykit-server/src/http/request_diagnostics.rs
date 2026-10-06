@@ -36,6 +36,7 @@ pub(crate) fn annotate(response: &mut Response, class: OutcomeFailureClass) {
 struct DiagnosedRoute {
     event: &'static str,
     operation: Option<&'static str>,
+    source_operation: &'static str,
     frequent_poll: bool,
 }
 
@@ -47,21 +48,25 @@ fn diagnosed_route(request: &Request<Body>) -> Option<DiagnosedRoute> {
         "/invoices" => Some(DiagnosedRoute {
             event: "paykit_invoice_outcome",
             operation: None,
+            source_operation: "invoice_create",
             frequent_poll: false,
         }),
         "/payment-requests/status" => Some(DiagnosedRoute {
             event: "paykit_locks_status_outcome",
             operation: Some("payment_request_status"),
+            source_operation: "payment_request_status",
             frequent_poll: true,
         }),
         "/connections/status" => Some(DiagnosedRoute {
             event: "paykit_locks_status_outcome",
             operation: Some("connection_status"),
+            source_operation: "connection_status",
             frequent_poll: true,
         }),
         "/setup/status" => Some(DiagnosedRoute {
             event: "paykit_locks_status_outcome",
             operation: Some("setup_status"),
+            source_operation: "setup_status",
             frequent_poll: true,
         }),
         _ => None,
@@ -75,7 +80,8 @@ pub(crate) async fn middleware(request: Request<Body>, next: Next) -> Response {
 
     let started = Instant::now();
     let request_id = accepted_request_id(request.headers()).unwrap_or_else(Uuid::new_v4);
-    let mut response = next.run(request).await;
+    let (mut response, source_failure) =
+        crate::diagnostics::scope(request_id, route.source_operation, next.run(request)).await;
     response.headers_mut().insert(
         REQUEST_ID_HEADER,
         HeaderValue::from_str(&request_id.hyphenated().to_string())
@@ -94,7 +100,14 @@ pub(crate) async fn middleware(request: Request<Body>, next: Next) -> Response {
             "unclassified"
         });
     let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-    emit(route, status, failure_class, elapsed_ms, request_id);
+    emit(
+        route,
+        status,
+        failure_class,
+        elapsed_ms,
+        request_id,
+        source_failure,
+    );
     response
 }
 
@@ -115,6 +128,7 @@ fn emit(
     failure_class: &'static str,
     elapsed_ms: u64,
     request_id: Uuid,
+    source_failure: bool,
 ) {
     let http_status = status.as_u16();
     let request_id = request_id.hyphenated();
@@ -138,7 +152,7 @@ fn emit(
             request_id = %request_id,
             "Paykit Locks status request completed"
         );
-    } else if status.is_server_error() {
+    } else if status.is_server_error() && !source_failure {
         tracing::warn!(
             event = route.event,
             http_status,
@@ -147,7 +161,7 @@ fn emit(
             request_id = %request_id,
             "Paykit invoice request completed"
         );
-    } else if status.is_success() {
+    } else if status.is_success() || source_failure {
         tracing::debug!(
             event = route.event,
             http_status,

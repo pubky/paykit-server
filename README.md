@@ -199,6 +199,12 @@ class, and an opaque request ID. Status events also carry a closed
 label. Expected status-poll outcomes, including typed dependency failures,
 remain DEBUG-only; only an unclassified server error is WARN to avoid
 outage-driven INFO/WARN log storms.
+Failures inside these request flows also emit one WARN event at the narrowest
+known source. Its closed fields are `operation`, `stage`, `category`, and the
+same opaque request ID returned in `X-Request-ID`; raw errors, identities, keys,
+signatures, bodies, and URLs are excluded. Outer error mappings are fallback
+sites only, so one request emits at most one source-failure warning. When a
+source warning was emitted, the coarse completion event remains DEBUG-only.
 Locks may supply `X-Request-ID` only as a canonical UUIDv4; other values are ignored
 without being echoed or logged, and Paykit Server generates a replacement UUIDv4.
 Successful outcomes remain DEBUG-only. A `503` produced by a reverse proxy before the
