@@ -2,8 +2,9 @@
 //!
 //! A call can commit to the SDK queue and the process can crash before the
 //! fenced database transition. Retrying therefore has **at-least-once**
-//! semantics: Payment Request proposals may be duplicated. The SDK owns its
-//! queue and encrypted-link retry state; this worker never claims exactly-once.
+//! semantics. The adapter makes a proposal idempotent per Payment Reference by
+//! reusing the request already queued for it. The SDK owns its queue and
+//! encrypted-link retry state; this worker never claims exactly-once.
 
 use async_trait::async_trait;
 use paykit_lib::PaykitAppRegistry;
@@ -232,7 +233,7 @@ pub(crate) async fn handoff_steps<A: Adapter + ?Sized>(
 /// Executes one already-fenced claim. Enqueue is only `handed_off`; the SDK
 /// outbound record is reconciled separately before publication is acknowledged.
 /// A crash after enqueue but before this fenced transition is intentionally
-/// retried, so Payment Request proposals are at-least-once and may duplicate.
+/// retried; the adapter reuses the request already queued for the intent.
 pub async fn process_claim(
     store: &OutboxStore,
     adapter: &dyn Adapter,

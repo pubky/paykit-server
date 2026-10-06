@@ -8,13 +8,7 @@
 //! ephemeral Pubky testnet) against a reader on the same SDK, and checks the
 //! payer's admission.
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    net::SocketAddr,
-    str::FromStr,
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::BTreeMap, net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use axum::{
@@ -482,6 +476,27 @@ fn allowance_terms(per_payment_maximum: &str) -> AllowanceTerms {
         .unwrap()
 }
 
+/// The Payment Requests the server queued, by Locks bundle: outbound message
+/// id and Payment Reference of each.
+async fn queued_proposals(creator_sdk: &HostedSdk) -> BTreeMap<String, Vec<(u64, String)>> {
+    let state = creator_sdk.export_backup_state().await.unwrap();
+    let mut queued: BTreeMap<String, Vec<(u64, String)>> = BTreeMap::new();
+    for record in state
+        .outbound_private_messages
+        .iter()
+        .filter(|record| record.kind == "paykit.payment_request")
+    {
+        let json: serde_json::Value = serde_json::from_str(&record.raw_json).unwrap();
+        let bundle = json["request"]["metadata"]["bundle_id"].as_str().unwrap();
+        let reference = json["request"]["payment_reference"].as_str().unwrap();
+        queued
+            .entry(bundle.to_owned())
+            .or_default()
+            .push((record.outbound_message_id, reference.to_owned()));
+    }
+    queued
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn allowance_proposed_on_the_server_link_covers_the_next_locks_invoice() {
     let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
@@ -672,44 +687,102 @@ async fn allowance_proposed_on_the_server_link_covers_the_next_locks_invoice() {
             .all(|record| record.status == OutboundPrivateMessageStatus::Sent)
     );
 
-    // The outbox hands a row off at least once: a handoff that outlives its
-    // lease is claimed again and queues the same Payment Request once more.
-    // What the feature promises is one logical request per Locks invoice, so
-    // group the queued requests by invoice and compare their references.
-    let mut references_by_bundle: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    let mut first_request_by_bundle: BTreeMap<String, u64> = BTreeMap::new();
-    for record in outbound("paykit.payment_request") {
-        let json: serde_json::Value = serde_json::from_str(&record.raw_json).unwrap();
-        let bundle = json["request"]["metadata"]["bundle_id"].as_str().unwrap();
-        let reference = json["request"]["payment_reference"].as_str().unwrap();
-        references_by_bundle
-            .entry(bundle.to_owned())
-            .or_default()
-            .insert(reference.to_owned());
-        first_request_by_bundle
-            .entry(bundle.to_owned())
-            .and_modify(|id| *id = (*id).min(record.outbound_message_id))
-            .or_insert(record.outbound_message_id);
-    }
+    // The outbox hands a row off at least once: under load a handoff outlives
+    // its lease and is claimed again. The feature promises one request per
+    // Locks invoice, because the reader admits each Payment Request ID on
+    // its own and would pay a second one.
+    let queued = queued_proposals(&stack.creator_sdk).await;
     assert_eq!(
-        references_by_bundle
-            .keys()
-            .map(String::as_str)
-            .collect::<Vec<_>>(),
+        queued.keys().map(String::as_str).collect::<Vec<_>>(),
         [BUNDLE_BEFORE_GRANT, BUNDLE_AFTER_GRANT],
         "one invoice per unlock"
     );
-    for (bundle, references) in &references_by_bundle {
-        assert_eq!(
-            references.len(),
-            1,
-            "{bundle} was proposed under {references:?}"
-        );
+    for (bundle, requests) in &queued {
+        assert_eq!(requests.len(), 1, "{bundle} was proposed {requests:?}");
     }
     assert!(
         acceptances
             .iter()
-            .all(|record| record.outbound_message_id < first_request_by_bundle[BUNDLE_AFTER_GRANT])
+            .all(|record| record.outbound_message_id < queued[BUNDLE_AFTER_GRANT][0].0)
+    );
+
+    // A crash after the SDK queued the request and before the fenced
+    // transition leaves the row leased with nothing recorded. Reset both rows
+    // that way: the outbox claims them again once the lease is over.
+    let handed_off: Vec<(String, Option<String>, i32)> = sqlx::query_as(
+        "SELECT id::text, sdk_payment_request_id, attempt_count FROM outbox \
+         WHERE intent_kind = 'payment_request_proposal' ORDER BY id",
+    )
+    .fetch_all(&stack.pool)
+    .await
+    .unwrap();
+    assert_eq!(handed_off.len(), 2);
+    assert!(
+        handed_off
+            .iter()
+            .all(|(_, request_id, _)| request_id.is_some())
+    );
+    sqlx::query(
+        "UPDATE outbox SET status = 'leased', lease_owner = gen_random_uuid(), \
+             claim_token = gen_random_uuid(), \
+             lease_expires_at = NOW() - INTERVAL '1 second', \
+             sdk_outbound_message_id = NULL, sdk_event_id = NULL, \
+             sdk_payment_request_id = NULL \
+         WHERE intent_kind = 'payment_request_proposal'",
+    )
+    .execute(&stack.pool)
+    .await
+    .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let redelivered = loop {
+        let rows: Vec<(String, Option<String>, i32)> = sqlx::query_as(
+            "SELECT id::text, sdk_payment_request_id, attempt_count FROM outbox \
+             WHERE intent_kind = 'payment_request_proposal' \
+               AND status IN ('handed_off', 'delivered') ORDER BY id",
+        )
+        .fetch_all(&stack.pool)
+        .await
+        .unwrap();
+        if rows.len() == 2 {
+            break rows;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the outbox never handed the reset rows off again"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    for (first, again) in handed_off.iter().zip(&redelivered) {
+        assert_eq!(first.0, again.0);
+        assert!(again.2 > first.2, "the row was not handed off again");
+        assert_eq!(
+            first.1, again.1,
+            "the second handoff proposed under a new Payment Request ID"
+        );
+    }
+    assert_eq!(queued_proposals(&stack.creator_sdk).await, queued);
+
+    // The reader still holds the one request, so its admission has no second
+    // Payment Request ID to admit.
+    reader
+        .receive_private_messages(stack.creator_key.clone())
+        .await
+        .unwrap();
+    let after_redelivery = reader
+        .payment_requests_with(&stack.creator_key)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|record| {
+            record.terms.as_ref().is_some_and(|terms| {
+                terms.metadata.get("bundle_id") == Some(&serde_json::json!(BUNDLE_AFTER_GRANT))
+            })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(after_redelivery.len(), 1);
+    assert_eq!(
+        after_redelivery[0].payment_request_id,
+        request.payment_request_id
     );
 
     stack.shutdown().await;

@@ -286,9 +286,9 @@ A successful new invoice transaction atomically allocates an address and persist
 
 The later SDK handoff is not exactly once. Server delivery is at least once:
 
-- a crash before SDK-generated identifiers are durably associated may enqueue another Payment Request with new SDK Event, Payment Request, and outbound-message identifiers;
-- consumers must tolerate duplicate proposals and use stable server intent/Payment Reference values where applicable;
-- retries preserve the invoice's bound address and terms even when SDK identifiers change;
+- a crash before SDK-generated identifiers are durably associated is retried by first looking up the request the SDK already queued for the intent's Payment Reference and reusing its identifiers, so a retry does not enqueue a second Payment Request;
+- the lookup runs under the Creator mutation lock and sees only requests in this Creator's SDK state, so a second server process sharing that state is not covered;
+- retries preserve the invoice's bound address and terms;
 - marking server work delivered means the exact SDK outbound record reached SDK `Sent`, not that the remote application acknowledged it.
 
 The invoice API returns after durable intent commit. It does not wait for Encrypted Link establishment or remote delivery.

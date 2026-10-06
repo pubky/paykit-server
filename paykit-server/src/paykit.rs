@@ -875,6 +875,34 @@ fn awaits_allowee_acceptance(record: &AllowanceRecord) -> bool {
         && record.proposal_outbound_message_id.is_none()
 }
 
+/// The Payment Request this server already queued for a Payment Reference.
+///
+/// A proposal whose outbound message the SDK marked `Invalid` or `Superseded`
+/// never reaches the reader, so it does not count as queued.
+fn queued_proposal<'a>(
+    records: &'a [PaymentRequestRecord],
+    app_id: &PaykitAppId,
+    payment_reference: &str,
+) -> Option<&'a PaymentRequestRecord> {
+    records.iter().find(|record| {
+        record.local_role == Some(PaymentRequestLocalRole::Payee)
+            && record.proposal_app_id.as_ref() == Some(app_id)
+            && record.proposal_outbound_message_id.is_some()
+            && record.proposal_event_id.is_some()
+            && !matches!(
+                record.proposal_outbound_status,
+                Some(
+                    OutboundPrivateMessageStatus::Invalid
+                        | OutboundPrivateMessageStatus::Superseded
+                )
+            )
+            && record
+                .terms
+                .as_ref()
+                .is_some_and(|terms| terms.payment_reference == payment_reference)
+    })
+}
+
 fn retryable_recovery_observation(error: HandoffError) -> HandoffError {
     match error {
         HandoffError::Retryable(cause) => HandoffError::Retryable(cause),
@@ -1028,11 +1056,27 @@ impl Adapter for PaykitAdapter {
         terms: &PaymentTermsV1,
     ) -> Result<HandoffResult, HandoffError> {
         let reader = parse_peer(reader)?;
-        let record = self
+        let payment_terms = payment_terms(terms)?;
+        // The outbox hands a proposal off at least once, and the SDK mints a new
+        // Payment Request ID for every proposal. A retry after an ambiguous
+        // attempt would reach the reader as a second request for the same
+        // invoice, and an accepted Allowance would pay it again. The Payment
+        // Reference is generated once per intent, so a request already queued
+        // for it is this intent's request: reuse it. Callers hold the creator
+        // mutation lock, so the lookup and the enqueue below cannot interleave.
+        let existing = self
             .sdk
-            .propose_payment_request(reader, payment_terms(terms)?)
+            .payment_requests_with(&reader)
             .await
             .map_err(classify)?;
+        let record = match queued_proposal(&existing, &self.app_id, &terms.payment_reference) {
+            Some(record) => record.clone(),
+            None => self
+                .sdk
+                .propose_payment_request(reader, payment_terms)
+                .await
+                .map_err(classify)?,
+        };
         Ok(HandoffResult::PaymentRequestProposal {
             outbound_message_id: record
                 .proposal_outbound_message_id
@@ -1871,6 +1915,64 @@ mod tests {
             last_outbound_status: None,
             last_event_at: None,
             invalid_reason: None,
+        }
+    }
+
+    fn queued_payee_record(reference: &str) -> PaymentRequestRecord {
+        let mut record = canonical_record(Some(PaymentRequestLocalRole::Payee));
+        record.proposal_stream_item_id = None;
+        record.proposal_outbound_message_id = Some(3);
+        record.proposal_outbound_status = Some(OutboundPrivateMessageStatus::Pending);
+        record.terms.as_mut().unwrap().payment_reference = reference.into();
+        record
+    }
+
+    #[test]
+    fn a_proposal_queued_for_the_payment_reference_is_reused() {
+        let reference = Uuid::new_v4().to_string();
+        let queued = queued_payee_record(&reference);
+        let other = queued_payee_record(&Uuid::new_v4().to_string());
+
+        for status in [
+            OutboundPrivateMessageStatus::Pending,
+            OutboundPrivateMessageStatus::Sending,
+            OutboundPrivateMessageStatus::Failed,
+            OutboundPrivateMessageStatus::Sent,
+        ] {
+            let mut queued = queued.clone();
+            queued.proposal_outbound_status = Some(status);
+            let records = [other.clone(), queued.clone()];
+            let found = queued_proposal(&records, &server_app_id(), &reference);
+            assert_eq!(
+                found.map(|record| record.payment_request_id.as_str()),
+                Some(queued.payment_request_id.as_str())
+            );
+        }
+        assert!(queued_proposal(&[other], &server_app_id(), &reference).is_none());
+    }
+
+    #[test]
+    fn only_this_servers_deliverable_proposals_count_as_queued() {
+        let reference = Uuid::new_v4().to_string();
+        let rejected: [fn(&mut PaymentRequestRecord); 6] = [
+            // The reader proposed it, or another Paykit App did.
+            |record| record.local_role = Some(PaymentRequestLocalRole::Payer),
+            |record| record.proposal_app_id = Some(PaykitAppId::new("bitkit").unwrap()),
+            // Nothing was queued locally for the reader.
+            |record| record.proposal_outbound_message_id = None,
+            // The SDK will never deliver it.
+            |record| {
+                record.proposal_outbound_status = Some(OutboundPrivateMessageStatus::Invalid);
+            },
+            |record| {
+                record.proposal_outbound_status = Some(OutboundPrivateMessageStatus::Superseded);
+            },
+            |record| record.terms = None,
+        ];
+        for change in rejected {
+            let mut record = queued_payee_record(&reference);
+            change(&mut record);
+            assert!(queued_proposal(&[record], &server_app_id(), &reference).is_none());
         }
     }
 
