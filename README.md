@@ -193,12 +193,14 @@ Production logging allowlists only the `paykit_server` target at INFO and above.
 `POST /invoices` and the Locks-facing `POST /payment-requests/status`,
 `POST /connections/status`, and `POST /setup/status` polls emit one coarse
 outcome event for each request reaching the application, including admission
-rejections. Fields are HTTP status, elapsed milliseconds, a closed failure
-class, and an opaque request ID. Status events also carry a closed
+rejections. Completed-event fields are HTTP status, elapsed milliseconds, a
+closed failure class, and an opaque request ID. Status events also carry a closed
 `payment_request_status`, `connection_status`, or `setup_status` operation
-label. Expected status-poll outcomes, including typed dependency failures,
-remain DEBUG-only; only an unclassified server error is WARN to avoid
-outage-driven INFO/WARN log storms.
+label. A request cancelled or unwound before producing a response emits the
+same event with failure class `cancelled`, no fabricated HTTP status, and no
+response header. Expected status-poll outcomes, including typed dependency
+failures and ordinary cancellation, remain DEBUG-only; an unclassified server
+error or handler panic is WARN to avoid outage-driven INFO/WARN log storms.
 Failures inside these request flows also emit one WARN event at the narrowest
 known source. Its closed fields are `operation`, `stage`, `category`, and the
 same opaque request ID returned in `X-Request-ID`; raw errors, identities, keys,

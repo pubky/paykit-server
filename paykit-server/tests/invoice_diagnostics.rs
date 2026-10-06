@@ -76,12 +76,100 @@ fn runtime() -> Arc<Runtime> {
 }
 
 fn request(request_id: &str) -> Request<Body> {
+    request_for("/invoices", request_id)
+}
+
+fn request_for(path: &str, request_id: &str) -> Request<Body> {
     Request::builder()
         .method("POST")
-        .uri("/invoices")
+        .uri(path)
         .header(REQUEST_ID_HEADER, request_id)
         .body(Body::empty())
         .unwrap()
+}
+
+async fn intentional_panic_handler() -> StatusCode {
+    panic!("intentional handler panic")
+}
+
+#[tokio::test]
+async fn cancelled_status_request_emits_one_safe_event_without_fabricated_response() {
+    let request_id = "d9428888-122b-4b85-bc8f-2c2e0bf7c874";
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let handler_entered = entered.clone();
+    let capture = EventCapture::default();
+    let subscriber = tracing_subscriber::registry().with(capture.clone());
+    let router = operational_router(
+        Router::new().route(
+            "/payment-requests/status",
+            post(move || {
+                let entered = handler_entered.clone();
+                async move {
+                    entered.notify_one();
+                    std::future::pending::<StatusCode>().await
+                }
+            }),
+        ),
+        runtime(),
+    );
+
+    let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+    let request = tokio::spawn(router.oneshot(request_for("/payment-requests/status", request_id)));
+    entered.notified().await;
+    request.abort();
+    assert!(request.await.unwrap_err().is_cancelled());
+
+    let events = capture.0.lock().unwrap();
+    let events = events
+        .iter()
+        .filter(|fields| field(fields, "event") == Some("paykit_locks_status_outcome"))
+        .collect::<Vec<_>>();
+    assert_eq!(events.len(), 1);
+    let event = events[0];
+    assert_eq!(field(event, "operation"), Some("payment_request_status"));
+    assert_eq!(field(event, "failure_class"), Some("cancelled"));
+    assert_eq!(field(event, "request_id"), Some(request_id));
+    assert!(field(event, "elapsed_ms").unwrap().parse::<u64>().is_ok());
+    assert_eq!(field(event, "http_status"), None);
+    assert!(event.iter().all(|(name, _)| {
+        matches!(
+            name.as_str(),
+            "message" | "event" | "operation" | "failure_class" | "elapsed_ms" | "request_id"
+        )
+    }));
+}
+
+#[tokio::test]
+async fn panicking_invoice_request_emits_one_safe_event_without_fabricated_response() {
+    let request_id = "d9428888-122b-4b85-bc8f-2c2e0bf7c874";
+    let capture = EventCapture::default();
+    let subscriber = tracing_subscriber::registry().with(capture.clone());
+    let router = operational_router(
+        Router::new().route("/invoices", post(intentional_panic_handler)),
+        runtime(),
+    );
+
+    let request = tokio::spawn(
+        router
+            .oneshot(request(request_id))
+            .with_subscriber(subscriber),
+    );
+    assert!(request.await.unwrap_err().is_panic());
+
+    let events = capture.invoice_events();
+    assert_eq!(events.len(), 1);
+    let event = &events[0];
+    assert_eq!(field(event, "failure_class"), Some("cancelled"));
+    assert_eq!(field(event, "request_id"), Some(request_id));
+    assert!(field(event, "elapsed_ms").unwrap().parse::<u64>().is_ok());
+    assert_eq!(field(event, "http_status"), None);
+    assert_eq!(field(event, "operation"), None);
+    assert!(event.iter().all(|(name, _)| {
+        matches!(
+            name.as_str(),
+            "message" | "event" | "failure_class" | "elapsed_ms" | "request_id"
+        )
+    }));
 }
 
 #[tokio::test]

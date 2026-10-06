@@ -40,6 +40,43 @@ struct DiagnosedRoute {
     frequent_poll: bool,
 }
 
+struct RequestOutcomeGuard {
+    route: DiagnosedRoute,
+    started: Instant,
+    request_id: Uuid,
+    armed: bool,
+}
+
+impl RequestOutcomeGuard {
+    fn new(route: DiagnosedRoute, started: Instant, request_id: Uuid) -> Self {
+        Self {
+            route,
+            started,
+            request_id,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RequestOutcomeGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let route = self.route;
+        let elapsed_ms = elapsed_ms(self.started);
+        let request_id = self.request_id;
+        let panicking = std::thread::panicking();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            emit_incomplete(route, elapsed_ms, request_id, panicking);
+        }));
+    }
+}
+
 fn diagnosed_route(request: &Request<Body>) -> Option<DiagnosedRoute> {
     if request.method() != Method::POST {
         return None;
@@ -80,8 +117,10 @@ pub(crate) async fn middleware(request: Request<Body>, next: Next) -> Response {
 
     let started = Instant::now();
     let request_id = accepted_request_id(request.headers()).unwrap_or_else(Uuid::new_v4);
+    let mut outcome_guard = RequestOutcomeGuard::new(route, started, request_id);
     let (mut response, source_failure) =
         crate::diagnostics::scope(request_id, route.source_operation, next.run(request)).await;
+    outcome_guard.disarm();
     response.headers_mut().insert(
         REQUEST_ID_HEADER,
         HeaderValue::from_str(&request_id.hyphenated().to_string())
@@ -99,7 +138,7 @@ pub(crate) async fn middleware(request: Request<Body>, next: Next) -> Response {
         } else {
             "unclassified"
         });
-    let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let elapsed_ms = elapsed_ms(started);
     emit(
         route,
         status,
@@ -109,6 +148,10 @@ pub(crate) async fn middleware(request: Request<Body>, next: Next) -> Response {
         source_failure,
     );
     response
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 fn accepted_request_id(headers: &axum::http::HeaderMap) -> Option<Uuid> {
@@ -178,6 +221,48 @@ fn emit(
             elapsed_ms,
             request_id = %request_id,
             "Paykit invoice request completed"
+        );
+    }
+}
+
+fn emit_incomplete(route: DiagnosedRoute, elapsed_ms: u64, request_id: Uuid, panicking: bool) {
+    let failure_class = "cancelled";
+    let request_id = request_id.hyphenated();
+    if panicking {
+        if let Some(operation) = route.operation {
+            tracing::warn!(
+                event = route.event,
+                operation,
+                failure_class,
+                elapsed_ms,
+                request_id = %request_id,
+                "Paykit request ended without a response"
+            );
+        } else {
+            tracing::warn!(
+                event = route.event,
+                failure_class,
+                elapsed_ms,
+                request_id = %request_id,
+                "Paykit request ended without a response"
+            );
+        }
+    } else if route.frequent_poll {
+        tracing::debug!(
+            event = route.event,
+            operation = route.operation.expect("poll routes have an operation"),
+            failure_class,
+            elapsed_ms,
+            request_id = %request_id,
+            "Paykit request ended without a response"
+        );
+    } else {
+        tracing::info!(
+            event = route.event,
+            failure_class,
+            elapsed_ms,
+            request_id = %request_id,
+            "Paykit request ended without a response"
         );
     }
 }
