@@ -315,7 +315,17 @@ The later SDK handoff is not exactly once. Server delivery is at least once:
 The invoice API returns after durable intent commit. It does not wait for Encrypted Link establishment or remote delivery.
 
 Requests address the Reader identity, not a receiver folder. The Reader's App
-Registry must advertise a private-payment app capable of paying requests.
+Registry must advertise a private-payment app capable of paying requests. New
+invoice admission reads a cleanly missing registry at most three times, using
+full-jitter delays whose combined maximum is one second inside the existing
+15-second request deadline. Exhausted clean absence returns `503`
+`reader_setup_pending` with decimal `Retry-After: 1`; a present but incapable
+registry returns terminal `409` `reader_not_payable`. Transport/read failures
+return `503` `reader_registry_unavailable`, malformed or oversized registry
+data returns `502` `reader_registry_malformed`, and request-wide exhaustion
+remains `503` `dependency_timeout`. These failures occur before xpub loading,
+address allocation, invoice persistence, or outbox insertion. Exact replay is
+checked first and returns its existing invoice without live registry discovery.
 Readers resolve each Payment Request by ID through the SDK request-aware resolver.
 Bound destinations have no Payment List version and never fall back to mutable
 private or public lists. Another invoice or app cannot replace the destination.
