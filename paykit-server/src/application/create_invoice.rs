@@ -455,9 +455,8 @@ impl CreateInvoiceService {
         let creator = request.lock_resource.creator().clone();
         let bundle_binding = request.bundle_id.to_string().into_bytes();
         let lock_resource_binding = request.lock_resource.to_string().into_bytes();
-        let payment_request_binding = request_binding(&request).map_err(|error| {
+        let payment_request_binding = request_binding(&request).inspect_err(|&error| {
             diagnose("request_binding", error);
-            error
         })?;
         let preflight_remaining = remaining_at(started, self.clock.now(), "invoice_preflight")?;
         match tokio::time::timeout(
@@ -525,9 +524,8 @@ impl CreateInvoiceService {
                     CreateInvoiceError::InvalidRequest
                 }
             })?;
-        validate_lock(&request, &lock).map_err(|error| {
+        validate_lock(&request, &lock).inspect_err(|&error| {
             diagnose("lock_validation", error);
-            error
         })?;
         let registry_remaining = remaining_at(started, self.clock.now(), "reader_app_registry")?;
         let discovered = tokio::time::timeout(
@@ -536,9 +534,8 @@ impl CreateInvoiceService {
         )
         .await
         .map_err(|_| deadline("reader_app_registry"))?
-        .map_err(|error| {
+        .inspect_err(|&error| {
             diagnose("reader_app_registry_fetch", error);
-            error
         })?;
         let Some(discovered) = discovered else {
             crate::diagnostics::failure(
@@ -610,9 +607,8 @@ fn remaining_at(
     now: Instant,
     stage: &'static str,
 ) -> Result<Duration, CreateInvoiceError> {
-    remaining(start, now).map_err(|error| {
+    remaining(start, now).inspect_err(|&error| {
         diagnose(stage, error);
-        error
     })
 }
 
