@@ -1098,7 +1098,7 @@ impl AppRegistryDiscovery for PubkyAppRegistryDiscovery {
     ) -> Result<Option<PaykitAppRegistry>, RegistryDiscoveryError> {
         let reader = PubkyPublicKey::from_raw_or_app_key(reader.to_string())
             .and_then(|key| key.to_public_key())
-            .map_err(|_| RegistryDiscoveryError::Malformed)?;
+            .map_err(|_| RegistryDiscoveryError::InvalidRequest)?;
         get_paykit_app_registry(&self.storage, &reader)
             .await
             .or_else(|error| match error {

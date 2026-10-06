@@ -60,6 +60,7 @@ pub enum LockFetchError {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RegistryDiscoveryError {
+    InvalidRequest,
     Unavailable,
     Malformed,
 }
@@ -651,6 +652,13 @@ impl CreateInvoiceService {
                         CreateInvoiceError::ReaderSetupPending,
                     );
                     return Err(CreateInvoiceError::ReaderSetupPending);
+                }
+                Err(RegistryDiscoveryError::InvalidRequest) => {
+                    diagnose(
+                        "reader_app_registry_identity",
+                        CreateInvoiceError::InvalidRequest,
+                    );
+                    return Err(CreateInvoiceError::InvalidRequest);
                 }
                 Err(RegistryDiscoveryError::Unavailable) => {
                     diagnose(

@@ -1040,8 +1040,15 @@ async fn setup_pending_emits_one_redacted_source_diagnostic_with_request_id() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(response.headers()["retry-after"], "1");
+    assert!(!response.headers().contains_key("retry-after"));
     assert_eq!(response.headers()["x-request-id"], request_id);
+    let body = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+        serde_json::json!({"error":{"code":"reader_setup_pending","message":"reader wallet setup needed"}})
+    );
     let events: Vec<_> = capture
         .0
         .lock()
@@ -1071,6 +1078,10 @@ async fn setup_pending_emits_one_redacted_source_diagnostic_with_request_id() {
 #[tokio::test]
 async fn incapable_transport_and_malformed_registry_are_not_retried_or_persisted() {
     let cases = [
+        (
+            Err(RegistryDiscoveryError::InvalidRequest),
+            CreateInvoiceError::InvalidRequest,
+        ),
         (
             Ok(Some(paykit_lib::PaykitAppRegistry::new(None))),
             CreateInvoiceError::ReaderNotPayable,
@@ -1112,6 +1123,84 @@ async fn incapable_transport_and_malformed_registry_are_not_retried_or_persisted
         assert_eq!(credentials.calls.load(Ordering::SeqCst), 0);
         assert_eq!(store.create_calls.load(Ordering::SeqCst), 0);
     }
+}
+
+#[tokio::test]
+async fn signed_router_distinguishes_invalid_reader_from_malformed_remote_registry() {
+    let key = SigningKey::from_bytes(&[16; 32]);
+    let invalid_registries = Arc::new(SequencedRegistries {
+        results: Mutex::new(VecDeque::from([Ok(Some(capable_registry()))])),
+        calls: AtomicUsize::default(),
+    });
+    let invalid_store = Arc::new(FakeStore::with_preflight(InvoicePreflight::New));
+    let invalid_router = invoices_router(Arc::new(registry_service(
+        invalid_registries.clone(),
+        Arc::new(ImmediateRetryDelay::default()),
+        Arc::new(CountingCredentials {
+            calls: AtomicUsize::default(),
+        }),
+        invalid_store.clone(),
+    )))
+    .layer(Extension(signed_auth(&key)));
+    let invalid_body = serde_json_canonicalizer::to_vec(&serde_json::json!({
+        "bundle_id": BUNDLE,
+        "lock_resource": LOCK_RESOURCE,
+        "reader": "not-a-reader"
+    }))
+    .unwrap();
+
+    let invalid_response = invalid_router
+        .oneshot(signed_invoice_request(&key, invalid_body))
+        .await
+        .unwrap();
+    assert_eq!(invalid_response.status(), StatusCode::BAD_REQUEST);
+    assert!(!invalid_response.headers().contains_key("retry-after"));
+    let invalid_response_body = axum::body::to_bytes(invalid_response.into_body(), 4096)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&invalid_response_body).unwrap(),
+        serde_json::json!({"error":{"code":"invalid_request","message":"request is invalid"}})
+    );
+    assert_eq!(invalid_registries.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(invalid_store.create_calls.load(Ordering::SeqCst), 0);
+
+    let malformed_registries = Arc::new(SequencedRegistries {
+        results: Mutex::new(VecDeque::from([Err(RegistryDiscoveryError::Malformed)])),
+        calls: AtomicUsize::default(),
+    });
+    let malformed_store = Arc::new(FakeStore::with_preflight(InvoicePreflight::New));
+    let malformed_router = invoices_router(Arc::new(registry_service(
+        malformed_registries.clone(),
+        Arc::new(ImmediateRetryDelay::default()),
+        Arc::new(CountingCredentials {
+            calls: AtomicUsize::default(),
+        }),
+        malformed_store.clone(),
+    )))
+    .layer(Extension(signed_auth(&key)));
+    let malformed_body = serde_json_canonicalizer::to_vec(&serde_json::json!({
+        "bundle_id": BUNDLE,
+        "lock_resource": LOCK_RESOURCE,
+        "reader": reader()
+    }))
+    .unwrap();
+
+    let malformed_response = malformed_router
+        .oneshot(signed_invoice_request(&key, malformed_body))
+        .await
+        .unwrap();
+    assert_eq!(malformed_response.status(), StatusCode::BAD_GATEWAY);
+    assert!(!malformed_response.headers().contains_key("retry-after"));
+    let malformed_response_body = axum::body::to_bytes(malformed_response.into_body(), 4096)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&malformed_response_body).unwrap(),
+        serde_json::json!({"error":{"code":"reader_registry_malformed","message":"reader registry is malformed"}})
+    );
+    assert_eq!(malformed_registries.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(malformed_store.create_calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

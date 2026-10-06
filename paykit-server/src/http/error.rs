@@ -124,7 +124,7 @@ impl ApiError {
             Self::ReaderSetupPending => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "reader_setup_pending",
-                "reader setup is pending",
+                "reader wallet setup needed",
             ),
             Self::ReaderNotPayable => (
                 StatusCode::CONFLICT,
@@ -155,7 +155,7 @@ impl IntoResponse for ApiError {
             }),
         )
             .into_response();
-        if matches!(self, Self::RateLimited | Self::ReaderSetupPending) {
+        if self == Self::RateLimited {
             response.headers_mut().insert(
                 header::RETRY_AFTER,
                 "1".parse().expect("static header value"),
@@ -182,8 +182,8 @@ mod tests {
                 ApiError::ReaderSetupPending,
                 StatusCode::SERVICE_UNAVAILABLE,
                 "reader_setup_pending",
-                "reader setup is pending",
-                Some("1"),
+                "reader wallet setup needed",
+                None,
             ),
             (
                 ApiError::ReaderNotPayable,
