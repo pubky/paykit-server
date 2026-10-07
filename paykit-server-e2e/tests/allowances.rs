@@ -36,7 +36,7 @@ use paykit_lib::{
 use paykit_sdk::{
     AllowanceAccountingBlock, AllowanceAccountingReconciliation, AllowanceFilter,
     AllowanceHistoryStatus, AllowanceLifecycleState, AllowanceLocalRole, AllowanceSelectionInput,
-    LinkedPeerState, OutboundPrivateMessageStatus, PAYKIT_SESSION_CAPABILITIES,
+    LinkedPeerState, OutboundPrivateMessageStatus, PAYKIT_AUTHORIZER_SESSION_CAPABILITIES,
     PaymentAttemptDecision, PaymentExecutionChecks, PaymentExecutionMode, PaymentOccurrence,
     PaymentRequestRecord, PaymentRequestScope, PubkyLocalSecretKey, PubkyPublicKey,
     PubkySessionBootstrap,
@@ -229,7 +229,7 @@ async fn boot(seed: u8) -> Stack {
             &PubkyLocalSecretKey::new(Keypair::random().secret_key()),
             &homeserver,
             None,
-            PAYKIT_SESSION_CAPABILITIES,
+            PAYKIT_AUTHORIZER_SESSION_CAPABILITIES,
         )
         .await
         .unwrap();
@@ -242,7 +242,7 @@ async fn boot(seed: u8) -> Stack {
             &PubkyLocalSecretKey::new(creator_keypair.secret_key()),
             &homeserver,
             None,
-            PAYKIT_SESSION_CAPABILITIES,
+            PAYKIT_AUTHORIZER_SESSION_CAPABILITIES,
         )
         .await
         .unwrap();
@@ -275,8 +275,11 @@ async fn boot(seed: u8) -> Stack {
             PubkyLocalSecretKey::new(creator_keypair.secret_key())
                 .derive_paykit_identity_secret_key(1)
                 .unwrap(),
-            account_xpub(seed),
-            0,
+            Some(paykit_server::domain::receiving::BitcoinAccount {
+                xpub: account_xpub(seed).into(),
+                account_index: 0,
+            }),
+            None,
         ))
         .await
         .unwrap();
@@ -289,7 +292,7 @@ async fn boot(seed: u8) -> Stack {
     .unwrap()
     .sign_in(
         &PubkyLocalSecretKey::new(creator_keypair.secret_key()),
-        PAYKIT_SESSION_CAPABILITIES,
+        PAYKIT_AUTHORIZER_SESSION_CAPABILITIES,
     )
     .await
     .unwrap();

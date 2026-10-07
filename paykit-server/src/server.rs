@@ -6,8 +6,8 @@ use crate::{
     application::{
         connection_status::ConnectionStatusService,
         create_invoice::{
-            AppRegistryDiscovery, CreateInvoiceError, CreateInvoiceService, LockFetchError,
-            LockFetcher, PaykitIntentBuilder, SessionValidationError, SessionValidator,
+            AppRegistryDiscovery, CreateInvoiceService, LockFetchError, LockFetcher,
+            PaykitIntentBuilder, RegistryDiscoveryError, SessionValidationError, SessionValidator,
         },
         payment_drain::{
             PaymentDrainCleanupToken, PaymentDrainError, PaymentDrainOperations,
@@ -44,7 +44,7 @@ use crate::{
 use async_trait::async_trait;
 use axum::{Extension, Router};
 use locks_core::lock_policy::ContentLock;
-use paykit_lib::{PaykitAppRegistry, get_paykit_app_registry};
+use paykit_lib::{PaykitAppRegistry, PaykitError, get_paykit_app_registry};
 use paykit_sdk::{PaykitSdkError, PubkyPublicKey, PubkySessionBootstrap, PubkySessionProvider};
 use pubky::{Pubky, errors::RequestError};
 use sqlx::PgPool;
@@ -76,6 +76,10 @@ pub enum ServerBuildError {
     Electrum,
     #[error("could not construct server cryptography")]
     Crypto,
+    #[error("could not construct Arbitrum verification")]
+    Arbitrum,
+    #[error("could not construct exchange-rate client")]
+    ExchangeRates,
 }
 
 /// Concrete process-owned server components.
@@ -93,6 +97,7 @@ struct WorkerComponents {
     invoices: InvoiceStore,
     payment_request_lifecycles: PaymentRequestLifecycleStore,
     electrum: Arc<dyn ElectrumPort>,
+    usdt: Option<crate::usdt::ArbitrumVerifier>,
     paykit: PaykitConfig,
     bitcoin_network: crate::config::BitcoinNetwork,
     outbox_poll_interval: Duration,
@@ -171,8 +176,18 @@ impl Server {
         )?;
         let relay = Arc::new(PubkyCompanionRelay::new(pubky.client().clone()));
         let sessions = CreatorSessions::new(creators.clone(), pubky.clone(), config.paykit.clone());
+        let mut auth_starter = BitkitAuthStarter::new(bootstrap);
+        let usdt = config
+            .usdt
+            .as_ref()
+            .map(|config| crate::usdt::ArbitrumVerifier::new(config.rpc_url.clone()))
+            .transpose()
+            .map_err(|_| ServerBuildError::Arbitrum)?;
+        if config.usdt.is_some() {
+            auth_starter = auth_starter.with_usdt();
+        }
         let setup_completer = Arc::new(RealSetupCompleter::new(
-            BitkitAuthStarter::new(bootstrap),
+            auth_starter,
             relay,
             creators.clone(),
             sessions.clone(),
@@ -196,32 +211,41 @@ impl Server {
                 max_pending_setup_flows: config.rate_limits.max_pending_setup_flows(),
             },
             config.setup.log_authorization_url,
-        );
+        )
+        .with_bitcoin_network(config.deployment_invariants().bitcoin_network.clone());
 
         let session_validator = Arc::new(CreatorSessionValidator {
             creators: creators.clone(),
             sessions: sessions.clone(),
         });
-        let invoice_service = Arc::new(CreateInvoiceService::with_invoice_windows(
-            session_validator.clone(),
-            Arc::new(PubkyLockFetcher {
-                storage: pubky.public_storage(),
-                max_bytes: config.limits.lock_resource_bytes,
-                timeout: config.limits.lock_fetch_timeout,
-            }),
-            Arc::new(PubkyAppRegistryDiscovery {
-                storage: pubky.public_storage(),
-            }),
-            config.paykit.app_id.clone(),
-            Arc::new(creators.clone()),
-            config.deployment_invariants().bitcoin_network.clone(),
-            Arc::new(invoices.clone()),
-            Arc::new(PaykitIntentBuilder::new(
+        let invoice_service = Arc::new(
+            CreateInvoiceService::with_invoice_windows(
+                session_validator.clone(),
+                Arc::new(PubkyLockFetcher {
+                    storage: pubky.public_storage(),
+                    max_bytes: config.limits.lock_resource_bytes,
+                    timeout: config.limits.lock_fetch_timeout,
+                }),
+                Arc::new(PubkyAppRegistryDiscovery {
+                    storage: pubky.public_storage(),
+                }),
+                config.paykit.app_id.clone(),
+                Arc::new(creators.clone()),
                 config.deployment_invariants().bitcoin_network.clone(),
+                Arc::new(invoices.clone()),
+                Arc::new(PaykitIntentBuilder::new(
+                    config.deployment_invariants().bitcoin_network.clone(),
+                )),
+                config.paykit.proposal_acceptance_window,
+                config.paykit.payment_window,
+            )
+            .with_usdt(usdt.is_some())
+            .with_conversion_payment_window(config.paykit.conversion_payment_window)
+            .with_exchange_rates(Arc::new(
+                crate::application::invoice_pricing::BlocktankRates::new()
+                    .map_err(|_| ServerBuildError::ExchangeRates)?,
             )),
-            config.paykit.proposal_acceptance_window,
-            config.paykit.payment_window,
-        ));
+        );
         let connection_status_service = Arc::new(ConnectionStatusService::new(
             Arc::new(invoices.clone()),
             Arc::new(sessions.clone()),
@@ -234,6 +258,8 @@ impl Server {
                 sessions: sessions.clone(),
                 lifecycles: payment_request_lifecycles.clone(),
                 drains: payment_drains,
+                invoices: invoices.clone(),
+                usdt: usdt.clone(),
                 paykit: config.paykit.clone(),
             });
         let payment_request_status_operations: Arc<dyn PaymentRequestStatusOperations> =
@@ -242,11 +268,19 @@ impl Server {
                 sessions: sessions.clone(),
                 lifecycles: payment_request_lifecycles.clone(),
                 statuses: invoices.clone(),
+                usdt: usdt.clone(),
                 paykit: config.paykit.clone(),
             });
-        let setup_status_service = Arc::new(SetupStatusService::new(session_validator));
+        let setup_status_service = Arc::new(
+            SetupStatusService::new(session_validator)
+                .with_receiving(Arc::new(creators.clone()), usdt.is_some()),
+        );
         let signed_auth = Arc::new(SignedLocksAuth::from_config(&config));
-        let business_routes = http::setup::setup_router(setup).merge(
+        let business_routes = http::setup::setup_router_with_trusted_proxy_hops(
+            setup,
+            config.http.trusted_proxy_hops(),
+        )
+        .merge(
             http::invoices::invoices_router(invoice_service)
                 .merge(http::connection_status::connection_status_router(
                     connection_status_service,
@@ -276,6 +310,7 @@ impl Server {
             invoices,
             payment_request_lifecycles,
             electrum,
+            usdt,
             paykit: config.paykit.clone(),
             bitcoin_network: config.deployment_invariants().bitcoin_network.clone(),
             outbox_poll_interval: config.outbox.poll_interval,
@@ -409,7 +444,10 @@ async fn shared_transport_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runt
             let maintained = match creator_adapter(&workers, creator).await {
                 Ok(adapter) => match adapter.maintain_transport().await {
                     Ok(()) => true,
-                    Err(error) if error.is_concurrent_update() => {
+                    Err(
+                        PaykitSdkError::ConcurrentUpdate { .. }
+                        | PaykitSdkError::SharedStateBusy { .. },
+                    ) => {
                         deferred = true;
                         true
                     }
@@ -449,6 +487,8 @@ struct ProductionPaymentDrainOperations {
     sessions: CreatorSessions,
     lifecycles: PaymentRequestLifecycleStore,
     drains: PaymentDrainStore,
+    invoices: InvoiceStore,
+    usdt: Option<crate::usdt::ArbitrumVerifier>,
     paykit: PaykitConfig,
 }
 
@@ -476,7 +516,8 @@ impl PaymentDrainOperations for ProductionPaymentDrainOperations {
         }
         let sessions = self.sessions.provider(lock_resource.creator());
         let adapter = PaykitAdapter::new(creator_id, sessions, &self.paykit)
-            .map_err(|_| PaymentDrainError::Unavailable)?;
+            .map_err(|_| PaymentDrainError::Unavailable)?
+            .with_usdt(self.invoices.clone(), self.usdt.clone());
         adapter
             .reconcile_and_create_payment_drain(&self.lifecycles, &self.drains, lock_resource)
             .await
@@ -525,6 +566,7 @@ struct ProductionPaymentRequestStatusOperations {
     sessions: CreatorSessions,
     lifecycles: PaymentRequestLifecycleStore,
     statuses: InvoiceStore,
+    usdt: Option<crate::usdt::ArbitrumVerifier>,
     paykit: PaykitConfig,
 }
 
@@ -539,21 +581,45 @@ impl PaymentRequestStatusOperations for ProductionPaymentRequestStatusOperations
             .statuses
             .invoice_exists(creator, bundle_id)
             .await
-            .map_err(|_| PaymentRequestStatusError::Unavailable)?
+            .map_err(|error| {
+                crate::diagnostics::failure(
+                    "payment_request_status",
+                    "invoice_existence_check",
+                    error.diagnostic_label(),
+                );
+                PaymentRequestStatusError::Unavailable
+            })?
         {
             return Ok(None);
         }
-        let (creator_id, credentials) = self
-            .creators
-            .load_with_id(creator)
-            .await
-            .map_err(|_| PaymentRequestStatusError::Unavailable)?;
+        let (creator_id, credentials) =
+            self.creators.load_with_id(creator).await.map_err(|error| {
+                crate::diagnostics::failure(
+                    "payment_request_status",
+                    "creator_credentials_load",
+                    error.diagnostic_label(),
+                );
+                PaymentRequestStatusError::Unavailable
+            })?;
         if credentials.creator() != creator {
+            crate::diagnostics::failure(
+                "payment_request_status",
+                "creator_credentials_check",
+                "creator_mismatch",
+            );
             return Err(PaymentRequestStatusError::Unavailable);
         }
         let sessions = self.sessions.provider(creator);
         let adapter = PaykitAdapter::new(creator_id, sessions, &self.paykit)
-            .map_err(|_| PaymentRequestStatusError::Unavailable)?;
+            .map_err(|_| {
+                crate::diagnostics::failure(
+                    "payment_request_status",
+                    "paykit_adapter_construction",
+                    "invalid_configuration",
+                );
+                PaymentRequestStatusError::Unavailable
+            })?
+            .with_usdt(self.statuses.clone(), self.usdt.clone());
         adapter
             .reconcile_and_lookup_payment_request_status(
                 &self.lifecycles,
@@ -580,6 +646,7 @@ async fn creator_adapter(
     let creator = credentials.creator().clone();
     let sessions = workers.sessions.provider(&creator);
     PaykitAdapter::new(creator_id, sessions, &workers.paykit)
+        .map(|adapter| adapter.with_usdt(workers.invoices.clone(), workers.usdt.clone()))
         .map_err(|_| AdapterBuildError::Permanent)
 }
 
@@ -884,7 +951,14 @@ impl SessionValidator for CreatorSessionValidator {
             .creators
             .setup_complete(creator)
             .await
-            .map_err(|_| SessionValidationError::Unavailable)?
+            .map_err(|error| {
+                crate::diagnostics::failure(
+                    "creator_session_validation",
+                    "setup_state_load",
+                    error.diagnostic_label(),
+                );
+                SessionValidationError::Unavailable
+            })?
         {
             return Err(SessionValidationError::Invalid);
         }
@@ -892,28 +966,55 @@ impl SessionValidator for CreatorSessionValidator {
         let access = provider
             .load_session_access()
             .await
-            .map_err(map_session_validation_error)?
+            .map_err(|error| {
+                let mapped = map_session_validation_error(error);
+                session_failure("session_access_load", mapped)
+            })?
             .ok_or(SessionValidationError::Invalid)?;
         access
             .session
             .revalidate()
             .await
-            .map_err(|error| classify_pubky_session_error(&error))?
+            .map_err(|error| {
+                let mapped = classify_pubky_session_error(&error);
+                session_failure("session_revalidation", mapped)
+            })?
             .ok_or(SessionValidationError::Invalid)?;
         let owner = access
             .public_key()
             .and_then(|key| key.to_public_key())
-            .map_err(map_session_validation_error)?;
+            .map_err(|error| {
+                let mapped = map_session_validation_error(error);
+                session_failure("session_public_key", mapped)
+            })?;
+        let authorization = paykit_lib::get_paykit_noise_key_authorization(
+            &access.outbox_client.public_storage(),
+            &owner,
+        )
+        .await
+        .map_err(|error| match error {
+            paykit_lib::PaykitError::Transport { .. } => session_failure(
+                "creator_noise_key_authorization_fetch",
+                SessionValidationError::Unavailable,
+            ),
+            _ => SessionValidationError::Invalid,
+        })?
+        .ok_or(SessionValidationError::Invalid)?;
         let registry =
             paykit_lib::get_paykit_app_registry(&access.outbox_client.public_storage(), &owner)
                 .await
-                .map_err(|_| SessionValidationError::Unavailable)?
+                .map_err(|_| {
+                    session_failure(
+                        "creator_app_registry_fetch",
+                        SessionValidationError::Unavailable,
+                    )
+                })?
                 .ok_or(SessionValidationError::Invalid)?;
         let key = access
             .paykit_identity_secret_key
             .as_ref()
             .ok_or(SessionValidationError::Invalid)?;
-        crate::real_setup::verify_registry_key(&registry, key)
+        crate::real_setup::verify_authorized_key(&authorization, key)
             .map_err(|_| SessionValidationError::Invalid)?;
         let app_id =
             paykit_lib::PaykitAppId::new(crate::config::PAYKIT_APP_ID).expect("static app id");
@@ -924,10 +1025,20 @@ impl SessionValidator for CreatorSessionValidator {
         paykit_sdk::PubkySharedStateStorage::new(provider)
             .transaction(|tx| Ok(tx.load_identity_state()))
             .await
-            .map_err(map_session_validation_error)?
+            .map_err(|error| {
+                let mapped = map_session_validation_error(error);
+                session_failure("identity_state_load", mapped)
+            })?
             .ok_or(SessionValidationError::Invalid)?;
         Ok(())
     }
+}
+
+fn session_failure(stage: &'static str, error: SessionValidationError) -> SessionValidationError {
+    if error == SessionValidationError::Unavailable {
+        crate::diagnostics::failure("creator_session_validation", stage, "unavailable");
+    }
+    error
 }
 
 fn map_session_validation_error(error: PaykitSdkError) -> SessionValidationError {
@@ -969,7 +1080,10 @@ impl LockFetcher for PubkyLockFetcher {
     async fn fetch(&self, resource: &PubkyLockResource) -> Result<ContentLock, LockFetchError> {
         tokio::time::timeout(self.timeout, self.fetch_inner(resource))
             .await
-            .map_err(|_| LockFetchError::Unavailable)?
+            .map_err(|_| {
+                crate::diagnostics::failure("invoice_create", "lock_fetch", "timeout");
+                LockFetchError::Unavailable
+            })?
     }
 }
 
@@ -986,31 +1100,43 @@ impl PubkyLockFetcher {
                     pubky::Error::Request(RequestError::Server { status, .. })
                         if status.as_u16() == 404 =>
                     {
+                        crate::diagnostics::failure("invoice_create", "lock_fetch", "not_found");
                         LockFetchError::NotFound
                     }
-                    _ => LockFetchError::Unavailable,
+                    _ => {
+                        crate::diagnostics::failure("invoice_create", "lock_fetch", "unavailable");
+                        LockFetchError::Unavailable
+                    }
                 })?;
         let mut bytes = Vec::new();
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|_| LockFetchError::Unavailable)?
-        {
+        while let Some(chunk) = response.chunk().await.map_err(|_| {
+            crate::diagnostics::failure("invoice_create", "lock_body_read", "unavailable");
+            LockFetchError::Unavailable
+        })? {
             let next_len = bytes
                 .len()
                 .checked_add(chunk.len())
                 .ok_or(LockFetchError::Invalid)?;
             if u64::try_from(next_len).map_err(|_| LockFetchError::Invalid)? > self.max_bytes {
+                crate::diagnostics::failure(
+                    "invoice_create",
+                    "lock_body_read",
+                    "payload_too_large",
+                );
                 return Err(LockFetchError::Invalid);
             }
             bytes.extend_from_slice(&chunk);
         }
-        let lock: ContentLock =
-            serde_json::from_slice(&bytes).map_err(|_| LockFetchError::Invalid)?;
-        let path = lock
-            .content_lock_path()
-            .map_err(|_| LockFetchError::Invalid)?;
+        let lock: ContentLock = serde_json::from_slice(&bytes).map_err(|_| {
+            crate::diagnostics::failure("invoice_create", "lock_parse", "invalid_json");
+            LockFetchError::Invalid
+        })?;
+        let path = lock.content_lock_path().map_err(|_| {
+            crate::diagnostics::failure("invoice_create", "lock_parse", "invalid_path");
+            LockFetchError::Invalid
+        })?;
         if format!("{}{}", resource.creator(), path) != resource.to_string() {
+            crate::diagnostics::failure("invoice_create", "lock_validation", "resource_mismatch");
             return Err(LockFetchError::Invalid);
         }
         Ok(lock)
@@ -1027,13 +1153,19 @@ impl AppRegistryDiscovery for PubkyAppRegistryDiscovery {
     async fn discover(
         &self,
         reader: &ReaderPubky,
-    ) -> Result<Option<PaykitAppRegistry>, CreateInvoiceError> {
+    ) -> Result<Option<PaykitAppRegistry>, RegistryDiscoveryError> {
         let reader = PubkyPublicKey::from_raw_or_app_key(reader.to_string())
             .and_then(|key| key.to_public_key())
-            .map_err(|_| CreateInvoiceError::InvalidRequest)?;
+            .map_err(|_| RegistryDiscoveryError::InvalidRequest)?;
         get_paykit_app_registry(&self.storage, &reader)
             .await
-            .map_err(|_| CreateInvoiceError::Unavailable)
+            .or_else(|error| match error {
+                PaykitError::NotFound(_) => Ok(None),
+                PaykitError::Transport { .. } => Err(RegistryDiscoveryError::Unavailable),
+                PaykitError::InvalidData { .. } | PaykitError::Validation(_) => {
+                    Err(RegistryDiscoveryError::Malformed)
+                }
+            })
     }
 }
 

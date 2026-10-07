@@ -11,6 +11,7 @@ pub mod bitkit_setup;
 pub mod config;
 /// Versioned authenticated encryption for persisted private state.
 pub mod crypto;
+mod diagnostics;
 /// Side-effect-free protocol and business value objects.
 pub mod domain;
 pub mod http;
@@ -35,3 +36,5 @@ pub mod startup;
 pub mod workers;
 
 pub use server::Server;
+
+pub mod usdt;

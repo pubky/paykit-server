@@ -26,9 +26,9 @@ use locks_core::{
 use paykit_server::{
     application::create_invoice::{
         AppRegistryDiscovery, CreateInvoiceError, CreateInvoiceRequest, CreateInvoiceService,
-        CreatorXpubProvider, DeadlineClock, IntentBuilder, InvoicePersistence, LockFetchError,
-        LockFetcher, PaykitIntentBuilder, SessionValidationError, SessionValidator,
-        derive_bip84_p2wpkh_address,
+        CreatorReceivingProvider, DeadlineClock, IntentBuilder, InvoicePersistence, LockFetchError,
+        LockFetcher, PaykitIntentBuilder, RegistryDiscoveryError, RegistryRetryDelay,
+        SessionValidationError, SessionValidator, derive_bip84_p2wpkh_address,
     },
     application::semantic_intent::DeliveryIntentV1,
     config::{BitcoinNetwork, Config, ConfigEnvironment},
@@ -38,12 +38,55 @@ use paykit_server::{
         invoices::invoices_router,
     },
     persistence::{AtomicInvoiceInput, AtomicInvoiceResult, InvoicePreflight, PersistenceError},
+    runtime::{DependencyCheck, Runtime, operational_router},
 };
 use tower::ServiceExt;
+use tracing::{Event, Subscriber, instrument::WithSubscriber};
+use tracing_subscriber::{Layer, layer::Context, prelude::*};
 
 const CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
 const LOCK_RESOURCE: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/app.locks/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json";
 const BUNDLE: &str = "000G40R40M30E209185GR38E1W";
+
+type CapturedEvents = Vec<Vec<(String, String)>>;
+
+#[derive(Clone, Default)]
+struct EventCapture(Arc<Mutex<CapturedEvents>>);
+
+impl<S> Layer<S> for EventCapture
+where
+    S: Subscriber,
+{
+    fn on_event(&self, event: &Event<'_>, _context: Context<'_, S>) {
+        let mut fields = Vec::new();
+        event.record(&mut FieldVisitor(&mut fields));
+        self.0.lock().unwrap().push(fields);
+    }
+}
+
+struct FieldVisitor<'a>(&'a mut Vec<(String, String)>);
+
+impl tracing::field::Visit for FieldVisitor<'_> {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn core::fmt::Debug) {
+        self.0.push((field.name().to_owned(), format!("{value:?}")));
+    }
+}
+
+fn event_field<'a>(fields: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    fields
+        .iter()
+        .find(|(field, _)| field == name)
+        .map(|(_, value)| value.trim_matches('"'))
+}
+
+struct ReadyDependency;
+
+#[async_trait]
+impl DependencyCheck for ReadyDependency {
+    async fn postgres_ready(&self) -> bool {
+        true
+    }
+}
 
 fn reader() -> String {
     for replacement in "ybndrfg8ejkmcpqxot1uwisza345h769".chars() {
@@ -113,7 +156,7 @@ fn capable_registry() -> paykit_lib::PaykitAppRegistry {
 fn library_payment_request_has_exact_terms_amount_and_metadata() {
     let request = request();
     let terms = PaykitIntentBuilder::new(BitcoinNetwork::Mainnet)
-        .payment_request_terms(&request, &valid_lock(), "address")
+        .payment_request_terms(&request, &valid_lock(), &bitcoin_receiving("address"), &[])
         .unwrap();
     assert_eq!(terms.amount().value(), "0.00050000");
     assert_eq!(terms.amount().asset(), "btc");
@@ -125,7 +168,7 @@ fn library_payment_request_has_exact_terms_amount_and_metadata() {
     );
     assert_eq!(
         serde_json::Value::Object(terms.metadata().clone()),
-        serde_json::json!({"bundle_id":BUNDLE,"lock_resource":LOCK_RESOURCE,"reader":reader()})
+        serde_json::json!({"bundle_id":BUNDLE})
     );
 }
 
@@ -139,7 +182,12 @@ fn payment_request_bound_endpoint_uses_the_configured_network() {
     ] {
         let builder = PaykitIntentBuilder::new(network);
         let terms = builder
-            .payment_request_terms(&request(), &valid_lock(), "address")
+            .payment_request_terms(
+                &request(),
+                &valid_lock(),
+                &bitcoin_receiving("address"),
+                &[],
+            )
             .unwrap();
 
         assert_eq!(
@@ -183,7 +231,7 @@ fn payment_request_binds_derived_bech32_p2wpkh_address() {
     let address = derive_bip84_p2wpkh_address(&xpub, 0, &BitcoinNetwork::Mainnet, 0)
         .expect("valid account xpub derives an address");
     let terms = PaykitIntentBuilder::new(BitcoinNetwork::Mainnet)
-        .payment_request_terms(&request(), &valid_lock(), &address)
+        .payment_request_terms(&request(), &valid_lock(), &bitcoin_receiving(&address), &[])
         .expect("canonical library types accept endpoint");
     let (identifier, payload) = terms.payment_endpoints().unwrap().iter().next().unwrap();
     assert_eq!(identifier.as_str(), "btc-bitcoin-p2wpkh");
@@ -197,6 +245,7 @@ struct FakeStore {
     preflight: Mutex<InvoicePreflight>,
     preflight_calls: AtomicUsize,
     create_calls: AtomicUsize,
+    created: Mutex<Vec<(DeliveryIntentV1, u64, u64)>>,
 }
 
 impl FakeStore {
@@ -205,6 +254,7 @@ impl FakeStore {
             preflight: Mutex::new(preflight),
             preflight_calls: AtomicUsize::default(),
             create_calls: AtomicUsize::default(),
+            created: Mutex::new(Vec::new()),
         }
     }
 }
@@ -242,8 +292,16 @@ impl InvoicePersistence for FakeStore {
 
     async fn create_atomic(
         &self,
-        _input: AtomicInvoiceInput<'_>,
+        input: AtomicInvoiceInput<'_>,
     ) -> Result<AtomicInvoiceResult, PersistenceError> {
+        self.created.lock().unwrap().push((
+            input
+                .invoice_payloads
+                .for_child_index(0)?
+                .payment_request_intent,
+            input.proposal_acceptance_seconds,
+            input.payment_window_seconds,
+        ));
         self.create_calls.fetch_add(1, Ordering::SeqCst);
         Ok(AtomicInvoiceResult::new(
             uuid::Uuid::nil(),
@@ -312,9 +370,21 @@ fn account_xpub() -> String {
 }
 
 #[async_trait]
-impl CreatorXpubProvider for FakeCredentials {
-    async fn xpub(&self, _creator: &CreatorPubky) -> Result<(String, u32), PersistenceError> {
-        Ok((account_xpub(), 0))
+impl CreatorReceivingProvider for FakeCredentials {
+    async fn receiving(
+        &self,
+        _creator: &CreatorPubky,
+    ) -> Result<paykit_server::application::create_invoice::ReceivingDetails, PersistenceError>
+    {
+        Ok(
+            paykit_server::application::create_invoice::ReceivingDetails {
+                bitcoin: Some(paykit_server::domain::receiving::BitcoinAccount {
+                    xpub: account_xpub().into(),
+                    account_index: 0,
+                }),
+                usdt: None,
+            },
+        )
     }
 }
 
@@ -824,10 +894,421 @@ impl AppRegistryDiscovery for FakeRegistries {
     async fn discover(
         &self,
         _reader: &paykit_server::domain::locks::ReaderPubky,
-    ) -> Result<Option<paykit_lib::PaykitAppRegistry>, CreateInvoiceError> {
+    ) -> Result<Option<paykit_lib::PaykitAppRegistry>, RegistryDiscoveryError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(self.registry.clone())
     }
+}
+
+struct SequencedRegistries {
+    results: Mutex<VecDeque<Result<Option<paykit_lib::PaykitAppRegistry>, RegistryDiscoveryError>>>,
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl AppRegistryDiscovery for SequencedRegistries {
+    async fn discover(
+        &self,
+        _reader: &paykit_server::domain::locks::ReaderPubky,
+    ) -> Result<Option<paykit_lib::PaykitAppRegistry>, RegistryDiscoveryError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.results.lock().unwrap().pop_front().unwrap()
+    }
+}
+
+#[derive(Default)]
+struct ImmediateRetryDelay {
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl RegistryRetryDelay for ImmediateRetryDelay {
+    async fn wait(&self, _retry_index: usize) {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+struct CountingCredentials {
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl CreatorReceivingProvider for CountingCredentials {
+    async fn receiving(
+        &self,
+        creator: &CreatorPubky,
+    ) -> Result<paykit_server::application::create_invoice::ReceivingDetails, PersistenceError>
+    {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        FakeCredentials.receiving(creator).await
+    }
+}
+
+fn registry_service(
+    registries: Arc<dyn AppRegistryDiscovery>,
+    retry_delay: Arc<dyn RegistryRetryDelay>,
+    credentials: Arc<dyn CreatorReceivingProvider>,
+    store: Arc<FakeStore>,
+) -> CreateInvoiceService {
+    CreateInvoiceService::with_registry_retry(
+        Arc::new(FakeSession {
+            result: Ok(()),
+            calls: AtomicUsize::default(),
+            creators: Mutex::new(vec![]),
+        }),
+        Arc::new(FakeLocks {
+            result: Ok(valid_lock()),
+            calls: AtomicUsize::default(),
+        }),
+        registries,
+        paykit_lib::PaykitAppId::new("paykit-server").unwrap(),
+        credentials,
+        BitcoinNetwork::Mainnet,
+        store,
+        Arc::new(PaykitIntentBuilder::new(BitcoinNetwork::Mainnet)),
+        retry_delay,
+    )
+}
+
+#[tokio::test]
+async fn missing_registry_retries_twice_then_accepts_capable_reader() {
+    let registries = Arc::new(SequencedRegistries {
+        results: Mutex::new(VecDeque::from([
+            Ok(None),
+            Ok(None),
+            Ok(Some(capable_registry())),
+        ])),
+        calls: AtomicUsize::default(),
+    });
+    let retry_delay = Arc::new(ImmediateRetryDelay::default());
+    let credentials = Arc::new(CountingCredentials {
+        calls: AtomicUsize::default(),
+    });
+    let store = Arc::new(FakeStore::with_preflight(InvoicePreflight::New));
+
+    let result = registry_service(
+        registries.clone(),
+        retry_delay.clone(),
+        credentials.clone(),
+        store.clone(),
+    )
+    .create(request())
+    .await;
+
+    assert!(result.is_ok());
+    assert_eq!(registries.calls.load(Ordering::SeqCst), 3);
+    assert_eq!(retry_delay.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(credentials.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(store.create_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn exhausted_missing_registry_returns_setup_pending_without_side_effects() {
+    let registries = Arc::new(SequencedRegistries {
+        results: Mutex::new(VecDeque::from([Ok(None), Ok(None), Ok(None)])),
+        calls: AtomicUsize::default(),
+    });
+    let retry_delay = Arc::new(ImmediateRetryDelay::default());
+    let credentials = Arc::new(CountingCredentials {
+        calls: AtomicUsize::default(),
+    });
+    let store = Arc::new(FakeStore::with_preflight(InvoicePreflight::New));
+
+    assert_eq!(
+        registry_service(
+            registries.clone(),
+            retry_delay.clone(),
+            credentials.clone(),
+            store.clone(),
+        )
+        .create(request())
+        .await,
+        Err(CreateInvoiceError::ReaderSetupPending)
+    );
+    assert_eq!(registries.calls.load(Ordering::SeqCst), 3);
+    assert_eq!(retry_delay.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(credentials.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(store.create_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn setup_pending_emits_one_redacted_source_diagnostic_with_request_id() {
+    let request_id = "d9428888-122b-4b85-bc8f-2c2e0bf7c874";
+    let key = SigningKey::from_bytes(&[15; 32]);
+    let registries = Arc::new(SequencedRegistries {
+        results: Mutex::new(VecDeque::from([Ok(None), Ok(None), Ok(None)])),
+        calls: AtomicUsize::default(),
+    });
+    let service = registry_service(
+        registries,
+        Arc::new(ImmediateRetryDelay::default()),
+        Arc::new(CountingCredentials {
+            calls: AtomicUsize::default(),
+        }),
+        Arc::new(FakeStore::with_preflight(InvoicePreflight::New)),
+    );
+    let router = operational_router(
+        invoices_router(Arc::new(service)).layer(Extension(signed_auth(&key))),
+        Arc::new(Runtime::new(Arc::new(ReadyDependency), 1)),
+    );
+    let body = serde_json_canonicalizer::to_vec(&serde_json::json!({
+        "bundle_id": BUNDLE,
+        "lock_resource": LOCK_RESOURCE,
+        "reader": reader()
+    }))
+    .unwrap();
+    let mut request = signed_invoice_request(&key, body);
+    request
+        .headers_mut()
+        .insert("x-request-id", request_id.parse().unwrap());
+    let capture = EventCapture::default();
+    let subscriber = tracing_subscriber::registry().with(capture.clone());
+
+    let response = router
+        .oneshot(request)
+        .with_subscriber(subscriber)
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(!response.headers().contains_key("retry-after"));
+    assert_eq!(response.headers()["x-request-id"], request_id);
+    let body = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+        serde_json::json!({"error":{"code":"reader_setup_pending","message":"reader wallet setup needed"}})
+    );
+    let events: Vec<_> = capture
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| event_field(event, "event") == Some("paykit_request_failure"))
+        .cloned()
+        .collect();
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        event_field(&events[0], "stage"),
+        Some("reader_app_registry_check")
+    );
+    assert_eq!(
+        event_field(&events[0], "category"),
+        Some("reader_setup_pending")
+    );
+    assert_eq!(event_field(&events[0], "request_id"), Some(request_id));
+    assert!(events[0].iter().all(|(name, _)| {
+        matches!(
+            name.as_str(),
+            "message" | "event" | "operation" | "stage" | "category" | "request_id"
+        )
+    }));
+}
+
+#[tokio::test]
+async fn incapable_transport_and_malformed_registry_are_not_retried_or_persisted() {
+    let cases = [
+        (
+            Err(RegistryDiscoveryError::InvalidRequest),
+            CreateInvoiceError::InvalidRequest,
+        ),
+        (
+            Ok(Some(paykit_lib::PaykitAppRegistry::new(None))),
+            CreateInvoiceError::ReaderNotPayable,
+        ),
+        (
+            Err(RegistryDiscoveryError::Unavailable),
+            CreateInvoiceError::ReaderRegistryUnavailable,
+        ),
+        (
+            Err(RegistryDiscoveryError::Malformed),
+            CreateInvoiceError::ReaderRegistryMalformed,
+        ),
+    ];
+
+    for (registry_result, expected) in cases {
+        let registries = Arc::new(SequencedRegistries {
+            results: Mutex::new(VecDeque::from([registry_result])),
+            calls: AtomicUsize::default(),
+        });
+        let retry_delay = Arc::new(ImmediateRetryDelay::default());
+        let credentials = Arc::new(CountingCredentials {
+            calls: AtomicUsize::default(),
+        });
+        let store = Arc::new(FakeStore::with_preflight(InvoicePreflight::New));
+
+        assert_eq!(
+            registry_service(
+                registries.clone(),
+                retry_delay.clone(),
+                credentials.clone(),
+                store.clone(),
+            )
+            .create(request())
+            .await,
+            Err(expected)
+        );
+        assert_eq!(registries.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(retry_delay.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(credentials.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(store.create_calls.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn signed_router_distinguishes_invalid_reader_from_malformed_remote_registry() {
+    let key = SigningKey::from_bytes(&[16; 32]);
+    let invalid_registries = Arc::new(SequencedRegistries {
+        results: Mutex::new(VecDeque::from([Ok(Some(capable_registry()))])),
+        calls: AtomicUsize::default(),
+    });
+    let invalid_store = Arc::new(FakeStore::with_preflight(InvoicePreflight::New));
+    let invalid_router = invoices_router(Arc::new(registry_service(
+        invalid_registries.clone(),
+        Arc::new(ImmediateRetryDelay::default()),
+        Arc::new(CountingCredentials {
+            calls: AtomicUsize::default(),
+        }),
+        invalid_store.clone(),
+    )))
+    .layer(Extension(signed_auth(&key)));
+    let invalid_body = serde_json_canonicalizer::to_vec(&serde_json::json!({
+        "bundle_id": BUNDLE,
+        "lock_resource": LOCK_RESOURCE,
+        "reader": "not-a-reader"
+    }))
+    .unwrap();
+
+    let invalid_response = invalid_router
+        .oneshot(signed_invoice_request(&key, invalid_body))
+        .await
+        .unwrap();
+    assert_eq!(invalid_response.status(), StatusCode::BAD_REQUEST);
+    assert!(!invalid_response.headers().contains_key("retry-after"));
+    let invalid_response_body = axum::body::to_bytes(invalid_response.into_body(), 4096)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&invalid_response_body).unwrap(),
+        serde_json::json!({"error":{"code":"invalid_request","message":"request is invalid"}})
+    );
+    assert_eq!(invalid_registries.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(invalid_store.create_calls.load(Ordering::SeqCst), 0);
+
+    let malformed_registries = Arc::new(SequencedRegistries {
+        results: Mutex::new(VecDeque::from([Err(RegistryDiscoveryError::Malformed)])),
+        calls: AtomicUsize::default(),
+    });
+    let malformed_store = Arc::new(FakeStore::with_preflight(InvoicePreflight::New));
+    let malformed_router = invoices_router(Arc::new(registry_service(
+        malformed_registries.clone(),
+        Arc::new(ImmediateRetryDelay::default()),
+        Arc::new(CountingCredentials {
+            calls: AtomicUsize::default(),
+        }),
+        malformed_store.clone(),
+    )))
+    .layer(Extension(signed_auth(&key)));
+    let malformed_body = serde_json_canonicalizer::to_vec(&serde_json::json!({
+        "bundle_id": BUNDLE,
+        "lock_resource": LOCK_RESOURCE,
+        "reader": reader()
+    }))
+    .unwrap();
+
+    let malformed_response = malformed_router
+        .oneshot(signed_invoice_request(&key, malformed_body))
+        .await
+        .unwrap();
+    assert_eq!(malformed_response.status(), StatusCode::BAD_GATEWAY);
+    assert!(!malformed_response.headers().contains_key("retry-after"));
+    let malformed_response_body = axum::body::to_bytes(malformed_response.into_body(), 4096)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&malformed_response_body).unwrap(),
+        serde_json::json!({"error":{"code":"reader_registry_malformed","message":"reader registry is malformed"}})
+    );
+    assert_eq!(malformed_registries.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(malformed_store.create_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn exact_replay_skips_missing_registry_and_retry_delay() {
+    let registries = Arc::new(SequencedRegistries {
+        results: Mutex::new(VecDeque::from([Ok(None)])),
+        calls: AtomicUsize::default(),
+    });
+    let retry_delay = Arc::new(ImmediateRetryDelay::default());
+    let credentials = Arc::new(CountingCredentials {
+        calls: AtomicUsize::default(),
+    });
+    let store = Arc::new(FakeStore::with_preflight(InvoicePreflight::ExactReplay));
+
+    let result = registry_service(
+        registries.clone(),
+        retry_delay.clone(),
+        credentials.clone(),
+        store,
+    )
+    .create(request())
+    .await
+    .unwrap();
+
+    assert!(result.replayed());
+    assert_eq!(registries.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(retry_delay.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(credentials.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn missing_registry_retry_stays_inside_request_deadline() {
+    let registries = Arc::new(SequencedRegistries {
+        results: Mutex::new(VecDeque::from([Ok(None), Ok(Some(capable_registry()))])),
+        calls: AtomicUsize::default(),
+    });
+    let retry_delay = Arc::new(ImmediateRetryDelay::default());
+    let credentials = Arc::new(CountingCredentials {
+        calls: AtomicUsize::default(),
+    });
+    let store = Arc::new(FakeStore::with_preflight(InvoicePreflight::New));
+    let start = Instant::now();
+    let service = CreateInvoiceService::with_clock_and_registry_retry(
+        Arc::new(FakeSession {
+            result: Ok(()),
+            calls: AtomicUsize::default(),
+            creators: Mutex::new(vec![]),
+        }),
+        Arc::new(FakeLocks {
+            result: Ok(valid_lock()),
+            calls: AtomicUsize::default(),
+        }),
+        registries.clone(),
+        paykit_lib::PaykitAppId::new("paykit-server").unwrap(),
+        credentials.clone(),
+        BitcoinNetwork::Mainnet,
+        store.clone(),
+        Arc::new(PaykitIntentBuilder::new(BitcoinNetwork::Mainnet)),
+        Arc::new(FixedClock::new([
+            start,
+            start,
+            start,
+            start,
+            start,
+            start + Duration::from_secs(15),
+        ])),
+        retry_delay.clone(),
+    );
+
+    assert_eq!(
+        service.create(request()).await,
+        Err(CreateInvoiceError::DeadlineExceeded)
+    );
+    assert_eq!(registries.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(retry_delay.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(credentials.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(store.create_calls.load(Ordering::SeqCst), 0);
 }
 
 struct CapturingIntentStore {
@@ -919,7 +1400,12 @@ async fn new_invoice_checks_registry_and_binds_invoice_address_to_request() {
 #[test]
 fn delivery_intent_is_closed_and_contains_complete_sdk_inputs_not_final_wire_ids() {
     let terms = PaykitIntentBuilder::new(BitcoinNetwork::Mainnet)
-        .payment_request_terms(&request(), &valid_lock(), "bc1qmeaningfuladdress")
+        .payment_request_terms(
+            &request(),
+            &valid_lock(),
+            &bitcoin_receiving("bc1qmeaningfuladdress"),
+            &[],
+        )
         .unwrap();
     let intent = DeliveryIntentV1::payment_request(
         reader(),
@@ -941,4 +1427,206 @@ fn delivery_intent_is_closed_and_contains_complete_sdk_inputs_not_final_wire_ids
             .windows(b"payment_request_id".len())
             .any(|window| window == b"payment_request_id")
     );
+}
+
+#[test]
+fn usdt_request_uses_exact_token_units_and_the_approved_address() {
+    use paykit_server::domain::receiving::{USDT_ENDPOINT, USDT_TOKEN};
+    let mut lock = valid_lock();
+    lock.criteria[0].params["asset"] = serde_json::json!("USDT");
+    lock.criteria[0].params["amount"] = serde_json::json!("50001");
+    let address = "0x2222222222222222222222222222222222222222";
+    let terms = PaykitIntentBuilder::new(BitcoinNetwork::Mainnet)
+        .payment_request_terms(
+            &request(),
+            &lock,
+            &paykit_server::application::create_invoice::ReceivingAddresses {
+                bitcoin: None,
+                usdt: Some(
+                    paykit_server::domain::receiving::UsdtAddress::try_from(address.to_owned())
+                        .unwrap(),
+                ),
+            },
+            &[],
+        )
+        .unwrap();
+    assert_eq!(terms.amount().value(), "0.050001");
+    assert_eq!(terms.amount().asset(), "usdt");
+    let endpoints = terms.payment_endpoints().unwrap();
+    assert_eq!(endpoints.len(), 1);
+    assert_eq!(
+        terms.accepted_payment_endpoint_identifiers()[0].as_str(),
+        USDT_ENDPOINT
+    );
+    let endpoint = endpoints.values().next().unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(endpoint.as_str()).unwrap(),
+        serde_json::json!({"value":address,"chain_id":"42161","token":USDT_TOKEN})
+    );
+}
+
+#[tokio::test]
+async fn disabled_usdt_never_creates_an_invoice() {
+    let session = Arc::new(FakeSession {
+        result: Ok(()),
+        calls: AtomicUsize::default(),
+        creators: Mutex::new(vec![]),
+    });
+    let mut lock = valid_lock();
+    lock.criteria[0].params["asset"] = serde_json::json!("USDT");
+    let locks = Arc::new(FakeLocks {
+        result: Ok(lock),
+        calls: AtomicUsize::default(),
+    });
+    let store = Arc::new(FakeStore::with_preflight(InvoicePreflight::New));
+    assert_eq!(
+        service(session, locks, store.clone())
+            .create(request())
+            .await,
+        Err(CreateInvoiceError::InvalidRequest)
+    );
+    assert_eq!(store.create_calls.load(Ordering::SeqCst), 0);
+}
+
+fn bitcoin_receiving(
+    address: &str,
+) -> paykit_server::application::create_invoice::ReceivingAddresses {
+    paykit_server::application::create_invoice::ReceivingAddresses {
+        bitcoin: Some(address.to_owned()),
+        usdt: None,
+    }
+}
+
+struct BothReceiving;
+#[async_trait]
+impl CreatorReceivingProvider for BothReceiving {
+    async fn receiving(
+        &self,
+        creator: &CreatorPubky,
+    ) -> Result<paykit_server::application::create_invoice::ReceivingDetails, PersistenceError>
+    {
+        let mut receiving = FakeCredentials.receiving(creator).await?;
+        receiving.usdt = Some(
+            paykit_server::domain::receiving::UsdtAddress::try_from(
+                "0x2222222222222222222222222222222222222222".to_owned(),
+            )
+            .unwrap(),
+        );
+        Ok(receiving)
+    }
+}
+struct Rates(Result<String, CreateInvoiceError>);
+#[async_trait]
+impl paykit_server::application::invoice_pricing::ExchangeRates for Rates {
+    async fn usd_per_btc(&self) -> Result<String, CreateInvoiceError> {
+        self.0.clone()
+    }
+}
+
+#[tokio::test]
+async fn invoices_publish_both_approved_methods_with_fixed_rates_and_configured_expiry() {
+    for (asset, amount, window) in [
+        ("BTC", "50000", 3600),
+        ("USD", "500", 7200),
+        ("USDT", "5000000", 3600),
+    ] {
+        let store = Arc::new(FakeStore::with_preflight(InvoicePreflight::New));
+        let mut lock = valid_lock();
+        lock.criteria[0].params["asset"] = serde_json::json!(asset);
+        lock.criteria[0].params["amount"] = serde_json::json!(amount);
+        let service = CreateInvoiceService::new(
+            Arc::new(FakeSession {
+                result: Ok(()),
+                calls: AtomicUsize::default(),
+                creators: Mutex::new(vec![]),
+            }),
+            Arc::new(FakeLocks {
+                result: Ok(lock),
+                calls: AtomicUsize::default(),
+            }),
+            Arc::new(FakeRegistries {
+                registry: Some(capable_registry()),
+                calls: AtomicUsize::default(),
+            }),
+            paykit_lib::PaykitAppId::new("paykit-server").unwrap(),
+            Arc::new(BothReceiving),
+            BitcoinNetwork::Mainnet,
+            store.clone(),
+            Arc::new(PaykitIntentBuilder::new(BitcoinNetwork::Mainnet)),
+        )
+        .with_usdt(true)
+        .with_exchange_rates(Arc::new(Rates(Ok("81000".into()))))
+        .with_conversion_payment_window(Duration::from_secs(window));
+        service.create(request()).await.unwrap();
+        let created = store.created.lock().unwrap();
+        let (intent, acceptance, payment) = &created[0];
+        assert_eq!((*acceptance, *payment), (window / 2, window));
+        let terms = intent.terms().unwrap();
+        assert_eq!(terms.asset, asset.to_ascii_lowercase());
+        assert_eq!(
+            terms.accepted_endpoint_identifiers,
+            vec!["btc-bitcoin-p2wpkh", "usdt-arbitrum-address"]
+        );
+        assert_eq!(terms.payment_endpoints.len(), 2);
+        assert_eq!(terms.rates.len(), if asset == "USD" { 2 } else { 1 });
+        let encoded = postcard::to_allocvec(intent).unwrap();
+        let restored = DeliveryIntentV1::decode(&encoded).unwrap();
+        assert_eq!(restored.terms().unwrap().rates, terms.rates);
+        let mut ready = restored;
+        ready
+            .set_deadlines(
+                "2026-10-07T12:30:00.123456Z".into(),
+                "2026-10-07T13:00:00.123456Z".into(),
+            )
+            .unwrap();
+        let event = paykit_lib::PaymentRequestEvent::Request(paykit_lib::PaymentRequest::new(
+            paykit_lib::EventId::new_v4(),
+            paykit_lib::PaymentRequestId::new_v4(),
+            ready.terms().unwrap().to_sdk().unwrap(),
+        ));
+        let wire = paykit_lib::serialize_payment_request_event(
+            &paykit_lib::PaykitAppId::new("paykit-server").unwrap(),
+            &event,
+        )
+        .unwrap();
+        assert!(
+            wire.len() <= paykit_lib::pubky_noise::snow_crypto::PUBKY_NOISE_MSG_LEN,
+            "{asset}: {} bytes",
+            wire.len()
+        );
+    }
+}
+
+#[tokio::test]
+async fn rate_failure_prevents_new_quotes_but_does_not_block_an_exact_replay() {
+    let store = Arc::new(FakeStore::with_preflight(InvoicePreflight::New));
+    let service = CreateInvoiceService::new(
+        Arc::new(FakeSession {
+            result: Ok(()),
+            calls: AtomicUsize::default(),
+            creators: Mutex::new(vec![]),
+        }),
+        Arc::new(FakeLocks {
+            result: Ok(valid_lock()),
+            calls: AtomicUsize::default(),
+        }),
+        Arc::new(FakeRegistries {
+            registry: Some(capable_registry()),
+            calls: AtomicUsize::default(),
+        }),
+        paykit_lib::PaykitAppId::new("paykit-server").unwrap(),
+        Arc::new(BothReceiving),
+        BitcoinNetwork::Mainnet,
+        store.clone(),
+        Arc::new(PaykitIntentBuilder::new(BitcoinNetwork::Mainnet)),
+    )
+    .with_usdt(true)
+    .with_exchange_rates(Arc::new(Rates(Err(CreateInvoiceError::Unavailable))));
+    assert_eq!(
+        service.create(request()).await,
+        Err(CreateInvoiceError::Unavailable)
+    );
+    assert!(store.created.lock().unwrap().is_empty());
+    *store.preflight.lock().unwrap() = InvoicePreflight::ExactReplay;
+    assert!(service.create(request()).await.is_ok());
 }

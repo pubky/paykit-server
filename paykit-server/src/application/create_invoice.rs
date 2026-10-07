@@ -18,8 +18,8 @@ use locks_core::{
     lock_policy::{ContentLock, VerifierType},
 };
 use paykit_lib::{
-    PaykitAppId, PaykitAppRegistry, PaymentAmount, PaymentEndpointIdentifier,
-    PaymentEndpointPayload, PaymentReference, PaymentRequestTerms,
+    ConversionRate, PaykitAppId, PaykitAppRegistry, PaymentAmount, PaymentConversion,
+    PaymentEndpointIdentifier, PaymentEndpointPayload, PaymentReference, PaymentRequestTerms,
 };
 use serde_json::{Map, Value};
 
@@ -36,6 +36,8 @@ use crate::{
 };
 
 const REQUEST_DEADLINE: Duration = Duration::from_secs(15);
+const REGISTRY_READ_ATTEMPTS: usize = 3;
+const REGISTRY_RETRY_DELAY_CAPS_MS: [u64; REGISTRY_READ_ATTEMPTS - 1] = [333, 667];
 
 #[derive(Clone, Debug)]
 pub struct CreateInvoiceRequest {
@@ -57,6 +59,12 @@ pub enum LockFetchError {
     Invalid,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RegistryDiscoveryError {
+    InvalidRequest,
+    Unavailable,
+    Malformed,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CreateInvoiceError {
     InvalidRequest,
     CreatorSessionInvalid,
@@ -64,8 +72,31 @@ pub enum CreateInvoiceError {
     LockNotFound,
     LockUnavailable,
     Conflict,
+    ReaderSetupPending,
+    ReaderNotPayable,
+    ReaderRegistryUnavailable,
+    ReaderRegistryMalformed,
     DeadlineExceeded,
     Unavailable,
+}
+
+impl CreateInvoiceError {
+    pub(crate) const fn diagnostic_label(self) -> &'static str {
+        match self {
+            Self::InvalidRequest => "invalid_request",
+            Self::CreatorSessionInvalid => "creator_session_invalid",
+            Self::CreatorSessionUnavailable => "creator_session_unavailable",
+            Self::LockNotFound => "lock_not_found",
+            Self::LockUnavailable => "lock_unavailable",
+            Self::Conflict => "conflict",
+            Self::ReaderSetupPending => "reader_setup_pending",
+            Self::ReaderNotPayable => "reader_not_payable",
+            Self::ReaderRegistryUnavailable => "reader_registry_unavailable",
+            Self::ReaderRegistryMalformed => "reader_registry_malformed",
+            Self::DeadlineExceeded => "deadline_exceeded",
+            Self::Unavailable => "unavailable",
+        }
+    }
 }
 
 #[async_trait]
@@ -78,20 +109,45 @@ pub trait LockFetcher: Send + Sync {
 }
 #[async_trait]
 pub trait AppRegistryDiscovery: Send + Sync {
+    /// `Ok(None)` is reserved for a clean homeserver not-found/gone response.
+    /// Read/transport failures and fetched invalid data remain typed errors.
     async fn discover(
         &self,
         reader: &ReaderPubky,
-    ) -> Result<Option<PaykitAppRegistry>, CreateInvoiceError>;
+    ) -> Result<Option<PaykitAppRegistry>, RegistryDiscoveryError>;
+}
+
+#[async_trait]
+pub trait RegistryRetryDelay: Send + Sync {
+    async fn wait(&self, retry_index: usize);
+}
+
+#[derive(Default)]
+struct FullJitterRegistryRetryDelay;
+
+#[async_trait]
+impl RegistryRetryDelay for FullJitterRegistryRetryDelay {
+    async fn wait(&self, retry_index: usize) {
+        let cap_ms = REGISTRY_RETRY_DELAY_CAPS_MS[retry_index];
+        tokio::time::sleep(Duration::from_millis(rand::random_range(0..=cap_ms))).await;
+    }
 }
 #[async_trait]
-pub trait CreatorXpubProvider: Send + Sync {
-    async fn xpub(&self, creator: &CreatorPubky) -> Result<(String, u32), PersistenceError>;
+pub trait CreatorReceivingProvider: Send + Sync {
+    async fn receiving(&self, creator: &CreatorPubky)
+    -> Result<ReceivingDetails, PersistenceError>;
 }
 #[async_trait]
-impl CreatorXpubProvider for CreatorStore {
-    async fn xpub(&self, creator: &CreatorPubky) -> Result<(String, u32), PersistenceError> {
+impl CreatorReceivingProvider for CreatorStore {
+    async fn receiving(
+        &self,
+        creator: &CreatorPubky,
+    ) -> Result<ReceivingDetails, PersistenceError> {
         let credentials = self.load(creator).await?;
-        Ok((credentials.xpub().to_owned(), credentials.account_index()))
+        Ok(ReceivingDetails {
+            bitcoin: credentials.bitcoin_account().cloned(),
+            usdt: credentials.usdt_address().cloned(),
+        })
     }
 }
 #[async_trait]
@@ -147,8 +203,19 @@ pub trait IntentBuilder: Send + Sync {
         &self,
         request: &CreateInvoiceRequest,
         lock: &ContentLock,
-        address: &str,
+        addresses: &ReceivingAddresses,
+        rates: &[ConversionRate],
     ) -> Result<PaymentRequestTerms, CreateInvoiceError>;
+}
+
+pub struct ReceivingDetails {
+    pub bitcoin: Option<crate::domain::receiving::BitcoinAccount>,
+    pub usdt: Option<crate::domain::receiving::UsdtAddress>,
+}
+
+pub struct ReceivingAddresses {
+    pub bitcoin: Option<String>,
+    pub usdt: Option<crate::domain::receiving::UsdtAddress>,
 }
 
 pub struct PaykitIntentBuilder {
@@ -175,44 +242,49 @@ impl IntentBuilder for PaykitIntentBuilder {
         &self,
         request: &CreateInvoiceRequest,
         lock: &ContentLock,
-        address: &str,
+        addresses: &ReceivingAddresses,
+        rates: &[ConversionRate],
     ) -> Result<PaymentRequestTerms, CreateInvoiceError> {
-        if address.is_empty() {
-            return Err(CreateInvoiceError::InvalidRequest);
+        let (asset, amount) = extract_terms(lock)?;
+        let mut endpoints = HashMap::new();
+        if let Some(address) = &addresses.bitcoin {
+            endpoints.insert(
+                PaymentEndpointIdentifier::new(self.p2wpkh_identifier())
+                    .map_err(|_| CreateInvoiceError::InvalidRequest)?,
+                PaymentEndpointPayload::new(serde_json::json!({"value": address}).to_string()),
+            );
         }
-        let identifier = PaymentEndpointIdentifier::new(self.p2wpkh_identifier())
-            .map_err(|_| CreateInvoiceError::InvalidRequest)?;
-        let payload = serde_json::to_string(&serde_json::json!({ "value": address }))
-            .map_err(|_| CreateInvoiceError::InvalidRequest)?;
-        let amount = extract_terms(lock)?;
-        let sats = amount.as_sats();
+        if let Some(address) = &addresses.usdt {
+            endpoints.insert(
+                PaymentEndpointIdentifier::new(crate::domain::receiving::USDT_ENDPOINT)
+                    .map_err(|_| CreateInvoiceError::InvalidRequest)?,
+                PaymentEndpointPayload::new(address.endpoint().to_string()),
+            );
+        }
+        let mut identifiers: Vec<_> = endpoints.keys().cloned().collect();
+        identifiers.sort_by(|a, b| a.as_str().cmp(b.as_str()));
         let mut metadata = Map::new();
         metadata.insert(
             "bundle_id".into(),
             Value::String(request.bundle_id.to_string()),
         );
-        metadata.insert(
-            "lock_resource".into(),
-            Value::String(request.lock_resource.to_string()),
-        );
-        metadata.insert("reader".into(), Value::String(request.reader.to_string()));
         PaymentRequestTerms::builder(
             PaymentAmount::new(
-                format!("{}.{:08}", sats / 100_000_000, sats % 100_000_000),
-                "btc",
+                asset.decimal_amount(amount.units()),
+                asset.as_str().to_ascii_lowercase(),
             )
             .map_err(|_| CreateInvoiceError::InvalidRequest)?,
             PaymentReference::new(uuid::Uuid::new_v4().hyphenated().to_string())
                 .map_err(|_| CreateInvoiceError::InvalidRequest)?,
-            vec![identifier.clone()],
+            identifiers,
         )
         .required_app_id(Some(
             PaykitAppId::new(crate::config::PAYKIT_APP_ID).expect("static app id"),
         ))
-        .payment_endpoints(Some(HashMap::from([(
-            identifier,
-            PaymentEndpointPayload::new(payload),
-        )])))
+        .payment_endpoints(Some(endpoints))
+        .conversion((!rates.is_empty()).then(|| PaymentConversion::Fixed {
+            rates: rates.to_vec(),
+        }))
         .metadata(metadata)
         .build()
         .map_err(|_| CreateInvoiceError::InvalidRequest)
@@ -257,8 +329,8 @@ pub fn derive_bip84_p2wpkh_address(
 
 struct DerivedInvoicePayloads<'a> {
     intents: Arc<dyn IntentBuilder>,
-    xpub: String,
-    account_index: u32,
+    receiving: ReceivingDetails,
+    rates: Vec<ConversionRate>,
     network: crate::config::BitcoinNetwork,
     request: &'a CreateInvoiceRequest,
     lock: &'a ContentLock,
@@ -266,22 +338,45 @@ struct DerivedInvoicePayloads<'a> {
 }
 impl InvoicePayloadFactory for DerivedInvoicePayloads<'_> {
     fn for_child_index(&self, child_index: i64) -> Result<InvoicePayloads, PersistenceError> {
-        let address =
-            derive_bip84_p2wpkh_address(&self.xpub, self.account_index, &self.network, child_index)
-                .map_err(|_| PersistenceError::CorruptOrMissing)?;
+        let addresses = ReceivingAddresses {
+            bitcoin: self
+                .receiving
+                .bitcoin
+                .as_ref()
+                .map(|account| {
+                    derive_bip84_p2wpkh_address(
+                        &account.xpub,
+                        account.account_index,
+                        &self.network,
+                        child_index,
+                    )
+                    .map_err(|_| PersistenceError::CorruptOrMissing)
+                })
+                .transpose()?,
+            usdt: self.receiving.usdt.clone(),
+        };
         let terms = self
             .intents
-            .payment_request_terms(self.request, self.lock, &address)
-            .map_err(|_| PersistenceError::CorruptOrMissing)?;
+            .payment_request_terms(self.request, self.lock, &addresses, &self.rates)
+            .map_err(|error| {
+                diagnose("payment_terms_construction", error);
+                PersistenceError::CorruptOrMissing
+            })?;
         let payment_request_intent = DeliveryIntentV1::payment_request(
             self.request.reader.to_string(),
             self.app_id.clone(),
             &terms,
         )
-        .map_err(|_| PersistenceError::CorruptOrMissing)?;
+        .map_err(|_| {
+            crate::diagnostics::failure(
+                "invoice_create",
+                "delivery_intent_construction",
+                "serialization_failed",
+            );
+            PersistenceError::CorruptOrMissing
+        })?;
         Ok(InvoicePayloads {
             payment_request_intent,
-            bitcoin_address: address,
         })
     }
 }
@@ -302,13 +397,17 @@ pub struct CreateInvoiceService {
     locks: Arc<dyn LockFetcher>,
     registries: Arc<dyn AppRegistryDiscovery>,
     app_id: PaykitAppId,
-    credentials: Arc<dyn CreatorXpubProvider>,
+    credentials: Arc<dyn CreatorReceivingProvider>,
+    usdt_enabled: bool,
+    rates: Option<Arc<dyn super::invoice_pricing::ExchangeRates>>,
     bitcoin_network: crate::config::BitcoinNetwork,
     store: Arc<dyn InvoicePersistence>,
     intents: Arc<dyn IntentBuilder>,
     clock: Arc<dyn DeadlineClock>,
+    registry_retry_delay: Arc<dyn RegistryRetryDelay>,
     proposal_acceptance_window: Duration,
     payment_window: Duration,
+    conversion_payment_window: Duration,
 }
 impl CreateInvoiceService {
     #[allow(clippy::too_many_arguments)]
@@ -317,7 +416,7 @@ impl CreateInvoiceService {
         locks: Arc<dyn LockFetcher>,
         registries: Arc<dyn AppRegistryDiscovery>,
         app_id: PaykitAppId,
-        credentials: Arc<dyn CreatorXpubProvider>,
+        credentials: Arc<dyn CreatorReceivingProvider>,
         bitcoin_network: crate::config::BitcoinNetwork,
         store: Arc<dyn InvoicePersistence>,
         intents: Arc<dyn IntentBuilder>,
@@ -341,7 +440,7 @@ impl CreateInvoiceService {
         locks: Arc<dyn LockFetcher>,
         registries: Arc<dyn AppRegistryDiscovery>,
         app_id: PaykitAppId,
-        credentials: Arc<dyn CreatorXpubProvider>,
+        credentials: Arc<dyn CreatorReceivingProvider>,
         bitcoin_network: crate::config::BitcoinNetwork,
         store: Arc<dyn InvoicePersistence>,
         intents: Arc<dyn IntentBuilder>,
@@ -357,6 +456,7 @@ impl CreateInvoiceService {
             store,
             intents,
             clock,
+            Arc::new(FullJitterRegistryRetryDelay),
             Duration::from_secs(60 * 60),
             Duration::from_secs(24 * 60 * 60),
         )
@@ -368,7 +468,7 @@ impl CreateInvoiceService {
         locks: Arc<dyn LockFetcher>,
         registries: Arc<dyn AppRegistryDiscovery>,
         app_id: PaykitAppId,
-        credentials: Arc<dyn CreatorXpubProvider>,
+        credentials: Arc<dyn CreatorReceivingProvider>,
         bitcoin_network: crate::config::BitcoinNetwork,
         store: Arc<dyn InvoicePersistence>,
         intents: Arc<dyn IntentBuilder>,
@@ -385,26 +485,54 @@ impl CreateInvoiceService {
             store,
             intents,
             Arc::new(SystemDeadlineClock),
+            Arc::new(FullJitterRegistryRetryDelay),
             proposal_acceptance_window,
             payment_window,
         )
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn with_clock_and_windows(
+    pub fn with_registry_retry(
         sessions: Arc<dyn SessionValidator>,
         locks: Arc<dyn LockFetcher>,
         registries: Arc<dyn AppRegistryDiscovery>,
         app_id: PaykitAppId,
-        credentials: Arc<dyn CreatorXpubProvider>,
+        credentials: Arc<dyn CreatorReceivingProvider>,
+        bitcoin_network: crate::config::BitcoinNetwork,
+        store: Arc<dyn InvoicePersistence>,
+        intents: Arc<dyn IntentBuilder>,
+        registry_retry_delay: Arc<dyn RegistryRetryDelay>,
+    ) -> Self {
+        Self::with_clock_and_windows(
+            sessions,
+            locks,
+            registries,
+            app_id,
+            credentials,
+            bitcoin_network,
+            store,
+            intents,
+            Arc::new(SystemDeadlineClock),
+            registry_retry_delay,
+            Duration::from_secs(60 * 60),
+            Duration::from_secs(24 * 60 * 60),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_clock_and_registry_retry(
+        sessions: Arc<dyn SessionValidator>,
+        locks: Arc<dyn LockFetcher>,
+        registries: Arc<dyn AppRegistryDiscovery>,
+        app_id: PaykitAppId,
+        credentials: Arc<dyn CreatorReceivingProvider>,
         bitcoin_network: crate::config::BitcoinNetwork,
         store: Arc<dyn InvoicePersistence>,
         intents: Arc<dyn IntentBuilder>,
         clock: Arc<dyn DeadlineClock>,
-        proposal_acceptance_window: Duration,
-        payment_window: Duration,
+        registry_retry_delay: Arc<dyn RegistryRetryDelay>,
     ) -> Self {
-        Self {
+        Self::with_clock_and_windows(
             sessions,
             locks,
             registries,
@@ -414,9 +542,62 @@ impl CreateInvoiceService {
             store,
             intents,
             clock,
+            registry_retry_delay,
+            Duration::from_secs(60 * 60),
+            Duration::from_secs(24 * 60 * 60),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn with_clock_and_windows(
+        sessions: Arc<dyn SessionValidator>,
+        locks: Arc<dyn LockFetcher>,
+        registries: Arc<dyn AppRegistryDiscovery>,
+        app_id: PaykitAppId,
+        credentials: Arc<dyn CreatorReceivingProvider>,
+        bitcoin_network: crate::config::BitcoinNetwork,
+        store: Arc<dyn InvoicePersistence>,
+        intents: Arc<dyn IntentBuilder>,
+        clock: Arc<dyn DeadlineClock>,
+        registry_retry_delay: Arc<dyn RegistryRetryDelay>,
+        proposal_acceptance_window: Duration,
+        payment_window: Duration,
+    ) -> Self {
+        Self {
+            sessions,
+            locks,
+            registries,
+            app_id,
+            credentials,
+            usdt_enabled: false,
+            rates: None,
+            bitcoin_network,
+            store,
+            intents,
+            clock,
+            registry_retry_delay,
             proposal_acceptance_window,
             payment_window,
+            conversion_payment_window: Duration::from_secs(3600),
         }
+    }
+
+    pub fn with_usdt(mut self, enabled: bool) -> Self {
+        self.usdt_enabled = enabled;
+        self
+    }
+
+    pub fn with_conversion_payment_window(mut self, window: Duration) -> Self {
+        self.conversion_payment_window = window;
+        self
+    }
+
+    pub fn with_exchange_rates(
+        mut self,
+        rates: Arc<dyn super::invoice_pricing::ExchangeRates>,
+    ) -> Self {
+        self.rates = Some(rates);
+        self
     }
 
     pub async fn create(
@@ -427,19 +608,21 @@ impl CreateInvoiceService {
         let creator = request.lock_resource.creator().clone();
         let bundle_binding = request.bundle_id.to_string().into_bytes();
         let lock_resource_binding = request.lock_resource.to_string().into_bytes();
-        let payment_request_binding = request_binding(&request)?;
-        let preflight_remaining = remaining(started, self.clock.now())?;
+        let payment_request_binding = request_binding(&request).inspect_err(|&error| {
+            diagnose("request_binding", error);
+        })?;
+        let preflight_remaining = remaining_at(started, self.clock.now(), "invoice_preflight")?;
         match tokio::time::timeout(
             preflight_remaining,
             self.store
                 .preflight(&creator, &bundle_binding, &payment_request_binding),
         )
         .await
-        .map_err(|_| CreateInvoiceError::DeadlineExceeded)?
-        .map_err(map_store)?
+        .map_err(|_| deadline("invoice_preflight"))?
+        .map_err(|error| store_failure("invoice_preflight", error))?
         {
             InvoicePreflight::ExactReplay => {
-                let replay_remaining = remaining(started, self.clock.now())?;
+                let replay_remaining = remaining_at(started, self.clock.now(), "exact_replay")?;
                 return tokio::time::timeout(
                     replay_remaining,
                     self.store.exact_replay(
@@ -450,58 +633,172 @@ impl CreateInvoiceService {
                     ),
                 )
                 .await
-                .map_err(|_| CreateInvoiceError::DeadlineExceeded)?
-                .map_err(map_store);
+                .map_err(|_| deadline("exact_replay"))?
+                .map_err(|error| store_failure("exact_replay", error));
             }
-            InvoicePreflight::Conflict => return Err(CreateInvoiceError::Conflict),
+            InvoicePreflight::Conflict => {
+                diagnose("invoice_preflight", CreateInvoiceError::Conflict);
+                return Err(CreateInvoiceError::Conflict);
+            }
             InvoicePreflight::New => {}
         }
-        let session_remaining = remaining(started, self.clock.now())?;
+        let session_remaining = remaining_at(started, self.clock.now(), "creator_session")?;
         tokio::time::timeout(session_remaining, self.sessions.validate(&creator))
             .await
-            .map_err(|_| CreateInvoiceError::DeadlineExceeded)?
+            .map_err(|_| deadline("creator_session"))?
             .map_err(|error| match error {
-                SessionValidationError::Invalid => CreateInvoiceError::CreatorSessionInvalid,
+                SessionValidationError::Invalid => {
+                    diagnose("creator_session", CreateInvoiceError::CreatorSessionInvalid);
+                    CreateInvoiceError::CreatorSessionInvalid
+                }
                 SessionValidationError::Unavailable => {
+                    diagnose(
+                        "creator_session",
+                        CreateInvoiceError::CreatorSessionUnavailable,
+                    );
                     CreateInvoiceError::CreatorSessionUnavailable
                 }
             })?;
-        let lock_remaining = remaining(started, self.clock.now())?;
+        let lock_remaining = remaining_at(started, self.clock.now(), "lock_fetch")?;
         let lock = tokio::time::timeout(lock_remaining, self.locks.fetch(&request.lock_resource))
             .await
-            .map_err(|_| CreateInvoiceError::DeadlineExceeded)?
+            .map_err(|_| deadline("lock_fetch"))?
             .map_err(|error| match error {
-                LockFetchError::NotFound => CreateInvoiceError::LockNotFound,
-                LockFetchError::Unavailable => CreateInvoiceError::LockUnavailable,
-                LockFetchError::Invalid => CreateInvoiceError::InvalidRequest,
+                LockFetchError::NotFound => {
+                    diagnose("lock_fetch", CreateInvoiceError::LockNotFound);
+                    CreateInvoiceError::LockNotFound
+                }
+                LockFetchError::Unavailable => {
+                    diagnose("lock_fetch", CreateInvoiceError::LockUnavailable);
+                    CreateInvoiceError::LockUnavailable
+                }
+                LockFetchError::Invalid => {
+                    diagnose("lock_fetch", CreateInvoiceError::InvalidRequest);
+                    CreateInvoiceError::InvalidRequest
+                }
             })?;
-        validate_lock(&request, &lock)?;
-        let registry_remaining = remaining(started, self.clock.now())?;
-        let discovered = tokio::time::timeout(
-            registry_remaining,
-            self.registries.discover(&request.reader),
-        )
-        .await
-        .map_err(|_| CreateInvoiceError::DeadlineExceeded)??;
-        if !discovered.as_ref().is_some_and(reader_is_capable) {
-            return Err(CreateInvoiceError::Unavailable);
+        validate_lock(&request, &lock).inspect_err(|&error| {
+            diagnose("lock_validation", error);
+        })?;
+        let mut registry_attempt = 1;
+        let discovered = loop {
+            let registry_remaining =
+                remaining_at(started, self.clock.now(), "reader_app_registry")?;
+            let result = tokio::time::timeout(
+                registry_remaining,
+                self.registries.discover(&request.reader),
+            )
+            .await
+            .map_err(|_| deadline("reader_app_registry"))?;
+            match result {
+                Ok(Some(registry)) => break registry,
+                Ok(None) if registry_attempt < REGISTRY_READ_ATTEMPTS => {
+                    let delay_remaining =
+                        remaining_at(started, self.clock.now(), "reader_app_registry_retry")?;
+                    tokio::time::timeout(
+                        delay_remaining,
+                        self.registry_retry_delay.wait(registry_attempt - 1),
+                    )
+                    .await
+                    .map_err(|_| deadline("reader_app_registry_retry"))?;
+                    registry_attempt += 1;
+                }
+                Ok(None) => {
+                    diagnose(
+                        "reader_app_registry_check",
+                        CreateInvoiceError::ReaderSetupPending,
+                    );
+                    return Err(CreateInvoiceError::ReaderSetupPending);
+                }
+                Err(RegistryDiscoveryError::InvalidRequest) => {
+                    diagnose(
+                        "reader_app_registry_identity",
+                        CreateInvoiceError::InvalidRequest,
+                    );
+                    return Err(CreateInvoiceError::InvalidRequest);
+                }
+                Err(RegistryDiscoveryError::Unavailable) => {
+                    diagnose(
+                        "reader_app_registry_fetch",
+                        CreateInvoiceError::ReaderRegistryUnavailable,
+                    );
+                    return Err(CreateInvoiceError::ReaderRegistryUnavailable);
+                }
+                Err(RegistryDiscoveryError::Malformed) => {
+                    diagnose(
+                        "reader_app_registry_parse",
+                        CreateInvoiceError::ReaderRegistryMalformed,
+                    );
+                    return Err(CreateInvoiceError::ReaderRegistryMalformed);
+                }
+            }
+        };
+        if !reader_is_capable(&discovered) {
+            diagnose(
+                "reader_app_registry_check",
+                CreateInvoiceError::ReaderNotPayable,
+            );
+            return Err(CreateInvoiceError::ReaderNotPayable);
         }
-        let credentials_remaining = remaining(started, self.clock.now())?;
-        let (xpub, account_index) =
-            tokio::time::timeout(credentials_remaining, self.credentials.xpub(&creator))
+        let credentials_remaining =
+            remaining_at(started, self.clock.now(), "creator_receiving_details")?;
+        let (asset, _) = extract_terms(&lock)?;
+        if asset == CriterionAsset::Usdt && !self.usdt_enabled {
+            return Err(CreateInvoiceError::InvalidRequest);
+        }
+        let mut receiving =
+            tokio::time::timeout(credentials_remaining, self.credentials.receiving(&creator))
                 .await
-                .map_err(|_| CreateInvoiceError::DeadlineExceeded)?
-                .map_err(map_store)?;
+                .map_err(|_| deadline("creator_receiving_details"))?
+                .map_err(|error| store_failure("creator_receiving_details", error))?;
+        if !self.usdt_enabled {
+            receiving.usdt = None;
+        }
+        if receiving.bitcoin.is_none() && receiving.usdt.is_none() {
+            return Err(CreateInvoiceError::InvalidRequest);
+        }
+        let cross_btc = (asset == CriterionAsset::Btc && receiving.usdt.is_some())
+            || (asset != CriterionAsset::Btc && receiving.bitcoin.is_some());
+        let price = if cross_btc {
+            let provider = self.rates.as_ref().ok_or(CreateInvoiceError::Unavailable)?;
+            Some(
+                tokio::time::timeout(
+                    remaining_at(started, self.clock.now(), "exchange_rate")?,
+                    provider.usd_per_btc(),
+                )
+                .await
+                .map_err(|_| deadline("exchange_rate"))??,
+            )
+        } else {
+            None
+        };
+        let rates = super::invoice_pricing::conversion_rates(
+            asset,
+            receiving.bitcoin.is_some(),
+            receiving.usdt.is_some(),
+            price.as_deref(),
+        )?;
+        let payment_window = if cross_btc {
+            self.payment_window.min(self.conversion_payment_window)
+        } else {
+            self.payment_window
+        };
+        let acceptance_window = if cross_btc {
+            self.proposal_acceptance_window
+                .min(Duration::from_secs(payment_window.as_secs() / 2))
+        } else {
+            self.proposal_acceptance_window
+        };
         let invoice_payloads = DerivedInvoicePayloads {
             intents: self.intents.clone(),
-            xpub,
-            account_index,
+            receiving,
+            rates,
             network: self.bitcoin_network.clone(),
             request: &request,
             lock: &lock,
             app_id: self.app_id.clone(),
         };
-        remaining(started, self.clock.now())?;
+        remaining_at(started, self.clock.now(), "create_atomic")?;
         // Once PostgreSQL mutation starts it must be awaited to a factual
         // commit/rollback result. Canceling this future at the HTTP deadline
         // could otherwise return failure while COMMIT succeeds concurrently.
@@ -513,12 +810,11 @@ impl CreateInvoiceService {
                 lock_resource_binding: &lock_resource_binding,
                 payment_request_binding: &payment_request_binding,
                 invoice_payloads: &invoice_payloads,
-                required_sats: extract_terms(&lock)?.as_sats(),
-                proposal_acceptance_seconds: self.proposal_acceptance_window.as_secs(),
-                payment_window_seconds: self.payment_window.as_secs(),
+                proposal_acceptance_seconds: acceptance_window.as_secs(),
+                payment_window_seconds: payment_window.as_secs(),
             })
             .await
-            .map_err(map_store)
+            .map_err(|error| store_failure("create_atomic", error))
     }
 }
 
@@ -534,6 +830,31 @@ fn remaining(start: Instant, now: Instant) -> Result<Duration, CreateInvoiceErro
     }
     Ok(remaining)
 }
+
+fn remaining_at(
+    start: Instant,
+    now: Instant,
+    stage: &'static str,
+) -> Result<Duration, CreateInvoiceError> {
+    remaining(start, now).inspect_err(|&error| {
+        diagnose(stage, error);
+    })
+}
+
+fn deadline(stage: &'static str) -> CreateInvoiceError {
+    diagnose(stage, CreateInvoiceError::DeadlineExceeded);
+    CreateInvoiceError::DeadlineExceeded
+}
+
+fn store_failure(stage: &'static str, error: PersistenceError) -> CreateInvoiceError {
+    crate::diagnostics::failure("invoice_create", stage, error.diagnostic_label());
+    map_store(error)
+}
+
+fn diagnose(stage: &'static str, error: CreateInvoiceError) {
+    crate::diagnostics::failure("invoice_create", stage, error.diagnostic_label());
+}
+
 fn map_store(error: PersistenceError) -> CreateInvoiceError {
     match error {
         PersistenceError::Conflict => CreateInvoiceError::Conflict,
@@ -575,13 +896,15 @@ fn validate_lock(
     .map_err(|_| CreateInvoiceError::InvalidRequest)?;
     Ok(())
 }
-fn extract_terms(lock: &ContentLock) -> Result<CriterionAmount, CreateInvoiceError> {
+fn extract_terms(
+    lock: &ContentLock,
+) -> Result<(CriterionAsset, CriterionAmount), CreateInvoiceError> {
     let criterion = lock
         .criteria
         .iter()
         .find(|criterion| criterion.verifier_type == VerifierType::PaykitPayment)
         .ok_or(CreateInvoiceError::InvalidRequest)?;
-    CriterionAsset::parse(
+    let asset = CriterionAsset::parse(
         criterion
             .params
             .get("asset")
@@ -589,12 +912,25 @@ fn extract_terms(lock: &ContentLock) -> Result<CriterionAmount, CreateInvoiceErr
             .ok_or(CreateInvoiceError::InvalidRequest)?,
     )
     .map_err(|_| CreateInvoiceError::InvalidRequest)?;
-    CriterionAmount::parse(
+    let amount = CriterionAmount::parse(
         criterion
             .params
             .get("amount")
             .and_then(Value::as_str)
             .ok_or(CreateInvoiceError::InvalidRequest)?,
     )
-    .map_err(|_| CreateInvoiceError::InvalidRequest)
+    .map_err(|_| CreateInvoiceError::InvalidRequest)?;
+    Ok((asset, amount))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registry_retry_policy_is_three_reads_with_at_most_one_second_of_delay() {
+        assert_eq!(REGISTRY_READ_ATTEMPTS, 3);
+        assert_eq!(REGISTRY_RETRY_DELAY_CAPS_MS.len(), 2);
+        assert_eq!(REGISTRY_RETRY_DELAY_CAPS_MS.iter().sum::<u64>(), 1_000);
+    }
 }

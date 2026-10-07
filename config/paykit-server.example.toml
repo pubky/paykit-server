@@ -5,6 +5,11 @@
 
 [http]
 listen_addr = "127.0.0.1:8080"
+# Exact number of reverse proxies in front of this listener that each append one
+# X-Forwarded-For entry. 0 keys per-IP setup limits by the TCP peer and ignores
+# the header. A value above the real proxy count lets clients pick their own
+# limiter key. At most 8.
+trusted_proxy_hops = 0
 
 [locks]
 # Use the exact Pubky rendered by Locks as credentials.lock_server_public_key.
@@ -29,6 +34,8 @@ app_id = "paykit-server"
 # complete before payment_window, measured from same invoice creation instant.
 proposal_acceptance_window = "1h"
 payment_window = "24h"
+# BTC conversion quotes expire sooner. Acceptance is capped at half this window.
+conversion_payment_window = "1h"
 # "testnet" targets the pinned Pubky client's fixed localhost testnet ports.
 # Run the Pubky static testnet; this is not a hosted public network.
 network = "testnet"
@@ -67,3 +74,8 @@ max_completion_polls = 200
 
 [shutdown]
 drain_timeout = "30s"
+
+# Optional direct Arbitrum One USDT0 receiving and receipt verification.
+# Keep provider credentials in the operator-owned config, never in client URLs.
+# [usdt]
+# rpc_url = "https://your-arbitrum-rpc.example/"

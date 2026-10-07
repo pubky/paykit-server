@@ -11,7 +11,8 @@ use time::format_description::well_known::Rfc3339;
 
 use crate::{
     application::payment_request_status::{
-        PaymentRequestStatusError, PaymentRequestStatusOperations, PaymentRequestStatusSummary,
+        BitcoinPaymentStatus, PaymentRequestStatusError, PaymentRequestStatusOperations,
+        PaymentRequestStatusSummary, UsdtPaymentStatus,
     },
     domain::{
         locks::{parse_bundle_id, parse_creator},
@@ -32,8 +33,8 @@ struct PaymentRequestStatusResponse {
     payment_state: &'static str,
     invoice_created_at: String,
     payment_deadline: String,
-    confirmations: u32,
-    amount_matched: bool,
+    bitcoin: Option<BitcoinPaymentStatus>,
+    usdt_arbitrum: Option<UsdtPaymentStatus>,
 }
 
 pub fn payment_requests_router(operations: Arc<dyn PaymentRequestStatusOperations>) -> Router {
@@ -64,12 +65,28 @@ async fn status(
             PaymentRequestLifecycleState::InvalidConflict => ApiError::Conflict.into_response(),
             _ => match PaymentRequestStatusResponse::try_from(summary) {
                 Ok(response) => axum::Json(response).into_response(),
-                Err(()) => ApiError::Unavailable.into_response(),
+                Err(()) => {
+                    crate::diagnostics::failure(
+                        "payment_request_status",
+                        "response_serialization",
+                        "invalid_timestamp",
+                    );
+                    ApiError::Unavailable.into_response()
+                }
             },
         },
         Ok(None) => ApiError::InvoiceNotFound.into_response(),
-        Err(PaymentRequestStatusError::Conflict) => ApiError::Conflict.into_response(),
-        Err(PaymentRequestStatusError::Unavailable) => ApiError::Unavailable.into_response(),
+        Err(error) => {
+            crate::diagnostics::failure(
+                "payment_request_status",
+                "status_lookup",
+                error.diagnostic_label(),
+            );
+            match error {
+                PaymentRequestStatusError::Conflict => ApiError::Conflict.into_response(),
+                PaymentRequestStatusError::Unavailable => ApiError::Unavailable.into_response(),
+            }
+        }
     }
 }
 
@@ -85,8 +102,8 @@ impl TryFrom<PaymentRequestStatusSummary> for PaymentRequestStatusResponse {
                 .format(&Rfc3339)
                 .map_err(|_| ())?,
             payment_deadline: value.payment_deadline().format(&Rfc3339).map_err(|_| ())?,
-            confirmations: value.confirmations(),
-            amount_matched: value.amount_matched(),
+            bitcoin: value.bitcoin(),
+            usdt_arbitrum: value.usdt_arbitrum(),
         })
     }
 }

@@ -22,6 +22,10 @@ pub enum ApiError {
     InternalError,
     LockNotFound,
     LockResourceUnavailable,
+    ReaderSetupPending,
+    ReaderNotPayable,
+    ReaderRegistryUnavailable,
+    ReaderRegistryMalformed,
 }
 
 #[derive(Serialize)]
@@ -36,6 +40,10 @@ struct ErrorBody {
 }
 
 impl ApiError {
+    pub(crate) const fn code(self) -> &'static str {
+        self.details().1
+    }
+
     const fn details(self) -> (StatusCode, &'static str, &'static str) {
         match self {
             Self::InvalidRequest => (
@@ -113,6 +121,26 @@ impl ApiError {
                 "lock_resource_unavailable",
                 "lock resource is unavailable",
             ),
+            Self::ReaderSetupPending => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "reader_setup_pending",
+                "reader wallet setup needed",
+            ),
+            Self::ReaderNotPayable => (
+                StatusCode::CONFLICT,
+                "reader_not_payable",
+                "reader has no Paykit app able to pay requests",
+            ),
+            Self::ReaderRegistryUnavailable => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "reader_registry_unavailable",
+                "reader registry is unavailable",
+            ),
+            Self::ReaderRegistryMalformed => (
+                StatusCode::BAD_GATEWAY,
+                "reader_registry_malformed",
+                "reader registry is malformed",
+            ),
         }
     }
 }
@@ -133,6 +161,68 @@ impl IntoResponse for ApiError {
                 "1".parse().expect("static header value"),
             );
         }
+        super::request_diagnostics::annotate(
+            &mut response,
+            super::request_diagnostics::OutcomeFailureClass::api(self),
+        );
         response
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::body::to_bytes;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn reader_registry_errors_have_closed_status_body_and_retry_contract() {
+        let cases = [
+            (
+                ApiError::ReaderSetupPending,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "reader_setup_pending",
+                "reader wallet setup needed",
+                None,
+            ),
+            (
+                ApiError::ReaderNotPayable,
+                StatusCode::CONFLICT,
+                "reader_not_payable",
+                "reader has no Paykit app able to pay requests",
+                None,
+            ),
+            (
+                ApiError::ReaderRegistryUnavailable,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "reader_registry_unavailable",
+                "reader registry is unavailable",
+                None,
+            ),
+            (
+                ApiError::ReaderRegistryMalformed,
+                StatusCode::BAD_GATEWAY,
+                "reader_registry_malformed",
+                "reader registry is malformed",
+                None,
+            ),
+        ];
+
+        for (error, status, code, message, retry_after) in cases {
+            let response = error.into_response();
+            assert_eq!(response.status(), status);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::RETRY_AFTER)
+                    .map(|value| value.to_str().unwrap()),
+                retry_after
+            );
+            let body = to_bytes(response.into_body(), 1024).await.unwrap();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+                serde_json::json!({"error":{"code":code,"message":message}})
+            );
+        }
     }
 }

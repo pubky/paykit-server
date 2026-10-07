@@ -54,7 +54,6 @@ impl InvoicePayloadFactory for AccountPayloads<'_> {
         .unwrap();
         Ok(InvoicePayloads {
             payment_request_intent: common::payment_intent(self.0, address.clone()),
-            bitcoin_address: address,
         })
     }
 }
@@ -73,7 +72,7 @@ async fn allocate_invoice(
             lock_resource_binding: binding,
             payment_request_binding: binding,
             invoice_payloads: &AccountPayloads(reader),
-            required_sats: 100,
+
             proposal_acceptance_seconds: 60 * 60,
             payment_window_seconds: 24 * 60 * 60,
         })
@@ -296,10 +295,16 @@ async fn real_setup_reconnect_preserves_pending_invoices_and_hosted_state() {
         .unwrap()
         .with_auth_relay(relay.local_url().join("inbox").unwrap().as_str())
         .unwrap();
-    let root = PubkyLocalSecretKey::new(pubky::Keypair::random().secret_key());
+    let root_keypair = pubky::Keypair::random();
+    let root = PubkyLocalSecretKey::new(root_keypair.secret_key());
     let home = PubkyPublicKey::from_public_key(&testnet.homeserver_app().public_key());
     let wallet_auth = bootstrap
-        .sign_up(&root, &home, None, PAYKIT_SESSION_CAPABILITIES)
+        .sign_up(
+            &root,
+            &home,
+            None,
+            paykit_sdk::PAYKIT_AUTHORIZER_SESSION_CAPABILITIES,
+        )
         .await
         .unwrap();
     let owner = wallet_auth.public_key.clone();
@@ -330,6 +335,7 @@ async fn real_setup_reconnect_preserves_pending_invoices_and_hosted_state() {
             network: paykit_server::config::PaykitNetwork::Testnet,
             proposal_acceptance_window: Duration::from_secs(60 * 60),
             payment_window: Duration::from_secs(24 * 60 * 60),
+            conversion_payment_window: std::time::Duration::from_secs(3600),
         },
     );
     let publisher = Arc::new(FailAfterPublication {
@@ -373,6 +379,45 @@ async fn real_setup_reconnect_preserves_pending_invoices_and_hosted_state() {
             .is_err()
     );
     let wrong = PaykitIdentitySecretKey::new([3; 32], 1).unwrap();
+    let authorization = wallet
+        .paykit_noise_key_authorization(owner.clone())
+        .await
+        .unwrap();
+    let authorization_path = paykit_lib::PAYKIT_NOISE_KEY_AUTHORIZATION_PATH;
+    let owner_storage = wallet_auth.access.session.storage();
+    owner_storage.delete(authorization_path).await.unwrap();
+    assert_eq!(
+        complete(&service, &bootstrap, &root, &key, 0).await,
+        PollResult::Failed
+    );
+    assert!(creators.load_optional(&creator).await.unwrap().is_none());
+    assert_eq!(publisher.calls.load(Ordering::SeqCst), 0);
+
+    let mut tampered = serde_json::to_value(&authorization).unwrap();
+    tampered["key_generation"] = serde_json::json!(2);
+    let mismatched =
+        paykit_lib::PaykitNoiseKeyAuthorization::sign(&root_keypair, &[9; 32], 1).unwrap();
+    // Raw owner writes inject invalid remote records without weakening SDK publication.
+    for invalid in [tampered, serde_json::to_value(mismatched).unwrap()] {
+        owner_storage
+            .put_json(authorization_path, &invalid)
+            .await
+            .unwrap();
+        assert_eq!(
+            complete(&service, &bootstrap, &root, &key, 0).await,
+            PollResult::Failed
+        );
+        assert!(creators.load_optional(&creator).await.unwrap().is_none());
+        assert_eq!(publisher.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            wallet.paykit_app_registry(owner.clone()).await.unwrap(),
+            Some(before.clone())
+        );
+    }
+    owner_storage
+        .put_json(authorization_path, &authorization)
+        .await
+        .unwrap();
     assert_eq!(
         complete(&service, &bootstrap, &root, &wrong, 0).await,
         PollResult::Failed
@@ -481,8 +526,20 @@ async fn real_setup_reconnect_preserves_pending_invoices_and_hosted_state() {
     let unchanged = creators.load(&creator).await.unwrap();
     assert!(unchanged.session_secret() == original.session_secret());
     assert_eq!(unchanged.paykit_identity_secret(), &key);
-    assert_eq!(unchanged.xpub(), original.xpub());
-    assert_eq!(creators.load(&creator).await.unwrap().account_index(), 0);
+    assert_eq!(
+        unchanged.bitcoin_account().unwrap().xpub.as_str(),
+        original.bitcoin_account().unwrap().xpub.as_str()
+    );
+    assert_eq!(
+        creators
+            .load(&creator)
+            .await
+            .unwrap()
+            .bitcoin_account()
+            .unwrap()
+            .account_index,
+        0
+    );
     assert!(creators.setup_complete(&creator).await.unwrap());
     assert_eq!(business_rows(&database).await, before_reconnect);
     assert_eq!(
@@ -490,10 +547,20 @@ async fn real_setup_reconnect_preserves_pending_invoices_and_hosted_state() {
         PollResult::Complete
     );
     let refreshed_credentials = creators.load(&creator).await.unwrap();
-    assert_eq!(refreshed_credentials.xpub(), original.xpub());
     assert_eq!(
-        refreshed_credentials.account_index(),
-        original.account_index()
+        refreshed_credentials
+            .bitcoin_account()
+            .unwrap()
+            .xpub
+            .as_str(),
+        original.bitcoin_account().unwrap().xpub.as_str()
+    );
+    assert_eq!(
+        refreshed_credentials
+            .bitcoin_account()
+            .unwrap()
+            .account_index,
+        original.bitcoin_account().unwrap().account_index
     );
     assert_eq!(refreshed_credentials.paykit_identity_secret(), &key);
     assert_eq!(business_rows(&database).await, before_reconnect);
@@ -531,6 +598,11 @@ poll_interval = "1s"
     );
     let access = provider.load_session_access().await.unwrap().unwrap();
     assert!(access.local_secret_key.is_none());
+    assert!(
+        access
+            .validate_for_capabilities(paykit_sdk::PAYKIT_AUTHORIZER_SESSION_CAPABILITIES)
+            .is_err()
+    );
     assert_eq!(access.public_key().unwrap(), owner);
     let refreshed = access
         .session
@@ -565,8 +637,14 @@ poll_interval = "1s"
         PollResult::Failed
     );
     let rotated = creators.load(&creator).await.unwrap();
-    assert_eq!(rotated.xpub(), original.xpub());
-    assert_eq!(rotated.account_index(), original.account_index());
+    assert_eq!(
+        rotated.bitcoin_account().unwrap().xpub.as_str(),
+        original.bitcoin_account().unwrap().xpub.as_str()
+    );
+    assert_eq!(
+        rotated.bitcoin_account().unwrap().account_index,
+        original.bitcoin_account().unwrap().account_index
+    );
     assert_eq!(rotated.paykit_identity_secret(), &replacement);
     assert!(creators.setup_complete(&creator).await.unwrap());
     assert_eq!(business_rows(&database).await, before_reconnect);

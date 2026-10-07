@@ -1,6 +1,8 @@
 use std::time::Duration;
 
-use paykit_server::config::{Config, ConfigEnvironment, ConfigError, PaykitNetwork};
+use paykit_server::config::{
+    Config, ConfigEnvironment, ConfigError, MAX_TRUSTED_PROXY_HOPS, PaykitNetwork,
+};
 
 const KEY: &str = "pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo";
 const MASTER_KEY: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE";
@@ -79,12 +81,16 @@ fn setup_authorization_url_logging_defaults_to_disabled() {
 }
 
 #[test]
-fn invoice_windows_default_to_one_hour_and_twenty_four_hours() {
+fn invoice_windows_default_to_one_hour_acceptance_and_conversion_and_twenty_four_hour_payment() {
     let config = Config::from_toml_and_environment(&valid_toml(), environment()).unwrap();
 
     assert_eq!(
         config.paykit.proposal_acceptance_window,
         Duration::from_secs(60 * 60)
+    );
+    assert_eq!(
+        config.paykit.conversion_payment_window,
+        Duration::from_secs(3600)
     );
     assert_eq!(
         config.paykit.payment_window,
@@ -95,6 +101,8 @@ fn invoice_windows_default_to_one_hour_and_twenty_four_hours() {
 #[test]
 fn invoice_windows_require_positive_acceptance_strictly_before_payment() {
     for windows in [
+        "conversion_payment_window = \"1s\"",
+        "conversion_payment_window = \"1500ms\"",
         "proposal_acceptance_window = \"0s\"\npayment_window = \"24h\"",
         "proposal_acceptance_window = \"24h\"\npayment_window = \"24h\"",
         "proposal_acceptance_window = \"25h\"\npayment_window = \"24h\"",
@@ -194,6 +202,38 @@ fn accepts_supported_paykit_network_and_rejects_retired_url_keys() {
         1,
     );
     assert!(Config::from_toml_and_environment(&retired, environment()).is_err());
+}
+
+#[test]
+fn trusted_proxy_hops_defaults_to_zero_and_rejects_values_above_the_maximum() {
+    let with_hops = |hops: &str| {
+        valid_toml().replace(
+            "listen_addr = \"127.0.0.1:8080\"",
+            &format!("listen_addr = \"127.0.0.1:8080\"\ntrusted_proxy_hops = {hops}"),
+        )
+    };
+
+    let default = Config::from_toml_and_environment(&valid_toml(), environment()).unwrap();
+    assert_eq!(default.http.trusted_proxy_hops(), 0);
+    for hops in [0, 1, MAX_TRUSTED_PROXY_HOPS] {
+        let config =
+            Config::from_toml_and_environment(&with_hops(&hops.to_string()), environment())
+                .unwrap();
+        assert_eq!(config.http.trusted_proxy_hops(), hops);
+    }
+    assert!(matches!(
+        Config::from_toml_and_environment(
+            &with_hops(&(MAX_TRUSTED_PROXY_HOPS + 1).to_string()),
+            environment()
+        ),
+        Err(ConfigError::ValueTooLarge("http.trusted_proxy_hops"))
+    ));
+    for invalid in ["-1", "256", "\"1\"", "1.0"] {
+        assert!(matches!(
+            Config::from_toml_and_environment(&with_hops(invalid), environment()),
+            Err(ConfigError::Toml)
+        ));
+    }
 }
 
 #[test]
@@ -484,4 +524,39 @@ fn rejects_outbox_batch_size_above_the_supported_integer_range() {
         "poll_interval = \"5s\"\nbatch_size = 4294967296",
     );
     assert!(Config::from_toml_and_environment(&oversized, environment()).is_err());
+}
+
+#[test]
+fn usdt_requires_an_explicit_protected_rpc_and_redacts_credentials() {
+    assert!(
+        Config::from_toml_and_environment(&valid_toml(), environment())
+            .unwrap()
+            .usdt
+            .is_none()
+    );
+    for url in [
+        "https://arbitrum.example/private-key",
+        "http://127.0.0.1:8545/",
+    ] {
+        let config = Config::from_toml_and_environment(
+            &format!("{}\n[usdt]\nrpc_url = \"{url}\"", valid_toml()),
+            environment(),
+        )
+        .unwrap();
+        assert!(config.usdt.is_some());
+        assert!(!format!("{:?}", config.usdt).contains(url));
+    }
+    for url in [
+        "http://arbitrum.example/",
+        "https://user:password@rpc.example/",
+        "https://rpc.example/#secret",
+    ] {
+        assert!(
+            Config::from_toml_and_environment(
+                &format!("{}\n[usdt]\nrpc_url = \"{url}\"", valid_toml()),
+                environment()
+            )
+            .is_err()
+        );
+    }
 }

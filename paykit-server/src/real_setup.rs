@@ -6,7 +6,7 @@
 use async_trait::async_trait;
 use bitcoin::bip32::Xpub;
 use ed25519_dalek::VerifyingKey;
-use paykit_lib::{PaykitApp, PaykitAppCapabilities, PaykitAppRegistry};
+use paykit_lib::{PaykitApp, PaykitAppCapabilities, PaykitNoiseKeyAuthorization};
 use paykit_sdk::{
     PaykitSdk, PaykitSdkConfig, PubkySessionAccess, PubkySessionProvider, PubkySharedStateStorage,
 };
@@ -91,14 +91,17 @@ impl PubkySessionProvider for SetupSessionProvider {
     }
 }
 
-/// Verifies delegated material against the wallet-published identity authority.
-pub fn verify_registry_key(
-    registry: &PaykitAppRegistry,
+/// Verifies delegated material against a verified, identity-signed authorization.
+pub fn verify_authorized_key(
+    authorization: &PaykitNoiseKeyAuthorization,
     key: &paykit_sdk::PaykitIdentitySecretKey,
 ) -> Result<(), ClaimError> {
-    if registry.key_generation() != key.key_generation()
-        || registry.noise_public_key()
-            != Some(&paykit_lib::derive_paykit_noise_public_key(key.as_bytes()))
+    let noise_secret = Zeroizing::new(paykit_lib::derive_paykit_noise_secret_key(key.as_bytes()));
+    if authorization.key_generation() != key.key_generation()
+        || authorization.noise_public_key()
+            != &paykit_lib::derive_paykit_noise_public_key(key.as_bytes())
+        || authorization.noise_static_public_key()
+            != &paykit_lib::pubky_noise::derive_static_public_key(&noise_secret)
     {
         return Err(ClaimError::AuthenticationFailed);
     }
@@ -116,21 +119,23 @@ impl AppPublisher for SharedAppPublisher {
             .public_key()
             .and_then(|key| key.to_public_key())
             .map_err(|_| ClaimError::AuthenticationFailed)?;
-        let registry =
-            paykit_lib::get_paykit_app_registry(&access.outbox_client.public_storage(), &owner)
-                .await
-                .map_err(|error| {
-                    emit_setup_stage(
-                        SetupStage::IdentityValidate,
-                        SetupOutcome::Failed,
-                        registry_failure_class(&error),
-                    );
-                    ClaimError::InvalidEnvelope
-                })?
-                .ok_or(ClaimError::AuthenticationFailed)?;
+        let authorization = paykit_lib::get_paykit_noise_key_authorization(
+            &access.outbox_client.public_storage(),
+            &owner,
+        )
+        .await
+        .map_err(|error| {
+            emit_setup_stage(
+                SetupStage::IdentityValidate,
+                SetupOutcome::Failed,
+                registry_failure_class(&error),
+            );
+            ClaimError::InvalidEnvelope
+        })?
+        .ok_or(ClaimError::AuthenticationFailed)?;
         stage_result(
             SetupStage::IdentityValidate,
-            verify_registry_key(&registry, key),
+            verify_authorized_key(&authorization, key),
             claim_failure_class,
         )
     }
@@ -372,41 +377,70 @@ impl crate::setup_orchestration::VerifiedSetupCommit for CreatorSetupCommit {
                 self.creators.load_optional(&self.creator).await,
                 persistence_failure_class,
             )?;
-            // Account binding comes only from initial setup, never a reconnect payload.
-            let (xpub, account_index, key) = match (self.reconnect, claim, existing.as_ref()) {
-                (false, VerifiedCompanionClaim::Setup(claim), None) => (
-                    stage_result(
-                        SetupStage::XpubValidate,
-                        validate_xpub(
-                            &claim.serialized_xpub,
-                            claim.account_index,
-                            &self.bitcoin_network,
-                        ),
-                        claim_failure_class,
-                    )?,
-                    claim.account_index,
-                    claim.paykit_identity_secret_key,
-                ),
-                (true, VerifiedCompanionClaim::Reconnect(key), Some(existing)) => {
-                    (existing.xpub().to_owned(), existing.account_index(), key)
-                }
-                _ => return Err(ClaimError::InvalidPayload),
-            };
+            // Reconnect preserves Bitcoin derivation and can add an optional USDT address.
+            let (bitcoin_account, usdt_address, key) =
+                match (self.reconnect, claim, existing.as_ref()) {
+                    (false, VerifiedCompanionClaim::Setup(claim), None) => {
+                        let account = claim
+                            .bitcoin_account
+                            .map(|account| {
+                                let xpub = stage_result(
+                                    SetupStage::XpubValidate,
+                                    validate_xpub(
+                                        &account.serialized_xpub,
+                                        account.account_index,
+                                        &self.bitcoin_network,
+                                    ),
+                                    claim_failure_class,
+                                )?;
+                                Ok(crate::domain::receiving::BitcoinAccount {
+                                    xpub: Zeroizing::new(xpub),
+                                    account_index: account.account_index,
+                                })
+                            })
+                            .transpose()?;
+                        (
+                            account,
+                            claim.usdt_address,
+                            claim.paykit_identity_secret_key,
+                        )
+                    }
+                    (true, VerifiedCompanionClaim::Setup(claim), Some(existing))
+                        if claim.bitcoin_account.is_none() =>
+                    {
+                        (
+                            existing.bitcoin_account().cloned(),
+                            claim
+                                .usdt_address
+                                .or_else(|| existing.usdt_address().cloned()),
+                            claim.paykit_identity_secret_key,
+                        )
+                    }
+                    (true, VerifiedCompanionClaim::Reconnect(key), Some(existing)) => (
+                        existing.bitcoin_account().cloned(),
+                        existing.usdt_address().cloned(),
+                        key,
+                    ),
+                    _ => return Err(ClaimError::InvalidPayload),
+                };
+            if bitcoin_account.is_none() && usdt_address.is_none() {
+                return Err(ClaimError::InvalidPayload);
+            }
             let mut access = self.access.clone();
             access.paykit_identity_secret_key = Some(key.clone());
             let credentials = CreatorCredentials::new(
                 self.creator.clone(),
                 self.session_secret.to_string(),
                 key,
-                xpub,
-                account_index,
+                bitcoin_account,
+                usdt_address,
             );
             if let Some(existing) = &existing {
                 existing
                     .validate_reauthentication(&credentials)
                     .map_err(|_| ClaimError::InvalidPayload)?;
             }
-            // Registry authority is verified before either credential or shared-state writes.
+            // Key authorization is verified before either credential or shared-state writes.
             self.publisher.verify_key(&access).await?;
             let persisted = if existing.is_some() {
                 self.creators.reauthenticate(&credentials).await
@@ -465,24 +499,59 @@ mod tests {
     }
 
     #[test]
-    fn delegated_key_must_match_registry_material_and_generation() {
+    fn delegated_key_must_match_authorized_material_and_generation() {
         let key = paykit_sdk::PaykitIdentitySecretKey::new([9; 32], 2).unwrap();
-        let mut registry = PaykitAppRegistry::new(None);
-        registry
-            .set_noise_public_key(
-                paykit_lib::derive_paykit_noise_public_key(key.as_bytes()),
-                2,
-            )
-            .unwrap();
-        assert_eq!(verify_registry_key(&registry, &key), Ok(()));
+        let authorization = PaykitNoiseKeyAuthorization::sign(
+            &pubky::Keypair::random(),
+            &paykit_lib::derive_paykit_noise_secret_key(key.as_bytes()),
+            2,
+        )
+        .unwrap();
+        assert_eq!(verify_authorized_key(&authorization, &key), Ok(()));
         for wrong in [
             paykit_sdk::PaykitIdentitySecretKey::new([8; 32], 2).unwrap(),
             paykit_sdk::PaykitIdentitySecretKey::new([9; 32], 1).unwrap(),
         ] {
             assert_eq!(
-                verify_registry_key(&registry, &wrong),
+                verify_authorized_key(&authorization, &wrong),
                 Err(ClaimError::AuthenticationFailed)
             );
         }
+    }
+
+    #[test]
+    fn delegated_key_rejects_authorized_static_key_substitution() {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+
+        let identity = pubky::Keypair::random();
+        let key = paykit_sdk::PaykitIdentitySecretKey::new([9; 32], 2).unwrap();
+        let authorization = PaykitNoiseKeyAuthorization::sign(
+            &identity,
+            &paykit_lib::derive_paykit_noise_secret_key(key.as_bytes()),
+            key.key_generation(),
+        )
+        .unwrap();
+        let substituted_static_key = [8; 32];
+        let signed_bytes = [
+            b"paykit.noise_key_authorization/v1\0".as_slice(),
+            authorization.owner().as_bytes(),
+            authorization.noise_public_key().as_bytes(),
+            &substituted_static_key,
+            &key.key_generation().to_be_bytes(),
+        ]
+        .concat();
+        let mut wire = serde_json::to_value(&authorization).unwrap();
+        wire["noise_static_public_key"] = serde_json::json!("08".repeat(32));
+        wire["signature"] =
+            serde_json::json!(STANDARD.encode(identity.sign(&signed_bytes).to_bytes()));
+        let substituted: PaykitNoiseKeyAuthorization = serde_json::from_value(wire).unwrap();
+        assert_eq!(
+            substituted.noise_public_key(),
+            authorization.noise_public_key()
+        );
+        assert_eq!(
+            verify_authorized_key(&substituted, &key),
+            Err(ClaimError::AuthenticationFailed)
+        );
     }
 }

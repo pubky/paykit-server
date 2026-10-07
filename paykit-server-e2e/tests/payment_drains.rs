@@ -134,7 +134,6 @@ impl InvoicePayloadFactory for RacePayloads {
                 "00000000-0000-4000-8000-000000000001",
                 &serde_json::json!({ "value": address }).to_string(),
             ),
-            bitcoin_address: address,
         })
     }
 }
@@ -152,7 +151,7 @@ fn admission_input<'a>(
         lock_resource_binding: LOCK_RESOURCE.as_bytes(),
         payment_request_binding: b"concurrent-admission-request",
         invoice_payloads: &RACE_PAYLOADS,
-        required_sats: 1_000,
+
         proposal_acceptance_seconds: 60 * 60,
         payment_window_seconds: 24 * 60 * 60,
     }
@@ -385,6 +384,7 @@ async fn insert_projectable_attempt(
             proposal_app_id: "paykit-server".into(),
             terms: PaymentTermsV1 {
                 amount: "0.00001000".into(),
+                rates: Vec::new(),
                 asset: "BTC".into(),
                 payment_reference: request_id,
                 proposal_expires_at: Some("2027-01-15T08:00:00Z".into()),
@@ -605,23 +605,31 @@ async fn shared_foreign_app_records_do_not_poison_existing_invoice_refresh_or_ne
             &creator_root,
             &homeserver,
             None,
-            PAYKIT_SESSION_CAPABILITIES,
+            paykit_sdk::PAYKIT_AUTHORIZER_SESSION_CAPABILITIES,
         )
         .await
         .unwrap();
     let creator = parse_creator(&format!("pubky{}", creator_account.public_key)).unwrap();
+    // The Server receives a separate grant without authorization-path access.
+    let creator_grant = bootstrap
+        .sign_in(&creator_root, PAYKIT_SESSION_CAPABILITIES)
+        .await
+        .unwrap();
     let creators = CreatorStore::new(database.pool(), crypto.clone());
     let creator_row = creators
         .create(&CreatorCredentials::new(
             creator.clone(),
-            creator_account
+            creator_grant
                 .export_session_secret()
                 .await
                 .unwrap()
                 .into_inner(),
             creator_root.derive_paykit_identity_secret_key(1).unwrap(),
-            "unused-test-xpub".into(),
-            0,
+            Some(paykit_server::domain::receiving::BitcoinAccount {
+                xpub: "unused-test-xpub".to_owned().into(),
+                account_index: 0,
+            }),
+            None,
         ))
         .await
         .unwrap();
@@ -634,7 +642,7 @@ async fn shared_foreign_app_records_do_not_poison_existing_invoice_refresh_or_ne
             &PubkyLocalSecretKey::new(Keypair::random().secret_key()),
             &homeserver,
             None,
-            PAYKIT_SESSION_CAPABILITIES,
+            paykit_sdk::PAYKIT_AUTHORIZER_SESSION_CAPABILITIES,
         )
         .await
         .unwrap();
@@ -791,6 +799,7 @@ async fn shared_foreign_app_records_do_not_poison_existing_invoice_refresh_or_ne
         network: PaykitNetwork::Testnet,
         proposal_acceptance_window: Duration::from_secs(60 * 60),
         payment_window: Duration::from_secs(24 * 60 * 60),
+        conversion_payment_window: Duration::from_secs(3600),
     };
     let sessions = CreatorSessionProvider::with_pubky(creators, creator.clone(), pubky, &paykit);
     let adapter = PaykitAdapter::new(creator_row.id(), sessions, &paykit).unwrap();
