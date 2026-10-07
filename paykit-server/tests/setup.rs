@@ -26,7 +26,7 @@ use paykit_server::{
     bitkit_claim::LOCAL_DEMO_CAPABILITIES,
     bitkit_setup::append_bitkit_claim,
     config::{BitcoinNetwork, PAYKIT_CLIENT_ID},
-    http::setup::setup_router,
+    http::setup::{setup_router, setup_router_with_trusted_proxy_hops},
     real_setup::validate_xpub,
     setup::{
         BeginError, Completion, ManualClock, PollResult, SetupAttempt, SetupCompleter, SetupLimits,
@@ -1033,6 +1033,61 @@ async fn setup_policy_uses_transport_ip_and_ignores_forwarded_for() {
 }
 
 #[tokio::test]
+async fn setup_policy_keys_forwarded_clients_only_behind_trusted_proxies() {
+    let creator = "pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo";
+    let proxy = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+    let begin = "/setup?return_to=https://app.example".to_owned();
+    let reconnect = format!("/setup/reconnect?return_to=https://app.example&creator={creator}");
+    for trusted_proxy_hops in [0, 1] {
+        for route in [&begin, &reconnect] {
+            let completer: Arc<dyn SetupCompleter> = if route == &begin {
+                Arc::new(MockCompleter::new([]))
+            } else {
+                Arc::new(ReconnectCompleter(
+                    paykit_server::domain::locks::parse_creator(creator).unwrap(),
+                ))
+            };
+            let router = setup_router_with_trusted_proxy_hops(
+                limited_service(completer, Arc::new(ManualClock::default()), 1, 10),
+                trusted_proxy_hops,
+            );
+            let status = async |forwarded_for: &str, state: &str| {
+                let mut request = Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("{route}&state={state}"))
+                    .header("X-Forwarded-For", forwarded_for)
+                    .body(Body::empty())
+                    .unwrap();
+                request
+                    .extensions_mut()
+                    .insert(ConnectInfo(SocketAddr::new(proxy, 443)));
+                router.clone().oneshot(request).await.unwrap().status()
+            };
+
+            assert_eq!(status("198.51.100.1", "one").await, StatusCode::OK);
+            assert_eq!(
+                status("203.0.113.2", "two").await,
+                if trusted_proxy_hops == 0 {
+                    StatusCode::TOO_MANY_REQUESTS
+                } else {
+                    StatusCode::OK
+                },
+                "{route} trusted_proxy_hops={trusted_proxy_hops}"
+            );
+            assert_eq!(
+                status("203.0.113.2", "three").await,
+                StatusCode::TOO_MANY_REQUESTS
+            );
+            assert_eq!(
+                status("203.0.113.4, 198.51.100.1", "four").await,
+                StatusCode::TOO_MANY_REQUESTS,
+                "{route}: a client-prepended entry must not select a fresh bucket"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn reservation_releases_after_start_failure_terminal_completion_and_expiry() {
     let failed_start = limited_service(
         Arc::new(FailFirstStartCompleter(AtomicUsize::new(0))),
@@ -1354,6 +1409,133 @@ async fn setup_iframe_escapes_the_auth_url_and_keeps_it_out_of_the_script() {
         r#"<a class="bitkit-btn" href="pubkyauth://signin?secret=mock&amp;label=&lt;approve&gt;""#
     ));
     assert!(!script.contains("pubkyauth://signin?secret=mock"));
+}
+
+async fn setup_shell(service: SetupService) -> String {
+    let response = request(
+        setup_router(service),
+        Method::GET,
+        "/setup?return_to=https://app.example/callback&state=opaque",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    body(response).await
+}
+
+async fn reconnect_shell(service: SetupService, creator: &str) -> String {
+    let response = request(
+        setup_router(service),
+        Method::GET,
+        &format!(
+            "/setup/reconnect?return_to=https://app.example/callback&state=opaque&creator={creator}"
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    body(response).await
+}
+
+fn qr_markup(shell: &str) -> &str {
+    let start = shell
+        .find("<span class=\"qr\"")
+        .expect("setup shell contains the QR");
+    let end = shell[start..].find("</span>").expect("QR span closes") + start;
+    &shell[start..end]
+}
+
+#[tokio::test]
+async fn android_bitkit_button_targets_the_configured_bitkit_package() {
+    // A canonical grant URL can still carry `'`, `&` and percent-encoded markup in its query.
+    let authorization_url = "pubkyauth://signin_grant?secret=mock&label='%22%3E%3C/script%3E;end&x-bitkit-claim=watch-only-account-v1";
+    let plain_href = "pubkyauth://signin_grant?secret=mock&amp;label=&#39;%22%3E%3C/script%3E;end&amp;x-bitkit-claim=watch-only-account-v1";
+    let without_network = setup_shell(service_with_authorization_url(authorization_url)).await;
+
+    for (network, package) in [
+        (BitcoinNetwork::Mainnet, "to.bitkit"),
+        (BitcoinNetwork::Testnet, "to.bitkit.tnet"),
+        (BitcoinNetwork::Regtest, "to.bitkit.dev"),
+    ] {
+        let shell = setup_shell(
+            service_with_authorization_url(authorization_url).with_bitcoin_network(network),
+        )
+        .await;
+        let (markup, script) = shell
+            .split_once("<script>")
+            .expect("setup shell contains polling script");
+
+        // The plain link stays the default href; the intent URL is an escaped attribute value.
+        assert!(markup.contains(&format!(
+            "<a class=\"bitkit-btn\" href=\"{plain_href}\" data-android-href=\"intent://signin_grant?secret=mock&amp;label=&#39;%22%3E%3C/script%3E;end&amp;x-bitkit-claim=watch-only-account-v1#Intent;scheme=pubkyauth;package={package};end\">Continue with Bitkit</a></main>"
+        )));
+        assert_eq!(qr_markup(&shell), qr_markup(&without_network));
+        assert_eq!(shell.matches("<script>").count(), 1);
+        assert_eq!(shell.matches("</script>").count(), 1);
+        assert!(script.contains(
+            "if(bitkitButton.dataset.androidHref&&/Android/i.test(navigator.userAgent)){bitkitButton.href=bitkitButton.dataset.androidHref;}"
+        ));
+        for forbidden in ["intent://", "pubkyauth", "secret=mock"] {
+            assert!(
+                !script.contains(forbidden),
+                "setup script contained forbidden value {forbidden}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn android_reconnect_targets_bitkit_and_keeps_the_paykit_only_qr() {
+    let creator = "pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo";
+    let reconnect_service = || {
+        service(
+            Arc::new(ReconnectCompleter(
+                paykit_server::domain::locks::parse_creator(creator).unwrap(),
+            )),
+            Arc::new(ManualClock::default()),
+        )
+    };
+    let without_network = reconnect_shell(reconnect_service(), creator).await;
+    let with_network = reconnect_shell(
+        reconnect_service().with_bitcoin_network(BitcoinNetwork::Testnet),
+        creator,
+    )
+    .await;
+
+    assert!(with_network.contains(
+        "<a class=\"bitkit-btn\" href=\"pubkyauth://signin_grant?x-bitkit-claim=paykit-access-v1\" data-android-href=\"intent://signin_grant?x-bitkit-claim=paykit-access-v1#Intent;scheme=pubkyauth;package=to.bitkit.tnet;end\">Continue with Bitkit</a>"
+    ));
+    assert_eq!(
+        with_network
+            .matches("x-bitkit-claim=paykit-access-v1")
+            .count(),
+        2
+    );
+    assert!(!with_network.contains("watch-only-account-v1"));
+    assert_eq!(qr_markup(&with_network), qr_markup(&without_network));
+}
+
+#[tokio::test]
+async fn bitkit_button_keeps_only_the_plain_link_without_an_android_package() {
+    let grant_url = "pubkyauth://signin_grant?secret=mock&x-bitkit-claim=watch-only-account-v1";
+    let plain_anchor = "<a class=\"bitkit-btn\" href=\"pubkyauth://signin_grant?secret=mock&amp;x-bitkit-claim=watch-only-account-v1\">Continue with Bitkit</a>";
+    for service in [
+        service_with_authorization_url(grant_url),
+        service_with_authorization_url(grant_url).with_bitcoin_network(BitcoinNetwork::Signet),
+    ] {
+        let shell = setup_shell(service).await;
+        assert!(shell.contains(plain_anchor));
+        assert!(!shell.contains("data-android-href"));
+    }
+
+    let shell = setup_shell(
+        service_with_authorization_url("pubkyauth://signin?secret=mock&label=<approve>")
+            .with_bitcoin_network(BitcoinNetwork::Mainnet),
+    )
+    .await;
+    assert!(shell.contains(
+        "<a class=\"bitkit-btn\" href=\"pubkyauth://signin?secret=mock&amp;label=&lt;approve&gt;\">Continue with Bitkit</a>"
+    ));
+    assert!(!shell.contains("data-android-href"));
+    assert!(!shell.contains("intent://"));
 }
 
 #[tokio::test]

@@ -6,8 +6,8 @@ use crate::{
     application::{
         connection_status::ConnectionStatusService,
         create_invoice::{
-            AppRegistryDiscovery, CreateInvoiceError, CreateInvoiceService, LockFetchError,
-            LockFetcher, PaykitIntentBuilder, SessionValidationError, SessionValidator,
+            AppRegistryDiscovery, CreateInvoiceService, LockFetchError, LockFetcher,
+            PaykitIntentBuilder, RegistryDiscoveryError, SessionValidationError, SessionValidator,
         },
         payment_drain::{
             PaymentDrainCleanupToken, PaymentDrainError, PaymentDrainOperations,
@@ -44,7 +44,7 @@ use crate::{
 use async_trait::async_trait;
 use axum::{Extension, Router};
 use locks_core::lock_policy::ContentLock;
-use paykit_lib::{PaykitAppRegistry, get_paykit_app_registry};
+use paykit_lib::{PaykitAppRegistry, PaykitError, get_paykit_app_registry};
 use paykit_sdk::{PaykitSdkError, PubkyPublicKey, PubkySessionBootstrap, PubkySessionProvider};
 use pubky::{Pubky, errors::RequestError};
 use sqlx::PgPool;
@@ -211,7 +211,8 @@ impl Server {
                 max_pending_setup_flows: config.rate_limits.max_pending_setup_flows(),
             },
             config.setup.log_authorization_url,
-        );
+        )
+        .with_bitcoin_network(config.deployment_invariants().bitcoin_network.clone());
 
         let session_validator = Arc::new(CreatorSessionValidator {
             creators: creators.clone(),
@@ -275,7 +276,11 @@ impl Server {
                 .with_receiving(Arc::new(creators.clone()), usdt.is_some()),
         );
         let signed_auth = Arc::new(SignedLocksAuth::from_config(&config));
-        let business_routes = http::setup::setup_router(setup).merge(
+        let business_routes = http::setup::setup_router_with_trusted_proxy_hops(
+            setup,
+            config.http.trusted_proxy_hops(),
+        )
+        .merge(
             http::invoices::invoices_router(invoice_service)
                 .merge(http::connection_status::connection_status_router(
                     connection_status_service,
@@ -1148,19 +1153,18 @@ impl AppRegistryDiscovery for PubkyAppRegistryDiscovery {
     async fn discover(
         &self,
         reader: &ReaderPubky,
-    ) -> Result<Option<PaykitAppRegistry>, CreateInvoiceError> {
+    ) -> Result<Option<PaykitAppRegistry>, RegistryDiscoveryError> {
         let reader = PubkyPublicKey::from_raw_or_app_key(reader.to_string())
             .and_then(|key| key.to_public_key())
-            .map_err(|_| CreateInvoiceError::InvalidRequest)?;
+            .map_err(|_| RegistryDiscoveryError::InvalidRequest)?;
         get_paykit_app_registry(&self.storage, &reader)
             .await
-            .map_err(|_| {
-                crate::diagnostics::failure(
-                    "invoice_create",
-                    "reader_app_registry_fetch",
-                    "unavailable",
-                );
-                CreateInvoiceError::Unavailable
+            .or_else(|error| match error {
+                PaykitError::NotFound(_) => Ok(None),
+                PaykitError::Transport { .. } => Err(RegistryDiscoveryError::Unavailable),
+                PaykitError::InvalidData { .. } | PaykitError::Validation(_) => {
+                    Err(RegistryDiscoveryError::Malformed)
+                }
             })
     }
 }
