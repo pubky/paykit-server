@@ -232,8 +232,11 @@ async fn create_creator(
             PubkyLocalSecretKey::new(keypair.secret_key())
                 .derive_paykit_identity_secret_key(1)
                 .unwrap(),
-            xpub.clone(),
-            account_index,
+            Some(paykit_server::domain::receiving::BitcoinAccount {
+                xpub: xpub.clone().into(),
+                account_index,
+            }),
+            None,
         ))
         .await
         .unwrap();

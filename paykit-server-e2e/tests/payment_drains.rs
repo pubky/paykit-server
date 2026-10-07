@@ -134,7 +134,8 @@ impl InvoicePayloadFactory for RacePayloads {
                 "00000000-0000-4000-8000-000000000001",
                 &serde_json::json!({ "value": address }).to_string(),
             ),
-            bitcoin_address: address,
+            asset: paykit_server::domain::invoice::CriterionAsset::Btc,
+            receiving_address: address,
         })
     }
 }
@@ -152,7 +153,7 @@ fn admission_input<'a>(
         lock_resource_binding: LOCK_RESOURCE.as_bytes(),
         payment_request_binding: b"concurrent-admission-request",
         invoice_payloads: &RACE_PAYLOADS,
-        required_sats: 1_000,
+        required_amount: 1_000,
         proposal_acceptance_seconds: 60 * 60,
         payment_window_seconds: 24 * 60 * 60,
     }
@@ -240,10 +241,10 @@ async fn insert_invoice_with_receiver_path(
              invoice_envelope, payment_record_envelope, bitcoin_address_lookup_hash,
              derivation_index_lookup_hash, payment_status, confirmation_count,
              amount_matched, invoice_created_at, proposal_expires_at, payment_deadline,
-             proposal_acceptance_seconds, payment_window_seconds
+             proposal_acceptance_seconds, payment_window_seconds, asset
          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
                    'undetected', 0, FALSE, $12, $12 + INTERVAL '1 hour', $13,
-                   3600, 86400)",
+                   3600, 86400, 'BTC')",
     )
     .bind(invoice_id)
     .bind(creator_id)
@@ -625,8 +626,11 @@ async fn shared_foreign_app_records_do_not_poison_existing_invoice_refresh_or_ne
                 .unwrap()
                 .into_inner(),
             creator_root.derive_paykit_identity_secret_key(1).unwrap(),
-            "unused-test-xpub".into(),
-            0,
+            Some(paykit_server::domain::receiving::BitcoinAccount {
+                xpub: "unused-test-xpub".to_owned().into(),
+                account_index: 0,
+            }),
+            None,
         ))
         .await
         .unwrap();

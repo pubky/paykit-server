@@ -485,3 +485,38 @@ fn rejects_outbox_batch_size_above_the_supported_integer_range() {
     );
     assert!(Config::from_toml_and_environment(&oversized, environment()).is_err());
 }
+
+#[test]
+fn usdt_requires_an_explicit_protected_rpc_and_redacts_credentials() {
+    assert!(
+        Config::from_toml_and_environment(&valid_toml(), environment())
+            .unwrap()
+            .usdt
+            .is_none()
+    );
+    for url in [
+        "https://arbitrum.example/private-key",
+        "http://127.0.0.1:8545/",
+    ] {
+        let config = Config::from_toml_and_environment(
+            &format!("{}\n[usdt]\nrpc_url = \"{url}\"", valid_toml()),
+            environment(),
+        )
+        .unwrap();
+        assert!(config.usdt.is_some());
+        assert!(!format!("{:?}", config.usdt).contains(url));
+    }
+    for url in [
+        "http://arbitrum.example/",
+        "https://user:password@rpc.example/",
+        "https://rpc.example/#secret",
+    ] {
+        assert!(
+            Config::from_toml_and_environment(
+                &format!("{}\n[usdt]\nrpc_url = \"{url}\"", valid_toml()),
+                environment()
+            )
+            .is_err()
+        );
+    }
+}

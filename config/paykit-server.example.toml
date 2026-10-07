@@ -67,3 +67,8 @@ max_completion_polls = 200
 
 [shutdown]
 drain_timeout = "30s"
+
+# Optional direct Arbitrum One USDT0 receiving and receipt verification.
+# Keep provider credentials in the operator-owned config, never in client URLs.
+# [usdt]
+# rpc_url = "https://your-arbitrum-rpc.example/"

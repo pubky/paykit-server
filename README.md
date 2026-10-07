@@ -1,6 +1,6 @@
 # Paykit Server
 
-A PostgreSQL-backed, receiver-side Paykit prototype for Locks invoice workflows. It derives and observes a direct invoice-specific Bitcoin address. It does not use payer identity, payer inbox messages, or payment-proof messages to attribute payment.
+A PostgreSQL-backed, receiver-side Paykit service for Locks invoices. It observes invoice-specific Bitcoin addresses and optionally verifies direct USDT0 payments on Arbitrum One using authenticated Paykit ERC-20 proofs. Locks makes the access decision; the server never spends funds.
 
 This repository is pre-production. Persisted-data compatibility, stable releases, and production deployment support are not yet provided.
 
@@ -74,7 +74,7 @@ invoices return `404`; authentication, storage, malformed-state, and dependency
 failures remain typed errors. `connected` is the identity's shared Noise state,
 not payment or verification completion.
 
-`POST /setup/status` is the Locks-only readiness check for an authenticated Creator. Its closed canonical body is `{"creator":"pubky..."}`. Every signed route verifies Ed25519 over `b"paykit-http-signature-v1\0" + uppercase_method + b"\0" + exact_query_free_path + b"\0" + exact_raw_body`; there is no body-only fallback. It returns exactly one coarse state: `ready` when the persisted session, delegated key, App Registry entry, and hosted state are usable; `setup_required` when authority is absent or confirmed invalid; and `unavailable` for validation timeouts and storage, rate-limit, server, DNS, or transport failures. Untyped Pubky 401 responses are also `unavailable`: they cannot distinguish revoked grants from recoverable PoP failures. A revoked grant reported this way requires explicit reconnect. Callers must not convert `unavailable` into a new authorization flow.
+`POST /setup/status` is the Locks-only readiness check for an authenticated Creator. Its closed body is `{"creator":"pubky..."}` with optional `asset: "BTC"` or `asset: "USDT"` to check approved receiving details for that asset. Every signed route verifies Ed25519 over `b"paykit-http-signature-v1\0" + uppercase_method + b"\0" + exact_query_free_path + b"\0" + exact_raw_body`; there is no body-only fallback. It returns exactly one coarse state: `ready` when the persisted session, delegated key, App Registry entry, and hosted state are usable; `setup_required` when authority is absent or confirmed invalid; and `unavailable` for validation timeouts and storage, rate-limit, server, DNS, or transport failures. Untyped Pubky 401 responses are also `unavailable`: they cannot distinguish revoked grants from recoverable PoP failures. A revoked grant reported this way requires explicit reconnect. Callers must not convert `unavailable` into a new authorization flow.
 
 ### Setup iframe
 
@@ -109,7 +109,7 @@ authorizer publishes that record. Reconnect refreshes delegated credentials whil
 preserving the account and invoices; signed authorization does not require a
 database reset.
 
-Bitkit authorizes only `/pub/paykit/:rw` for Server. The server requests two independent
+Bitkit authorizes only `/pub/paykit/:rw` for Server. With USDT disabled, the server requests two independent
 permissions as `x-bitkit-claim=paykit-access-v1.watch-only-account-v1` and Bitkit
 returns a signed, encrypted companion claim. Its 124-byte payload contains the BIP84
 account index, address kind, serialized xpub, Paykit key generation, and 32-byte
@@ -122,13 +122,13 @@ retryable. Reauthorization preserves the account/xpub and accepts only the same
 key or a newer generation. The server never receives the Pubky root secret or
 Bitcoin spending keys.
 
-Initial setup requires both permissions. The exact received list order binds the
+This Bitcoin setup requires both permissions. With `[usdt]` enabled, setup additionally requests optional `usdt-address-v1` and uses the JSON claim described below. The exact received list order binds the
 SDK signature and relay channel; the 124-byte payload always puts watch-only
 account bytes before Paykit key material regardless of list order. Empty,
 duplicate, unknown, or one-only selections fail setup.
 Reconnect uses `GET /setup/reconnect?creator=pubky...&return_to=...&state=...`.
-The server requires an existing Creator and requests only `paykit-access-v1`
-(41 unsigned bytes). The AUTH identity must match that exact Creator; the xpub
+The server requires an existing Creator and requests `paykit-access-v1`
+(41 unsigned bytes), adding optional `usdt-address-v1` when enabled. The AUTH identity must match that exact Creator; the xpub
 and account index come exclusively from stored credentials under the setup lock.
 No watch-only account is selected, allocated, or retransmitted on reconnect.
 Initial setup cannot replace an existing binding; use reconnect even when retrying
@@ -168,7 +168,7 @@ One process may own multiple Creator accounts. Each Creator has independent:
 - one BIP84 account xpub and hardened account index;
 - external-chain address derivation counter;
 - identity-wide hosted Paykit state and Encrypted Links shared with authorized apps;
-- encrypted invoices, assignments, outbox work, and Bitcoin observations.
+- encrypted invoices, assignments, outbox work, and payment observations.
 
 Different Creators may use the same numeric child index because their xpubs and derivation sequences are isolated. There is no configured Creator-count limit, but all loaded runtimes remain cached until process exit; practical cardinality is therefore bounded by process and database capacity.
 
@@ -182,7 +182,7 @@ does not upgrade that service. The SDK still requires commit-time fencing of
 expired lock holders and durable publication of complete files. Its five-minute
 uncertain-write cooldown remains in place and does not replace those requirements.
 
-Startup holds a session advisory lock while applying the single schema baseline. Before binding HTTP it verifies immutable deployment metadata and authenticates every persisted Creator credential, invoice payment record, and Bitcoin observation. Missing, corrupt, swapped, conflicting, or wrong-key database state aborts startup with a secret-free error. Hosted Paykit state is checked during SDK operations and setup readiness; failures do not create a replacement local state.
+Startup holds a session advisory lock while applying the single schema baseline. Before binding HTTP it verifies immutable deployment metadata and authenticates every persisted Creator credential, invoice payment record, and payment observation. Missing, corrupt, swapped, conflicting, or wrong-key database state aborts startup with a secret-free error. Hosted Paykit state is checked during SDK operations and setup readiness; failures do not create a replacement local state.
 
 Immutable deployment values are:
 
@@ -387,11 +387,51 @@ There is no payload-retention or pruning contract, retention worker, runtime idl
 - `tcp://` Electrum has no transport authentication; use a CA-valid `ssl://` endpoint for production.
 - No configured Creator-count bound or runtime eviction.
 - One xpub/account index per Creator; no xpub, account, master-key, or immutable-invariant rotation.
-- BTC only; no other assets.
-- No payer inbox/proofs or receipt workflows.
+- BTC and optional direct USDT0 on Arbitrum One; no bridging, swaps, or currency conversion.
+- No public payer inbox or proof-submission API, and no receipt issuance.
 - No spending custody, refunds, credits, or change.
 - No output aggregation and no deep-reorg repair after finality.
 - No retention/pruning contract.
 - Shared-state safety inherits the pinned SDK's homeserver lock contract and pending-write cooldown. The cooldown does not guarantee safety if a stale homeserver write finalizes after lock ownership is lost.
 - Live Pubky evidence uses a local static testnet, not a remote production homeserver or the complete Bitkit user-approval journey.
 - Live Electrum evidence proves one exact mainnet Fulcrum snapshot over plaintext protocol; it is not a production TLS endorsement.
+
+## Direct USDT0 invoices
+
+Enable `[usdt]` with `rpc_url` in the operator config to request optional USDT
+sharing and verify Arbitrum One receipts. Without it, the service requests only
+Bitcoin receiving details and rejects new USDT invoices. RPC credentials stay on
+the server. A standard Arbitrum JSON-RPC endpoint must support `eth_chainId`,
+`eth_getTransactionReceipt`, `eth_getBlockByNumber` (including `finalized`) and
+`eth_blockNumber`; archive history scanning is unnecessary.
+
+Setup requests the existing Bitcoin account plus `usdt-address-v1`. The user can
+skip USDT without blocking Bitcoin. Reconnect can add a previously omitted USDT
+address but cannot change an already-approved address or Bitcoin account.
+Signed `POST /setup/status` accepts optional `asset: "BTC"` or `asset: "USDT"`
+and returns the existing `{status}` response for that asset. Omitting `asset`
+checks Pubky/Paykit authority only. Locks should check the selected asset before
+publishing a priced lock.
+
+A USDT payment criterion uses `asset: "USDT"` and integer millionths, so `50000`
+means 0.05 USDT. Its immutable request contains the approved address, chain 42161,
+and token `0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9`. Multiple invoices use the
+same address. Requests require the `paykit-server` receiving app and do not permit
+conversion to another payment asset.
+
+The existing SDK receive loop reconciles `erc20-transfer-eip712` proofs. The
+server verifies the request-bound sender signature, successful canonical receipt,
+exact token, recipient and receipt-relative Transfer event. A single transfer must
+cover the full amount; split payments are not aggregated. Underpayments and late
+payments remain received funds but do not satisfy the invoice. Payment time comes
+from the canonical block timestamp (second precision), within the invoice window.
+An RPC outage leaves the last observation intact and returns unavailable when a
+fresh status is required. Non-final observations are rechecked for reorgs; finalized
+observations stop polling. The chain/hash/receipt-index identity is durably unique
+across invoices, including restarts. Confirmations are Arbitrum L2 block counts;
+Locks must choose an asset-appropriate acceptance policy, not assume Bitcoin timing.
+
+No public transaction-hash submission API is added. Proofs must arrive through the
+SDK's authenticated request flow. Address sharing is not proof of a purchase.
+The Locks creator/payment UI must offer the USDT criterion and asset-specific
+readiness check before an end-to-end Locks checkout can be enabled.

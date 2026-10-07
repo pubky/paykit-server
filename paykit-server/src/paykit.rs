@@ -270,6 +270,7 @@ pub struct PaykitAdapter {
     creator: CreatorPubky,
     app_id: PaykitAppId,
     mutation_lock: Arc<TokioMutex<()>>,
+    usdt: Option<(InvoiceStore, crate::usdt::ArbitrumVerifier)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -343,7 +344,17 @@ impl PaykitAdapter {
             creator_id,
             creator,
             app_id: config.app_id.clone(),
+            usdt: None,
         })
+    }
+
+    pub fn with_usdt(
+        mut self,
+        invoices: InvoiceStore,
+        verifier: Option<crate::usdt::ArbitrumVerifier>,
+    ) -> Self {
+        self.usdt = verifier.map(|verifier| (invoices, verifier));
+        self
     }
 
     /// Receives linked-peer messages and durably projects the SDK's canonical
@@ -353,7 +364,9 @@ impl PaykitAdapter {
         lifecycles: &PaymentRequestLifecycleStore,
     ) -> Result<(), LifecycleSyncError> {
         let _guard = self.mutation_lock.lock().await;
-        self.refresh_payment_requests_locked(lifecycles, None).await
+        self.refresh_payment_requests_locked(lifecycles, None)
+            .await?;
+        self.observe_usdt_requests(None).await
     }
 
     async fn refresh_payment_requests_locked(
@@ -378,7 +391,32 @@ impl PaykitAdapter {
                 .map_err(map_projection_persistence_error)?;
             Ok(())
         })
-        .await
+        .await?;
+        Ok(())
+    }
+
+    async fn observe_usdt_requests(
+        &self,
+        bundle: Option<&BundleId>,
+    ) -> Result<(), LifecycleSyncError> {
+        let Some((invoices, verifier)) = &self.usdt else {
+            return Ok(());
+        };
+        let records = self
+            .sdk
+            .payment_requests()
+            .await
+            .map_err(|_| LifecycleSyncError::Sdk)?;
+        let mut result = Ok(());
+        for record in &records {
+            if let Err(error) = invoices
+                .observe_usdt_request(self.creator_id, &self.creator, record, verifier, bundle)
+                .await
+            {
+                result = Err(map_projection_persistence_error(error));
+            }
+        }
+        result
     }
 
     /// Receives and projects fresh canonical state before returning status, all
@@ -425,6 +463,9 @@ impl PaykitAdapter {
                     })
             },
             || async {
+                self.observe_usdt_requests(Some(bundle_id))
+                    .await
+                    .map_err(map_lifecycle_status_error)?;
                 statuses
                     .payment_request_status_after_receive(
                         lifecycles,

@@ -4,6 +4,8 @@
 //! repository persists those complete SDK inputs inside Creator-bound AEAD
 //! envelopes before reporting invoice success.
 
+mod usdt;
+
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -13,6 +15,8 @@ use sqlx::{PgPool, Postgres, Transaction};
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 use zeroize::Zeroizing;
+
+use crate::domain::{invoice::CriterionAsset, receiving::UsdtAddress};
 
 use crate::{
     application::{
@@ -50,8 +54,8 @@ pub struct AtomicInvoiceInput<'a> {
     /// Derives the address and complete request only after this
     /// transaction has selected the permanent child index.
     pub invoice_payloads: &'a dyn InvoicePayloadFactory,
-    /// Settlement-authoritative integer satoshi amount captured from the lock.
-    pub required_sats: u64,
+    /// Settlement-authoritative integer asset base-unit amount captured from the lock.
+    pub required_amount: u64,
     /// Deployment-owned proposal acceptance window sampled from validated config.
     pub proposal_acceptance_seconds: u64,
     /// Deployment-owned payment window sampled from validated config.
@@ -61,16 +65,18 @@ pub struct AtomicInvoiceInput<'a> {
 /// Private payloads for a newly allocated invoice.
 pub struct InvoicePayloads {
     pub payment_request_intent: DeliveryIntentV1,
-    /// Invoice-specific BIP84 P2WPKH address derived at the allocated index.
-    pub bitcoin_address: String,
+    /// Derived Bitcoin address or the Creator-approved Arbitrum USDT address.
+    pub receiving_address: String,
+    pub asset: CriterionAsset,
 }
 
 #[derive(Serialize, Deserialize)]
 struct InvoicePaymentRecordV1 {
     version: u8,
     derivation_index: i64,
-    bitcoin_address: String,
-    required_sats: u64,
+    receiving_address: String,
+    required_amount: u64,
+    asset: CriterionAsset,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -184,18 +190,19 @@ impl InvoiceStore {
         }
     }
 
-    /// Authenticates all final encrypted Bitcoin values and their keyed lookup hashes.
+    /// Authenticates encrypted payment records and observations against their keyed lookup hashes.
     pub async fn scan_payment_record_integrity(&self) -> Result<(), PersistenceError> {
-        let invoices = sqlx::query_as::<_, (Uuid, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)>(
-            "SELECT invoices.id, creators.creator_lookup_hash,
+        let invoices =
+            sqlx::query_as::<_, (Uuid, Vec<u8>, Vec<u8>, Option<Vec<u8>>, Vec<u8>, String)>(
+                "SELECT invoices.id, creators.creator_lookup_hash,
                     invoices.payment_record_envelope, invoices.bitcoin_address_lookup_hash,
-                    invoices.derivation_index_lookup_hash
+                    invoices.derivation_index_lookup_hash, invoices.asset
              FROM invoices JOIN creators ON creators.id = invoices.creator_id",
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|_| PersistenceError::Unavailable)?;
-        for (id, creator_hash, envelope, address_hash, index_hash) in invoices {
+            )
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        for (id, creator_hash, envelope, address_hash, index_hash, asset) in invoices {
             let creator_hash = lookup_hash_from_storage(&creator_hash)?;
             let plaintext = self
                 .crypto
@@ -206,12 +213,22 @@ impl InvoiceStore {
                 .map_err(|_| PersistenceError::CorruptOrMissing)?;
             let record: InvoicePaymentRecordV1 =
                 postcard::from_bytes(&plaintext).map_err(|_| PersistenceError::CorruptOrMissing)?;
-            if record.version != 1
-                || address_hash
-                    != self
-                        .crypto
-                        .bitcoin_address_lookup_hash(record.bitcoin_address.as_bytes())
+            let expected_address_hash = match record.asset {
+                CriterionAsset::Btc => Some(
+                    self.crypto
+                        .bitcoin_address_lookup_hash(record.receiving_address.as_bytes())
                         .as_bytes()
+                        .to_vec(),
+                ),
+                CriterionAsset::Usdt => {
+                    UsdtAddress::try_from(record.receiving_address.clone())
+                        .map_err(|_| PersistenceError::CorruptOrMissing)?;
+                    None
+                }
+            };
+            if record.version != 1
+                || asset != record.asset.as_str()
+                || address_hash != expected_address_hash
                 || index_hash
                     != self
                         .crypto
@@ -253,7 +270,7 @@ impl InvoiceStore {
                 return Err(PersistenceError::CorruptOrMissing);
             }
         }
-        Ok(())
+        self.scan_usdt_observation_integrity().await
     }
 
     /// Loads every non-final invoice as an authenticated Electrum observation target.
@@ -315,7 +332,7 @@ impl InvoiceStore {
              FROM invoices JOIN creators ON creators.id = invoices.creator_id \
              LEFT JOIN bitcoin_observations AS observations \
                ON observations.invoice_id = invoices.id AND observations.active \
-             WHERE NOT (invoices.payment_status = 'confirmed' \
+             WHERE invoices.asset = 'BTC' AND NOT (invoices.payment_status = 'confirmed' \
                         AND invoices.confirmation_count = 6 AND invoices.amount_matched) \
              ORDER BY invoices.id",
         )
@@ -342,7 +359,7 @@ impl InvoiceStore {
                     || row.bitcoin_address_lookup_hash
                         != self
                             .crypto
-                            .bitcoin_address_lookup_hash(payment.bitcoin_address.as_bytes())
+                            .bitcoin_address_lookup_hash(payment.receiving_address.as_bytes())
                             .as_bytes()
                     || row.derivation_index_lookup_hash
                         != self
@@ -396,7 +413,7 @@ impl InvoiceStore {
                     }
                     _ => return Err(PersistenceError::CorruptOrMissing),
                 };
-                Ok(ObservationTarget::new(payment.bitcoin_address, current))
+                Ok(ObservationTarget::new(payment.receiving_address, current))
             })
             .collect()
     }
@@ -962,12 +979,12 @@ impl InvoiceStore {
             postcard::from_bytes(&payment_record_plaintext)
                 .map_err(|_| PersistenceError::CorruptOrMissing)?;
         if payment_record.version != 1
-            || payment_record.bitcoin_address != address
+            || payment_record.receiving_address != address
             || invoice.bitcoin_address_lookup_hash != address_lookup_hash.as_bytes()
         {
             return Err(PersistenceError::CorruptOrMissing);
         }
-        let required = payment_record.required_sats;
+        let required = payment_record.required_amount;
         let amount_matched = present && observed_sats >= required;
         let outpoint_lookup_hash = self
             .crypto
@@ -1357,10 +1374,20 @@ impl InvoiceStore {
                     .payment_request_intent
                     .terms()
                     .map_err(|_| PersistenceError::CorruptOrMissing)?;
+                let expected_endpoint = match payloads.asset {
+                    CriterionAsset::Btc => {
+                        serde_json::json!({ "value": payloads.receiving_address })
+                    }
+                    CriterionAsset::Usdt => {
+                        UsdtAddress::try_from(payloads.receiving_address.clone())
+                            .map_err(|_| PersistenceError::InvalidInput)?
+                            .endpoint()
+                    }
+                };
                 if terms.payment_endpoints.len() != 1
                     || terms.payment_endpoints.values().any(|payload| {
                         serde_json::from_str::<serde_json::Value>(payload).ok()
-                            != Some(serde_json::json!({ "value": payloads.bitcoin_address }))
+                            != Some(expected_endpoint.clone())
                     })
                 {
                     return Err(PersistenceError::CorruptOrMissing);
@@ -1417,8 +1444,9 @@ impl InvoiceStore {
         let payment_record_plaintext = postcard::to_allocvec(&InvoicePaymentRecordV1 {
             version: 1,
             derivation_index: assignment.child_index,
-            bitcoin_address: payloads.bitcoin_address.clone(),
-            required_sats: input.required_sats,
+            receiving_address: payloads.receiving_address.clone(),
+            asset: payloads.asset,
+            required_amount: input.required_amount,
         })
         .map_err(|_| PersistenceError::CorruptOrMissing)?;
         let payment_record_envelope = self
@@ -1428,9 +1456,10 @@ impl InvoiceStore {
                 &payment_record_plaintext,
             )
             .map_err(|_| PersistenceError::CorruptOrMissing)?;
-        let bitcoin_address_lookup_hash = self
-            .crypto
-            .bitcoin_address_lookup_hash(payloads.bitcoin_address.as_bytes());
+        let bitcoin_address_lookup_hash = (payloads.asset == CriterionAsset::Btc).then(|| {
+            self.crypto
+                .bitcoin_address_lookup_hash(payloads.receiving_address.as_bytes())
+        });
         let derivation_index_lookup_hash = self
             .crypto
             .bitcoin_derivation_index_lookup_hash(creator_hash, assignment.child_index);
@@ -1448,9 +1477,9 @@ impl InvoiceStore {
               payment_record_envelope, bitcoin_address_lookup_hash,
               derivation_index_lookup_hash, payment_status, invoice_created_at,
               proposal_expires_at, payment_deadline, proposal_acceptance_seconds,
-              payment_window_seconds) \
+              payment_window_seconds, asset) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'undetected',
-                     $12, $13, $14, $15, $16)",
+                     $12, $13, $14, $15, $16, $17)",
         )
         .bind(invoice_id)
         .bind(creator.id)
@@ -1461,13 +1490,18 @@ impl InvoiceStore {
         .bind(payment_request_hash.as_bytes().as_slice())
         .bind(invoice_envelope.as_bytes())
         .bind(payment_record_envelope.as_bytes())
-        .bind(bitcoin_address_lookup_hash.as_bytes().as_slice())
+        .bind(
+            bitcoin_address_lookup_hash
+                .as_ref()
+                .map(|hash| hash.as_bytes().as_slice()),
+        )
         .bind(derivation_index_lookup_hash.as_bytes().as_slice())
         .bind(invoice_created_at)
         .bind(proposal_expires_at)
         .bind(payment_deadline)
         .bind(proposal_acceptance_seconds)
         .bind(payment_window_seconds)
+        .bind(payloads.asset.as_str())
         .execute(&mut *tx)
         .await
         .map_err(|_| PersistenceError::Conflict)?;

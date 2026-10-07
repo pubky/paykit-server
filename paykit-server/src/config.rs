@@ -24,6 +24,7 @@ pub struct Config {
     pub setup: SetupConfig,
     pub paykit: PaykitConfig,
     pub electrum: ElectrumConfig,
+    pub usdt: Option<UsdtConfig>,
     pub outbox: OutboxConfig,
     pub limits: LimitsConfig,
     pub rate_limits: RateLimitsConfig,
@@ -86,6 +87,7 @@ impl Config {
                 request_timeout: raw.electrum.request_timeout,
                 connect_retries: raw.electrum.connect_retries,
             },
+            usdt: raw.usdt.map(UsdtConfig::try_from).transpose()?,
             outbox: OutboxConfig::from(raw.outbox),
             limits: LimitsConfig::from(raw.limits),
             rate_limits: RateLimitsConfig::from(raw.rate_limits),
@@ -342,6 +344,46 @@ pub struct SetupConfig {
     pub log_authorization_url: bool,
 }
 
+/// Optional direct Arbitrum USDT observation and receiving permissions.
+#[derive(Clone)]
+pub struct UsdtConfig {
+    pub rpc_url: Url,
+}
+
+impl fmt::Debug for UsdtConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("UsdtConfig")
+            .field("rpc_url", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawUsdtConfig {
+    rpc_url: String,
+}
+
+impl TryFrom<RawUsdtConfig> for UsdtConfig {
+    type Error = ConfigError;
+    fn try_from(value: RawUsdtConfig) -> Result<Self, Self::Error> {
+        let rpc_url = Url::parse(&value.rpc_url).map_err(|_| ConfigError::InvalidUsdtRpc)?;
+        let local = matches!(
+            rpc_url.host_str(),
+            Some("localhost" | "127.0.0.1" | "[::1]")
+        );
+        if (rpc_url.scheme() != "https" && !(local && rpc_url.scheme() == "http"))
+            || rpc_url.host_str().is_none()
+            || rpc_url.fragment().is_some()
+            || !rpc_url.username().is_empty()
+            || rpc_url.password().is_some()
+        {
+            return Err(ConfigError::InvalidUsdtRpc);
+        }
+        Ok(Self { rpc_url })
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct PaykitConfig {
     pub client_id: ClientId,
@@ -498,6 +540,8 @@ impl fmt::Debug for ElectrumEndpoint {
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
+    #[error("invalid Arbitrum RPC configuration")]
+    InvalidUsdtRpc,
     #[error("configuration TOML is invalid")]
     Toml,
     #[error("PAYKIT_DATABASE_URL is required")]
@@ -633,6 +677,7 @@ struct RawConfig {
     paykit: RawPaykitConfig,
     bitcoin: RawBitcoinConfig,
     electrum: RawElectrumConfig,
+    usdt: Option<RawUsdtConfig>,
     outbox: RawOutboxConfig,
     #[serde(default)]
     limits: RawLimitsConfig,

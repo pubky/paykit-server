@@ -99,14 +99,32 @@ pub trait AppRegistryDiscovery: Send + Sync {
     ) -> Result<Option<PaykitAppRegistry>, CreateInvoiceError>;
 }
 #[async_trait]
-pub trait CreatorXpubProvider: Send + Sync {
-    async fn xpub(&self, creator: &CreatorPubky) -> Result<(String, u32), PersistenceError>;
+pub trait CreatorReceivingProvider: Send + Sync {
+    async fn receiving(
+        &self,
+        creator: &CreatorPubky,
+        asset: CriterionAsset,
+    ) -> Result<ReceivingDetails, PersistenceError>;
 }
 #[async_trait]
-impl CreatorXpubProvider for CreatorStore {
-    async fn xpub(&self, creator: &CreatorPubky) -> Result<(String, u32), PersistenceError> {
+impl CreatorReceivingProvider for CreatorStore {
+    async fn receiving(
+        &self,
+        creator: &CreatorPubky,
+        asset: CriterionAsset,
+    ) -> Result<ReceivingDetails, PersistenceError> {
         let credentials = self.load(creator).await?;
-        Ok((credentials.xpub().to_owned(), credentials.account_index()))
+        match asset {
+            CriterionAsset::Btc => credentials
+                .bitcoin_account()
+                .cloned()
+                .map(ReceivingDetails::Bitcoin),
+            CriterionAsset::Usdt => credentials
+                .usdt_address()
+                .cloned()
+                .map(ReceivingDetails::Usdt),
+        }
+        .ok_or(PersistenceError::InvalidInput)
     }
 }
 #[async_trait]
@@ -166,6 +184,11 @@ pub trait IntentBuilder: Send + Sync {
     ) -> Result<PaymentRequestTerms, CreateInvoiceError>;
 }
 
+pub enum ReceivingDetails {
+    Bitcoin(crate::domain::receiving::BitcoinAccount),
+    Usdt(crate::domain::receiving::UsdtAddress),
+}
+
 pub struct PaykitIntentBuilder {
     bitcoin_network: crate::config::BitcoinNetwork,
 }
@@ -195,12 +218,22 @@ impl IntentBuilder for PaykitIntentBuilder {
         if address.is_empty() {
             return Err(CreateInvoiceError::InvalidRequest);
         }
-        let identifier = PaymentEndpointIdentifier::new(self.p2wpkh_identifier())
+        let (asset, amount) = extract_terms(lock)?;
+        let (identifier, payload) = match asset {
+            CriterionAsset::Btc => (
+                self.p2wpkh_identifier(),
+                serde_json::json!({"value": address}),
+            ),
+            CriterionAsset::Usdt => (
+                crate::domain::receiving::USDT_ENDPOINT,
+                crate::domain::receiving::UsdtAddress::try_from(address.to_owned())
+                    .map_err(|_| CreateInvoiceError::InvalidRequest)?
+                    .endpoint(),
+            ),
+        };
+        let identifier = PaymentEndpointIdentifier::new(identifier)
             .map_err(|_| CreateInvoiceError::InvalidRequest)?;
-        let payload = serde_json::to_string(&serde_json::json!({ "value": address }))
-            .map_err(|_| CreateInvoiceError::InvalidRequest)?;
-        let amount = extract_terms(lock)?;
-        let sats = amount.as_sats();
+        let payload = payload.to_string();
         let mut metadata = Map::new();
         metadata.insert(
             "bundle_id".into(),
@@ -213,8 +246,8 @@ impl IntentBuilder for PaykitIntentBuilder {
         metadata.insert("reader".into(), Value::String(request.reader.to_string()));
         PaymentRequestTerms::builder(
             PaymentAmount::new(
-                format!("{}.{:08}", sats / 100_000_000, sats % 100_000_000),
-                "btc",
+                asset.decimal_amount(amount.units()),
+                asset.as_str().to_ascii_lowercase(),
             )
             .map_err(|_| CreateInvoiceError::InvalidRequest)?,
             PaymentReference::new(uuid::Uuid::new_v4().hyphenated().to_string())
@@ -272,8 +305,7 @@ pub fn derive_bip84_p2wpkh_address(
 
 struct DerivedInvoicePayloads<'a> {
     intents: Arc<dyn IntentBuilder>,
-    xpub: String,
-    account_index: u32,
+    receiving: ReceivingDetails,
     network: crate::config::BitcoinNetwork,
     request: &'a CreateInvoiceRequest,
     lock: &'a ContentLock,
@@ -281,12 +313,19 @@ struct DerivedInvoicePayloads<'a> {
 }
 impl InvoicePayloadFactory for DerivedInvoicePayloads<'_> {
     fn for_child_index(&self, child_index: i64) -> Result<InvoicePayloads, PersistenceError> {
-        let address =
-            derive_bip84_p2wpkh_address(&self.xpub, self.account_index, &self.network, child_index)
-                .map_err(|error| {
-                    diagnose("address_derivation", error);
-                    PersistenceError::CorruptOrMissing
-                })?;
+        let (address, asset) = match &self.receiving {
+            ReceivingDetails::Bitcoin(account) => (
+                derive_bip84_p2wpkh_address(
+                    &account.xpub,
+                    account.account_index,
+                    &self.network,
+                    child_index,
+                )
+                .map_err(|_| PersistenceError::CorruptOrMissing)?,
+                CriterionAsset::Btc,
+            ),
+            ReceivingDetails::Usdt(address) => (address.as_str().to_owned(), CriterionAsset::Usdt),
+        };
         let terms = self
             .intents
             .payment_request_terms(self.request, self.lock, &address)
@@ -309,7 +348,8 @@ impl InvoicePayloadFactory for DerivedInvoicePayloads<'_> {
         })?;
         Ok(InvoicePayloads {
             payment_request_intent,
-            bitcoin_address: address,
+            receiving_address: address,
+            asset,
         })
     }
 }
@@ -330,7 +370,8 @@ pub struct CreateInvoiceService {
     locks: Arc<dyn LockFetcher>,
     registries: Arc<dyn AppRegistryDiscovery>,
     app_id: PaykitAppId,
-    credentials: Arc<dyn CreatorXpubProvider>,
+    credentials: Arc<dyn CreatorReceivingProvider>,
+    usdt_enabled: bool,
     bitcoin_network: crate::config::BitcoinNetwork,
     store: Arc<dyn InvoicePersistence>,
     intents: Arc<dyn IntentBuilder>,
@@ -345,7 +386,7 @@ impl CreateInvoiceService {
         locks: Arc<dyn LockFetcher>,
         registries: Arc<dyn AppRegistryDiscovery>,
         app_id: PaykitAppId,
-        credentials: Arc<dyn CreatorXpubProvider>,
+        credentials: Arc<dyn CreatorReceivingProvider>,
         bitcoin_network: crate::config::BitcoinNetwork,
         store: Arc<dyn InvoicePersistence>,
         intents: Arc<dyn IntentBuilder>,
@@ -369,7 +410,7 @@ impl CreateInvoiceService {
         locks: Arc<dyn LockFetcher>,
         registries: Arc<dyn AppRegistryDiscovery>,
         app_id: PaykitAppId,
-        credentials: Arc<dyn CreatorXpubProvider>,
+        credentials: Arc<dyn CreatorReceivingProvider>,
         bitcoin_network: crate::config::BitcoinNetwork,
         store: Arc<dyn InvoicePersistence>,
         intents: Arc<dyn IntentBuilder>,
@@ -396,7 +437,7 @@ impl CreateInvoiceService {
         locks: Arc<dyn LockFetcher>,
         registries: Arc<dyn AppRegistryDiscovery>,
         app_id: PaykitAppId,
-        credentials: Arc<dyn CreatorXpubProvider>,
+        credentials: Arc<dyn CreatorReceivingProvider>,
         bitcoin_network: crate::config::BitcoinNetwork,
         store: Arc<dyn InvoicePersistence>,
         intents: Arc<dyn IntentBuilder>,
@@ -424,7 +465,7 @@ impl CreateInvoiceService {
         locks: Arc<dyn LockFetcher>,
         registries: Arc<dyn AppRegistryDiscovery>,
         app_id: PaykitAppId,
-        credentials: Arc<dyn CreatorXpubProvider>,
+        credentials: Arc<dyn CreatorReceivingProvider>,
         bitcoin_network: crate::config::BitcoinNetwork,
         store: Arc<dyn InvoicePersistence>,
         intents: Arc<dyn IntentBuilder>,
@@ -438,6 +479,7 @@ impl CreateInvoiceService {
             registries,
             app_id,
             credentials,
+            usdt_enabled: false,
             bitcoin_network,
             store,
             intents,
@@ -445,6 +487,11 @@ impl CreateInvoiceService {
             proposal_acceptance_window,
             payment_window,
         }
+    }
+
+    pub fn with_usdt(mut self, enabled: bool) -> Self {
+        self.usdt_enabled = enabled;
+        self
     }
 
     pub async fn create(
@@ -553,16 +600,22 @@ impl CreateInvoiceService {
             );
             return Err(CreateInvoiceError::Unavailable);
         }
-        let credentials_remaining = remaining_at(started, self.clock.now(), "creator_xpub_load")?;
-        let (xpub, account_index) =
-            tokio::time::timeout(credentials_remaining, self.credentials.xpub(&creator))
-                .await
-                .map_err(|_| deadline("creator_xpub_load"))?
-                .map_err(|error| store_failure("creator_xpub_load", error))?;
+        let credentials_remaining =
+            remaining_at(started, self.clock.now(), "creator_receiving_details")?;
+        let (asset, amount) = extract_terms(&lock)?;
+        if asset == CriterionAsset::Usdt && !self.usdt_enabled {
+            return Err(CreateInvoiceError::InvalidRequest);
+        }
+        let receiving = tokio::time::timeout(
+            credentials_remaining,
+            self.credentials.receiving(&creator, asset),
+        )
+        .await
+        .map_err(|_| deadline("creator_receiving_details"))?
+        .map_err(|error| store_failure("creator_receiving_details", error))?;
         let invoice_payloads = DerivedInvoicePayloads {
             intents: self.intents.clone(),
-            xpub,
-            account_index,
+            receiving,
             network: self.bitcoin_network.clone(),
             request: &request,
             lock: &lock,
@@ -580,7 +633,7 @@ impl CreateInvoiceService {
                 lock_resource_binding: &lock_resource_binding,
                 payment_request_binding: &payment_request_binding,
                 invoice_payloads: &invoice_payloads,
-                required_sats: extract_terms(&lock)?.as_sats(),
+                required_amount: amount.units(),
                 proposal_acceptance_seconds: self.proposal_acceptance_window.as_secs(),
                 payment_window_seconds: self.payment_window.as_secs(),
             })
@@ -667,13 +720,15 @@ fn validate_lock(
     .map_err(|_| CreateInvoiceError::InvalidRequest)?;
     Ok(())
 }
-fn extract_terms(lock: &ContentLock) -> Result<CriterionAmount, CreateInvoiceError> {
+fn extract_terms(
+    lock: &ContentLock,
+) -> Result<(CriterionAsset, CriterionAmount), CreateInvoiceError> {
     let criterion = lock
         .criteria
         .iter()
         .find(|criterion| criterion.verifier_type == VerifierType::PaykitPayment)
         .ok_or(CreateInvoiceError::InvalidRequest)?;
-    CriterionAsset::parse(
+    let asset = CriterionAsset::parse(
         criterion
             .params
             .get("asset")
@@ -681,12 +736,13 @@ fn extract_terms(lock: &ContentLock) -> Result<CriterionAmount, CreateInvoiceErr
             .ok_or(CreateInvoiceError::InvalidRequest)?,
     )
     .map_err(|_| CreateInvoiceError::InvalidRequest)?;
-    CriterionAmount::parse(
+    let amount = CriterionAmount::parse(
         criterion
             .params
             .get("amount")
             .and_then(Value::as_str)
             .ok_or(CreateInvoiceError::InvalidRequest)?,
     )
-    .map_err(|_| CreateInvoiceError::InvalidRequest)
+    .map_err(|_| CreateInvoiceError::InvalidRequest)?;
+    Ok((asset, amount))
 }

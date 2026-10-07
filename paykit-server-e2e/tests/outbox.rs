@@ -70,7 +70,8 @@ impl InvoicePayloadFactory for Payloads {
         let address = format!("outbox-test-address-{child_index}");
         Ok(InvoicePayloads {
             payment_request_intent: common::payment_intent(&self.reader, address.clone()),
-            bitcoin_address: address,
+            asset: paykit_server::domain::invoice::CriterionAsset::Btc,
+            receiving_address: address,
         })
     }
 }
@@ -186,8 +187,11 @@ async fn invoice_request_is_claimable_directly_and_preserves_delivery_fences() {
             creator.clone(),
             "session-secret".into(),
             PaykitIdentitySecretKey::new([9; 32], 1).unwrap(),
-            "xpub-secret".into(),
-            0,
+            Some(paykit_server::domain::receiving::BitcoinAccount {
+                xpub: "xpub-secret".to_owned().into(),
+                account_index: 0,
+            }),
+            None,
         ))
         .await
         .unwrap();
@@ -202,7 +206,7 @@ async fn invoice_request_is_claimable_directly_and_preserves_delivery_fences() {
             lock_resource_binding: b"outbox-lock",
             payment_request_binding: b"outbox-payment-request",
             invoice_payloads: &payloads,
-            required_sats: 100,
+            required_amount: 100,
             proposal_acceptance_seconds: 60 * 60,
             payment_window_seconds: 24 * 60 * 60,
         })
@@ -575,8 +579,11 @@ async fn public_sdk_payment_request_retry_persists_distinct_ids_and_only_active_
             PubkyLocalSecretKey::new(creator_keypair.secret_key())
                 .derive_paykit_identity_secret_key(1)
                 .unwrap(),
-            "unused-test-xpub".into(),
-            0,
+            Some(paykit_server::domain::receiving::BitcoinAccount {
+                xpub: "unused-test-xpub".to_owned().into(),
+                account_index: 0,
+            }),
+            None,
         ))
         .await
         .unwrap();
@@ -636,7 +643,7 @@ async fn public_sdk_payment_request_retry_persists_distinct_ids_and_only_active_
             invoice_payloads: &Payloads {
                 reader: reader.clone(),
             },
-            required_sats: 100,
+            required_amount: 100,
             proposal_acceptance_seconds: 60 * 60,
             payment_window_seconds: 24 * 60 * 60,
         })

@@ -21,7 +21,8 @@ impl InvoicePayloadFactory for TestPayloads {
     fn for_child_index(&self, child_index: i64) -> Result<InvoicePayloads, PersistenceError> {
         Ok(InvoicePayloads {
             payment_request_intent: payment_intent(format!("test-address-{child_index}")),
-            bitcoin_address: format!("test-address-{child_index}"),
+            asset: paykit_server::domain::invoice::CriterionAsset::Btc,
+            receiving_address: format!("test-address-{child_index}"),
         })
     }
 }
@@ -31,7 +32,8 @@ impl InvoicePayloadFactory for MismatchedAddressPayloads {
     fn for_child_index(&self, child_index: i64) -> Result<InvoicePayloads, PersistenceError> {
         Ok(InvoicePayloads {
             payment_request_intent: payment_intent("wrong-address".into()),
-            bitcoin_address: format!("bad-address-{child_index}"),
+            asset: paykit_server::domain::invoice::CriterionAsset::Btc,
+            receiving_address: format!("bad-address-{child_index}"),
         })
     }
 }
@@ -45,7 +47,8 @@ impl InvoicePayloadFactory for CreatorPayloads {
         let address = format!("{}-{child_index}", self.address_prefix);
         Ok(InvoicePayloads {
             payment_request_intent: payment_intent(address.clone()),
-            bitcoin_address: address,
+            asset: paykit_server::domain::invoice::CriterionAsset::Btc,
+            receiving_address: address,
         })
     }
 }
@@ -100,8 +103,11 @@ async fn invoice_store(database: &TestDatabase) -> InvoiceStore {
             creator(),
             "session-secret".into(),
             PaykitIdentitySecretKey::new([9; 32], 1).unwrap(),
-            "xpub-secret".into(),
-            0,
+            Some(paykit_server::domain::receiving::BitcoinAccount {
+                xpub: "xpub-secret".to_owned().into(),
+                account_index: 0,
+            }),
+            None,
         ))
         .await
         .unwrap();
@@ -121,7 +127,7 @@ fn input<'a>(
         lock_resource_binding: request,
         payment_request_binding: request,
         invoice_payloads: &TEST_PAYLOADS,
-        required_sats: 100,
+        required_amount: 100,
         proposal_acceptance_seconds: 60 * 60,
         payment_window_seconds: 24 * 60 * 60,
     }
@@ -595,8 +601,11 @@ async fn concurrent_creators_own_distinct_intents_at_the_same_child_index() {
             first_creator.clone(),
             "session-one".into(),
             PaykitIdentitySecretKey::new([9; 32], 1).unwrap(),
-            "xpub-one".into(),
-            0,
+            Some(paykit_server::domain::receiving::BitcoinAccount {
+                xpub: "xpub-one".to_owned().into(),
+                account_index: 0,
+            }),
+            None,
         ))
         .await
         .unwrap();
@@ -605,8 +614,11 @@ async fn concurrent_creators_own_distinct_intents_at_the_same_child_index() {
             second_creator.clone(),
             "session-two".into(),
             PaykitIdentitySecretKey::new([8; 32], 1).unwrap(),
-            "xpub-two".into(),
-            0,
+            Some(paykit_server::domain::receiving::BitcoinAccount {
+                xpub: "xpub-two".to_owned().into(),
+                account_index: 0,
+            }),
+            None,
         ))
         .await
         .unwrap();
@@ -628,7 +640,7 @@ async fn concurrent_creators_own_distinct_intents_at_the_same_child_index() {
             lock_resource_binding: b"creator-one-lock",
             payment_request_binding: b"creator-one-request",
             invoice_payloads: &first_payloads,
-            required_sats: 100,
+            required_amount: 100,
             proposal_acceptance_seconds: 60 * 60,
             payment_window_seconds: 24 * 60 * 60,
         }),
@@ -639,7 +651,7 @@ async fn concurrent_creators_own_distinct_intents_at_the_same_child_index() {
             lock_resource_binding: b"creator-two-lock",
             payment_request_binding: b"creator-two-request",
             invoice_payloads: &second_payloads,
-            required_sats: 100,
+            required_amount: 100,
             proposal_acceptance_seconds: 60 * 60,
             payment_window_seconds: 24 * 60 * 60,
         })

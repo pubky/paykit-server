@@ -26,7 +26,7 @@ use locks_core::{
 use paykit_server::{
     application::create_invoice::{
         AppRegistryDiscovery, CreateInvoiceError, CreateInvoiceRequest, CreateInvoiceService,
-        CreatorXpubProvider, DeadlineClock, IntentBuilder, InvoicePersistence, LockFetchError,
+        CreatorReceivingProvider, DeadlineClock, IntentBuilder, InvoicePersistence, LockFetchError,
         LockFetcher, PaykitIntentBuilder, SessionValidationError, SessionValidator,
         derive_bip84_p2wpkh_address,
     },
@@ -312,9 +312,21 @@ fn account_xpub() -> String {
 }
 
 #[async_trait]
-impl CreatorXpubProvider for FakeCredentials {
-    async fn xpub(&self, _creator: &CreatorPubky) -> Result<(String, u32), PersistenceError> {
-        Ok((account_xpub(), 0))
+impl CreatorReceivingProvider for FakeCredentials {
+    async fn receiving(
+        &self,
+        _creator: &CreatorPubky,
+        _asset: paykit_server::domain::invoice::CriterionAsset,
+    ) -> Result<paykit_server::application::create_invoice::ReceivingDetails, PersistenceError>
+    {
+        Ok(
+            paykit_server::application::create_invoice::ReceivingDetails::Bitcoin(
+                paykit_server::domain::receiving::BitcoinAccount {
+                    xpub: account_xpub().into(),
+                    account_index: 0,
+                },
+            ),
+        )
     }
 }
 
@@ -941,4 +953,52 @@ fn delivery_intent_is_closed_and_contains_complete_sdk_inputs_not_final_wire_ids
             .windows(b"payment_request_id".len())
             .any(|window| window == b"payment_request_id")
     );
+}
+
+#[test]
+fn usdt_request_uses_exact_token_units_and_the_approved_address() {
+    use paykit_server::domain::receiving::{USDT_ENDPOINT, USDT_TOKEN};
+    let mut lock = valid_lock();
+    lock.criteria[0].params["asset"] = serde_json::json!("USDT");
+    lock.criteria[0].params["amount"] = serde_json::json!("50001");
+    let address = "0x2222222222222222222222222222222222222222";
+    let terms = PaykitIntentBuilder::new(BitcoinNetwork::Mainnet)
+        .payment_request_terms(&request(), &lock, address)
+        .unwrap();
+    assert_eq!(terms.amount().value(), "0.050001");
+    assert_eq!(terms.amount().asset(), "usdt");
+    let endpoints = terms.payment_endpoints().unwrap();
+    assert_eq!(endpoints.len(), 1);
+    assert_eq!(
+        terms.accepted_payment_endpoint_identifiers()[0].as_str(),
+        USDT_ENDPOINT
+    );
+    let endpoint = endpoints.values().next().unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(endpoint.as_str()).unwrap(),
+        serde_json::json!({"value":address,"chain_id":"42161","token":USDT_TOKEN})
+    );
+}
+
+#[tokio::test]
+async fn disabled_usdt_never_creates_an_invoice() {
+    let session = Arc::new(FakeSession {
+        result: Ok(()),
+        calls: AtomicUsize::default(),
+        creators: Mutex::new(vec![]),
+    });
+    let mut lock = valid_lock();
+    lock.criteria[0].params["asset"] = serde_json::json!("USDT");
+    let locks = Arc::new(FakeLocks {
+        result: Ok(lock),
+        calls: AtomicUsize::default(),
+    });
+    let store = Arc::new(FakeStore::with_preflight(InvoicePreflight::New));
+    assert_eq!(
+        service(session, locks, store.clone())
+            .create(request())
+            .await,
+        Err(CreateInvoiceError::InvalidRequest)
+    );
+    assert_eq!(store.create_calls.load(Ordering::SeqCst), 0);
 }
