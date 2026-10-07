@@ -39,7 +39,7 @@ use paykit_sdk::{
     LinkedPeerState, OutboundPrivateMessageStatus, PAYKIT_AUTHORIZER_SESSION_CAPABILITIES,
     PaymentAttemptDecision, PaymentExecutionChecks, PaymentExecutionMode, PaymentOccurrence,
     PaymentRequestRecord, PaymentRequestScope, PubkyLocalSecretKey, PubkyPublicKey,
-    PubkySessionBootstrap,
+    PubkySessionAccess, PubkySessionBootstrap, PubkySharedStateStorage, StorageAdapter,
 };
 use paykit_server::{
     Server,
@@ -60,7 +60,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[path = "fixtures/sdk.rs"]
 mod sdk_fixtures;
 
-use sdk_fixtures::{HostedSdk, hosted_sdk};
+use sdk_fixtures::{HostedSdk, TestSessionProvider, hosted_sdk};
 
 const MASTER_KEY: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE";
 const BUNDLE_BEFORE_GRANT: &str = "000G40R40M30E209185GR38E1W";
@@ -185,6 +185,8 @@ struct Stack {
     creator_sdk: HostedSdk,
     lock_resource: String,
     reader: ReaderPubky,
+    reader_key: PubkyPublicKey,
+    reader_access: PubkySessionAccess,
     reader_sdk: ReaderSdk,
     _testnet: EphemeralTestnet,
     database: TestDatabase,
@@ -234,6 +236,8 @@ async fn boot(seed: u8) -> Stack {
         .await
         .unwrap();
     let reader = parse_reader(&format!("pubky{}", reader_account.public_key)).unwrap();
+    let reader_key = reader_account.public_key.clone();
+    let reader_access = reader_account.access.clone();
     let reader_sdk = hosted_sdk(reader_account.access, "bitkit", 0).await;
 
     let creator_keypair = Keypair::random();
@@ -319,6 +323,8 @@ async fn boot(seed: u8) -> Stack {
         creator_key,
         creator_sdk,
         reader,
+        reader_key,
+        reader_access,
         reader_sdk,
         _testnet: testnet,
         database,
@@ -479,10 +485,28 @@ fn allowance_terms(per_payment_maximum: &str) -> AllowanceTerms {
         .unwrap()
 }
 
+/// The creator's shared state is also written by the running server, and a
+/// read that meets the server's lock reports it busy. Reads here wait it out.
+async fn when_unlocked<T, F, Fut>(mut read: F) -> T
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = paykit_sdk::Result<T>>,
+{
+    for _ in 0..100 {
+        match read().await {
+            Err(paykit_sdk::PaykitSdkError::SharedStateBusy { .. }) => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            result => return result.unwrap(),
+        }
+    }
+    panic!("the creator's shared state stayed locked");
+}
+
 /// The Payment Requests the server queued, by Locks bundle: outbound message
 /// id and Payment Reference of each.
 async fn queued_proposals(creator_sdk: &HostedSdk) -> BTreeMap<String, Vec<(u64, String)>> {
-    let state = creator_sdk.export_backup_state().await.unwrap();
+    let state = when_unlocked(|| creator_sdk.export_backup_state()).await;
     let mut queued: BTreeMap<String, Vec<(u64, String)>> = BTreeMap::new();
     for record in state
         .outbound_private_messages
@@ -498,6 +522,73 @@ async fn queued_proposals(creator_sdk: &HostedSdk) -> BTreeMap<String, Vec<(u64,
             .push((record.outbound_message_id, reference.to_owned()));
     }
     queued
+}
+
+/// A proposal the server queued: the IDs a retry has to reuse.
+struct QueuedEvent {
+    payment_request_id: String,
+    /// The same event as a message the reader's `bitkit` App sends: it reuses
+    /// the server's Event ID and names the server's Payment Request ID.
+    echoed_by_reader: String,
+}
+
+/// The server's queued `paykit.payment_request` messages, oldest first.
+async fn outbound_proposal_events(creator_sdk: &HostedSdk) -> Vec<QueuedEvent> {
+    let state = when_unlocked(|| creator_sdk.export_backup_state()).await;
+    let mut records = state
+        .outbound_private_messages
+        .iter()
+        .filter(|record| record.kind == "paykit.payment_request")
+        .collect::<Vec<_>>();
+    records.sort_by_key(|record| record.outbound_message_id);
+    records
+        .into_iter()
+        .map(|record| {
+            let mut json: serde_json::Value = serde_json::from_str(&record.raw_json).unwrap();
+            let payment_request_id = json["payment_request_id"].as_str().unwrap().to_owned();
+            json["app_id"] = "bitkit".into();
+            QueuedEvent {
+                payment_request_id,
+                echoed_by_reader: json.to_string(),
+            }
+        })
+        .collect()
+}
+
+/// Sends a raw `paykit.payment_request` message from the reader to the
+/// server, as a non-conforming wallet could. The SDK queues only valid events,
+/// so the test queues an Allowance proposal and rewrites the queued record.
+async fn send_from_reader(stack: &Stack, raw_json: String) {
+    let reader = &stack.reader_sdk;
+    let queued = reader
+        .propose_allowance(
+            stack.creator_key.clone(),
+            AllowanceLocalRole::Allower,
+            allowance_terms("0.00005000"),
+        )
+        .await
+        .unwrap()
+        .proposal_outbound_message_id
+        .unwrap();
+    let counterparty = stack.creator_key.clone();
+    PubkySharedStateStorage::new(TestSessionProvider::new(stack.reader_access.clone()))
+        .transaction(move |transaction| {
+            let mut record = transaction
+                .outbound_private_messages(&counterparty)
+                .into_iter()
+                .find(|record| record.outbound_message_id == queued)
+                .expect("the queued proposal");
+            record.kind = "paykit.payment_request".into();
+            record.raw_json = raw_json;
+            transaction.save_outbound_private_message(record)
+        })
+        .await
+        .unwrap();
+    let sent = reader
+        .process_outbound_private_messages(stack.creator_key.clone())
+        .await
+        .unwrap();
+    assert!(sent.sent.contains(&queued), "{sent:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
@@ -709,6 +800,16 @@ async fn allowance_proposed_on_the_server_link_covers_the_next_locks_invoice() {
             .all(|record| record.outbound_message_id < queued[BUNDLE_AFTER_GRANT][0].0)
     );
 
+    // The reader controls what it sends back. A message that reuses the Event
+    // ID of the server's proposal (or one that names the request and fails
+    // validation) makes the SDK's derived record drop the server's own
+    // outbound proposal. The retry below must not decide from that record.
+    let outbound_proposals = outbound_proposal_events(&stack.creator_sdk).await;
+    assert_eq!(outbound_proposals.len(), 2);
+    for proposal in &outbound_proposals {
+        send_from_reader(&stack, proposal.echoed_by_reader.clone()).await;
+    }
+
     // A crash after the SDK queued the request and before the fenced
     // transition leaves the row leased with nothing recorded. Reset both rows
     // that way: the outbox claims them again once the lease is over.
@@ -765,27 +866,46 @@ async fn allowance_proposed_on_the_server_link_covers_the_next_locks_invoice() {
     }
     assert_eq!(queued_proposals(&stack.creator_sdk).await, queued);
 
-    // The reader still holds the one request, so its admission has no second
-    // Payment Request ID to admit.
+    // The retry read the reader's messages, and the SDK's derived records no
+    // longer carry the server's proposals: a lookup through them finds nothing.
+    let derived =
+        when_unlocked(|| stack.creator_sdk.payment_requests_with(&stack.reader_key)).await;
+    for sent in &outbound_proposals {
+        assert!(
+            derived
+                .iter()
+                .filter(|record| record.payment_request_id == sent.payment_request_id)
+                .all(|record| record.terms.is_none()),
+            "the reader's message did not invalidate request {}",
+            sent.payment_request_id
+        );
+    }
+
+    // The reader holds the one request the server proposed, so its admission
+    // has no second Payment Request ID to admit. Its own derived record for the
+    // request is gone for the same reason as the server's (the message it
+    // sent reuses the Event ID), so count the proposals on its stream.
     reader
         .receive_private_messages(stack.creator_key.clone())
         .await
         .unwrap();
-    let after_redelivery = reader
-        .payment_requests_with(&stack.creator_key)
+    let proposals_received = reader
+        .export_backup_state()
         .await
         .unwrap()
-        .into_iter()
-        .filter(|record| {
-            record.terms.as_ref().is_some_and(|terms| {
-                terms.metadata.get("bundle_id") == Some(&serde_json::json!(BUNDLE_AFTER_GRANT))
-            })
+        .private_stream_items
+        .iter()
+        .filter(|item| item.known_paykit_kind.as_deref() == Some("paykit.payment_request"))
+        .filter_map(|item| serde_json::from_str::<serde_json::Value>(&item.raw_json).ok())
+        .filter(|json| {
+            json["app_id"] == "paykit-server"
+                && json["request"]["metadata"]["bundle_id"] == BUNDLE_AFTER_GRANT
         })
+        .map(|json| json["payment_request_id"].as_str().unwrap().to_owned())
         .collect::<Vec<_>>();
-    assert_eq!(after_redelivery.len(), 1);
     assert_eq!(
-        after_redelivery[0].payment_request_id,
-        request.payment_request_id
+        proposals_received,
+        std::slice::from_ref(&request.payment_request_id)
     );
 
     stack.shutdown().await;

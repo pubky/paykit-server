@@ -7,7 +7,10 @@ use std::{
 };
 
 use async_trait::async_trait;
-use paykit_lib::{AllowanceId, PaykitAppId, PaymentRequestId};
+use paykit_lib::{
+    AllowanceId, PaykitAppId, PaymentRequestEvent, PaymentRequestId, PrivateApplicationMessage,
+    parse_payment_request_event_message,
+};
 use paykit_sdk::{
     AllowanceFilter, AllowanceHistoryStatus, AllowanceLifecycleState, AllowanceLocalRole,
     AllowanceRecord, LinkedPeerState, OutboundPrivateMessageStatus, OutboundPrivateSendReport,
@@ -15,7 +18,7 @@ use paykit_sdk::{
     PaymentRequestLifecycleState as SdkPaymentRequestLifecycleState, PaymentRequestLocalRole,
     PaymentRequestRecord, PrivateStreamCounterpartyIntakeReport, PubkyPublicKey,
     PubkySessionAccess, PubkySessionBootstrap, PubkySessionProvider, PubkySharedStateStorage,
-    StorageAdapter,
+    StorageAdapter, storage::OutboundPrivateMessageRecord,
 };
 use pubky::Pubky;
 use tokio::sync::Mutex as TokioMutex;
@@ -952,33 +955,64 @@ fn awaits_allowee_acceptance(record: &AllowanceRecord) -> bool {
         && record.proposal_outbound_message_id.is_none()
 }
 
+/// A Payment Request proposal this server already queued for the reader.
+struct QueuedProposal {
+    outbound_message_id: u64,
+    event_id: String,
+    payment_request_id: String,
+}
+
 /// The Payment Request this server already queued for a Payment Reference.
 ///
+/// This reads only the server's own stored outbound messages, never the SDK's
+/// derived Payment Request record. The derivation also folds in what the
+/// reader sent: a reader message that names the request and fails validation,
+/// or that reuses the Event ID of the proposal, makes it drop the proposal
+/// (`derivation/stored_events.rs`, `pre_invalid_request_ids`). A lookup through
+/// the derived record would then miss the queued request and propose a second
+/// one for the same Payment Reference.
+///
 /// A proposal whose outbound message the SDK marked `Invalid` or `Superseded`
-/// never reaches the reader, so it does not count as queued.
-fn queued_proposal<'a>(
-    records: &'a [PaymentRequestRecord],
+/// never reaches the reader, so it does not count as queued. The oldest
+/// match wins.
+fn queued_proposal(
+    messages: &[OutboundPrivateMessageRecord],
     app_id: &PaykitAppId,
     payment_reference: &str,
-) -> Option<&'a PaymentRequestRecord> {
-    records.iter().find(|record| {
-        record.local_role == Some(PaymentRequestLocalRole::Payee)
-            && record.proposal_app_id.as_ref() == Some(app_id)
-            && record.proposal_outbound_message_id.is_some()
-            && record.proposal_event_id.is_some()
-            && !matches!(
-                record.proposal_outbound_status,
-                Some(
+) -> Option<QueuedProposal> {
+    messages
+        .iter()
+        .filter(|message| {
+            message.kind == PAYMENT_REQUEST_KIND
+                && &message.app_id == app_id
+                && !matches!(
+                    message.status,
                     OutboundPrivateMessageStatus::Invalid
                         | OutboundPrivateMessageStatus::Superseded
                 )
-            )
-            && record
-                .terms
-                .as_ref()
-                .is_some_and(|terms| terms.payment_reference == payment_reference)
-    })
+        })
+        .filter_map(|message| {
+            let parsed = parse_payment_request_event_message(&PrivateApplicationMessage {
+                version: Some(1),
+                kind: Some(message.kind.clone()),
+                app_id: Some(message.app_id.to_string()),
+                raw_json: message.raw_json.clone(),
+            })?;
+            let PaymentRequestEvent::Request(request) = parsed.parsed_event()? else {
+                return None;
+            };
+            (request.request().payment_reference().as_str() == payment_reference).then(|| {
+                QueuedProposal {
+                    outbound_message_id: message.outbound_message_id,
+                    event_id: request.event_id().as_str().to_owned(),
+                    payment_request_id: request.payment_request_id().as_str().to_owned(),
+                }
+            })
+        })
+        .min_by_key(|proposal| proposal.outbound_message_id)
 }
+
+const PAYMENT_REQUEST_KIND: &str = "paykit.payment_request";
 
 fn retryable_recovery_observation(error: HandoffError) -> HandoffError {
     match error {
@@ -1095,19 +1129,25 @@ impl Adapter for PaykitAdapter {
         // Reference is generated once per intent, so a request already queued
         // for it is this intent's request: reuse it. Callers hold the creator
         // mutation lock, so the lookup and the enqueue below cannot interleave.
-        let existing = self
+        let queued = {
+            let reader = reader.clone();
+            self.storage
+                .transaction(move |transaction| Ok(transaction.outbound_private_messages(&reader)))
+                .await
+                .map_err(classify)?
+        };
+        if let Some(proposal) = queued_proposal(&queued, &self.app_id, &terms.payment_reference) {
+            return Ok(HandoffResult::PaymentRequestProposal {
+                outbound_message_id: proposal.outbound_message_id,
+                event_id: proposal.event_id,
+                payment_request_id: proposal.payment_request_id,
+            });
+        }
+        let record = self
             .sdk
-            .payment_requests_with(&reader)
+            .propose_payment_request(reader, payment_terms)
             .await
             .map_err(classify)?;
-        let record = match queued_proposal(&existing, &self.app_id, &terms.payment_reference) {
-            Some(record) => record.clone(),
-            None => self
-                .sdk
-                .propose_payment_request(reader, payment_terms)
-                .await
-                .map_err(classify)?,
-        };
         Ok(HandoffResult::PaymentRequestProposal {
             outbound_message_id: record
                 .proposal_outbound_message_id
@@ -1962,20 +2002,64 @@ mod tests {
         }
     }
 
-    fn queued_payee_record(reference: &str) -> PaymentRequestRecord {
-        let mut record = canonical_record(Some(PaymentRequestLocalRole::Payee));
-        record.proposal_stream_item_id = None;
-        record.proposal_outbound_message_id = Some(3);
-        record.proposal_outbound_status = Some(OutboundPrivateMessageStatus::Pending);
-        record.terms.as_mut().unwrap().payment_reference = reference.into();
-        record
+    fn proposal_terms(reference: &str) -> PaymentTermsV1 {
+        PaymentTermsV1 {
+            amount: "1".into(),
+            asset: "btc".into(),
+            rates: Vec::new(),
+            payment_reference: reference.into(),
+            proposal_expires_at: None,
+            payment_deadline: None,
+            accepted_endpoint_identifiers: vec!["btc-bitcoin-p2wpkh".into()],
+            payment_endpoints: [("btc-bitcoin-p2wpkh".into(), "bc1qexample".into())]
+                .into_iter()
+                .collect(),
+            metadata: serde_json::Map::new(),
+        }
+    }
+
+    /// An outbound `paykit.payment_request` the way the SDK stores a proposal.
+    fn outbound_proposal(
+        id: u64,
+        app_id: &PaykitAppId,
+        reference: &str,
+    ) -> OutboundPrivateMessageRecord {
+        let request = paykit_lib::PaymentRequest::new(
+            paykit_lib::EventId::new_v4(),
+            PaymentRequestId::new_v4(),
+            proposal_terms(reference).to_sdk().unwrap(),
+        );
+        let raw_json = paykit_lib::serialize_payment_request_event(
+            app_id,
+            &PaymentRequestEvent::Request(request),
+        )
+        .unwrap();
+        let at = (std::time::SystemTime::UNIX_EPOCH
+            + std::time::Duration::from_secs(1_800_000_000))
+        .into();
+        OutboundPrivateMessageRecord {
+            outbound_message_id: id,
+            counterparty: PubkyPublicKey::from_raw_or_app_key(CREATOR).unwrap(),
+            app_id: app_id.clone(),
+            kind: PAYMENT_REQUEST_KIND.into(),
+            raw_json,
+            status: OutboundPrivateMessageStatus::Pending,
+            attempt_count: 0,
+            created_at: at,
+            updated_at: at,
+            last_attempt_at: None,
+            sent_at: None,
+            confirmed_at: None,
+            last_error: None,
+            prepared_send: None,
+        }
     }
 
     #[test]
     fn a_proposal_queued_for_the_payment_reference_is_reused() {
         let reference = Uuid::new_v4().to_string();
-        let queued = queued_payee_record(&reference);
-        let other = queued_payee_record(&Uuid::new_v4().to_string());
+        let queued = outbound_proposal(7, &server_app_id(), &reference);
+        let other = outbound_proposal(6, &server_app_id(), &Uuid::new_v4().to_string());
 
         for status in [
             OutboundPrivateMessageStatus::Pending,
@@ -1984,37 +2068,48 @@ mod tests {
             OutboundPrivateMessageStatus::Sent,
         ] {
             let mut queued = queued.clone();
-            queued.proposal_outbound_status = Some(status);
-            let records = [other.clone(), queued.clone()];
-            let found = queued_proposal(&records, &server_app_id(), &reference);
-            assert_eq!(
-                found.map(|record| record.payment_request_id.as_str()),
-                Some(queued.payment_request_id.as_str())
-            );
+            queued.status = status;
+            let found = queued_proposal(
+                &[other.clone(), queued.clone()],
+                &server_app_id(),
+                &reference,
+            )
+            .expect("the queued proposal");
+            assert_eq!(found.outbound_message_id, 7);
+            let json: serde_json::Value = serde_json::from_str(&queued.raw_json).unwrap();
+            assert_eq!(json["event_id"], found.event_id);
+            assert_eq!(json["payment_request_id"], found.payment_request_id);
         }
         assert!(queued_proposal(&[other], &server_app_id(), &reference).is_none());
     }
 
     #[test]
+    fn the_oldest_proposal_for_a_payment_reference_wins() {
+        let reference = Uuid::new_v4().to_string();
+        let first = outbound_proposal(3, &server_app_id(), &reference);
+        let second = outbound_proposal(9, &server_app_id(), &reference);
+
+        let found = queued_proposal(&[second, first], &server_app_id(), &reference).unwrap();
+
+        assert_eq!(found.outbound_message_id, 3);
+    }
+
+    #[test]
     fn only_this_servers_deliverable_proposals_count_as_queued() {
         let reference = Uuid::new_v4().to_string();
-        let rejected: [fn(&mut PaymentRequestRecord); 6] = [
-            // The reader proposed it, or another Paykit App did.
-            |record| record.local_role = Some(PaymentRequestLocalRole::Payer),
-            |record| record.proposal_app_id = Some(PaykitAppId::new("bitkit").unwrap()),
-            // Nothing was queued locally for the reader.
-            |record| record.proposal_outbound_message_id = None,
+        let rejected: [fn(&mut OutboundPrivateMessageRecord); 5] = [
+            // Another Paykit App on the same identity proposed it.
+            |record| record.app_id = PaykitAppId::new("bitkit").unwrap(),
             // The SDK will never deliver it.
-            |record| {
-                record.proposal_outbound_status = Some(OutboundPrivateMessageStatus::Invalid);
-            },
-            |record| {
-                record.proposal_outbound_status = Some(OutboundPrivateMessageStatus::Superseded);
-            },
-            |record| record.terms = None,
+            |record| record.status = OutboundPrivateMessageStatus::Invalid,
+            |record| record.status = OutboundPrivateMessageStatus::Superseded,
+            // Not a Payment Request proposal.
+            |record| record.kind = "paykit.payment_request_cancellation".into(),
+            // Not a readable Payment Request.
+            |record| record.raw_json = "{}".into(),
         ];
         for change in rejected {
-            let mut record = queued_payee_record(&reference);
+            let mut record = outbound_proposal(3, &server_app_id(), &reference);
             change(&mut record);
             assert!(queued_proposal(&[record], &server_app_id(), &reference).is_none());
         }
