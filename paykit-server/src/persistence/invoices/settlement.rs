@@ -7,20 +7,13 @@ pub(super) struct ObservedPayment {
     pub matched: bool,
     pub timely: bool,
     pub confirmations: i32,
+    pub finalized: bool,
     pub received_at: Option<OffsetDateTime>,
 }
 
 impl ObservedPayment {
-    fn eligible(&self) -> bool {
+    pub(super) fn eligible(&self) -> bool {
         self.present && self.matched && self.timely
-    }
-    fn rank(&self) -> (bool, bool, bool, i32) {
-        (
-            self.eligible(),
-            self.present,
-            self.matched,
-            self.confirmations,
-        )
     }
 }
 
@@ -38,11 +31,12 @@ impl InvoiceStore {
             "SELECT i.id, c.creator_lookup_hash, i.payment_record_envelope, i.invoice_envelope,
                 i.invoice_created_at, i.payment_deadline FROM invoices i JOIN creators c ON c.id = i.creator_id WHERE i.id = $1")
             .bind(invoice).fetch_one(&mut **tx).await.map_err(|_| PersistenceError::Unavailable)?;
-        let mut selected = ObservedPayment {
+        let mut bitcoin = ObservedPayment {
             present: false,
             matched: false,
             timely: false,
             confirmations: 0,
+            finalized: false,
             received_at: None,
         };
         if let Some(destination) = &payment.bitcoin {
@@ -56,7 +50,7 @@ impl InvoiceStore {
                     observation.present && facts.observed_sats >= destination.required_amount;
                 let timely: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM invoice_timely_amount_matched_outpoints WHERE invoice_id = $1 AND outpoint_lookup_hash = $2)")
                     .bind(invoice).bind(&observation.outpoint_lookup_hash).fetch_one(&mut **tx).await.map_err(|_| PersistenceError::Unavailable)?;
-                selected = ObservedPayment {
+                bitcoin = ObservedPayment {
                     present: observation.present,
                     matched,
                     timely,
@@ -67,32 +61,36 @@ impl InvoiceStore {
                     } else {
                         observation.confirmations
                     },
+                    finalized: false,
                     received_at: None,
                 };
             }
         }
-        if let Some(destination) = &payment.usdt
-            && let Some(usdt) = self
-                .usdt_payment(tx, &row, creator_hash, destination.required_amount)
+        let usdt = if let Some(destination) = &payment.usdt {
+            self.usdt_payment(tx, &row, creator_hash, destination.required_amount)
                 .await?
-            && usdt.rank() > selected.rank()
-        {
-            selected = usdt;
-        }
-        let eligible = selected.eligible();
-        let status = if !selected.present {
+        } else {
+            None
+        };
+        let eligible = bitcoin.eligible() || usdt.as_ref().is_some_and(ObservedPayment::eligible);
+        let received_at = usdt
+            .as_ref()
+            .filter(|payment| payment.eligible())
+            .and_then(|payment| payment.received_at);
+        // Keep the Bitcoin projection chain-specific. USDT facts stay in its receipt observations.
+        let status = if !bitcoin.present {
             "undetected"
-        } else if selected.confirmations == 0 {
+        } else if bitcoin.confirmations == 0 {
             "detected"
         } else {
             "confirmed"
         };
         sqlx::query("UPDATE invoices SET payment_status = $2, confirmation_count = $3, amount_matched = $4,
-            first_amount_matched_observed_at = COALESCE(first_amount_matched_observed_at, $5),
+            first_amount_matched_observed_at = LEAST(first_amount_matched_observed_at, $5),
             payment_expired_at = CASE WHEN $6 THEN NULL WHEN payment_deadline < $7 THEN COALESCE(payment_expired_at, $7) ELSE payment_expired_at END,
             updated_at = NOW() WHERE id = $1")
-            .bind(invoice).bind(status).bind(selected.confirmations).bind(selected.matched)
-            .bind(if eligible { selected.received_at } else { None }).bind(eligible).bind(now)
+            .bind(invoice).bind(status).bind(bitcoin.confirmations).bind(bitcoin.matched)
+            .bind(received_at).bind(eligible).bind(now)
             .execute(&mut **tx).await.map_err(|_| PersistenceError::Unavailable)?;
         Ok(())
     }

@@ -23,8 +23,8 @@ use crate::{
     application::{
         connection_status::ConnectionBinding,
         payment_request_status::{
-            PaymentRequestStatusError, PaymentRequestStatusOperations, PaymentRequestStatusSummary,
-            PaymentState,
+            BitcoinPaymentStatus, PaymentRequestStatusError, PaymentRequestStatusOperations,
+            PaymentRequestStatusSummary, PaymentState, UsdtPaymentStatus,
         },
         payment_status::PersistedPaymentStatus,
         semantic_intent::DeliveryIntentV1,
@@ -806,7 +806,12 @@ impl InvoiceStore {
             "SELECT lifecycle.request_state, invoices.payment_status,
                     invoices.confirmation_count, invoices.amount_matched,
                     invoices.invoice_created_at, invoices.payment_deadline,
-                    invoices.payment_expired_at
+                    invoices.payment_expired_at,
+                    EXISTS(SELECT 1 FROM bitcoin_observations observation
+                           JOIN invoice_timely_amount_matched_outpoints timely
+                             ON timely.invoice_id = observation.invoice_id
+                            AND timely.outpoint_lookup_hash = observation.outpoint_lookup_hash
+                           WHERE observation.invoice_id = invoices.id AND observation.active AND observation.present) AS bitcoin_timely
              FROM invoices
              JOIN creators ON creators.id = invoices.creator_id
              LEFT JOIN LATERAL (
@@ -833,7 +838,11 @@ impl InvoiceStore {
         .fetch_optional(&mut **transaction)
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
-        row.map(PaymentRequestStatusSummary::try_from).transpose()
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let usdt = self.usdt_payment_status(transaction, invoice_id).await?;
+        row.into_summary(usdt).map(Some)
     }
 
     /// Records one direct, invoice-address-specific output observation. The
@@ -1810,12 +1819,15 @@ struct PaymentRequestStatusRow {
     invoice_created_at: OffsetDateTime,
     payment_deadline: OffsetDateTime,
     payment_expired_at: Option<OffsetDateTime>,
+    bitcoin_timely: bool,
 }
 
-impl TryFrom<PaymentRequestStatusRow> for PaymentRequestStatusSummary {
-    type Error = PersistenceError;
-
-    fn try_from(row: PaymentRequestStatusRow) -> Result<Self, Self::Error> {
+impl PaymentRequestStatusRow {
+    fn into_summary(
+        self,
+        usdt: Option<UsdtPaymentStatus>,
+    ) -> Result<PaymentRequestStatusSummary, PersistenceError> {
+        let row = self;
         let request_state = row
             .request_state
             .as_deref()
@@ -1825,9 +1837,15 @@ impl TryFrom<PaymentRequestStatusRow> for PaymentRequestStatusSummary {
             PaymentState::Expired
         } else {
             match row.payment_status.as_str() {
-                "undetected" => PaymentState::Undetected,
-                "detected" => PaymentState::Detected,
                 "confirmed" => PaymentState::Confirmed,
+                "undetected" | "detected"
+                    if usdt.is_some_and(|payment| payment.confirmations > 0) =>
+                {
+                    PaymentState::Confirmed
+                }
+                "detected" => PaymentState::Detected,
+                "undetected" if usdt.is_some() => PaymentState::Detected,
+                "undetected" => PaymentState::Undetected,
                 _ => return Err(PersistenceError::CorruptOrMissing),
             }
         };
@@ -1838,8 +1856,12 @@ impl TryFrom<PaymentRequestStatusRow> for PaymentRequestStatusSummary {
             payment_state,
             row.invoice_created_at,
             row.payment_deadline,
-            confirmations,
-            row.amount_matched,
+            (row.payment_status != "undetected").then_some(BitcoinPaymentStatus {
+                confirmations,
+                amount_matched: row.amount_matched,
+                paid_on_time: row.amount_matched && row.bitcoin_timely,
+            }),
+            usdt,
         ))
     }
 }

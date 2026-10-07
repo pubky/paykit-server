@@ -357,12 +357,28 @@ Each invoice accepting Bitcoin receives a unique BIP84 external-chain address. O
 
 The server has no Bitcoin spending keys and cannot spend, refund, or create change.
 
-`POST /transactions/status` exposes the selected payment observation without request lifecycle details. Its closed `status` vocabulary is `undetected`, `detected`, and
+`POST /transactions/status` exposes only the persisted Bitcoin observation without request lifecycle details. USDT payments do not populate this Bitcoin-only response. Its closed `status` vocabulary is `undetected`, `detected`, and
 `confirmed`; Payment Request lifecycle never changes those labels.
 
 `POST /payment-requests/status` is the canonical Locks lifecycle contract. It
-exposes request lifecycle, payment state, invoice timestamps, confirmations, and
-amount matching as separate facts. Before returning them, it performs linked-peer
+exposes request lifecycle, payment state and invoice timestamps, with independent
+`bitcoin` and `usdt_arbitrum` observations. Each is `null` when no current payment
+is observed on that rail. An observation includes `confirmations`, `amount_matched`
+and `paid_on_time`; the last requires a full payment within the inclusive invoice
+payment window. Arbitrum additionally reports `finalized` from the verified
+canonical receipt and the RPC finalized block. Amounts and confirmation counts
+are never combined across rails.
+
+`payment_state: confirmed` means a payment is included in a block, not that it
+meets Locks' settlement policy. Locks must check the request lifecycle, then
+choose a qualifying observation (`amount_matched` and `paid_on_time`) and apply
+its Bitcoin confirmation or Arbitrum finality policy to that observation. A large
+Arbitrum L2 block count does not substitute for Bitcoin confirmations or Arbitrum
+finality. When both assets are paid, both observations remain available.
+
+Deploy this contract together with the matching Locks consumer.
+
+Before returning status, the server performs linked-peer
 receive, exact required-target freshness checks, Creator-local SDK mutation
 serialization, and transactional target revalidation. Missing, partial,
 unrelated, or failed required-peer intake returns unavailable. Exact terminal
@@ -461,3 +477,13 @@ No public transaction-hash submission API is added. Proofs must arrive through t
 SDK's authenticated request flow. Address sharing is not proof of a purchase.
 The Locks creator/payment UI must offer the denominations and receiving-option
 readiness check before an end-to-end Locks checkout can be enabled.
+
+### Draining USDT-capable locks
+
+A timely full payment in either asset advances the existing payment drain. This
+means the invoice no longer requires waiting for a payment, not that Locks may
+grant access. Drain cleanup retains invoices, lifecycle records and both chains'
+observations. Locks must finish its per-bundle status verification using the
+appropriate settlement policy, including reorg handling before finality. A late
+payment in one asset cannot hide an on-time payment in the other when its proof
+arrives later. No refunds or conflict-resolution workflow is introduced.

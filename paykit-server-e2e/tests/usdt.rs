@@ -7,15 +7,20 @@ use paykit_lib::{
 };
 use paykit_sdk::{PaykitIdentitySecretKey, PaymentProofRecord, PaymentRequestRecord};
 use paykit_server::{
-    application::semantic_intent::DeliveryIntentV1,
+    application::{
+        payment_request_status::{PaymentRequestStatusOperations, PaymentRequestStatusSummary},
+        semantic_intent::DeliveryIntentV1,
+    },
     crypto::Crypto,
     domain::{
-        locks::{parse_bundle_id, parse_creator, parse_reader},
+        locks::{
+            BundleId, parse_addressed_lock_resource, parse_bundle_id, parse_creator, parse_reader,
+        },
         receiving::{USDT_ENDPOINT, USDT_TOKEN, UsdtAddress},
     },
     persistence::{
         AtomicInvoiceInput, CreatorCredentials, CreatorStore, InvoicePayloadFactory,
-        InvoicePayloads, InvoiceStore, PersistenceError, run_migrations,
+        InvoicePayloads, InvoiceStore, PaymentDrainStore, PersistenceError, run_migrations,
     },
     usdt::{ArbitrumVerifier, PaymentContext, VerificationError},
 };
@@ -27,6 +32,7 @@ use uuid::Uuid;
 const CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
 const BUNDLES: [&str; 2] = ["000G40R40M30E209185GR38E1W", "000G40R40M30E209185GR38E2W"];
 const RECIPIENT: &str = "0x2222222222222222222222222222222222222222";
+const LOCK_RESOURCE: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/app.locks/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json";
 const BLOCK: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
 fn fixture(index: usize) -> Value {
@@ -449,10 +455,20 @@ async fn invoices_share_an_address_but_never_share_payment_evidence() {
             .await
             .unwrap();
         assert_eq!(
-            status(&database, ids[0]).await,
+            status(&store, &bundles[0]).await,
             (matched, 2),
             "amount={amount}, offset={offset}"
         );
+        let facts = payment_status(&store, &bundles[0]).await;
+        assert!(facts.bitcoin().is_none());
+        let facts = facts.usdt_arbitrum().unwrap();
+        assert_eq!(facts.amount_matched, amount >= 50_000);
+        assert_eq!(facts.paid_on_time, offset == 0 && amount >= 50_000);
+        assert!(!facts.finalized);
+        assert!(matches!(
+            store.payment_status(&creator, &bundles[0]).await.unwrap(),
+            Some(paykit_server::application::payment_status::PersistedPaymentStatus::Undetected)
+        ));
     }
     let request_count = rpc.requests.lock().unwrap().len();
     let restarted = InvoiceStore::new(database.pool(), crypto.clone());
@@ -468,13 +484,13 @@ async fn invoices_share_an_address_but_never_share_payment_evidence() {
         .observe_usdt_request(creator_id, &creator, &record(0), &rpc.verifier, None)
         .await
         .unwrap();
-    assert_eq!(status(&database, ids[0]).await, (false, 0));
+    assert_eq!(status(&store, &bundles[0]).await, (false, 0));
     rpc.chain.lock().unwrap().reorg = false;
     restarted
         .observe_usdt_request(creator_id, &creator, &record(0), &rpc.verifier, None)
         .await
         .unwrap();
-    assert_eq!(status(&database, ids[0]).await, (true, 2));
+    assert_eq!(status(&store, &bundles[0]).await, (true, 2));
     store.scan_payment_record_integrity().await.unwrap();
     // Chain timestamps have second precision; invoice timestamps retain subsecond precision.
     let mut evidence = record(0);
@@ -492,7 +508,7 @@ async fn invoices_share_an_address_but_never_share_payment_evidence() {
         )
         .await
         .unwrap();
-    assert_eq!(status(&database, ids[0]).await, (true, 2));
+    assert_eq!(status(&store, &bundles[0]).await, (true, 2));
     rpc.chain.lock().unwrap().unavailable = true;
     assert!(matches!(
         store
@@ -506,7 +522,7 @@ async fn invoices_share_an_address_but_never_share_payment_evidence() {
             .await,
         Err(PersistenceError::Unavailable)
     ));
-    assert_eq!(status(&database, ids[0]).await, (true, 2));
+    assert_eq!(status(&store, &bundles[0]).await, (true, 2));
     rpc.chain.lock().unwrap().unavailable = false;
     // An independently valid second signature over the same receipt cannot buy another lock.
     store
@@ -519,7 +535,7 @@ async fn invoices_share_an_address_but_never_share_payment_evidence() {
         )
         .await
         .unwrap();
-    assert_eq!(status(&database, ids[1]).await, (false, 0));
+    assert_eq!(status(&store, &bundles[1]).await, (false, 0));
     let restarted = InvoiceStore::new(database.pool(), crypto);
     rpc.chain.lock().unwrap().reorg = true;
     restarted
@@ -532,7 +548,7 @@ async fn invoices_share_an_address_but_never_share_payment_evidence() {
         )
         .await
         .unwrap();
-    assert_eq!(status(&database, ids[0]).await, (false, 0));
+    assert_eq!(status(&store, &bundles[0]).await, (false, 0));
     let first_match: Option<OffsetDateTime> =
         sqlx::query_scalar("SELECT first_amount_matched_observed_at FROM invoices WHERE id=$1")
             .bind(ids[0])
@@ -564,16 +580,34 @@ async fn invoices_share_an_address_but_never_share_payment_evidence() {
         )
         .await
         .unwrap();
-    assert_eq!(status(&database, ids[0]).await, (true, 2));
+    assert_eq!(status(&store, &bundles[0]).await, (true, 2));
+    assert!(
+        payment_status(&restarted, &bundles[0])
+            .await
+            .usdt_arbitrum()
+            .unwrap()
+            .finalized
+    );
     database.cleanup().await;
 }
 
-async fn status(database: &TestDatabase, id: Uuid) -> (bool, i32) {
-    sqlx::query_as("SELECT amount_matched,confirmation_count FROM invoices WHERE id=$1")
-        .bind(id)
-        .fetch_one(database.pool())
+async fn payment_status(store: &InvoiceStore, bundle: &BundleId) -> PaymentRequestStatusSummary {
+    PaymentRequestStatusOperations::lookup(store, &parse_creator(CREATOR).unwrap(), bundle)
         .await
         .unwrap()
+        .unwrap()
+}
+
+async fn status(store: &InvoiceStore, bundle: &BundleId) -> (bool, u32) {
+    payment_status(store, bundle)
+        .await
+        .usdt_arbitrum()
+        .map_or((false, 0), |payment| {
+            (
+                payment.amount_matched && payment.paid_on_time,
+                payment.confirmations,
+            )
+        })
 }
 
 #[tokio::test]
@@ -627,12 +661,25 @@ async fn either_quoted_payment_can_settle_without_overwriting_the_other() {
         .apply_bitcoin_observation_at("quoted-btc-0", &outpoint, 49, 1, true, now)
         .await
         .unwrap();
-    assert_eq!(status(&database, id).await, (false, 1));
+    assert!(
+        !payment_status(&store, &bundle)
+            .await
+            .bitcoin()
+            .unwrap()
+            .amount_matched
+    );
     store
         .apply_bitcoin_observation_at("quoted-btc-0", &outpoint, 50, 1, true, now)
         .await
         .unwrap();
-    assert_eq!(status(&database, id).await, (true, 1));
+    assert_eq!(
+        payment_status(&store, &bundle)
+            .await
+            .bitcoin()
+            .unwrap()
+            .confirmations,
+        1
+    );
     rpc.chain.lock().unwrap().receipt["logs"][1]["data"] = json!(format!("0x{:064x}", 49_999));
     store
         .observe_usdt_request(
@@ -644,7 +691,14 @@ async fn either_quoted_payment_can_settle_without_overwriting_the_other() {
         )
         .await
         .unwrap();
-    assert_eq!(status(&database, id).await, (true, 1));
+    assert_eq!(
+        payment_status(&store, &bundle)
+            .await
+            .bitcoin()
+            .unwrap()
+            .confirmations,
+        1
+    );
     rpc.chain.lock().unwrap().receipt["logs"][1]["data"] = json!(format!("0x{:064x}", 50_000));
     store
         .observe_usdt_request(
@@ -656,14 +710,19 @@ async fn either_quoted_payment_can_settle_without_overwriting_the_other() {
         )
         .await
         .unwrap();
-    assert_eq!(status(&database, id).await, (true, 2));
+    let both = payment_status(&store, &bundle).await;
+    assert!(both.bitcoin().unwrap().amount_matched);
+    assert_eq!(both.bitcoin().unwrap().confirmations, 1);
+    assert!(both.usdt_arbitrum().unwrap().amount_matched);
+    assert_eq!(both.usdt_arbitrum().unwrap().confirmations, 2);
+    assert!(!both.usdt_arbitrum().unwrap().finalized);
     // Restart and independently reorg either chain; only losing both payments removes satisfaction.
     let restarted = InvoiceStore::new(database.pool(), crypto);
     restarted
         .apply_bitcoin_observation_at("quoted-btc-0", &outpoint, 50, 0, false, now)
         .await
         .unwrap();
-    assert_eq!(status(&database, id).await, (true, 2));
+    assert_eq!(status(&restarted, &bundle).await, (true, 2));
     rpc.chain.lock().unwrap().reorg = true;
     restarted
         .observe_usdt_request(
@@ -675,12 +734,19 @@ async fn either_quoted_payment_can_settle_without_overwriting_the_other() {
         )
         .await
         .unwrap();
-    assert_eq!(status(&database, id).await, (false, 0));
+    assert_eq!(status(&restarted, &bundle).await, (false, 0));
     restarted
         .apply_bitcoin_observation_at("quoted-btc-0", &outpoint, 50, 6, true, now)
         .await
         .unwrap();
-    assert_eq!(status(&database, id).await, (true, 6));
+    assert_eq!(
+        payment_status(&restarted, &bundle)
+            .await
+            .bitcoin()
+            .unwrap()
+            .confirmations,
+        6
+    );
     restarted
         .observe_usdt_request(
             creator_id,
@@ -691,8 +757,135 @@ async fn either_quoted_payment_can_settle_without_overwriting_the_other() {
         )
         .await
         .unwrap();
-    assert_eq!(status(&database, id).await, (true, 6));
+    assert_eq!(
+        payment_status(&restarted, &bundle)
+            .await
+            .bitcoin()
+            .unwrap()
+            .confirmations,
+        6
+    );
     assert!(restarted.observation_targets().await.unwrap().is_empty());
     restarted.scan_payment_record_integrity().await.unwrap();
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn timely_usdt_payment_remains_verifiable_after_drain_cleanup() {
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(&[7; 32]).unwrap());
+    let creator = parse_creator(CREATOR).unwrap();
+    let bundle = parse_bundle_id(BUNDLES[0]).unwrap();
+    let lock = parse_addressed_lock_resource(LOCK_RESOURCE).unwrap();
+    let creator_id = CreatorStore::new(database.pool(), crypto.clone())
+        .create(&CreatorCredentials::new(
+            creator.clone(),
+            "test-session".into(),
+            PaykitIdentitySecretKey::new([9; 32], 1).unwrap(),
+            None,
+            Some(UsdtAddress::try_from(RECIPIENT.to_owned()).unwrap()),
+        ))
+        .await
+        .unwrap()
+        .id();
+    let store = InvoiceStore::new(database.pool(), crypto.clone());
+    let invoice = store
+        .create_atomic(AtomicInvoiceInput {
+            creator: &creator,
+            reader: &parse_reader(CREATOR).unwrap(),
+            bundle_binding: BUNDLES[0].as_bytes(),
+            lock_resource_binding: LOCK_RESOURCE.as_bytes(),
+            payment_request_binding: b"quoted-request",
+            invoice_payloads: &QuotedPayload { index: 0 },
+            proposal_acceptance_seconds: 1800,
+            payment_window_seconds: 3600,
+        })
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO payment_request_lifecycles (invoice_id,sdk_payment_request_id,request_state,last_event_at,last_stream_item_id) VALUES ($1,$2,'proof_submitted',NOW(),1)")
+        .bind(invoice.invoice_id()).bind(record(0).payment_request_id).execute(database.pool()).await.unwrap();
+    let drains = PaymentDrainStore::new(database.pool(), crypto.clone());
+    let active = drains.create(&lock).await.unwrap();
+    assert_eq!(active.accepted_count(), 1);
+    assert!(!active.completed());
+
+    // A Bitcoin payment observed too late cannot replace earlier on-time USDT evidence.
+    let outpoint =
+        paykit_server::domain::payment::BitcoinOutpoint::from_bitcoin(bitcoin::OutPoint::new(
+            bitcoin::Txid::from_raw_hash(bitcoin::hashes::Hash::all_zeros()),
+            0,
+        ));
+    store
+        .apply_bitcoin_observation_at(
+            "quoted-btc-0",
+            &outpoint,
+            50,
+            6,
+            true,
+            invoice.payment_deadline() + time::Duration::seconds(1),
+        )
+        .await
+        .unwrap();
+    let late = payment_status(&store, &bundle).await;
+    assert!(!late.bitcoin().unwrap().paid_on_time);
+    let rpc = Rpc::start().await;
+    store
+        .observe_usdt_request(
+            creator_id,
+            &creator,
+            &record(0),
+            &rpc.verifier,
+            Some(&bundle),
+        )
+        .await
+        .unwrap();
+    let facts = payment_status(&store, &bundle).await;
+    assert!(facts.usdt_arbitrum().unwrap().paid_on_time);
+    assert!(!facts.usdt_arbitrum().unwrap().finalized);
+    assert_ne!(
+        facts.payment_state(),
+        paykit_server::application::payment_request_status::PaymentState::Expired
+    );
+    let completed = drains.exact_replay(&lock).await.unwrap().unwrap();
+    assert!(completed.completed());
+    assert_eq!(completed.terminal_count(), 1);
+    let token = crypto.payment_drain_cleanup_token(completed.drain_id());
+    drains
+        .cleanup_completed(&lock, token.as_bytes())
+        .await
+        .unwrap();
+
+    // Drain completion closes request creation; it does not decide access or remove evidence.
+    let restarted = InvoiceStore::new(database.pool(), crypto);
+    assert_eq!(payment_status(&restarted, &bundle).await, facts);
+    rpc.chain.lock().unwrap().reorg = true;
+    restarted
+        .observe_usdt_request(
+            creator_id,
+            &creator,
+            &record(0),
+            &rpc.verifier,
+            Some(&bundle),
+        )
+        .await
+        .unwrap();
+    let reorged = payment_status(&restarted, &bundle).await;
+    assert!(reorged.usdt_arbitrum().is_none());
+    assert!(!reorged.bitcoin().unwrap().paid_on_time);
+    rpc.chain.lock().unwrap().reorg = false;
+    rpc.chain.lock().unwrap().finalized = true;
+    let verifier = ArbitrumVerifier::new(rpc.url.clone()).unwrap();
+    restarted
+        .observe_usdt_request(creator_id, &creator, &record(0), &verifier, Some(&bundle))
+        .await
+        .unwrap();
+    assert!(
+        payment_status(&restarted, &bundle)
+            .await
+            .usdt_arbitrum()
+            .unwrap()
+            .finalized
+    );
     database.cleanup().await;
 }
