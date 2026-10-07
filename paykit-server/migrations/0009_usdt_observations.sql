@@ -12,6 +12,6 @@ CREATE TABLE usdt_observations (
     confirmations INTEGER NOT NULL CHECK (confirmations >= 0),
     present BOOLEAN NOT NULL,
     finalized BOOLEAN NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    checked_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX usdt_observations_invoice_id_index ON usdt_observations (invoice_id);

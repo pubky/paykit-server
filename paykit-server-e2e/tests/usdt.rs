@@ -10,7 +10,7 @@ use paykit_server::{
     application::semantic_intent::DeliveryIntentV1,
     crypto::Crypto,
     domain::{
-        locks::{parse_creator, parse_reader},
+        locks::{parse_bundle_id, parse_creator, parse_reader},
         receiving::{USDT_ENDPOINT, USDT_TOKEN, UsdtAddress},
     },
     persistence::{
@@ -25,6 +25,7 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 const CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
+const BUNDLES: [&str; 2] = ["000G40R40M30E209185GR38E1W", "000G40R40M30E209185GR38E2W"];
 const RECIPIENT: &str = "0x2222222222222222222222222222222222222222";
 const BLOCK: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
@@ -58,6 +59,8 @@ fn record(index: usize) -> PaymentRequestRecord {
 #[derive(Clone)]
 struct Chain {
     receipt: Value,
+    chain_id: u64,
+    head: u64,
     timestamp: i64,
     finalized: bool,
     reorg: bool,
@@ -74,6 +77,8 @@ impl Chain {
             receipt: json!({"transactionHash":hash,"status":"0x1","blockNumber":"0x64","blockHash":BLOCK,
             "logs":[{}, {"address":USDT_TOKEN,"transactionHash":hash,"blockHash":BLOCK,"removed":false,
                 "logIndex":"0xf", "topics":[topic,sender,recipient],"data":format!("0x{:064x}",50_000)}]}),
+            chain_id: 42161,
+            head: 101,
             timestamp: OffsetDateTime::now_utc().unix_timestamp(),
             finalized: false,
             reorg: false,
@@ -82,9 +87,17 @@ impl Chain {
     }
 }
 
+#[derive(Clone)]
+struct RpcState {
+    chain: Arc<Mutex<Chain>>,
+    requests: Arc<Mutex<Vec<(String, Value)>>>,
+}
+
 struct Rpc {
     chain: Arc<Mutex<Chain>>,
     verifier: ArbitrumVerifier,
+    url: url::Url,
+    requests: Arc<Mutex<Vec<(String, Value)>>>,
     task: tokio::task::JoinHandle<()>,
 }
 impl Drop for Rpc {
@@ -94,44 +107,49 @@ impl Drop for Rpc {
 }
 impl Rpc {
     async fn start() -> Self {
-        async fn handle(
-            State(state): State<Arc<Mutex<Chain>>>,
-            Json(request): Json<Value>,
-        ) -> Json<Value> {
-            let chain = state.lock().unwrap();
+        async fn handle(State(state): State<RpcState>, Json(request): Json<Value>) -> Json<Value> {
+            state.requests.lock().unwrap().push((
+                request["method"].as_str().unwrap().to_owned(),
+                request["params"].clone(),
+            ));
+            let chain = state.chain.lock().unwrap();
             if chain.unavailable {
                 return Json(
                     json!({"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"unavailable"}}),
                 );
             }
             let result = match request["method"].as_str().unwrap() {
-                "eth_chainId" => json!("0xa4b1"),
+                "eth_chainId" => json!(format!("0x{:x}", chain.chain_id)),
                 "eth_getTransactionReceipt" => chain.receipt.clone(),
-                "eth_blockNumber" => json!("0x65"),
+                "eth_blockNumber" => json!(format!("0x{:x}", chain.head)),
                 "eth_getBlockByNumber" if request["params"][0] == "finalized" => {
                     json!({"number":if chain.finalized {"0x64"}else{"0x63"}})
                 }
                 "eth_getBlockByNumber" => {
-                    json!({"number":"0x64","hash":if chain.reorg {"0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}else{BLOCK},"timestamp":format!("0x{:x}",chain.timestamp)})
+                    json!({"number":request["params"][0],"hash":if chain.reorg {"0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}else{BLOCK},"timestamp":format!("0x{:x}",chain.timestamp)})
                 }
                 _ => panic!("unexpected RPC"),
             };
             Json(json!({"jsonrpc":"2.0","id":1,"result":result}))
         }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap())
+        let url: url::Url = format!("http://{}", listener.local_addr().unwrap())
             .parse()
             .unwrap();
         let chain = Arc::new(Mutex::new(Chain::new()));
-        let app = Router::new()
-            .route("/", post(handle))
-            .with_state(chain.clone());
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new().route("/", post(handle)).with_state(RpcState {
+            chain: chain.clone(),
+            requests: requests.clone(),
+        });
         let task = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
         Self {
             chain,
-            verifier: ArbitrumVerifier::new(url).unwrap(),
+            verifier: ArbitrumVerifier::new(url.clone()).unwrap(),
+            url,
+            requests,
             task,
         }
     }
@@ -209,6 +227,85 @@ async fn account_attestation_and_canonical_receipt_are_both_required() {
         rpc.verifier.verify(&context, &valid).await,
         Err(VerificationError::Unavailable)
     ));
+}
+
+#[tokio::test]
+async fn concurrent_receipt_checks_share_only_fresh_network_state() {
+    let rpc = Rpc::start().await;
+    let recipient = UsdtAddress::try_from(RECIPIENT.to_owned()).unwrap();
+    let f = fixture(0);
+    let context = PaymentContext {
+        payer: CREATOR.trim_start_matches("pubky"),
+        payee: CREATOR.trim_start_matches("pubky"),
+        request_id: f["binding"]["paymentRequestId"].as_str().unwrap(),
+        reference: f["binding"]["paymentReference"].as_str().unwrap(),
+        recipient: &recipient,
+    };
+    let proof = proof(0);
+    let cloned = rpc.verifier.clone();
+    let (first, second) = tokio::join!(
+        rpc.verifier.verify(&context, &proof),
+        cloned.verify(&context, &proof),
+    );
+    assert!(first.unwrap().is_some());
+    assert!(second.unwrap().is_some());
+    let count = |method: &str, params: Value| {
+        rpc.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(name, args)| name == method && *args == params)
+            .count()
+    };
+    assert_eq!(count("eth_chainId", json!([])), 1);
+    assert_eq!(count("eth_blockNumber", json!([])), 1);
+    assert_eq!(
+        count("eth_getBlockByNumber", json!(["finalized", false])),
+        1
+    );
+    assert_eq!(
+        count(
+            "eth_getTransactionReceipt",
+            json!([proof.proof["transaction_hash"]])
+        ),
+        2
+    );
+    assert_eq!(count("eth_getBlockByNumber", json!(["0x64", false])), 2);
+
+    // A just-mined receipt refreshes an older cached head immediately.
+    {
+        let mut chain = rpc.chain.lock().unwrap();
+        chain.head = 102;
+        chain.receipt["blockNumber"] = json!("0x66");
+    }
+    assert!(cloned.verify(&context, &proof).await.unwrap().is_some());
+    assert_eq!(count("eth_blockNumber", json!([])), 2);
+    // Receipt and canonical-block checks are never served from the shared snapshot.
+    rpc.chain.lock().unwrap().reorg = true;
+    assert!(cloned.verify(&context, &proof).await.unwrap().is_none());
+    rpc.chain.lock().unwrap().reorg = false;
+
+    tokio::time::sleep(std::time::Duration::from_millis(5100)).await;
+    rpc.chain.lock().unwrap().chain_id = 1;
+    assert!(matches!(
+        cloned.verify(&context, &proof).await,
+        Err(VerificationError::Unavailable)
+    ));
+    rpc.chain.lock().unwrap().chain_id = 42161;
+    rpc.chain.lock().unwrap().unavailable = true;
+    assert!(matches!(
+        rpc.verifier.verify(&context, &proof).await,
+        Err(VerificationError::Unavailable)
+    ));
+    rpc.chain.lock().unwrap().unavailable = false;
+    assert!(
+        rpc.verifier
+            .verify(&context, &proof)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(count("eth_blockNumber", json!([])), 3);
 }
 
 struct Payload {
@@ -291,6 +388,7 @@ fn invoice_payload(
 
 #[tokio::test]
 async fn invoices_share_an_address_but_never_share_payment_evidence() {
+    let bundles = BUNDLES.map(|value| parse_bundle_id(value).unwrap());
     let database = TestDatabase::create().await;
     run_migrations(database.pool()).await.unwrap();
     let crypto = Arc::new(Crypto::from_master_key(&[7; 32]).unwrap());
@@ -308,8 +406,7 @@ async fn invoices_share_an_address_but_never_share_payment_evidence() {
         .id();
     let store = InvoiceStore::new(database.pool(), crypto.clone());
     let mut ids = Vec::new();
-    for index in 0..2 {
-        let binding = format!("bundle-{index}");
+    for (index, binding) in BUNDLES.iter().enumerate() {
         let invoice = store
             .create_atomic(AtomicInvoiceInput {
                 creator: &creator,
@@ -342,7 +439,13 @@ async fn invoices_share_an_address_but_never_share_payment_evidence() {
             chain.timestamp = paid_at + offset;
         }
         store
-            .observe_usdt_request(creator_id, &creator, &record(0), &rpc.verifier, None)
+            .observe_usdt_request(
+                creator_id,
+                &creator,
+                &record(0),
+                &rpc.verifier,
+                Some(&bundles[0]),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -351,6 +454,27 @@ async fn invoices_share_an_address_but_never_share_payment_evidence() {
             "amount={amount}, offset={offset}"
         );
     }
+    let request_count = rpc.requests.lock().unwrap().len();
+    let restarted = InvoiceStore::new(database.pool(), crypto.clone());
+    restarted
+        .observe_usdt_request(creator_id, &creator, &record(0), &rpc.verifier, None)
+        .await
+        .unwrap();
+    assert_eq!(rpc.requests.lock().unwrap().len(), request_count);
+    sqlx::query("UPDATE usdt_observations SET checked_at = NOW() - INTERVAL '1 minute' WHERE invoice_id = $1")
+        .bind(ids[0]).execute(database.pool()).await.unwrap();
+    rpc.chain.lock().unwrap().reorg = true;
+    restarted
+        .observe_usdt_request(creator_id, &creator, &record(0), &rpc.verifier, None)
+        .await
+        .unwrap();
+    assert_eq!(status(&database, ids[0]).await, (false, 0));
+    rpc.chain.lock().unwrap().reorg = false;
+    restarted
+        .observe_usdt_request(creator_id, &creator, &record(0), &rpc.verifier, None)
+        .await
+        .unwrap();
+    assert_eq!(status(&database, ids[0]).await, (true, 2));
     store.scan_payment_record_integrity().await.unwrap();
     // Chain timestamps have second precision; invoice timestamps retain subsecond precision.
     let mut evidence = record(0);
@@ -359,20 +483,53 @@ async fn invoices_share_an_address_but_never_share_payment_evidence() {
     evidence.payment_proofs.insert(0, incorrect.clone());
     evidence.payment_proofs.push(incorrect);
     store
-        .observe_usdt_request(creator_id, &creator, &evidence, &rpc.verifier, None)
+        .observe_usdt_request(
+            creator_id,
+            &creator,
+            &evidence,
+            &rpc.verifier,
+            Some(&bundles[0]),
+        )
         .await
         .unwrap();
     assert_eq!(status(&database, ids[0]).await, (true, 2));
+    rpc.chain.lock().unwrap().unavailable = true;
+    assert!(matches!(
+        store
+            .observe_usdt_request(
+                creator_id,
+                &creator,
+                &evidence,
+                &rpc.verifier,
+                Some(&bundles[0])
+            )
+            .await,
+        Err(PersistenceError::Unavailable)
+    ));
+    assert_eq!(status(&database, ids[0]).await, (true, 2));
+    rpc.chain.lock().unwrap().unavailable = false;
     // An independently valid second signature over the same receipt cannot buy another lock.
     store
-        .observe_usdt_request(creator_id, &creator, &record(1), &rpc.verifier, None)
+        .observe_usdt_request(
+            creator_id,
+            &creator,
+            &record(1),
+            &rpc.verifier,
+            Some(&bundles[1]),
+        )
         .await
         .unwrap();
     assert_eq!(status(&database, ids[1]).await, (false, 0));
     let restarted = InvoiceStore::new(database.pool(), crypto);
     rpc.chain.lock().unwrap().reorg = true;
     restarted
-        .observe_usdt_request(creator_id, &creator, &evidence, &rpc.verifier, None)
+        .observe_usdt_request(
+            creator_id,
+            &creator,
+            &evidence,
+            &rpc.verifier,
+            Some(&bundles[0]),
+        )
         .await
         .unwrap();
     assert_eq!(status(&database, ids[0]).await, (false, 0));
@@ -385,13 +542,26 @@ async fn invoices_share_an_address_but_never_share_payment_evidence() {
     assert!(first_match.is_some(), "drain history survives a reorg");
     rpc.chain.lock().unwrap().reorg = false;
     rpc.chain.lock().unwrap().finalized = true;
+    let verifier = ArbitrumVerifier::new(rpc.url.clone()).unwrap();
     restarted
-        .observe_usdt_request(creator_id, &creator, &evidence, &rpc.verifier, None)
+        .observe_usdt_request(
+            creator_id,
+            &creator,
+            &evidence,
+            &verifier,
+            Some(&bundles[0]),
+        )
         .await
         .unwrap();
     rpc.chain.lock().unwrap().unavailable = true;
     restarted
-        .observe_usdt_request(creator_id, &creator, &evidence, &rpc.verifier, None)
+        .observe_usdt_request(
+            creator_id,
+            &creator,
+            &evidence,
+            &verifier,
+            Some(&bundles[0]),
+        )
         .await
         .unwrap();
     assert_eq!(status(&database, ids[0]).await, (true, 2));
@@ -408,6 +578,7 @@ async fn status(database: &TestDatabase, id: Uuid) -> (bool, i32) {
 
 #[tokio::test]
 async fn either_quoted_payment_can_settle_without_overwriting_the_other() {
+    let bundle = parse_bundle_id(BUNDLES[0]).unwrap();
     let database = TestDatabase::create().await;
     run_migrations(database.pool()).await.unwrap();
     let crypto = Arc::new(Crypto::from_master_key(&[7; 32]).unwrap());
@@ -429,7 +600,7 @@ async fn either_quoted_payment_can_settle_without_overwriting_the_other() {
     let input = || AtomicInvoiceInput {
         creator: &creator,
         reader: &reader,
-        bundle_binding: b"quoted-bundle",
+        bundle_binding: BUNDLES[0].as_bytes(),
         lock_resource_binding: b"lock",
         payment_request_binding: b"quoted-request",
         invoice_payloads: &payload,
@@ -464,13 +635,25 @@ async fn either_quoted_payment_can_settle_without_overwriting_the_other() {
     assert_eq!(status(&database, id).await, (true, 1));
     rpc.chain.lock().unwrap().receipt["logs"][1]["data"] = json!(format!("0x{:064x}", 49_999));
     store
-        .observe_usdt_request(creator_id, &creator, &record(0), &rpc.verifier, None)
+        .observe_usdt_request(
+            creator_id,
+            &creator,
+            &record(0),
+            &rpc.verifier,
+            Some(&bundle),
+        )
         .await
         .unwrap();
     assert_eq!(status(&database, id).await, (true, 1));
     rpc.chain.lock().unwrap().receipt["logs"][1]["data"] = json!(format!("0x{:064x}", 50_000));
     store
-        .observe_usdt_request(creator_id, &creator, &record(0), &rpc.verifier, None)
+        .observe_usdt_request(
+            creator_id,
+            &creator,
+            &record(0),
+            &rpc.verifier,
+            Some(&bundle),
+        )
         .await
         .unwrap();
     assert_eq!(status(&database, id).await, (true, 2));
@@ -483,7 +666,13 @@ async fn either_quoted_payment_can_settle_without_overwriting_the_other() {
     assert_eq!(status(&database, id).await, (true, 2));
     rpc.chain.lock().unwrap().reorg = true;
     restarted
-        .observe_usdt_request(creator_id, &creator, &record(0), &rpc.verifier, None)
+        .observe_usdt_request(
+            creator_id,
+            &creator,
+            &record(0),
+            &rpc.verifier,
+            Some(&bundle),
+        )
         .await
         .unwrap();
     assert_eq!(status(&database, id).await, (false, 0));
@@ -493,7 +682,13 @@ async fn either_quoted_payment_can_settle_without_overwriting_the_other() {
         .unwrap();
     assert_eq!(status(&database, id).await, (true, 6));
     restarted
-        .observe_usdt_request(creator_id, &creator, &record(0), &rpc.verifier, None)
+        .observe_usdt_request(
+            creator_id,
+            &creator,
+            &record(0),
+            &rpc.verifier,
+            Some(&bundle),
+        )
         .await
         .unwrap();
     assert_eq!(status(&database, id).await, (true, 6));

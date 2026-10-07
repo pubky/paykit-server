@@ -1,6 +1,10 @@
 //! Direct Arbitrum USDT0 receipts and Paykit ERC-20 account attestations.
 
-use std::{str::FromStr, time::Duration};
+use std::{
+    str::FromStr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use alloy_primitives::{Address, B256, U256};
 use alloy_sol_types::{SolStruct, eip712_domain, sol};
@@ -12,6 +16,7 @@ use secp256k1::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 use time::OffsetDateTime;
+use tokio::sync::Mutex;
 
 use crate::domain::receiving::{USDT_CHAIN_ID, USDT_ENDPOINT, USDT_TOKEN, UsdtAddress};
 
@@ -73,6 +78,15 @@ pub enum VerificationError {
 pub struct ArbitrumVerifier {
     client: reqwest::Client,
     url: url::Url,
+    chain_tip: Arc<Mutex<Option<(Instant, ChainTip)>>>,
+}
+
+const CHAIN_TIP_TTL: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Copy)]
+struct ChainTip {
+    head: u64,
+    finalized: Option<u64>,
 }
 
 impl ArbitrumVerifier {
@@ -82,7 +96,42 @@ impl ArbitrumVerifier {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|_| VerificationError::Unavailable)?;
-        Ok(Self { client, url })
+        Ok(Self {
+            client,
+            url,
+            chain_tip: Arc::new(Mutex::new(None)),
+        })
+    }
+
+    async fn chain_tip(&self, minimum_block: u64) -> Result<ChainTip, VerificationError> {
+        // Share one bounded snapshot across creators and coalesce concurrent refreshes.
+        let mut cached = self.chain_tip.lock().await;
+        if let Some((read_at, tip)) = *cached
+            && read_at.elapsed() < CHAIN_TIP_TTL
+            && tip.head >= minimum_block
+        {
+            return Ok(tip);
+        }
+        *cached = None;
+        let read_at = Instant::now();
+        if quantity(&self.call("eth_chainId", json!([])).await?)? != 42161 {
+            return Err(VerificationError::Unavailable);
+        }
+        let finalized = self
+            .call("eth_getBlockByNumber", json!(["finalized", false]))
+            .await?;
+        let finalized = if finalized.is_null() {
+            None
+        } else {
+            Some(quantity(&finalized["number"])?)
+        };
+        let head = quantity(&self.call("eth_blockNumber", json!([])).await?)?;
+        if head < minimum_block || finalized.is_some_and(|block| block > head) {
+            return Err(VerificationError::Unavailable);
+        }
+        let tip = ChainTip { head, finalized };
+        *cached = Some((read_at, tip));
+        Ok(tip)
     }
 
     async fn call(&self, method: &str, params: Value) -> Result<Value, VerificationError> {
@@ -126,9 +175,7 @@ impl ArbitrumVerifier {
         record: &PaymentProofRecord,
     ) -> Result<Option<VerifiedTransfer>, VerificationError> {
         let (proof, hash, index, sender) = parse_proof(context, record)?;
-        if quantity(&self.call("eth_chainId", json!([])).await?)? != 42161 {
-            return Err(VerificationError::Unavailable);
-        }
+        let mut tip = self.chain_tip(0).await?;
         let receipt = self
             .call("eth_getTransactionReceipt", json!([proof.transaction_hash]))
             .await?;
@@ -142,6 +189,9 @@ impl ArbitrumVerifier {
             return Err(VerificationError::InvalidProof);
         }
         let number = quantity(&receipt["blockNumber"])?;
+        if tip.head < number {
+            tip = self.chain_tip(number).await?;
+        }
         let block = self
             .call(
                 "eth_getBlockByNumber",
@@ -163,16 +213,13 @@ impl ArbitrumVerifier {
             .ok_or(VerificationError::Unavailable)?;
         let log = logs.get(index).ok_or(VerificationError::InvalidProof)?;
         let amount = transfer_amount(log, sender, context.recipient, hash, &receipt["blockHash"])?;
-        let head = quantity(&self.call("eth_blockNumber", json!([])).await?)?;
-        let confirmations = head
+        let confirmations = tip
+            .head
             .checked_sub(number)
             .and_then(|n| n.checked_add(1))
             .and_then(|n| u32::try_from(n).ok())
             .ok_or(VerificationError::Unavailable)?;
-        let finalized = self
-            .call("eth_getBlockByNumber", json!(["finalized", false]))
-            .await?;
-        let finalized = !finalized.is_null() && quantity(&finalized["number"])? >= number;
+        let finalized = tip.finalized.is_some_and(|block| block >= number);
         Ok(Some(VerifiedTransfer {
             identity: format!("{USDT_CHAIN_ID}:{hash:#x}:{index}"),
             amount,

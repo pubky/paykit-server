@@ -67,6 +67,7 @@ impl InvoiceStore {
     }
 
     /// Resolves invoices only through their already-attributed SDK lifecycle record.
+    /// Background scans defer present observations for a minute; bundle status reads are fresh.
     pub async fn observe_usdt_request(
         &self,
         creator_id: Uuid,
@@ -147,9 +148,18 @@ impl InvoiceStore {
         }
         for (identity, proofs) in candidates {
             let identity_hash = self.crypto.usdt_transfer_lookup_hash(identity.as_bytes());
-            let final_owner: Option<Uuid> = sqlx::query_scalar("SELECT invoice_id FROM usdt_observations WHERE transfer_lookup_hash = $1 AND finalized")
-                .bind(identity_hash.as_bytes().as_slice()).fetch_optional(&self.pool).await.map_err(|_| PersistenceError::Unavailable)?;
-            if final_owner.is_some() {
+            let skip: Option<bool> = sqlx::query_scalar(
+                "SELECT finalized OR ($2 AND invoice_id = $3 AND present
+                    AND checked_at <= NOW() AND checked_at > NOW() - INTERVAL '1 minute')
+                 FROM usdt_observations WHERE transfer_lookup_hash = $1",
+            )
+            .bind(identity_hash.as_bytes().as_slice())
+            .bind(bundle.is_none())
+            .bind(row.id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+            if skip == Some(true) {
                 continue;
             }
             // Corrective proofs cannot erase another valid account attestation for the same event.
@@ -256,6 +266,7 @@ impl InvoiceStore {
                 observation_envelope = CASE WHEN usdt_observations.invoice_id = EXCLUDED.invoice_id THEN EXCLUDED.observation_envelope ELSE usdt_observations.observation_envelope END,
                 confirmations = CASE WHEN usdt_observations.invoice_id = EXCLUDED.invoice_id THEN EXCLUDED.confirmations ELSE usdt_observations.confirmations END,
                 present = CASE WHEN usdt_observations.invoice_id = EXCLUDED.invoice_id THEN TRUE ELSE usdt_observations.present END,
+                checked_at = CASE WHEN usdt_observations.invoice_id = EXCLUDED.invoice_id THEN NOW() ELSE usdt_observations.checked_at END,
                 finalized = CASE WHEN usdt_observations.invoice_id = EXCLUDED.invoice_id THEN EXCLUDED.finalized ELSE usdt_observations.finalized END
              RETURNING invoice_id")
             .bind(id).bind(row.id).bind(transfer_hash.as_bytes().as_slice()).bind(envelope.as_bytes())

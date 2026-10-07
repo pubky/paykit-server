@@ -68,6 +68,7 @@ app; only SDK `Sent` means delivered, not payer acknowledgement. See
 
 Bitcoin attribution uses direct observation of the invoice-specific address. USDT attribution combines an authenticated, request-bound ERC-20 account signature with independent Arbitrum receipt verification. Neither SDK lifecycle state nor a transaction hash alone proves settlement. One amount-matched output is required; split outputs are not aggregated.
 A Bitcoin amount-matched output freezes at one confirmation and becomes final at six. USDT observations remain reorg-sensitive until the RPC finalized block covers the receipt; their unique transfer identity cannot settle another invoice.
+USDT verification shares a bounded five-second chain-tip snapshot across Creator adapters. Each receipt and canonical block is read afresh. Persisted observation check times limit background refreshes of present transfers to once per minute; explicit status reads bypass this delay, and missing transfers remain eligible on every receive cycle.
 No spending, refunds, receipt issuance, or horizontal replicas are supported.
 
 Upgrade policy and operational limits are in the [README](../README.md);

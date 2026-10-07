@@ -448,7 +448,12 @@ payments remain received funds but do not satisfy the invoice. Payment time come
 from the canonical block timestamp (second precision), within the invoice window.
 An RPC outage leaves the last observation intact and returns unavailable when a
 fresh status is required. Non-final observations are rechecked for reorgs; finalized
-observations stop polling. The chain/hash/receipt-index identity is durably unique
+observations stop polling. Chain identity, head and finality reads share a five-second
+snapshot across payments. Receipts and their canonical blocks are verified afresh;
+a receipt newer than the cached head immediately refreshes the snapshot. Background
+checks of detected transfers run at most once per minute, with the last successful
+check stored across restarts. New or missing transfers retain the normal receive-loop
+cadence. Explicit checkout status checks bypass this background delay. The chain/hash/receipt-index identity is durably unique
 across invoices, including restarts. Confirmations are Arbitrum L2 block counts;
 Locks must choose an asset-appropriate acceptance policy, not assume Bitcoin timing.
 
