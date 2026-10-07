@@ -1422,6 +1422,19 @@ async fn setup_shell(service: SetupService) -> String {
     body(response).await
 }
 
+async fn reconnect_shell(service: SetupService, creator: &str) -> String {
+    let response = request(
+        setup_router(service),
+        Method::GET,
+        &format!(
+            "/setup/reconnect?return_to=https://app.example/callback&state=opaque&creator={creator}"
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    body(response).await
+}
+
 fn qr_markup(shell: &str) -> &str {
     let start = shell
         .find("<span class=\"qr\"")
@@ -1467,6 +1480,37 @@ async fn android_bitkit_button_targets_the_configured_bitkit_package() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn android_reconnect_targets_bitkit_and_keeps_the_paykit_only_qr() {
+    let creator = "pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo";
+    let reconnect_service = || {
+        service(
+            Arc::new(ReconnectCompleter(
+                paykit_server::domain::locks::parse_creator(creator).unwrap(),
+            )),
+            Arc::new(ManualClock::default()),
+        )
+    };
+    let without_network = reconnect_shell(reconnect_service(), creator).await;
+    let with_network = reconnect_shell(
+        reconnect_service().with_bitcoin_network(BitcoinNetwork::Testnet),
+        creator,
+    )
+    .await;
+
+    assert!(with_network.contains(
+        "<a class=\"bitkit-btn\" href=\"pubkyauth://signin_grant?x-bitkit-claim=paykit-access-v1\" data-android-href=\"intent://signin_grant?x-bitkit-claim=paykit-access-v1#Intent;scheme=pubkyauth;package=to.bitkit.tnet;end\">Continue with Bitkit</a>"
+    ));
+    assert_eq!(
+        with_network
+            .matches("x-bitkit-claim=paykit-access-v1")
+            .count(),
+        2
+    );
+    assert!(!with_network.contains("watch-only-account-v1"));
+    assert_eq!(qr_markup(&with_network), qr_markup(&without_network));
 }
 
 #[tokio::test]
