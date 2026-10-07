@@ -826,9 +826,12 @@ async fn public_sdk_payment_request_retry_persists_distinct_ids_and_only_active_
         })
         .await
         .unwrap();
+    let intake = paykit_server::paykit::AllowanceIntake::new(
+        paykit_server::paykit::ALLOWANCE_INTAKE_COOLDOWN,
+    );
     assert!(
         adapter
-            .maintain_transport()
+            .maintain_transport(&intake)
             .await
             .unwrap_err()
             .is_concurrent_update()
@@ -866,7 +869,7 @@ async fn public_sdk_payment_request_retry_persists_distinct_ids_and_only_active_
         .await
         .unwrap();
     assert!(matches!(
-        adapter.maintain_transport().await,
+        adapter.maintain_transport(&intake).await,
         Err(paykit_sdk::PaykitSdkError::Transport { .. })
     ));
     // Use the process-shared provider after it restores the stored grant.

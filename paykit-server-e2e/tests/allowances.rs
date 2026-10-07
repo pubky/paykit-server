@@ -485,6 +485,40 @@ fn allowance_terms(per_payment_maximum: &str) -> AllowanceTerms {
         .unwrap()
 }
 
+/// The reader's Bitkit keeps reading the link until the server has accepted
+/// `count` Allowances, and returns them.
+async fn wait_for_acceptances(stack: &Stack, count: usize) -> Vec<paykit_sdk::AllowanceRecord> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        stack
+            .reader_sdk
+            .receive_private_messages(stack.creator_key.clone())
+            .await
+            .unwrap();
+        let allowances = stack
+            .reader_sdk
+            .list_allowances(AllowanceFilter {
+                counterparty: Some(stack.creator_key.clone()),
+                local_role: Some(AllowanceLocalRole::Allower),
+                states: Vec::new(),
+            })
+            .await
+            .unwrap();
+        if allowances.len() == count
+            && allowances
+                .iter()
+                .all(|allowance| allowance.state == AllowanceLifecycleState::Accepted)
+        {
+            return allowances;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the server did not accept {count} Allowances: {allowances:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
 /// The creator's shared state is also written by the running server, and a
 /// read that meets the server's lock reports it busy. Reads here wait it out.
 async fn when_unlocked<T, F, Fut>(mut read: F) -> T
@@ -643,19 +677,9 @@ async fn allowance_proposed_on_the_server_link_covers_the_next_locks_invoice() {
         );
     }
 
-    // The next unlock: the server accepts both during the handoff, before it
-    // proposes the request.
-    post_locks_invoice(&stack, BUNDLE_AFTER_GRANT).await;
-    let request = wait_for_request(&stack, BUNDLE_AFTER_GRANT).await;
-    let allowances = reader
-        .list_allowances(AllowanceFilter {
-            counterparty: Some(stack.creator_key.clone()),
-            local_role: Some(AllowanceLocalRole::Allower),
-            states: Vec::new(),
-        })
-        .await
-        .unwrap();
-    assert_eq!(allowances.len(), 2);
+    // The server accepts both from its transport loop once the link has
+    // received them, not as part of a request handoff.
+    let allowances = wait_for_acceptances(&stack, 2).await;
     for allowance in &allowances {
         assert_eq!(
             allowance.state,
@@ -666,6 +690,10 @@ async fn allowance_proposed_on_the_server_link_covers_the_next_locks_invoice() {
         assert_eq!(allowance.history_status, AllowanceHistoryStatus::Consistent);
         assert!(allowance.acceptance_event_id.is_some());
     }
+
+    // The next unlock: the server proposes the request after the acceptances.
+    post_locks_invoice(&stack, BUNDLE_AFTER_GRANT).await;
+    let request = wait_for_request(&stack, BUNDLE_AFTER_GRANT).await;
 
     // The request is the lock price on the regtest on-chain endpoint.
     let terms = request.terms.clone().unwrap();
@@ -907,6 +935,61 @@ async fn allowance_proposed_on_the_server_link_covers_the_next_locks_invoice() {
         proposals_received,
         std::slice::from_ref(&request.payment_request_id)
     );
+
+    stack.shutdown().await;
+}
+
+/// A reader can leave more proposals on the link than one intake accepts. The
+/// server drains them over several intakes, never from a request handoff, so
+/// the request is not held up behind them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_backlog_of_proposals_is_drained_without_holding_up_requests() {
+    const BACKLOG: usize = 6;
+    let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
+    let stack = boot(72).await;
+    let reader = &stack.reader_sdk;
+
+    post_locks_invoice(&stack, BUNDLE_BEFORE_GRANT).await;
+    wait_for_request(&stack, BUNDLE_BEFORE_GRANT).await;
+
+    let mut proposals = Vec::new();
+    for _ in 0..BACKLOG {
+        proposals.push(
+            reader
+                .propose_allowance(
+                    stack.creator_key.clone(),
+                    AllowanceLocalRole::Allower,
+                    allowance_terms("0.00005000"),
+                )
+                .await
+                .unwrap()
+                .proposal_outbound_message_id
+                .unwrap(),
+        );
+    }
+    let sent = reader
+        .process_outbound_private_messages(stack.creator_key.clone())
+        .await
+        .unwrap();
+    assert!(
+        proposals.iter().all(|id| sent.sent.contains(id)),
+        "{sent:?}"
+    );
+
+    // The request arrives while the backlog is still being accepted.
+    post_locks_invoice(&stack, BUNDLE_AFTER_GRANT).await;
+    wait_for_request(&stack, BUNDLE_AFTER_GRANT).await;
+
+    // Every proposal is accepted once: four per intake, the rest on the next.
+    let allowances = wait_for_acceptances(&stack, BACKLOG).await;
+    assert_eq!(allowances.len(), BACKLOG);
+    let state = when_unlocked(|| stack.creator_sdk.export_backup_state()).await;
+    let acceptances = state
+        .outbound_private_messages
+        .iter()
+        .filter(|record| record.kind == "paykit.allowance_acceptance")
+        .count();
+    assert_eq!(acceptances, BACKLOG);
 
     stack.shutdown().await;
 }

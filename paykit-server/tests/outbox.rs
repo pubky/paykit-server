@@ -42,7 +42,6 @@ struct FakeAdapter {
     recovery_marker_error: Option<HandoffError>,
     link_error: Option<HandoffError>,
     payment_request_calls: Mutex<usize>,
-    allowance_error: Option<HandoffError>,
     calls: Mutex<Vec<&'static str>>,
 }
 
@@ -53,7 +52,6 @@ impl FakeAdapter {
             recovery_marker_error: None,
             link_error: None,
             payment_request_calls: Mutex::new(0),
-            allowance_error: None,
             calls: Mutex::new(Vec::new()),
         }
     }
@@ -85,11 +83,6 @@ impl Adapter for FakeAdapter {
     async fn ensure_link_with_peer(&self, _reader: &str) -> Result<(), HandoffError> {
         self.record("ensure_link_with_peer");
         self.link_error.map_or(Ok(()), Err)
-    }
-
-    async fn accept_allowance_proposals(&self, _reader: &str) -> Result<usize, HandoffError> {
-        self.record("accept_allowance_proposals");
-        self.allowance_error.map_or(Ok(1), Err)
     }
 
     async fn propose_payment_request(
@@ -181,7 +174,7 @@ async fn link_failure_has_one_durable_diagnostic_stage() {
 }
 
 #[tokio::test]
-async fn allowance_intake_runs_on_the_link_before_the_request() {
+async fn the_handoff_proposes_the_request_without_reading_allowances() {
     let adapter = FakeAdapter::new(registry(true));
     handoff(&adapter, &payment_intent()).await.unwrap();
     assert_eq!(
@@ -190,32 +183,9 @@ async fn allowance_intake_runs_on_the_link_before_the_request() {
             "fetch_registry",
             "observe_recovery_marker",
             "ensure_link_with_peer",
-            "accept_allowance_proposals",
             "propose_payment_request",
         ]
     );
-}
-
-#[tokio::test]
-async fn failed_allowance_intake_still_proposes_the_request() {
-    for error in [
-        HandoffError::Retryable(RetryableHandoffCause::Transport),
-        HandoffError::Retryable(RetryableHandoffCause::RecoveryRequired),
-        HandoffError::Permanent,
-    ] {
-        let adapter = FakeAdapter {
-            allowance_error: Some(error),
-            ..FakeAdapter::new(registry(true))
-        };
-        assert!(matches!(
-            handoff(&adapter, &payment_intent()).await,
-            Ok(HandoffResult::PaymentRequestProposal {
-                outbound_message_id: 42,
-                ..
-            })
-        ));
-        assert_eq!(*adapter.payment_request_calls.lock().unwrap(), 1);
-    }
 }
 
 #[tokio::test]
@@ -255,7 +225,6 @@ async fn recovery_marker_observation_precedes_link_ensure_and_enqueue() {
             "fetch_registry",
             "observe_recovery_marker",
             "ensure_link_with_peer",
-            "accept_allowance_proposals",
             "propose_payment_request",
         ]
     );

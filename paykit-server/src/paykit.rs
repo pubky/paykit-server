@@ -4,6 +4,7 @@ use std::{
     collections::HashMap,
     future::Future,
     sync::{Arc, Mutex as StdMutex, OnceLock, Weak},
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
@@ -22,7 +23,7 @@ use paykit_sdk::{
 };
 use pubky::Pubky;
 use tokio::sync::Mutex as TokioMutex;
-use tracing::warn;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -293,36 +294,128 @@ impl PaykitAdapter {
     /// Persists the mixed private stream before the SDK sends confirmations.
     /// No request is claimed, accepted, or executed by the server.
     /// Lock or revision contention is deferred to the next poll; other failures take precedence.
-    pub async fn maintain_transport(&self) -> paykit_sdk::Result<()> {
-        let _guard = self.mutation_lock.lock().await;
-        let peers = self.sdk.linked_peers().await?;
+    ///
+    /// Afterwards, outside the Creator mutation lock, it reads the Allowance
+    /// proposals of linked readers whose link received new items.
+    pub async fn maintain_transport(&self, intake: &AllowanceIntake) -> paykit_sdk::Result<()> {
+        let mut linked = Vec::new();
         let mut results = Vec::new();
-        for peer in peers
-            .into_iter()
-            .filter(|peer| peer.state == LinkedPeerState::Linked)
         {
-            results.push(
-                self.sdk
-                    .receive_private_messages(peer.counterparty)
-                    .await
-                    .map(|_| ()),
+            let _guard = self.mutation_lock.lock().await;
+            let peers = self.sdk.linked_peers().await?;
+            for peer in peers
+                .into_iter()
+                .filter(|peer| peer.state == LinkedPeerState::Linked)
+            {
+                linked.push(peer.counterparty.clone());
+                results.push(
+                    self.sdk
+                        .receive_private_messages(peer.counterparty)
+                        .await
+                        .map(|_| ()),
+                );
+            }
+            // A peer's receive failure must not prevent other peers' queued sends.
+            match self.sdk.pending_outbound_private_counterparties().await {
+                Ok(peers) => {
+                    for peer in peers {
+                        results.push(
+                            self.sdk
+                                .process_outbound_private_messages(peer)
+                                .await
+                                .and_then(check_send_report),
+                        );
+                    }
+                }
+                Err(error) => results.push(Err(error)),
+            }
+        }
+        let result = check_transport_results(&results);
+        self.read_allowances(intake, &linked).await;
+        result
+    }
+
+    /// Accepts the Allowance proposals of readers whose link received items
+    /// the last read did not cover. A reader controls how much Allowance
+    /// history its link holds, and the SDK derives the whole history on every
+    /// read and every acceptance, so this stays off the outbox handoff and
+    /// takes the Creator mutation lock only around one acceptance at a time.
+    /// Failures are logged and retried after the cooldown; they never affect
+    /// transport health.
+    async fn read_allowances(&self, intake: &AllowanceIntake, linked: &[PubkyPublicKey]) {
+        if linked.is_empty() {
+            return;
+        }
+        let Ok(newest) = self.newest_stream_items(linked).await else {
+            return;
+        };
+        for reader in linked {
+            let Some(ticket) = intake.begin(
+                self.creator_id,
+                reader,
+                newest.get(reader).copied(),
+                Instant::now(),
+            ) else {
+                continue;
+            };
+            match accept_proposals(self, &self.mutation_lock, reader).await {
+                Ok(outcome) => {
+                    if outcome.accepted > 0 {
+                        info!(
+                            accepted = outcome.accepted,
+                            "accepted Paykit Allowance proposals"
+                        );
+                        self.send_queued_messages(reader).await;
+                    }
+                    intake.finish(ticket, outcome.drained);
+                }
+                Err(error) => warn!(
+                    stage = "allowance_intake",
+                    cause = error.diagnostic_label(),
+                    "Paykit Allowance intake failed; retried after the cooldown"
+                ),
+            }
+        }
+    }
+
+    async fn newest_stream_items(
+        &self,
+        linked: &[PubkyPublicKey],
+    ) -> Result<HashMap<PubkyPublicKey, u64>, PaykitSdkError> {
+        let linked = linked.to_vec();
+        self.storage
+            .transaction(move |transaction| {
+                Ok(linked
+                    .into_iter()
+                    .filter_map(|reader| {
+                        let newest = transaction
+                            .private_stream_items(&reader)
+                            .iter()
+                            .map(|item| item.stream_item_id)
+                            .max()?;
+                        Some((reader, newest))
+                    })
+                    .collect())
+            })
+            .await
+    }
+
+    /// Sends what the intake queued now, rather than on the next poll. A
+    /// failure is left to the next poll, which sends every queued message.
+    async fn send_queued_messages(&self, reader: &PubkyPublicKey) {
+        let _guard = self.mutation_lock.lock().await;
+        if self
+            .sdk
+            .process_outbound_private_messages(reader.clone())
+            .await
+            .and_then(check_send_report)
+            .is_err()
+        {
+            warn!(
+                stage = "allowance_intake",
+                "Paykit Allowance acceptances stay queued for the next poll"
             );
         }
-        // A peer's receive failure must not prevent other peers' queued sends.
-        match self.sdk.pending_outbound_private_counterparties().await {
-            Ok(peers) => {
-                for peer in peers {
-                    results.push(
-                        self.sdk
-                            .process_outbound_private_messages(peer)
-                            .await
-                            .and_then(check_send_report),
-                    );
-                }
-            }
-            Err(error) => results.push(Err(error)),
-        }
-        check_transport_results(&results)
     }
 
     pub fn new(
@@ -940,10 +1033,170 @@ fn classify(error: PaykitSdkError) -> HandoffError {
     }
 }
 
-/// Acceptances queued per handoff. Each one is a durable outbound message, so
-/// a reader that floods the link cannot turn one handoff into unbounded work;
-/// later handoffs accept the rest.
-const MAX_ALLOWANCE_ACCEPTANCES_PER_HANDOFF: usize = 4;
+/// Acceptances queued per intake. Each one is a durable outbound message, so
+/// a reader that floods the link cannot turn one intake into unbounded
+/// output; a later intake accepts the rest.
+const MAX_ALLOWANCE_ACCEPTANCES_PER_INTAKE: usize = 4;
+
+/// Least time between two reads of one reader's Allowances.
+pub const ALLOWANCE_INTAKE_COOLDOWN: Duration = Duration::from_secs(10);
+
+/// Decides when a reader's Allowances are read. The read is worth doing only
+/// when the reader's link holds stream items an earlier read did not cover,
+/// and at most once per cooldown per reader, so a reader cannot make the
+/// server derive its history faster than that.
+#[derive(Debug)]
+pub struct AllowanceIntake {
+    cooldown: Duration,
+    readers: StdMutex<HashMap<(Uuid, PubkyPublicKey), ReaderIntake>>,
+}
+
+#[derive(Debug, Default)]
+struct ReaderIntake {
+    /// Newest stream item an earlier read covered completely.
+    covered_through: Option<u64>,
+    last_started: Option<Instant>,
+}
+
+/// A read that is due, to be reported back with [`AllowanceIntake::finish`].
+struct IntakeTicket {
+    creator_id: Uuid,
+    reader: PubkyPublicKey,
+    newest_stream_item_id: u64,
+}
+
+impl AllowanceIntake {
+    pub fn new(cooldown: Duration) -> Self {
+        Self {
+            cooldown,
+            readers: StdMutex::new(HashMap::new()),
+        }
+    }
+
+    /// Whether the reader's link, whose newest stream item is `newest`, is due
+    /// for a read at `now`. A due read counts against the cooldown at once, so
+    /// a failed read is not retried sooner.
+    fn begin(
+        &self,
+        creator_id: Uuid,
+        reader: &PubkyPublicKey,
+        newest: Option<u64>,
+        now: Instant,
+    ) -> Option<IntakeTicket> {
+        let newest = newest?;
+        let mut readers = self
+            .readers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let state = readers.entry((creator_id, reader.clone())).or_default();
+        if state
+            .covered_through
+            .is_some_and(|covered| newest <= covered)
+            || state
+                .last_started
+                .is_some_and(|started| now.saturating_duration_since(started) < self.cooldown)
+        {
+            return None;
+        }
+        state.last_started = Some(now);
+        Some(IntakeTicket {
+            creator_id,
+            reader: reader.clone(),
+            newest_stream_item_id: newest,
+        })
+    }
+
+    /// Records a finished read. When it left proposals unaccepted, the same
+    /// items stay due for the next read.
+    fn finish(&self, ticket: IntakeTicket, drained: bool) {
+        if !drained {
+            return;
+        }
+        let mut readers = self
+            .readers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        readers
+            .entry((ticket.creator_id, ticket.reader))
+            .or_default()
+            .covered_through = Some(ticket.newest_stream_item_id);
+    }
+}
+
+/// What the intake does on one reader's link.
+#[async_trait]
+trait AllowanceLink: Send + Sync {
+    /// Proposals awaiting acceptance, at most one more than an intake accepts.
+    /// The SDK derives the link's whole history for this, so it must not run
+    /// under the Creator mutation lock.
+    async fn pending_proposals(
+        &self,
+        reader: &PubkyPublicKey,
+    ) -> Result<Vec<AllowanceId>, HandoffError>;
+
+    /// Queues one acceptance. The SDK derives the link's history again, and
+    /// the caller serializes it with the Creator's other mutations.
+    async fn accept(&self, reader: &PubkyPublicKey, id: &AllowanceId) -> Result<(), HandoffError>;
+}
+
+struct IntakeOutcome {
+    accepted: usize,
+    /// No proposal is left waiting behind the per-intake limit.
+    drained: bool,
+}
+
+/// Accepts up to [`MAX_ALLOWANCE_ACCEPTANCES_PER_INTAKE`] pending proposals.
+/// The Creator mutation lock is held for one acceptance at a time, never for
+/// the scan, so other Creator work interleaves with a reader's large history.
+async fn accept_proposals<L: AllowanceLink + ?Sized>(
+    link: &L,
+    mutation_lock: &TokioMutex<()>,
+    reader: &PubkyPublicKey,
+) -> Result<IntakeOutcome, HandoffError> {
+    let pending = link.pending_proposals(reader).await?;
+    let mut accepted = 0;
+    for id in pending.iter().take(MAX_ALLOWANCE_ACCEPTANCES_PER_INTAKE) {
+        let _guard = mutation_lock.lock().await;
+        link.accept(reader, id).await?;
+        accepted += 1;
+    }
+    Ok(IntakeOutcome {
+        accepted,
+        drained: pending.len() <= MAX_ALLOWANCE_ACCEPTANCES_PER_INTAKE,
+    })
+}
+
+#[async_trait]
+impl AllowanceLink for PaykitAdapter {
+    async fn pending_proposals(
+        &self,
+        reader: &PubkyPublicKey,
+    ) -> Result<Vec<AllowanceId>, HandoffError> {
+        self.sdk
+            .list_allowances(AllowanceFilter {
+                counterparty: Some(reader.clone()),
+                local_role: Some(AllowanceLocalRole::Allowee),
+                states: vec![AllowanceLifecycleState::Proposed],
+            })
+            .await
+            .map_err(classify)?
+            .iter()
+            .filter(|record| awaits_allowee_acceptance(record))
+            .take(MAX_ALLOWANCE_ACCEPTANCES_PER_INTAKE + 1)
+            .map(|record| {
+                AllowanceId::new(record.allowance_id.clone()).map_err(|_| HandoffError::Permanent)
+            })
+            .collect()
+    }
+
+    async fn accept(&self, reader: &PubkyPublicKey, id: &AllowanceId) -> Result<(), HandoffError> {
+        self.sdk
+            .accept_allowance(reader.clone(), id)
+            .await
+            .map(|_| ())
+            .map_err(classify)
+    }
+}
 
 /// An Allowance proposal the reader sent, naming this identity as the Allowee,
 /// with consistent history and no response yet.
@@ -1081,38 +1334,6 @@ impl Adapter for PaykitAdapter {
             );
         }
         result
-    }
-
-    async fn accept_allowance_proposals(&self, reader: &str) -> Result<usize, HandoffError> {
-        let reader = parse_peer(reader)?;
-        self.sdk
-            .receive_private_messages(reader.clone())
-            .await
-            .map_err(classify)?;
-        let proposals = self
-            .sdk
-            .list_allowances(AllowanceFilter {
-                counterparty: Some(reader.clone()),
-                local_role: Some(AllowanceLocalRole::Allowee),
-                states: vec![AllowanceLifecycleState::Proposed],
-            })
-            .await
-            .map_err(classify)?;
-        let mut accepted = 0;
-        for record in proposals
-            .iter()
-            .filter(|record| awaits_allowee_acceptance(record))
-            .take(MAX_ALLOWANCE_ACCEPTANCES_PER_HANDOFF)
-        {
-            let allowance_id = AllowanceId::new(record.allowance_id.clone())
-                .map_err(|_| HandoffError::Permanent)?;
-            self.sdk
-                .accept_allowance(reader.clone(), &allowance_id)
-                .await
-                .map_err(classify)?;
-            accepted += 1;
-        }
-        Ok(accepted)
     }
 
     async fn propose_payment_request(
@@ -2113,6 +2334,224 @@ mod tests {
             change(&mut record);
             assert!(queued_proposal(&[record], &server_app_id(), &reference).is_none());
         }
+    }
+
+    fn reader() -> PubkyPublicKey {
+        PubkyPublicKey::from_raw_or_app_key(CREATOR).unwrap()
+    }
+
+    #[test]
+    fn allowances_are_read_only_when_the_link_received_new_items() {
+        let intake = AllowanceIntake::new(Duration::from_secs(10));
+        let creator = Uuid::new_v4();
+        let start = Instant::now();
+
+        // Nothing received on the link: nothing to read.
+        assert!(intake.begin(creator, &reader(), None, start).is_none());
+
+        let ticket = intake.begin(creator, &reader(), Some(5), start).unwrap();
+        intake.finish(ticket, true);
+
+        // The same items again, long after the cooldown: still nothing to read.
+        let later = start + Duration::from_secs(3_600);
+        assert!(intake.begin(creator, &reader(), Some(5), later).is_none());
+        assert!(intake.begin(creator, &reader(), Some(6), later).is_some());
+    }
+
+    #[test]
+    fn a_reader_is_read_at_most_once_per_cooldown() {
+        let intake = AllowanceIntake::new(Duration::from_secs(10));
+        let creator = Uuid::new_v4();
+        let start = Instant::now();
+
+        let ticket = intake.begin(creator, &reader(), Some(1), start).unwrap();
+        intake.finish(ticket, true);
+
+        // A flood of new items does not make the next read come sooner.
+        for (seconds, newest) in [(1, 10), (5, 500), (9, 90_000)] {
+            let now = start + Duration::from_secs(seconds);
+            assert!(
+                intake
+                    .begin(creator, &reader(), Some(newest), now)
+                    .is_none()
+            );
+        }
+        let after = start + Duration::from_secs(10);
+        assert!(
+            intake
+                .begin(creator, &reader(), Some(90_000), after)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn a_failed_or_unfinished_read_is_retried_after_the_cooldown() {
+        let intake = AllowanceIntake::new(Duration::from_secs(10));
+        let creator = Uuid::new_v4();
+        let start = Instant::now();
+        let after = start + Duration::from_secs(10);
+
+        // A read that failed never reports back, and counted against the cooldown.
+        assert!(intake.begin(creator, &reader(), Some(4), start).is_some());
+        assert!(intake.begin(creator, &reader(), Some(4), start).is_none());
+        let ticket = intake.begin(creator, &reader(), Some(4), after).unwrap();
+
+        // A read that left proposals behind the per-intake limit keeps the items due.
+        intake.finish(ticket, false);
+        let again = after + Duration::from_secs(10);
+        let ticket = intake.begin(creator, &reader(), Some(4), again).unwrap();
+        intake.finish(ticket, true);
+        let last = again + Duration::from_secs(10);
+        assert!(intake.begin(creator, &reader(), Some(4), last).is_none());
+    }
+
+    #[test]
+    fn readers_and_creators_are_scheduled_independently() {
+        let intake = AllowanceIntake::new(Duration::from_secs(10));
+        let (creator, other_creator) = (Uuid::new_v4(), Uuid::new_v4());
+        let other_reader = PubkyPublicKey::from_raw_or_app_key(
+            "pubky8pinxxgqs41n4aididenw5apqp1urfmzdztr8jt4abrkdn435ewo",
+        )
+        .unwrap();
+        let now = Instant::now();
+
+        assert!(intake.begin(creator, &reader(), Some(1), now).is_some());
+        assert!(intake.begin(creator, &other_reader, Some(1), now).is_some());
+        assert!(
+            intake
+                .begin(other_creator, &reader(), Some(1), now)
+                .is_some()
+        );
+    }
+
+    /// A link whose scan can be held in flight, like the derivation of a
+    /// large Allowance history, and that reports whether the Creator mutation
+    /// lock was held at each step.
+    struct SlowLink {
+        lock: Arc<TokioMutex<()>>,
+        pending: usize,
+        scan_entered: tokio::sync::Notify,
+        scan_release: tokio::sync::Notify,
+        lock_held_during_accepts: StdMutex<Vec<bool>>,
+        lock_held_during_scan: StdMutex<Option<bool>>,
+        fail_accept: bool,
+    }
+
+    impl SlowLink {
+        fn new(lock: &Arc<TokioMutex<()>>, pending: usize) -> Self {
+            Self {
+                lock: lock.clone(),
+                pending,
+                scan_entered: tokio::sync::Notify::new(),
+                scan_release: tokio::sync::Notify::new(),
+                lock_held_during_accepts: StdMutex::new(Vec::new()),
+                lock_held_during_scan: StdMutex::new(None),
+                fail_accept: false,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl AllowanceLink for SlowLink {
+        async fn pending_proposals(
+            &self,
+            _reader: &PubkyPublicKey,
+        ) -> Result<Vec<AllowanceId>, HandoffError> {
+            *self.lock_held_during_scan.lock().unwrap() = Some(self.lock.try_lock().is_err());
+            self.scan_entered.notify_one();
+            self.scan_release.notified().await;
+            Ok((0..self.pending)
+                .map(|_| AllowanceId::new(Uuid::new_v4().to_string()).unwrap())
+                .collect())
+        }
+
+        async fn accept(
+            &self,
+            _reader: &PubkyPublicKey,
+            _id: &AllowanceId,
+        ) -> Result<(), HandoffError> {
+            self.lock_held_during_accepts
+                .lock()
+                .unwrap()
+                .push(self.lock.try_lock().is_err());
+            if self.fail_accept {
+                return Err(HandoffError::Retryable(RetryableHandoffCause::Transport));
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_large_allowance_history_does_not_hold_the_creator_lock_while_it_is_read() {
+        let lock = Arc::new(TokioMutex::new(()));
+        let link = Arc::new(SlowLink::new(&lock, 1_000));
+        let intake = tokio::spawn({
+            let (link, lock) = (link.clone(), lock.clone());
+            async move { accept_proposals(link.as_ref(), &lock, &reader()).await }
+        });
+
+        // The scan is in flight, as for a reader with a very large history.
+        // Every other Creator operation takes this lock, and none waits for it.
+        link.scan_entered.notified().await;
+        let other_creator_work = tokio::time::timeout(Duration::from_secs(5), lock.lock()).await;
+        assert!(
+            other_creator_work.is_ok(),
+            "another operation waited for the reader's scan"
+        );
+        drop(other_creator_work);
+
+        link.scan_release.notify_one();
+        let outcome = intake.await.unwrap().unwrap();
+
+        assert_eq!(*link.lock_held_during_scan.lock().unwrap(), Some(false));
+        // Each acceptance runs under the lock, and the lock is free between them.
+        assert_eq!(
+            *link.lock_held_during_accepts.lock().unwrap(),
+            [true; MAX_ALLOWANCE_ACCEPTANCES_PER_INTAKE]
+        );
+        assert_eq!(outcome.accepted, MAX_ALLOWANCE_ACCEPTANCES_PER_INTAKE);
+        assert!(!outcome.drained);
+        assert!(lock.try_lock().is_ok());
+    }
+
+    #[tokio::test]
+    async fn the_intake_accepts_everything_pending_up_to_its_limit() {
+        for (pending, accepted, drained) in [
+            (0, 0, true),
+            (1, 1, true),
+            (
+                MAX_ALLOWANCE_ACCEPTANCES_PER_INTAKE,
+                MAX_ALLOWANCE_ACCEPTANCES_PER_INTAKE,
+                true,
+            ),
+            (
+                MAX_ALLOWANCE_ACCEPTANCES_PER_INTAKE + 1,
+                MAX_ALLOWANCE_ACCEPTANCES_PER_INTAKE,
+                false,
+            ),
+        ] {
+            let lock = Arc::new(TokioMutex::new(()));
+            let link = SlowLink::new(&lock, pending);
+            link.scan_release.notify_one();
+
+            let outcome = accept_proposals(&link, &lock, &reader()).await.unwrap();
+
+            assert_eq!((outcome.accepted, outcome.drained), (accepted, drained));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_acceptance_ends_the_intake_and_frees_the_lock() {
+        let lock = Arc::new(TokioMutex::new(()));
+        let mut link = SlowLink::new(&lock, 3);
+        link.fail_accept = true;
+        link.scan_release.notify_one();
+
+        let result = accept_proposals(&link, &lock, &reader()).await;
+
+        assert!(matches!(result, Err(HandoffError::Retryable(_))));
+        assert_eq!(link.lock_held_during_accepts.lock().unwrap().len(), 1);
+        assert!(lock.try_lock().is_ok());
     }
 
     #[test]
