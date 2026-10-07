@@ -194,11 +194,47 @@ Do not put database credentials or the master key in TOML, logs, shell history, 
 
 Production logging allowlists only the `paykit_server` target at INFO and above. Dependency targets are disabled because upstream diagnostics may contain identities, URLs, or response text.
 
+`POST /invoices` and the Locks-facing `POST /payment-requests/status`,
+`POST /connections/status`, and `POST /setup/status` polls emit one coarse
+outcome event for each request reaching the application, including admission
+rejections. Completed-event fields are HTTP status, elapsed milliseconds, a
+closed failure class, and an opaque request ID. Status events also carry a closed
+`payment_request_status`, `connection_status`, or `setup_status` operation
+label. A request cancelled or unwound before producing a response emits the
+same event with failure class `cancelled`, no fabricated HTTP status, and no
+response header. Expected status-poll outcomes, including typed dependency
+failures and ordinary cancellation, remain DEBUG-only; an unclassified server
+error or handler panic is WARN to avoid outage-driven INFO/WARN log storms.
+Failures inside these request flows also emit one WARN event at the narrowest
+known source. Its closed fields are `operation`, `stage`, `category`, and the
+same opaque request ID returned in `X-Request-ID`; raw errors, identities, keys,
+signatures, bodies, and URLs are excluded. Outer error mappings are fallback
+sites only, so one request emits at most one source-failure warning. When a
+source warning was emitted, the coarse completion event remains DEBUG-only.
+Locks may supply `X-Request-ID` only as a canonical UUIDv4; other values are ignored
+without being echoed or logged, and Paykit Server generates a replacement UUIDv4.
+Successful outcomes remain DEBUG-only. A `503` produced by a reverse proxy before the
+request reaches Paykit Server cannot produce this application event and must be
+diagnosed from proxy telemetry.
+
 `setup.log_authorization_url` defaults to `false` and must remain false for
 production. When explicitly enabled in the generated local-demo config, each
 new setup flow emits one labeled authorization URL log line for operator
 retrieval. The URL is a bearer secret; the local operator owns access to and
 retention of those logs.
+
+`rate_limits.setup_per_ip_per_minute` applies to `GET /setup` and
+`GET /setup/reconnect` per client IP. With the default `http.trusted_proxy_hops = 0`
+that IP is the TCP peer and `X-Forwarded-For` is ignored. Behind a reverse proxy or
+load balancer the TCP peer is the proxy, so every client shares one setup bucket.
+Set `http.trusted_proxy_hops` to the exact number of proxies in front of the server
+that each append one `X-Forwarded-For` entry; the server then uses the entry that
+many positions from the right across all header lines, and falls back to the TCP
+peer when that entry is missing or not an IP address. Entries further left are
+client-supplied and are never used. A value larger than the real proxy count
+selects a client-supplied entry, so any client can choose its own bucket and bypass
+the limit; only set it when the listener is reachable exclusively through those
+proxies. A smaller value keys clients by a proxy address. Values above 8 are rejected.
 
 The parser rejects the retired `[inbox]` section. The executable exposes no payer
 inbox API or worker, and the baseline schema contains no payer inbox tables.
@@ -298,7 +334,30 @@ The later SDK handoff is not exactly once. Server delivery is at least once:
 The invoice API returns after durable intent commit. It does not wait for Encrypted Link establishment or remote delivery.
 
 Requests address the Reader identity, not a receiver folder. The Reader's App
-Registry must advertise a private-payment app capable of paying requests.
+Registry must advertise a private-payment app capable of paying requests. New
+invoice admission reads a cleanly missing registry at most three times, using
+full-jitter delays whose combined maximum is one second inside the existing
+15-second request deadline. Exhausted clean absence returns `503`
+`reader_setup_pending` with the safe message `reader wallet setup needed` and
+no `Retry-After` header; a present but incapable registry returns terminal `409`
+`reader_not_payable`. Transport/read failures return `503`
+`reader_registry_unavailable`, malformed or oversized registry data returns
+`502` `reader_registry_malformed`, and request-wide exhaustion remains `503`
+`dependency_timeout`. Invalid Reader identifiers return `400` `invalid_request`
+before discovery; malformed remote registry data remains a distinct `502`.
+These failures occur before xpub loading, address allocation, invoice
+persistence, or outbox insertion. Exact replay is checked first and returns its
+existing invoice without live registry discovery.
+
+Locks caller policy is code-specific, not status-class-wide. Its backend may
+retry `reader_setup_pending` and `reader_registry_malformed` only within the
+original fixed 10-minute invoice-admission deadline; retries must never extend
+that deadline. `reader_not_payable` is terminal. Marketplace UI must surface
+`Reader wallet setup needed` immediately for `reader_setup_pending`, even while
+bounded backend retries remain possible, and provide an explicit wallet-setup
+or user retry action instead of rendering generic `Paykit unavailable` or
+automatically following `503` responses. This UI mapping and retry orchestration
+are a required Marketplace-repository follow-up; they are not implemented here.
 Readers resolve each Payment Request by ID through the SDK request-aware resolver.
 Bound destinations have no Payment List version and never fall back to mutable
 private or public lists. Another invoice or app cannot replace the destination.
@@ -332,13 +391,53 @@ response fixtures for Locks are published under
 
 ## Payer, proof, and receipt exclusions
 
-The server receives and durably projects Paykit Payment Request acceptance, rejection, proof, and cancellation records from its local SDK state. It exposes no payer inbox or proof-submission API. Direct invoice-address observation remains the only Bitcoin payment-attribution input; Paykit Server never decides Locks access.
+The server receives and durably projects Paykit Payment Request acceptance, rejection, proof, and cancellation records from the identity's shared SDK state. It exposes no payer inbox or proof-submission API. Direct invoice-address observation remains the only Bitcoin payment-attribution input; Paykit Server never decides Locks access.
 
 Paykit Receipt issuance, Receipt Access delivery, and receipt storage are unsupported.
 
 ## Retention and data lifecycle
 
 There is no payload-retention or pruning contract, retention worker, runtime idle eviction, or SDK compaction contract. Operators must treat encrypted Creator, SDK, invoice, assignment, outbox, internal relay, and Bitcoin observation records as retained according to current database/SDK behavior. Any deletion policy requires a separate product and migration decision.
+
+### Backup and recovery
+
+Back up the whole PostgreSQL database as one consistent snapshot, including
+deployment metadata, Creator credentials and address counters, assignments,
+invoices, observations, outbox, and internal relay records.
+
+Encrypted identity-wide SDK state lives on each Creator's homeserver, not in
+PostgreSQL. A database backup does not include it, and public homeserver files
+alone are not a backup of it. Any separately retained SDK backup contains private
+state and must be encrypted and access-controlled. The server does not create a
+coordinated database-and-homeserver backup.
+
+Keep the matching `PAYKIT_MASTER_KEY` recoverable in the deployment secret store,
+separately from database dumps. The database alone cannot decrypt its records.
+Also retain the deployment configuration and exact server release/commit and
+`Cargo.lock`: SDK state decoding depends on the pinned Paykit version. Restrict
+access to backup files and never include credentials in logs or support bundles.
+
+Test recovery into a separate database with the original release, key, and
+deployment configuration. Block outbound network access and do not direct Locks
+traffic to the test instance: a running server starts delivery workers. Startup
+checks deployment invariants and authenticates Creator credentials and encrypted
+payment records before binding. Hosted SDK state is checked by
+SDK operations, not database startup. `--check-config` alone does not read or
+verify stored data. Confirm record counts and address counters as well;
+successful startup does not prove the backup is complete or the hosted state
+is usable.
+
+For a live recovery, stop the old instance before starting its replacement.
+Other authorized apps can still change hosted state while the server is stopped.
+Do not reset a database or generate a new master key to bypass a decode or
+integrity failure; retain the original data and investigate with its matching
+release. Restoring an older snapshot is not automatically safe to resume:
+addresses may have been allocated, invoices paid, or Noise messages sent since
+the snapshot. Those differences need reconciliation before delivery resumes to
+avoid address reuse, duplicate requests, or stale Encrypted Link state. Backup
+preservation does not implement that reconciliation. Do not overwrite current
+hosted state with an older blob; coordinate recovery with the identity owner and
+other authorized apps through the SDK's recovery flow.
 
 ## Known limitations
 
