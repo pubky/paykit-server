@@ -54,8 +54,6 @@ impl InvoicePayloadFactory for AccountPayloads<'_> {
         .unwrap();
         Ok(InvoicePayloads {
             payment_request_intent: common::payment_intent(self.0, address.clone()),
-            asset: paykit_server::domain::invoice::CriterionAsset::Btc,
-            receiving_address: address,
         })
     }
 }
@@ -74,7 +72,7 @@ async fn allocate_invoice(
             lock_resource_binding: binding,
             payment_request_binding: binding,
             invoice_payloads: &AccountPayloads(reader),
-            required_amount: 100,
+
             proposal_acceptance_seconds: 60 * 60,
             payment_window_seconds: 24 * 60 * 60,
         })
@@ -337,6 +335,7 @@ async fn real_setup_reconnect_preserves_pending_invoices_and_hosted_state() {
             network: paykit_server::config::PaykitNetwork::Testnet,
             proposal_acceptance_window: Duration::from_secs(60 * 60),
             payment_window: Duration::from_secs(24 * 60 * 60),
+            conversion_payment_window: std::time::Duration::from_secs(3600),
         },
     );
     let publisher = Arc::new(FailAfterPublication {

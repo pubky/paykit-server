@@ -7,10 +7,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use paykit_lib::{
-    PaykitAppId, PaymentAmount, PaymentDeadline, PaymentEndpointIdentifier, PaymentEndpointPayload,
-    PaymentReference, PaymentRequestId, PaymentRequestTerms,
-};
+use paykit_lib::{PaykitAppId, PaymentRequestId};
 use paykit_sdk::{
     LinkedPeerState, OutboundPrivateMessageStatus, OutboundPrivateSendReport,
     PAYKIT_SESSION_CAPABILITIES, PaykitSdk, PaykitSdkConfig, PaykitSdkError, PaymentAdapter,
@@ -773,6 +770,13 @@ fn lifecycle_projection(
             terms: PaymentTermsV1 {
                 amount: terms.amount.value.clone(),
                 asset: terms.amount.asset.clone(),
+                rates: match &terms.conversion {
+                    Some(paykit_lib::PaymentConversion::Fixed { rates }) => rates.clone(),
+                    Some(paykit_lib::PaymentConversion::PerPeriod {}) => {
+                        return Err(LifecycleSyncError::InvalidProjection);
+                    }
+                    None => Vec::new(),
+                },
                 payment_reference: terms.payment_reference.clone(),
                 proposal_expires_at: terms.proposal_expires_at.clone(),
                 payment_deadline: terms
@@ -939,52 +943,6 @@ fn retryable_recovery_observation(error: HandoffError) -> HandoffError {
     }
 }
 
-fn payment_terms(terms: &PaymentTermsV1) -> Result<PaymentRequestTerms, HandoffError> {
-    let amount = PaymentAmount::new(terms.amount.clone(), terms.asset.clone())
-        .map_err(|_| HandoffError::Permanent)?;
-    let payment_reference = PaymentReference::new(terms.payment_reference.clone())
-        .map_err(|_| HandoffError::Permanent)?;
-    let accepted_payment_endpoint_identifiers = terms
-        .accepted_endpoint_identifiers
-        .iter()
-        .cloned()
-        .map(PaymentEndpointIdentifier::new)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| HandoffError::Permanent)?;
-    PaymentRequestTerms::builder(
-        amount,
-        payment_reference,
-        accepted_payment_endpoint_identifiers,
-    )
-    .proposal_expires_at(terms.proposal_expires_at.clone())
-    .payment_deadline(
-        terms
-            .payment_deadline
-            .clone()
-            .map(|timestamp| PaymentDeadline::At { timestamp }),
-    )
-    .required_app_id(Some(
-        paykit_lib::PaykitAppId::new(crate::config::PAYKIT_APP_ID)
-            .map_err(|_| HandoffError::Permanent)?,
-    ))
-    .payment_endpoints(Some(
-        terms
-            .payment_endpoints
-            .iter()
-            .map(|(identifier, payload)| {
-                Ok((
-                    PaymentEndpointIdentifier::new(identifier.clone())
-                        .map_err(|_| HandoffError::Permanent)?,
-                    PaymentEndpointPayload::new(payload.clone()),
-                ))
-            })
-            .collect::<Result<_, HandoffError>>()?,
-    ))
-    .metadata(terms.metadata.clone())
-    .build()
-    .map_err(|_| HandoffError::Permanent)
-}
-
 #[async_trait]
 impl Adapter for PaykitAdapter {
     async fn execute_claimed_handoff(
@@ -1055,7 +1013,7 @@ impl Adapter for PaykitAdapter {
         let reader = parse_peer(reader)?;
         let record = self
             .sdk
-            .propose_payment_request(reader, payment_terms(terms)?)
+            .propose_payment_request(reader, terms.to_sdk().map_err(|_| HandoffError::Permanent)?)
             .await
             .map_err(classify)?;
         Ok(HandoffResult::PaymentRequestProposal {
@@ -1718,6 +1676,7 @@ mod tests {
                 terms: PaymentTermsV1 {
                     amount: "1".into(),
                     asset: "btc".into(),
+                    rates: Vec::new(),
                     payment_reference: Uuid::new_v4().to_string(),
                     proposal_expires_at: None,
                     payment_deadline: None,

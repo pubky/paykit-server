@@ -108,10 +108,10 @@ async fn attributable_invoice(
              bitcoin_address_lookup_hash, derivation_index_lookup_hash,
              payment_status, confirmation_count, amount_matched,
              invoice_created_at, proposal_expires_at, payment_deadline,
-             proposal_acceptance_seconds, payment_window_seconds, asset
+             proposal_acceptance_seconds, payment_window_seconds
          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
                    'pending', 0, FALSE, $11, $11 + INTERVAL '1 hour', $12,
-                   3600, 86400, 'BTC')",
+                   3600, 86400)",
     )
     .bind(invoice_id)
     .bind(creator_id)
@@ -190,6 +190,7 @@ fn projection(
             terms: PaymentTermsV1 {
                 amount: "1".into(),
                 asset: "btc".into(),
+                rates: Vec::new(),
                 payment_reference: payment_request_id.clone(),
                 proposal_expires_at: None,
                 payment_deadline: None,

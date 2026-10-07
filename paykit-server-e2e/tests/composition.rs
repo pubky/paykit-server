@@ -36,8 +36,6 @@ impl InvoicePayloadFactory for Payloads {
         let address = format!("{}-{child_index}", self.address_prefix);
         Ok(InvoicePayloads {
             payment_request_intent: common::payment_intent(&self.reader, address.clone()),
-            asset: paykit_server::domain::invoice::CriterionAsset::Btc,
-            receiving_address: address,
         })
     }
 }
@@ -244,7 +242,7 @@ async fn production_server_workers_process_two_creators_without_sdk_state_fallba
                 reader: reader.clone(),
                 address_prefix: "creator-a-address",
             },
-            required_amount: 100,
+
             proposal_acceptance_seconds: 60 * 60,
             payment_window_seconds: 24 * 60 * 60,
         })
@@ -261,7 +259,7 @@ async fn production_server_workers_process_two_creators_without_sdk_state_fallba
                 reader: reader.clone(),
                 address_prefix: "creator-b-address",
             },
-            required_amount: 200,
+
             proposal_acceptance_seconds: 60 * 60,
             payment_window_seconds: 24 * 60 * 60,
         })
@@ -280,7 +278,7 @@ async fn production_server_workers_process_two_creators_without_sdk_state_fallba
                 reader: unreachable_reader.clone(),
                 address_prefix: "creator-c-address",
             },
-            required_amount: 300,
+
             proposal_acceptance_seconds: 60 * 60,
             payment_window_seconds: 24 * 60 * 60,
         })

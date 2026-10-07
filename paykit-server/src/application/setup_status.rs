@@ -75,8 +75,13 @@ impl SetupStatusService {
         let Some(receiving) = &self.receiving else {
             return SetupStatus::SetupRequired;
         };
-        match tokio::time::timeout(self.timeout, receiving.receiving(creator, asset)).await {
-            Ok(Ok(_)) => SetupStatus::Ready,
+        match tokio::time::timeout(self.timeout, receiving.receiving(creator)).await {
+            Ok(Ok(details))
+                if details.bitcoin.is_some() || (self.usdt_enabled && details.usdt.is_some()) =>
+            {
+                SetupStatus::Ready
+            }
+            Ok(Ok(_)) => SetupStatus::SetupRequired,
             Ok(Err(crate::persistence::PersistenceError::InvalidInput)) => {
                 SetupStatus::SetupRequired
             }

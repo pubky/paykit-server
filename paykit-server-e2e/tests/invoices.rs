@@ -21,19 +21,15 @@ impl InvoicePayloadFactory for TestPayloads {
     fn for_child_index(&self, child_index: i64) -> Result<InvoicePayloads, PersistenceError> {
         Ok(InvoicePayloads {
             payment_request_intent: payment_intent(format!("test-address-{child_index}")),
-            asset: paykit_server::domain::invoice::CriterionAsset::Btc,
-            receiving_address: format!("test-address-{child_index}"),
         })
     }
 }
 
-struct MismatchedAddressPayloads;
-impl InvoicePayloadFactory for MismatchedAddressPayloads {
-    fn for_child_index(&self, child_index: i64) -> Result<InvoicePayloads, PersistenceError> {
+struct EmptyAddressPayloads;
+impl InvoicePayloadFactory for EmptyAddressPayloads {
+    fn for_child_index(&self, _child_index: i64) -> Result<InvoicePayloads, PersistenceError> {
         Ok(InvoicePayloads {
-            payment_request_intent: payment_intent("wrong-address".into()),
-            asset: paykit_server::domain::invoice::CriterionAsset::Btc,
-            receiving_address: format!("bad-address-{child_index}"),
+            payment_request_intent: payment_intent(String::new()),
         })
     }
 }
@@ -47,8 +43,6 @@ impl InvoicePayloadFactory for CreatorPayloads {
         let address = format!("{}-{child_index}", self.address_prefix);
         Ok(InvoicePayloads {
             payment_request_intent: payment_intent(address.clone()),
-            asset: paykit_server::domain::invoice::CriterionAsset::Btc,
-            receiving_address: address,
         })
     }
 }
@@ -127,7 +121,7 @@ fn input<'a>(
         lock_resource_binding: request,
         payment_request_binding: request,
         invoice_payloads: &TEST_PAYLOADS,
-        required_amount: 100,
+
         proposal_acceptance_seconds: 60 * 60,
         payment_window_seconds: 24 * 60 * 60,
     }
@@ -497,8 +491,8 @@ async fn concurrent_invoices_for_same_reader_bind_distinct_addresses() {
 }
 
 #[tokio::test]
-async fn atomic_store_rejects_mismatched_address_and_reader_before_any_insert() {
-    static BAD_PAYLOADS: MismatchedAddressPayloads = MismatchedAddressPayloads;
+async fn atomic_store_rejects_empty_address_and_wrong_reader_before_any_insert() {
+    static BAD_PAYLOADS: EmptyAddressPayloads = EmptyAddressPayloads;
     let database = TestDatabase::create().await;
     let store = invoice_store(&database).await;
     let creator = creator();
@@ -508,7 +502,7 @@ async fn atomic_store_rejects_mismatched_address_and_reader_before_any_insert() 
     mismatched_address.invoice_payloads = &BAD_PAYLOADS;
     assert_eq!(
         store.create_atomic(mismatched_address).await,
-        Err(PersistenceError::CorruptOrMissing)
+        Err(PersistenceError::InvalidInput)
     );
 
     let other_reader = second_reader();
@@ -640,7 +634,7 @@ async fn concurrent_creators_own_distinct_intents_at_the_same_child_index() {
             lock_resource_binding: b"creator-one-lock",
             payment_request_binding: b"creator-one-request",
             invoice_payloads: &first_payloads,
-            required_amount: 100,
+
             proposal_acceptance_seconds: 60 * 60,
             payment_window_seconds: 24 * 60 * 60,
         }),
@@ -651,7 +645,7 @@ async fn concurrent_creators_own_distinct_intents_at_the_same_child_index() {
             lock_resource_binding: b"creator-two-lock",
             payment_request_binding: b"creator-two-request",
             invoice_payloads: &second_payloads,
-            required_amount: 100,
+
             proposal_acceptance_seconds: 60 * 60,
             payment_window_seconds: 24 * 60 * 60,
         })

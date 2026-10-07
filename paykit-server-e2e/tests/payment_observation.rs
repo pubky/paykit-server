@@ -32,8 +32,6 @@ impl InvoicePayloadFactory for Payloads {
                 &reader(),
                 format!("bitcoin-address-{child_index}"),
             ),
-            asset: paykit_server::domain::invoice::CriterionAsset::Btc,
-            receiving_address: format!("bitcoin-address-{child_index}"),
         })
     }
 }
@@ -103,7 +101,7 @@ async fn invoice_for(
             lock_resource_binding: b"payment-observation-lock",
             payment_request_binding: request,
             invoice_payloads: &PAYLOADS,
-            required_amount: 100,
+
             proposal_acceptance_seconds: 60 * 60,
             payment_window_seconds: 24 * 60 * 60,
         })
@@ -117,8 +115,6 @@ impl InvoicePayloadFactory for FixedPayloads {
     fn for_child_index(&self, _child_index: i64) -> Result<InvoicePayloads, PersistenceError> {
         Ok(InvoicePayloads {
             payment_request_intent: common::payment_intent(&reader(), self.0.to_owned()),
-            asset: paykit_server::domain::invoice::CriterionAsset::Btc,
-            receiving_address: self.0.into(),
         })
     }
 }
@@ -153,7 +149,7 @@ async fn other_creator_invoice(
             lock_resource_binding: b"payment-observation-lock",
             payment_request_binding: request,
             invoice_payloads: &FixedPayloads(address),
-            required_amount: 100,
+
             proposal_acceptance_seconds: 60 * 60,
             payment_window_seconds: 24 * 60 * 60,
         })
@@ -212,7 +208,7 @@ async fn batch_invoice(database: &TestDatabase) -> (InvoiceStore, uuid::Uuid) {
             lock_resource_binding: b"batch-lock",
             payment_request_binding: b"batch-request",
             invoice_payloads: &FixedPayloads(REGTEST_ADDRESS),
-            required_amount: 100,
+
             proposal_acceptance_seconds: 60 * 60,
             payment_window_seconds: 24 * 60 * 60,
         })

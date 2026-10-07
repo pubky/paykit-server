@@ -10,7 +10,6 @@ use paykit_server::{
     application::semantic_intent::DeliveryIntentV1,
     crypto::Crypto,
     domain::{
-        invoice::CriterionAsset,
         locks::{parse_creator, parse_reader},
         receiving::{USDT_ENDPOINT, USDT_TOKEN, UsdtAddress},
     },
@@ -217,40 +216,77 @@ struct Payload {
 }
 impl InvoicePayloadFactory for Payload {
     fn for_child_index(&self, _index: i64) -> Result<InvoicePayloads, PersistenceError> {
-        let endpoint = PaymentEndpointIdentifier::new(USDT_ENDPOINT).unwrap();
-        let address = UsdtAddress::try_from(RECIPIENT.to_owned()).unwrap();
-        let terms = PaymentRequestTerms::builder(
-            PaymentAmount::new("0.050000", "usdt").unwrap(),
-            PaymentReference::new(
-                fixture(self.index)["binding"]["paymentReference"]
-                    .as_str()
-                    .unwrap(),
-            )
-            .unwrap(),
-            vec![endpoint.clone()],
-        )
-        .required_app_id(Some(PaykitAppId::new("paykit-server").unwrap()))
-        .payment_endpoints(Some(
-            [(
-                endpoint,
-                PaymentEndpointPayload::new(address.endpoint().to_string()),
-            )]
-            .into_iter()
-            .collect(),
-        ))
-        .build()
-        .unwrap();
-        Ok(InvoicePayloads {
-            payment_request_intent: DeliveryIntentV1::payment_request(
-                CREATOR.to_owned(),
-                PaykitAppId::new("paykit-server").unwrap(),
-                &terms,
-            )
-            .unwrap(),
-            receiving_address: RECIPIENT.into(),
-            asset: CriterionAsset::Usdt,
-        })
+        invoice_payload(self.index, None)
     }
+}
+
+struct QuotedPayload {
+    index: usize,
+}
+impl InvoicePayloadFactory for QuotedPayload {
+    fn for_child_index(&self, index: i64) -> Result<InvoicePayloads, PersistenceError> {
+        invoice_payload(self.index, Some(format!("quoted-btc-{index}")))
+    }
+}
+
+fn invoice_payload(
+    index: usize,
+    bitcoin: Option<String>,
+) -> Result<InvoicePayloads, PersistenceError> {
+    let endpoint = PaymentEndpointIdentifier::new(USDT_ENDPOINT).unwrap();
+    let address = UsdtAddress::try_from(RECIPIENT.to_owned()).unwrap();
+    let mut identifiers = vec![endpoint.clone()];
+    let mut endpoints = std::collections::HashMap::from([(
+        endpoint,
+        PaymentEndpointPayload::new(address.endpoint().to_string()),
+    )]);
+    let quoted = bitcoin.is_some();
+    if let Some(bitcoin) = bitcoin {
+        let id = PaymentEndpointIdentifier::new("btc-bitcoin-p2wpkh").unwrap();
+        identifiers.push(id.clone());
+        endpoints.insert(
+            id,
+            PaymentEndpointPayload::new(json!({"value": bitcoin}).to_string()),
+        );
+    }
+    let terms = PaymentRequestTerms::builder(
+        PaymentAmount::new(
+            if quoted { "0.05" } else { "0.050000" },
+            if quoted { "usd" } else { "usdt" },
+        )
+        .unwrap(),
+        PaymentReference::new(
+            fixture(index)["binding"]["paymentReference"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap(),
+        identifiers,
+    )
+    .required_app_id(Some(PaykitAppId::new("paykit-server").unwrap()))
+    .conversion(quoted.then(|| paykit_lib::PaymentConversion::Fixed {
+        rates: vec![
+            paykit_lib::ConversionRate {
+                asset: "btc".into(),
+                value: "0.00001".into(),
+            },
+            paykit_lib::ConversionRate {
+                asset: "usdt".into(),
+                value: "1".into(),
+            },
+        ],
+    }))
+    .payment_endpoints(Some(endpoints))
+    .build()
+    .unwrap();
+    Ok(InvoicePayloads {
+        payment_request_intent: DeliveryIntentV1::payment_request(
+            CREATOR.to_owned(),
+            PaykitAppId::new("paykit-server").unwrap(),
+            &terms,
+        )
+        .unwrap(),
+    })
 }
 
 #[tokio::test]
@@ -282,7 +318,7 @@ async fn invoices_share_an_address_but_never_share_payment_evidence() {
                 lock_resource_binding: b"lock",
                 payment_request_binding: binding.as_bytes(),
                 invoice_payloads: &Payload { index },
-                required_amount: 50_000,
+
                 proposal_acceptance_seconds: 3600,
                 payment_window_seconds: 86400,
             })
@@ -368,4 +404,100 @@ async fn status(database: &TestDatabase, id: Uuid) -> (bool, i32) {
         .fetch_one(database.pool())
         .await
         .unwrap()
+}
+
+#[tokio::test]
+async fn either_quoted_payment_can_settle_without_overwriting_the_other() {
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(&[7; 32]).unwrap());
+    let creator = parse_creator(CREATOR).unwrap();
+    let creator_id = CreatorStore::new(database.pool(), crypto.clone())
+        .create(&CreatorCredentials::new(
+            creator.clone(),
+            "test-session".into(),
+            PaykitIdentitySecretKey::new([9; 32], 1).unwrap(),
+            None,
+            Some(UsdtAddress::try_from(RECIPIENT.to_owned()).unwrap()),
+        ))
+        .await
+        .unwrap()
+        .id();
+    let store = InvoiceStore::new(database.pool(), crypto.clone());
+    let reader = parse_reader(CREATOR).unwrap();
+    let payload = QuotedPayload { index: 0 };
+    let input = || AtomicInvoiceInput {
+        creator: &creator,
+        reader: &reader,
+        bundle_binding: b"quoted-bundle",
+        lock_resource_binding: b"lock",
+        payment_request_binding: b"quoted-request",
+        invoice_payloads: &payload,
+        proposal_acceptance_seconds: 1800,
+        payment_window_seconds: 3600,
+    };
+    let invoice = store.create_atomic(input()).await.unwrap();
+    assert_eq!(
+        store.create_atomic(input()).await.unwrap().invoice_id(),
+        invoice.invoice_id()
+    );
+    let id = invoice.invoice_id();
+    sqlx::query("INSERT INTO payment_request_lifecycles (invoice_id,sdk_payment_request_id,request_state,last_event_at,last_stream_item_id) VALUES ($1,$2,'proof_submitted',NOW(),1)")
+        .bind(id).bind(record(0).payment_request_id).execute(database.pool()).await.unwrap();
+    let rpc = Rpc::start().await;
+    let outpoint =
+        paykit_server::domain::payment::BitcoinOutpoint::from_bitcoin(bitcoin::OutPoint::new(
+            bitcoin::Txid::from_raw_hash(bitcoin::hashes::Hash::all_zeros()),
+            0,
+        ));
+    let now = invoice.invoice_created_at();
+    // 0.05 USD at the stored quote requires exactly 50 sats or 50,000 micro-USDT.
+    store
+        .apply_bitcoin_observation_at("quoted-btc-0", &outpoint, 49, 1, true, now)
+        .await
+        .unwrap();
+    assert_eq!(status(&database, id).await, (false, 1));
+    store
+        .apply_bitcoin_observation_at("quoted-btc-0", &outpoint, 50, 1, true, now)
+        .await
+        .unwrap();
+    assert_eq!(status(&database, id).await, (true, 1));
+    rpc.chain.lock().unwrap().receipt["logs"][1]["data"] = json!(format!("0x{:064x}", 49_999));
+    store
+        .observe_usdt_request(creator_id, &creator, &record(0), &rpc.verifier, None)
+        .await
+        .unwrap();
+    assert_eq!(status(&database, id).await, (true, 1));
+    rpc.chain.lock().unwrap().receipt["logs"][1]["data"] = json!(format!("0x{:064x}", 50_000));
+    store
+        .observe_usdt_request(creator_id, &creator, &record(0), &rpc.verifier, None)
+        .await
+        .unwrap();
+    assert_eq!(status(&database, id).await, (true, 2));
+    // Restart and independently reorg either chain; only losing both payments removes satisfaction.
+    let restarted = InvoiceStore::new(database.pool(), crypto);
+    restarted
+        .apply_bitcoin_observation_at("quoted-btc-0", &outpoint, 50, 0, false, now)
+        .await
+        .unwrap();
+    assert_eq!(status(&database, id).await, (true, 2));
+    rpc.chain.lock().unwrap().reorg = true;
+    restarted
+        .observe_usdt_request(creator_id, &creator, &record(0), &rpc.verifier, None)
+        .await
+        .unwrap();
+    assert_eq!(status(&database, id).await, (false, 0));
+    restarted
+        .apply_bitcoin_observation_at("quoted-btc-0", &outpoint, 50, 6, true, now)
+        .await
+        .unwrap();
+    assert_eq!(status(&database, id).await, (true, 6));
+    restarted
+        .observe_usdt_request(creator_id, &creator, &record(0), &rpc.verifier, None)
+        .await
+        .unwrap();
+    assert_eq!(status(&database, id).await, (true, 6));
+    assert!(restarted.observation_targets().await.unwrap().is_empty());
+    restarted.scan_payment_record_integrity().await.unwrap();
+    database.cleanup().await;
 }

@@ -113,7 +113,7 @@ fn capable_registry() -> paykit_lib::PaykitAppRegistry {
 fn library_payment_request_has_exact_terms_amount_and_metadata() {
     let request = request();
     let terms = PaykitIntentBuilder::new(BitcoinNetwork::Mainnet)
-        .payment_request_terms(&request, &valid_lock(), "address")
+        .payment_request_terms(&request, &valid_lock(), &bitcoin_receiving("address"), &[])
         .unwrap();
     assert_eq!(terms.amount().value(), "0.00050000");
     assert_eq!(terms.amount().asset(), "btc");
@@ -125,7 +125,7 @@ fn library_payment_request_has_exact_terms_amount_and_metadata() {
     );
     assert_eq!(
         serde_json::Value::Object(terms.metadata().clone()),
-        serde_json::json!({"bundle_id":BUNDLE,"lock_resource":LOCK_RESOURCE,"reader":reader()})
+        serde_json::json!({"bundle_id":BUNDLE})
     );
 }
 
@@ -139,7 +139,12 @@ fn payment_request_bound_endpoint_uses_the_configured_network() {
     ] {
         let builder = PaykitIntentBuilder::new(network);
         let terms = builder
-            .payment_request_terms(&request(), &valid_lock(), "address")
+            .payment_request_terms(
+                &request(),
+                &valid_lock(),
+                &bitcoin_receiving("address"),
+                &[],
+            )
             .unwrap();
 
         assert_eq!(
@@ -183,7 +188,7 @@ fn payment_request_binds_derived_bech32_p2wpkh_address() {
     let address = derive_bip84_p2wpkh_address(&xpub, 0, &BitcoinNetwork::Mainnet, 0)
         .expect("valid account xpub derives an address");
     let terms = PaykitIntentBuilder::new(BitcoinNetwork::Mainnet)
-        .payment_request_terms(&request(), &valid_lock(), &address)
+        .payment_request_terms(&request(), &valid_lock(), &bitcoin_receiving(&address), &[])
         .expect("canonical library types accept endpoint");
     let (identifier, payload) = terms.payment_endpoints().unwrap().iter().next().unwrap();
     assert_eq!(identifier.as_str(), "btc-bitcoin-p2wpkh");
@@ -197,6 +202,7 @@ struct FakeStore {
     preflight: Mutex<InvoicePreflight>,
     preflight_calls: AtomicUsize,
     create_calls: AtomicUsize,
+    created: Mutex<Vec<(DeliveryIntentV1, u64, u64)>>,
 }
 
 impl FakeStore {
@@ -205,6 +211,7 @@ impl FakeStore {
             preflight: Mutex::new(preflight),
             preflight_calls: AtomicUsize::default(),
             create_calls: AtomicUsize::default(),
+            created: Mutex::new(Vec::new()),
         }
     }
 }
@@ -242,8 +249,16 @@ impl InvoicePersistence for FakeStore {
 
     async fn create_atomic(
         &self,
-        _input: AtomicInvoiceInput<'_>,
+        input: AtomicInvoiceInput<'_>,
     ) -> Result<AtomicInvoiceResult, PersistenceError> {
+        self.created.lock().unwrap().push((
+            input
+                .invoice_payloads
+                .for_child_index(0)?
+                .payment_request_intent,
+            input.proposal_acceptance_seconds,
+            input.payment_window_seconds,
+        ));
         self.create_calls.fetch_add(1, Ordering::SeqCst);
         Ok(AtomicInvoiceResult::new(
             uuid::Uuid::nil(),
@@ -316,16 +331,16 @@ impl CreatorReceivingProvider for FakeCredentials {
     async fn receiving(
         &self,
         _creator: &CreatorPubky,
-        _asset: paykit_server::domain::invoice::CriterionAsset,
     ) -> Result<paykit_server::application::create_invoice::ReceivingDetails, PersistenceError>
     {
         Ok(
-            paykit_server::application::create_invoice::ReceivingDetails::Bitcoin(
-                paykit_server::domain::receiving::BitcoinAccount {
+            paykit_server::application::create_invoice::ReceivingDetails {
+                bitcoin: Some(paykit_server::domain::receiving::BitcoinAccount {
                     xpub: account_xpub().into(),
                     account_index: 0,
-                },
-            ),
+                }),
+                usdt: None,
+            },
         )
     }
 }
@@ -931,7 +946,12 @@ async fn new_invoice_checks_registry_and_binds_invoice_address_to_request() {
 #[test]
 fn delivery_intent_is_closed_and_contains_complete_sdk_inputs_not_final_wire_ids() {
     let terms = PaykitIntentBuilder::new(BitcoinNetwork::Mainnet)
-        .payment_request_terms(&request(), &valid_lock(), "bc1qmeaningfuladdress")
+        .payment_request_terms(
+            &request(),
+            &valid_lock(),
+            &bitcoin_receiving("bc1qmeaningfuladdress"),
+            &[],
+        )
         .unwrap();
     let intent = DeliveryIntentV1::payment_request(
         reader(),
@@ -963,7 +983,18 @@ fn usdt_request_uses_exact_token_units_and_the_approved_address() {
     lock.criteria[0].params["amount"] = serde_json::json!("50001");
     let address = "0x2222222222222222222222222222222222222222";
     let terms = PaykitIntentBuilder::new(BitcoinNetwork::Mainnet)
-        .payment_request_terms(&request(), &lock, address)
+        .payment_request_terms(
+            &request(),
+            &lock,
+            &paykit_server::application::create_invoice::ReceivingAddresses {
+                bitcoin: None,
+                usdt: Some(
+                    paykit_server::domain::receiving::UsdtAddress::try_from(address.to_owned())
+                        .unwrap(),
+                ),
+            },
+            &[],
+        )
         .unwrap();
     assert_eq!(terms.amount().value(), "0.050001");
     assert_eq!(terms.amount().asset(), "usdt");
@@ -1001,4 +1032,147 @@ async fn disabled_usdt_never_creates_an_invoice() {
         Err(CreateInvoiceError::InvalidRequest)
     );
     assert_eq!(store.create_calls.load(Ordering::SeqCst), 0);
+}
+
+fn bitcoin_receiving(
+    address: &str,
+) -> paykit_server::application::create_invoice::ReceivingAddresses {
+    paykit_server::application::create_invoice::ReceivingAddresses {
+        bitcoin: Some(address.to_owned()),
+        usdt: None,
+    }
+}
+
+struct BothReceiving;
+#[async_trait]
+impl CreatorReceivingProvider for BothReceiving {
+    async fn receiving(
+        &self,
+        creator: &CreatorPubky,
+    ) -> Result<paykit_server::application::create_invoice::ReceivingDetails, PersistenceError>
+    {
+        let mut receiving = FakeCredentials.receiving(creator).await?;
+        receiving.usdt = Some(
+            paykit_server::domain::receiving::UsdtAddress::try_from(
+                "0x2222222222222222222222222222222222222222".to_owned(),
+            )
+            .unwrap(),
+        );
+        Ok(receiving)
+    }
+}
+struct Rates(Result<String, CreateInvoiceError>);
+#[async_trait]
+impl paykit_server::application::invoice_pricing::ExchangeRates for Rates {
+    async fn usd_per_btc(&self) -> Result<String, CreateInvoiceError> {
+        self.0.clone()
+    }
+}
+
+#[tokio::test]
+async fn invoices_publish_both_approved_methods_with_fixed_rates_and_configured_expiry() {
+    for (asset, amount, window) in [
+        ("BTC", "50000", 3600),
+        ("USD", "500", 7200),
+        ("USDT", "5000000", 3600),
+    ] {
+        let store = Arc::new(FakeStore::with_preflight(InvoicePreflight::New));
+        let mut lock = valid_lock();
+        lock.criteria[0].params["asset"] = serde_json::json!(asset);
+        lock.criteria[0].params["amount"] = serde_json::json!(amount);
+        let service = CreateInvoiceService::new(
+            Arc::new(FakeSession {
+                result: Ok(()),
+                calls: AtomicUsize::default(),
+                creators: Mutex::new(vec![]),
+            }),
+            Arc::new(FakeLocks {
+                result: Ok(lock),
+                calls: AtomicUsize::default(),
+            }),
+            Arc::new(FakeRegistries {
+                registry: Some(capable_registry()),
+                calls: AtomicUsize::default(),
+            }),
+            paykit_lib::PaykitAppId::new("paykit-server").unwrap(),
+            Arc::new(BothReceiving),
+            BitcoinNetwork::Mainnet,
+            store.clone(),
+            Arc::new(PaykitIntentBuilder::new(BitcoinNetwork::Mainnet)),
+        )
+        .with_usdt(true)
+        .with_exchange_rates(Arc::new(Rates(Ok("81000".into()))))
+        .with_conversion_payment_window(Duration::from_secs(window));
+        service.create(request()).await.unwrap();
+        let created = store.created.lock().unwrap();
+        let (intent, acceptance, payment) = &created[0];
+        assert_eq!((*acceptance, *payment), (window / 2, window));
+        let terms = intent.terms().unwrap();
+        assert_eq!(terms.asset, asset.to_ascii_lowercase());
+        assert_eq!(
+            terms.accepted_endpoint_identifiers,
+            vec!["btc-bitcoin-p2wpkh", "usdt-arbitrum-address"]
+        );
+        assert_eq!(terms.payment_endpoints.len(), 2);
+        assert_eq!(terms.rates.len(), if asset == "USD" { 2 } else { 1 });
+        let encoded = postcard::to_allocvec(intent).unwrap();
+        let restored = DeliveryIntentV1::decode(&encoded).unwrap();
+        assert_eq!(restored.terms().unwrap().rates, terms.rates);
+        let mut ready = restored;
+        ready
+            .set_deadlines(
+                "2026-10-07T12:30:00.123456Z".into(),
+                "2026-10-07T13:00:00.123456Z".into(),
+            )
+            .unwrap();
+        let event = paykit_lib::PaymentRequestEvent::Request(paykit_lib::PaymentRequest::new(
+            paykit_lib::EventId::new_v4(),
+            paykit_lib::PaymentRequestId::new_v4(),
+            ready.terms().unwrap().to_sdk().unwrap(),
+        ));
+        let wire = paykit_lib::serialize_payment_request_event(
+            &paykit_lib::PaykitAppId::new("paykit-server").unwrap(),
+            &event,
+        )
+        .unwrap();
+        assert!(
+            wire.len() <= paykit_lib::pubky_noise::snow_crypto::PUBKY_NOISE_MSG_LEN,
+            "{asset}: {} bytes",
+            wire.len()
+        );
+    }
+}
+
+#[tokio::test]
+async fn rate_failure_prevents_new_quotes_but_does_not_block_an_exact_replay() {
+    let store = Arc::new(FakeStore::with_preflight(InvoicePreflight::New));
+    let service = CreateInvoiceService::new(
+        Arc::new(FakeSession {
+            result: Ok(()),
+            calls: AtomicUsize::default(),
+            creators: Mutex::new(vec![]),
+        }),
+        Arc::new(FakeLocks {
+            result: Ok(valid_lock()),
+            calls: AtomicUsize::default(),
+        }),
+        Arc::new(FakeRegistries {
+            registry: Some(capable_registry()),
+            calls: AtomicUsize::default(),
+        }),
+        paykit_lib::PaykitAppId::new("paykit-server").unwrap(),
+        Arc::new(BothReceiving),
+        BitcoinNetwork::Mainnet,
+        store.clone(),
+        Arc::new(PaykitIntentBuilder::new(BitcoinNetwork::Mainnet)),
+    )
+    .with_usdt(true)
+    .with_exchange_rates(Arc::new(Rates(Err(CreateInvoiceError::Unavailable))));
+    assert_eq!(
+        service.create(request()).await,
+        Err(CreateInvoiceError::Unavailable)
+    );
+    assert!(store.created.lock().unwrap().is_empty());
+    *store.preflight.lock().unwrap() = InvoicePreflight::ExactReplay;
+    assert!(service.create(request()).await.is_ok());
 }

@@ -78,6 +78,8 @@ pub enum ServerBuildError {
     Crypto,
     #[error("could not construct Arbitrum verification")]
     Arbitrum,
+    #[error("could not construct exchange-rate client")]
+    ExchangeRates,
 }
 
 /// Concrete process-owned server components.
@@ -236,7 +238,12 @@ impl Server {
                 config.paykit.proposal_acceptance_window,
                 config.paykit.payment_window,
             )
-            .with_usdt(usdt.is_some()),
+            .with_usdt(usdt.is_some())
+            .with_conversion_payment_window(config.paykit.conversion_payment_window)
+            .with_exchange_rates(Arc::new(
+                crate::application::invoice_pricing::BlocktankRates::new()
+                    .map_err(|_| ServerBuildError::ExchangeRates)?,
+            )),
         );
         let connection_status_service = Arc::new(ConnectionStatusService::new(
             Arc::new(invoices.clone()),

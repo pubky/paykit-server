@@ -58,7 +58,7 @@ and is not a substitute for those storage guarantees.
 A database transaction allocates one fresh BIP84 address per invoice and persists
 the complete Payment Request with that address in `payment_endpoints` and
 `required_app_id = "paykit-server"`. Exact replay returns the same invoice,
-assignment, terms, and outbox row. A different Bitcoin invoice cannot reuse its address. USDT invoices share the approved address and attribute individual transfers through verified request proofs.
+assignment, terms, and outbox row. Invoices accepting Bitcoin cannot reuse its address. Invoices accepting USDT share the approved address and attribute individual transfers through verified request proofs. Both options may belong to one invoice; fixed conversion rates and per-option amounts are persisted with its immutable terms.
 Reader discovery checks that at least one registered app supports private payments,
 Payment Requests, and outgoing payments; it does not select a receiver path.
 
@@ -72,3 +72,5 @@ No spending, refunds, receipt issuance, or horizontal replicas are supported.
 
 Upgrade policy and operational limits are in the [README](../README.md);
 validation commands are in [CONTRIBUTING](../CONTRIBUTING.md).
+
+Invoice pricing uses the same Blocktank BTC/USD feed as Bitkit. Fixed Paykit rates determine exact amounts in either asset; verification never fetches another market price. Bitcoin and USDT observers update their own evidence under the invoice lock and rebuild the shared payment status from both. The published request is the authority for destinations and amounts, avoiding independently supplied settlement amounts.

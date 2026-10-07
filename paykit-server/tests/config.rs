@@ -79,12 +79,16 @@ fn setup_authorization_url_logging_defaults_to_disabled() {
 }
 
 #[test]
-fn invoice_windows_default_to_one_hour_and_twenty_four_hours() {
+fn invoice_windows_default_to_one_hour_acceptance_and_conversion_and_twenty_four_hour_payment() {
     let config = Config::from_toml_and_environment(&valid_toml(), environment()).unwrap();
 
     assert_eq!(
         config.paykit.proposal_acceptance_window,
         Duration::from_secs(60 * 60)
+    );
+    assert_eq!(
+        config.paykit.conversion_payment_window,
+        Duration::from_secs(3600)
     );
     assert_eq!(
         config.paykit.payment_window,
@@ -95,6 +99,8 @@ fn invoice_windows_default_to_one_hour_and_twenty_four_hours() {
 #[test]
 fn invoice_windows_require_positive_acceptance_strictly_before_payment() {
     for windows in [
+        "conversion_payment_window = \"1s\"",
+        "conversion_payment_window = \"1500ms\"",
         "proposal_acceptance_window = \"0s\"\npayment_window = \"24h\"",
         "proposal_acceptance_window = \"24h\"\npayment_window = \"24h\"",
         "proposal_acceptance_window = \"25h\"\npayment_window = \"24h\"",

@@ -58,10 +58,11 @@ impl InvoiceIdentity {
     }
 }
 
-/// Assets accepted by the direct-payment observer.
+/// Denominations accepted in a Locks payment criterion.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum CriterionAsset {
     Btc,
+    Usd,
     Usdt,
 }
 
@@ -69,6 +70,7 @@ impl CriterionAsset {
     pub fn parse(value: &str) -> Result<Self, CriterionAssetError> {
         match value {
             "BTC" => Ok(Self::Btc),
+            "USD" => Ok(Self::Usd),
             "USDT" => Ok(Self::Usdt),
             _ => Err(CriterionAssetError::UnsupportedAsset),
         }
@@ -77,12 +79,22 @@ impl CriterionAsset {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Btc => "BTC",
+            Self::Usd => "USD",
             Self::Usdt => "USDT",
+        }
+    }
+
+    pub fn decimals(self) -> u32 {
+        match self {
+            Self::Btc => 8,
+            Self::Usd => 2,
+            Self::Usdt => 6,
         }
     }
 
     pub fn decimal_amount(self, units: u64) -> String {
         match self {
+            Self::Usd => format!("{}.{:02}", units / 100, units % 100),
             Self::Btc => format!("{}.{:08}", units / 100_000_000, units % 100_000_000),
             Self::Usdt => format!("{}.{:06}", units / 1_000_000, units % 1_000_000),
         }
@@ -93,7 +105,7 @@ impl CriterionAsset {
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum CriterionAssetError {
     /// The asset is not supported.
-    #[error("criterion asset must be BTC or USDT")]
+    #[error("criterion asset must be BTC, USD or USDT")]
     UnsupportedAsset,
 }
 

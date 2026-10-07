@@ -1,13 +1,7 @@
 -- Direct USDT invoices use an approved shared address and ERC-20 receipt identity.
 ALTER TABLE invoices
-    ADD COLUMN asset TEXT NOT NULL DEFAULT 'BTC' CHECK (asset IN ('BTC', 'USDT')),
     ALTER COLUMN bitcoin_address_lookup_hash DROP NOT NULL,
-    DROP CONSTRAINT invoices_first_amount_matched_outpoint_pair,
-    ADD CONSTRAINT invoices_first_amount_matched_outpoint_pair CHECK (
-        asset = 'USDT' OR
-        ((first_amount_matched_observed_at IS NULL) = (first_amount_matched_outpoint_lookup_hash IS NULL))
-    );
-ALTER TABLE invoices ALTER COLUMN asset DROP DEFAULT;
+    DROP CONSTRAINT invoices_first_amount_matched_outpoint_pair;
 
 -- Each verified ERC-20 event belongs permanently to one invoice.
 CREATE TABLE usdt_observations (

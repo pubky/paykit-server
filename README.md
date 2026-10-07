@@ -74,7 +74,7 @@ invoices return `404`; authentication, storage, malformed-state, and dependency
 failures remain typed errors. `connected` is the identity's shared Noise state,
 not payment or verification completion.
 
-`POST /setup/status` is the Locks-only readiness check for an authenticated Creator. Its closed body is `{"creator":"pubky..."}` with optional `asset: "BTC"` or `asset: "USDT"` to check approved receiving details for that asset. Every signed route verifies Ed25519 over `b"paykit-http-signature-v1\0" + uppercase_method + b"\0" + exact_query_free_path + b"\0" + exact_raw_body`; there is no body-only fallback. It returns exactly one coarse state: `ready` when the persisted session, delegated key, App Registry entry, and hosted state are usable; `setup_required` when authority is absent or confirmed invalid; and `unavailable` for validation timeouts and storage, rate-limit, server, DNS, or transport failures. Untyped Pubky 401 responses are also `unavailable`: they cannot distinguish revoked grants from recoverable PoP failures. A revoked grant reported this way requires explicit reconnect. Callers must not convert `unavailable` into a new authorization flow.
+`POST /setup/status` is the Locks-only readiness check for an authenticated Creator. Its closed body is `{"creator":"pubky..."}` with optional `asset: "BTC"`, `"USD"`, or `"USDT"` to check whether approved receiving details can accept that denomination. Every signed route verifies Ed25519 over `b"paykit-http-signature-v1\0" + uppercase_method + b"\0" + exact_query_free_path + b"\0" + exact_raw_body`; there is no body-only fallback. It returns exactly one coarse state: `ready` when the persisted session, delegated key, App Registry entry, and hosted state are usable; `setup_required` when authority is absent or confirmed invalid; and `unavailable` for validation timeouts and storage, rate-limit, server, DNS, or transport failures. Untyped Pubky 401 responses are also `unavailable`: they cannot distinguish revoked grants from recoverable PoP failures. A revoked grant reported this way requires explicit reconnect. Callers must not convert `unavailable` into a new authorization flow.
 
 ### Setup iframe
 
@@ -345,20 +345,19 @@ private or public lists. Another invoice or app cannot replace the destination.
 
 ## Bitcoin settlement semantics
 
-Each invoice receives a unique BIP84 external-chain address. Observation uses the configured `bdk_electrum` adapter and persists complete validated batches atomically.
+Each invoice accepting Bitcoin receives a unique BIP84 external-chain address. Observation uses the configured `bdk_electrum` adapter and persists complete validated batches atomically.
 
 - Outputs are evaluated independently; split or multi-output payments are not aggregated.
 - A single amount-matched output is sufficient for the factual amount match.
 - An underpaying output remains a replaceable factual underpayment at every confirmation depth.
 - A one-confirmation amount-matched output is frozen against replacement while monitoring continues.
-- At six confirmations, an amount-matched output becomes final with stored/reported confirmation count exactly `6`, and monitoring for that invoice stops.
+- At six confirmations, an amount-matched output becomes final with stored/reported confirmation count exactly `6`, and Bitcoin monitoring for that invoice stops.
 - Overpayment is factual but has no credit/refund workflow.
 - Reorg handling is supported before finality; uncommon repair after six-confirmation finality is unsupported.
 
 The server has no Bitcoin spending keys and cannot spend, refund, or create change.
 
-`POST /transactions/status` remains the legacy Bitcoin-only compatibility
-endpoint. Its closed `status` vocabulary is `undetected`, `detected`, and
+`POST /transactions/status` exposes the selected payment observation without request lifecycle details. Its closed `status` vocabulary is `undetected`, `detected`, and
 `confirmed`; Payment Request lifecycle never changes those labels.
 
 `POST /payment-requests/status` is the canonical Locks lifecycle contract. It
@@ -387,7 +386,7 @@ There is no payload-retention or pruning contract, retention worker, runtime idl
 - `tcp://` Electrum has no transport authentication; use a CA-valid `ssl://` endpoint for production.
 - No configured Creator-count bound or runtime eviction.
 - One xpub/account index per Creator; no xpub, account, master-key, or immutable-invariant rotation.
-- BTC and optional direct USDT0 on Arbitrum One; no bridging, swaps, or currency conversion.
+- BTC and optional direct USDT0 on Arbitrum One, with fixed denomination conversion; no bridging or asset swaps.
 - No public payer inbox or proof-submission API, and no receipt issuance.
 - No spending custody, refunds, credits, or change.
 - No output aggregation and no deep-reorg repair after finality.
@@ -408,16 +407,38 @@ the server. A standard Arbitrum JSON-RPC endpoint must support `eth_chainId`,
 Setup requests the existing Bitcoin account plus `usdt-address-v1`. The user can
 skip USDT without blocking Bitcoin. Reconnect can add a previously omitted USDT
 address but cannot change an already-approved address or Bitcoin account.
-Signed `POST /setup/status` accepts optional `asset: "BTC"` or `asset: "USDT"`
-and returns the existing `{status}` response for that asset. Omitting `asset`
+Signed `POST /setup/status` accepts optional `asset: "BTC"`, `"USD"`, or `"USDT"`
+and returns the existing `{status}` response for that denomination. Omitting `asset`
 checks Pubky/Paykit authority only. Locks should check the selected asset before
 publishing a priced lock.
 
-A USDT payment criterion uses `asset: "USDT"` and integer millionths, so `50000`
-means 0.05 USDT. Its immutable request contains the approved address, chain 42161,
-and token `0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9`. Multiple invoices use the
-same address. Requests require the `paykit-server` receiving app and do not permit
-conversion to another payment asset.
+Payment criteria use integer units: satoshis for `BTC`, cents for `USD`, and
+millionths for `USDT`. For example, `asset: "USD", amount: "500"` requests $5.
+Each request includes every enabled receiving option approved by the creator: a
+unique Bitcoin address and/or the shared Arbitrum address, chain 42161, and token
+`0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9`. Requests require the `paykit-server`
+receiving app. A payer with both options can choose either; this changes the
+payment asset, not the requested value.
+
+BTC conversions use Bitkit's feed, `https://api1.blocktank.to/api/fx/rates/btc`.
+Only a positive BTC/USD price timestamped within the past ten minutes is accepted.
+USD and USDT use fixed 1:1 parity. Published rates are payment-asset units per
+requested unit; reciprocal BTC rates round half-even to 18 decimal places. The
+required payment rounds up to whole satoshis or millionths of USDT. Fees are
+additional. The exact published rates and both destinations are encrypted with
+the invoice and reused for delivery, replay, restart, and settlement verification.
+The server does not reprice a received payment at the current market rate.
+
+`paykit.conversion_payment_window` defaults to `"1h"` for invoices offering BTC
+conversion, capped by `paykit.payment_window`. Acceptance is capped at half the
+resulting payment window, leaving time to pay. Same-asset and USD/USDT-only
+invoices retain the ordinary configured windows. Unavailable or stale market
+rates prevent creation of a new BTC conversion quote, but do not block exact
+invoice replay, settlement, or payments that need no BTC rate.
+
+Either full, timely payment can satisfy the invoice. Partial payments are not
+combined across assets. Reconciliation on one chain cannot erase a qualifying
+payment on the other; reorgs recompute the result from both observations.
 
 The existing SDK receive loop reconciles `erc20-transfer-eip712` proofs. The
 server verifies the request-bound sender signature, successful canonical receipt,
@@ -433,5 +454,5 @@ Locks must choose an asset-appropriate acceptance policy, not assume Bitcoin tim
 
 No public transaction-hash submission API is added. Proofs must arrive through the
 SDK's authenticated request flow. Address sharing is not proof of a purchase.
-The Locks creator/payment UI must offer the USDT criterion and asset-specific
+The Locks creator/payment UI must offer the denominations and receiving-option
 readiness check before an end-to-end Locks checkout can be enabled.

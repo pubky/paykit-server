@@ -500,9 +500,9 @@ async fn insert_invoice_result_with_reader(
           invoice_envelope, payment_record_envelope, bitcoin_address_lookup_hash,
           derivation_index_lookup_hash, payment_status, lock_resource_lookup_hash,
           invoice_created_at, proposal_expires_at, payment_deadline,
-          proposal_acceptance_seconds, payment_window_seconds, asset) \
+          proposal_acceptance_seconds, payment_window_seconds) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                 NOW(), NOW() + INTERVAL '1 hour', NOW() + INTERVAL '24 hours', 3600, 86400, 'BTC')",
+                 NOW(), NOW() + INTERVAL '1 hour', NOW() + INTERVAL '24 hours', 3600, 86400)",
     )
     .bind(creator_id)
     .bind(reader_hash)

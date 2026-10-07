@@ -193,13 +193,17 @@ async fn asset_readiness_requires_the_optional_receiving_permission() {
         async fn receiving(
             &self,
             _creator: &CreatorPubky,
-            _asset: CriterionAsset,
         ) -> Result<ReceivingDetails, PersistenceError> {
             if self.0 {
-                Ok(ReceivingDetails::Usdt(
-                    UsdtAddress::try_from("0x2222222222222222222222222222222222222222".to_owned())
+                Ok(ReceivingDetails {
+                    bitcoin: None,
+                    usdt: Some(
+                        UsdtAddress::try_from(
+                            "0x2222222222222222222222222222222222222222".to_owned(),
+                        )
                         .unwrap(),
-                ))
+                    ),
+                })
             } else {
                 Err(PersistenceError::InvalidInput)
             }
