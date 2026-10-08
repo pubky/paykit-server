@@ -26,7 +26,14 @@ completion each retain their SDK validation boundaries. The Server never
 publishes a marker on the Reader's behalf, and these checks cannot recall a
 message already durably `Sent`.
 
-A successful proposal stores the returned SDK outbound, Event, and Payment Request IDs under the same live fence as `handed_off`. If the SDK transaction commits before this server transition, reclaimed work calls the public API again with the persisted terms and address. That accepted crash window is at-least-once and may create duplicate Payment Request proposals.
+A successful proposal stores the returned SDK outbound, Event, and Payment Request IDs under the same live fence as `handed_off`. The existing outbox row UUID supplies the stable UUID-v4 Payment Request ID. If the SDK transaction commits before this server transition, reclaimed work calls `propose_payment_request_with_id` with that ID and the exact persisted terms and Reader. The SDK atomically returns the original proposal and message IDs without enqueueing another proposal. A different App, Reader, or canonical payload under the same identity-scoped ID is a conflict. No additional intent field or index is required.
+
+This idempotency binding uses the retained SDK proposal Event Message history,
+including expired and terminal proposals. It does not survive deletion of that
+history or restoration of a backup from before proposal creation. Every retry
+still requires current session, App capability, and link readiness. Cancellation
+and transport retries retain their existing semantics; this is not exactly-once
+remote delivery.
 
 An admitted enqueue task renews its database claim every third of the configured
 lease duration while work is active. Renewal requires the same unexpired claim
@@ -34,8 +41,9 @@ token and an eligible proposal generation with no active drain. An expired or
 replaced claim cannot be revived. Renewal failure does not cancel an in-flight
 SDK operation: it finishes, while subsequent SDK effects and the final database
 transition revalidate ownership. Shutdown drains admitted work within the existing
-server deadline. Renewal reduces expiry during slow work; it does not close the
-crash window between SDK persistence and the database association.
+server deadline. Renewal reduces expiry during slow work. Stable proposal IDs
+make retry after SDK persistence safe without a cross-system transaction, while
+the live claim fence still controls the database association.
 
 Normal handshake progress or waiting uses the bounded link retry schedule and
 resets the consecutive failure counter. Actual dependency failures, including
