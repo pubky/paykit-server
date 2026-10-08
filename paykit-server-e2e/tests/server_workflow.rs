@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     net::SocketAddr,
     str::FromStr,
-    sync::Arc,
+    sync::{Arc, Once},
     time::Duration,
 };
 
@@ -130,6 +130,13 @@ impl ElectrumPort for DeterministicElectrum {
 }
 
 async fn build_pubky_testnet() -> EphemeralTestnet {
+    static DIAGNOSTICS: Once = Once::new();
+    DIAGNOSTICS.call_once(|| {
+        tracing_subscriber::fmt()
+            .with_env_filter("paykit_server::diagnostics=warn")
+            .with_test_writer()
+            .init();
+    });
     let postgres = std::env::var("TEST_DATABASE_URL").unwrap();
     let postgres = pubky_testnet::pubky_homeserver::ConnectionString::new(&postgres).unwrap();
     EphemeralTestnet::builder()

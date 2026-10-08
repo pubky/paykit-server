@@ -232,7 +232,15 @@ impl crate::application::connection_status::PeerConnectionStateRepository for Cr
                 )
             })
             .await
-            .map_err(|_| PersistenceError::Unavailable)
+            .map_err(|error| {
+                let category = match error {
+                    PaykitSdkError::SharedStateBusy { .. } => "shared_state_busy",
+                    PaykitSdkError::ConcurrentUpdate { .. } => "concurrent_update",
+                    error => classify(error).diagnostic_label(),
+                };
+                crate::diagnostics::failure("connection_status", "peer_state_load", category);
+                PersistenceError::Unavailable
+            })
     }
 }
 
