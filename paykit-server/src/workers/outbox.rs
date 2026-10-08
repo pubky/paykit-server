@@ -2,8 +2,9 @@
 //!
 //! A call can commit to the SDK queue and the process can crash before the
 //! fenced database transition. Retrying therefore has **at-least-once**
-//! semantics: Payment Request proposals may be duplicated. The SDK owns its
-//! queue and encrypted-link retry state; this worker never claims exactly-once.
+//! semantics. The adapter makes a proposal idempotent per Payment Reference by
+//! reusing the request already queued for it. The SDK owns its queue and
+//! encrypted-link retry state; this worker never claims exactly-once.
 
 use async_trait::async_trait;
 use paykit_lib::PaykitAppRegistry;
@@ -192,10 +193,15 @@ pub(crate) async fn handoff_steps<A: Adapter + ?Sized>(
         .await
         .map_err(|error| at_stage(error, RetryableHandoffStage::LinkEstablishment))?;
     match intent.operation() {
-        DeliveryOperationV1::PaymentRequestProposal { terms } => adapter
-            .propose_payment_request(intent.reader_pubky(), terms)
-            .await
-            .map_err(|error| at_stage(error, RetryableHandoffStage::PaymentRequestProposal)),
+        DeliveryOperationV1::PaymentRequestProposal { terms } => {
+            // The handoff never reads the reader's Allowances. A reader controls how
+            // much Allowance history its link holds, so that scan runs on the transport
+            // loop (`PaykitAdapter::accept_allowance_proposals`), outside any lease.
+            adapter
+                .propose_payment_request(intent.reader_pubky(), terms)
+                .await
+                .map_err(|error| at_stage(error, RetryableHandoffStage::PaymentRequestProposal))
+        }
         DeliveryOperationV1::PaymentRequestCancellation { payment_request_id } => adapter
             .cancel_payment_request(intent.reader_pubky(), payment_request_id)
             .await
@@ -206,7 +212,7 @@ pub(crate) async fn handoff_steps<A: Adapter + ?Sized>(
 /// Executes one already-fenced claim. Enqueue is only `handed_off`; the SDK
 /// outbound record is reconciled separately before publication is acknowledged.
 /// A crash after enqueue but before this fenced transition is intentionally
-/// retried, so Payment Request proposals are at-least-once and may duplicate.
+/// retried; the adapter reuses the request already queued for the intent.
 pub async fn process_claim(
     store: &OutboxStore,
     adapter: &dyn Adapter,

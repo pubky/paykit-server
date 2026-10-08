@@ -24,7 +24,7 @@ use crate::{
     crypto::Crypto,
     domain::locks::{BundleId, CreatorPubky, PubkyLockResource, ReaderPubky},
     http::{self, auth::SignedLocksAuth},
-    paykit::{CreatorSessions, PaykitAdapter},
+    paykit::{ALLOWANCE_INTAKE_COOLDOWN, AllowanceIntake, CreatorSessions, PaykitAdapter},
     persistence::{
         CreatorStore, InvoiceStore, OutboxRetryClass, OutboxStore, PaymentDrainStore,
         PaymentRequestLifecycleStore, PersistenceError,
@@ -424,6 +424,7 @@ fn spawn_owned_workers(workers: WorkerComponents, runtime: Arc<Runtime>) -> Join
 }
 
 async fn shared_transport_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtime>) {
+    let intake = AllowanceIntake::new(ALLOWANCE_INTAKE_COOLDOWN);
     let mut interval = tokio::time::interval(workers.outbox_poll_interval);
     interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
@@ -442,7 +443,7 @@ async fn shared_transport_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runt
                 return;
             }
             let maintained = match creator_adapter(&workers, creator).await {
-                Ok(adapter) => match adapter.maintain_transport().await {
+                Ok(adapter) => match adapter.maintain_transport(&intake).await {
                     Ok(()) => true,
                     Err(
                         PaykitSdkError::ConcurrentUpdate { .. }

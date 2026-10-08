@@ -45,6 +45,14 @@ The SDK owns encrypted identity-wide homeserver state under WebDAV locks. Apps
 share Encrypted Links and history; app IDs attribute requests and outbound records.
 The server does not maintain a PostgreSQL copy of SDK state. Its transport worker
 receives private events and processes queued delivery without executing payments.
+It also accepts, as the Allowee, the Allowance proposals a reader leaves on the
+server link, so the reader's wallet can pay later requests without a prompt.
+Acceptance never runs inside an outbox handoff: the SDK derives a link's whole
+history for each read and each acceptance, and the reader decides how large that
+history is. The worker reads a reader's Allowances only after that reader's link
+received new items, at most once per cooldown (10 seconds), accepts at most four
+proposals per read and takes the Creator mutation lock for one acceptance at a
+time. Proposals left behind the limit are accepted by the next read.
 The local reader demo likewise uses hosted SDK state; its encrypted local file
 retains only the app/Creator binding and a process ownership lock.
 
