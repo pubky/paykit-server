@@ -1205,7 +1205,12 @@ async fn wait_for_fresh_server_link_state(
             connection_status_request(expected.signing_key, expected.fixture, expected.bundle),
         )
         .await;
-        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(
+            response.status,
+            StatusCode::OK,
+            "connection status failed: {}",
+            String::from_utf8_lossy(&response.body)
+        );
         let state = serde_json::from_slice::<serde_json::Value>(&response.body).unwrap();
         let public_state = state["state"].as_str().unwrap();
         let storage = creator_backup_state(&expected.fixture.sdk).await;
