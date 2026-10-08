@@ -64,6 +64,7 @@ type PeerSdk = sdk_fixtures::HostedSdk;
 struct CreatorFixture {
     creator: CreatorPubky,
     sdk: CreatorSdk,
+    access: PubkySessionAccess,
     lock_resource: String,
     xpub: String,
     account_index: u32,
@@ -258,11 +259,13 @@ async fn create_creator(
     )
     .await
     .unwrap();
-    let sdk = sdk_fixtures::hosted_sdk(observer.access, "paykit-server", counter_seed).await;
+    let access = observer.access;
+    let sdk = sdk_fixtures::hosted_sdk(access.clone(), "paykit-server", counter_seed).await;
     store.mark_setup_complete(&creator).await.unwrap();
     CreatorFixture {
         creator,
         sdk,
+        access,
         lock_resource,
         xpub,
         account_index,
@@ -1212,6 +1215,17 @@ async fn wait_for_fresh_server_link_state(
             connection_status_request(expected.signing_key, expected.fixture, expected.bundle),
         )
         .await;
+        if response.status == StatusCode::SERVICE_UNAVAILABLE
+            && serde_json::from_slice::<serde_json::Value>(&response.body)
+                .is_ok_and(|body| body["error"]["code"] == "dependency_unavailable")
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "connection state remained busy"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            continue;
+        }
         assert_eq!(
             response.status,
             StatusCode::OK,
@@ -1356,6 +1370,23 @@ async fn server_relinks_when_the_reader_publishes_a_recovery_marker() {
     // the request to the link the wallet abandoned.
     let second_payment =
         open_invoice(&pool, address, &signing_key, &creator, &reader, BUNDLE_B).await;
+    let busy = paykit_lib::with_write_lock::<_, paykit_lib::PaykitError, _, _>(
+        &creator.access.session,
+        paykit_lib::PAYKIT_SHARED_STATE_PATH,
+        |_held| async {
+            Ok(send_http(
+                address,
+                connection_status_request(&signing_key, &creator, BUNDLE_B),
+            )
+            .await)
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(busy.status, StatusCode::SERVICE_UNAVAILABLE);
+    let busy: serde_json::Value = serde_json::from_slice(&busy.body).unwrap();
+    assert_eq!(busy["error"]["code"], "dependency_unavailable");
+    assert!(busy.get("state").is_none());
     wait_for_fresh_server_link_state(
         address,
         FreshServerLinkExpectation {

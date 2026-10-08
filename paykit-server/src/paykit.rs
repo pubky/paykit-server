@@ -203,12 +203,11 @@ impl crate::application::connection_status::PeerConnectionStateRepository for Cr
         binding: &crate::application::connection_status::ConnectionBinding,
     ) -> Result<
         crate::application::connection_status::PaykitConnectionState,
-        crate::persistence::PersistenceError,
+        crate::application::connection_status::ConnectionStatusError,
     > {
-        use crate::application::connection_status::PaykitConnectionState;
-        use crate::persistence::PersistenceError;
+        use crate::application::connection_status::{ConnectionStatusError, PaykitConnectionState};
         let reader = PubkyPublicKey::from_raw_or_app_key(binding.reader().to_string())
-            .map_err(|_| PersistenceError::CorruptOrMissing)?;
+            .map_err(|_| ConnectionStatusError::Unavailable)?;
         let storage = PubkySharedStateStorage::new(self.provider(creator));
         storage
             .transaction(move |tx| {
@@ -233,13 +232,20 @@ impl crate::application::connection_status::PeerConnectionStateRepository for Cr
             })
             .await
             .map_err(|error| {
-                let category = match error {
-                    PaykitSdkError::SharedStateBusy { .. } => "shared_state_busy",
-                    PaykitSdkError::ConcurrentUpdate { .. } => "concurrent_update",
-                    error => classify(error).diagnostic_label(),
+                let (category, mapped) = match error {
+                    PaykitSdkError::SharedStateBusy { .. } => {
+                        ("shared_state_busy", ConnectionStatusError::Busy)
+                    }
+                    PaykitSdkError::ConcurrentUpdate { .. } => {
+                        ("concurrent_update", ConnectionStatusError::Unavailable)
+                    }
+                    error => (
+                        classify(error).diagnostic_label(),
+                        ConnectionStatusError::Unavailable,
+                    ),
                 };
                 crate::diagnostics::failure("connection_status", "peer_state_load", category);
-                PersistenceError::Unavailable
+                mapped
             })
     }
 }
