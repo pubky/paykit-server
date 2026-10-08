@@ -119,7 +119,7 @@ async fn verified_timely_payment_queues_one_contact_attempt_per_buyer() {
     let restarted = InvoiceStore::new(database.pool(), crypto());
     let retried = restarted.claim_buyer_contact().await.unwrap().unwrap();
     assert_eq!(retried.invoice_id, id);
-    restarted.complete_buyer_contact(id).await.unwrap();
+    restarted.complete_buyer_contact(&retried).await.unwrap();
     let (_, second_address) = invoice_for(
         &store,
         b"second-bundle",

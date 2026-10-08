@@ -88,7 +88,12 @@ contact, or unblocks a peer. The existing Encrypted Link is unchanged.
 Contact work is recorded atomically with payment observation and retried after
 transient failures or worker restart, independently of payment delivery and status
 responses. Completed or skipped attempts are retained per Creator/buyer so later
-purchases do not recreate a contact the Creator removed. Profile data stays in
+purchases do not recreate a contact the Creator removed. Profile resolution runs
+outside the shared-state lock. The worker rechecks completion under that lock and
+holds it through the contact write and database completion, fencing expired
+claims before they can modify shared contacts. These are two durable writes: a
+crash after the contact write but before database completion leaves a retryable
+attempt, not a completed one. Profile data stays in
 encrypted shared state; the queue reuses the encrypted invoice and keyed lookups.
 
 Upgrade policy and operational limits are in the [README](../README.md);

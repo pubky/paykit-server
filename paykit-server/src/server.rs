@@ -455,21 +455,13 @@ async fn buyer_contacts_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtim
                 }
             };
             let saved = match creator_adapter(&workers, pending.creator_id).await {
-                Ok(adapter) => {
-                    match PubkyPublicKey::from_raw_or_app_key(pending.reader.to_string()) {
-                        Ok(buyer) => adapter.save_buyer_contact(buyer).await.is_ok(),
-                        Err(_) => false,
-                    }
-                }
+                Ok(adapter) => adapter
+                    .save_buyer_contact(&workers.invoices, &pending)
+                    .await
+                    .is_ok(),
                 Err(_) => false,
             };
-            if !saved
-                || workers
-                    .invoices
-                    .complete_buyer_contact(pending.invoice_id)
-                    .await
-                    .is_err()
-            {
+            if !saved {
                 tracing::warn!(stage = "buyer_contact_save", "Buyer contact save deferred");
             }
         }

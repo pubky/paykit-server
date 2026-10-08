@@ -473,10 +473,7 @@ async fn invoices_share_an_address_but_never_share_payment_evidence() {
         );
         if let Some(contact) = contact {
             assert_eq!(contact.invoice_id, ids[0]);
-            store
-                .complete_buyer_contact(contact.invoice_id)
-                .await
-                .unwrap();
+            store.complete_buyer_contact(&contact).await.unwrap();
         }
         assert!(matches!(
             store.payment_status(&creator, &bundles[0]).await.unwrap(),

@@ -4,17 +4,61 @@ use paykit_sdk::{
 };
 
 use super::PaykitAdapter;
+use crate::persistence::{InvoiceStore, PendingBuyerContact, PersistenceError};
 
 impl PaykitAdapter {
     /// Saves a verified buyer privately, preferring their Paykit profile to Pubky.app.
     /// Missing profiles, existing contacts and blocked peers are terminal no-ops.
-    pub async fn save_buyer_contact(&self, buyer: PubkyPublicKey) -> paykit_sdk::Result<()> {
+    pub async fn save_buyer_contact(
+        &self,
+        invoices: &InvoiceStore,
+        pending: &PendingBuyerContact,
+    ) -> paykit_sdk::Result<()> {
+        if pending.creator_id != self.creator_id {
+            return Err(PaykitSdkError::Identity {
+                context: "buyer contact attempt does not match Creator".into(),
+                source: None,
+            });
+        }
+        let buyer = PubkyPublicKey::from_raw_or_app_key(pending.reader.to_string())?;
         let owner = PubkyPublicKey::from_raw_or_app_key(self.creator.to_string())?;
-        if buyer == owner {
-            return Ok(());
+        let contact = self.resolve_buyer_contact(&owner, buyer).await?;
+        let _guard = self.mutation_lock.lock().await;
+        // The shared-state lock fences all workers, including claims whose retry
+        // delay elapsed during profile resolution. Record completion before
+        // releasing it, so a later attempt cannot recreate a deleted contact.
+        self.storage
+            .with_operation(async {
+                if !invoices
+                    .buyer_contact_is_pending(pending)
+                    .await
+                    .map_err(contact_store_error)?
+                {
+                    return Ok(());
+                }
+                if let Some(contact) = contact {
+                    self.storage
+                        .transaction(move |tx| insert_buyer_contact(tx, &owner, contact))
+                        .await?;
+                }
+                invoices
+                    .complete_buyer_contact(pending)
+                    .await
+                    .map_err(contact_store_error)
+            })
+            .await
+    }
+
+    async fn resolve_buyer_contact(
+        &self,
+        owner: &PubkyPublicKey,
+        buyer: PubkyPublicKey,
+    ) -> paykit_sdk::Result<Option<ContactRecord>> {
+        if &buyer == owner {
+            return Ok(None);
         }
         let Some(resolved) = self.sdk.resolve_profile(buyer.clone(), true).await? else {
-            return Ok(());
+            return Ok(None);
         };
         let profile = resolved.paykit_profile.unwrap_or(PaykitProfile {
             display_name: resolved.display_name,
@@ -33,7 +77,7 @@ impl PaykitAdapter {
         };
         update.validate()?;
         let now = std::time::SystemTime::now().into();
-        let contact = ContactRecord {
+        Ok(Some(ContactRecord {
             public_key: update.public_key,
             label: update.label,
             profile: Some(profile),
@@ -44,13 +88,14 @@ impl PaykitAdapter {
             public_contact_published_at: None,
             public_contact_removed_at: None,
             public_contact_last_error: None,
-        };
-        // Recheck after the public read, in the same transaction as the insert.
-        // Never overwrite a wallet edit, publish a public marker or unblock a peer.
-        let _guard = self.mutation_lock.lock().await;
-        self.storage
-            .transaction(move |tx| insert_buyer_contact(tx, &owner, contact))
-            .await
+        }))
+    }
+}
+
+fn contact_store_error(_error: PersistenceError) -> PaykitSdkError {
+    PaykitSdkError::Storage {
+        context: "buyer contact work unavailable".into(),
+        source: None,
     }
 }
 

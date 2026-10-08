@@ -20,7 +20,7 @@ struct BuyerContactRow {
 
 impl InvoiceStore {
     /// Claims one due contact attempt. Failed or interrupted attempts become due after a minute.
-    /// Saving to shared state is insert-only, so overlapping attempts remain idempotent.
+    /// This schedules work only; completion must be rechecked under the shared-state lock.
     pub async fn claim_buyer_contact(
         &self,
     ) -> Result<Option<PendingBuyerContact>, PersistenceError> {
@@ -75,10 +75,39 @@ impl InvoiceStore {
         .transpose()
     }
 
-    /// Retains a terminal record so later purchases do not recreate a removed contact.
-    pub async fn complete_buyer_contact(&self, invoice_id: Uuid) -> Result<(), PersistenceError> {
-        sqlx::query("UPDATE buyer_contacts SET completed_at = COALESCE(completed_at, NOW()) WHERE invoice_id = $1")
-            .bind(invoice_id).execute(&self.pool).await.map_err(|_| PersistenceError::Unavailable)?;
+    /// Checks that a claimed attempt still needs saving. Call under the Creator's
+    /// shared-state lock and retain that lock through saving and completion.
+    pub async fn buyer_contact_is_pending(
+        &self,
+        pending: &PendingBuyerContact,
+    ) -> Result<bool, PersistenceError> {
+        sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM buyer_contacts
+             WHERE invoice_id = $1 AND creator_id = $2 AND reader_lookup_hash = $3
+                 AND completed_at IS NULL)",
+        )
+        .bind(pending.invoice_id)
+        .bind(pending.creator_id)
+        .bind(
+            self.crypto
+                .lookup_hash(pending.reader.to_string().as_bytes())
+                .as_bytes()
+                .as_slice(),
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)
+    }
+
+    /// Retains a terminal record while the caller still holds the shared-state lock.
+    pub async fn complete_buyer_contact(
+        &self,
+        pending: &PendingBuyerContact,
+    ) -> Result<(), PersistenceError> {
+        sqlx::query("UPDATE buyer_contacts SET completed_at = COALESCE(completed_at, NOW()) WHERE invoice_id = $1 AND creator_id = $2 AND reader_lookup_hash = $3")
+            .bind(pending.invoice_id).bind(pending.creator_id)
+            .bind(self.crypto.lookup_hash(pending.reader.to_string().as_bytes()).as_bytes().as_slice())
+            .execute(&self.pool).await.map_err(|_| PersistenceError::Unavailable)?;
         Ok(())
     }
 }
