@@ -432,6 +432,7 @@ async fn shared_transport_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runt
     loop {
         tokio::select! {
             _ = runtime.cancelled() => break,
+            _ = workers.outbox.wait_for_transport() => {},
             _ = interval.tick() => {}
         }
         let Ok(creators) = workers.creators.ready_ids().await else {
@@ -689,6 +690,7 @@ async fn outbox_enqueue_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtim
     loop {
         tokio::select! {
             _ = runtime.cancelled() => break,
+            _ = workers.invoices.wait_for_admission() => {},
             _ = tokio::time::sleep(next_poll_delay) => {}
         }
         if !runtime.may_start_worker_claim() {
@@ -787,6 +789,7 @@ async fn outbox_reconciliation_loop(workers: Arc<WorkerComponents>, runtime: Arc
     loop {
         tokio::select! {
             _ = runtime.cancelled() => break,
+            _ = workers.outbox.wait_for_reconciliation() => {},
             _ = interval.tick() => {}
         }
         if !runtime.may_start_worker_claim() {

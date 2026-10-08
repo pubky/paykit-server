@@ -26,3 +26,10 @@ Payment Requests are retained Event Messages. The server neither publishes nor w
 The schema requires `handed_off` and `delivered` rows to carry a canonical numeric SDK outbound ID. See the [upgrade policy](../README.md#persistence-startup-and-upgrades) before replacing a database or binary.
 
 No part of this design claims exactly-once remote delivery.
+
+New invoice admissions wake the enqueue worker only after their database commit.
+A committed, fenced SDK handoff separately wakes transport and reconciliation.
+These process-local hints coalesce during work and do not bypass persisted due
+times or lease fences. Periodic polling remains the recovery path for restarts,
+missed hints, and work admitted through other stores. Hints reduce idle polling
+waits without changing the meaning of Linked, handed-off, or delivered state.

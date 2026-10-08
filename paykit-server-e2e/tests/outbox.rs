@@ -315,6 +315,16 @@ async fn invoice_request_is_claimable_directly_and_preserves_delivery_fences() {
         "an expired fence overwrote reclaimed work"
     );
     assert!(
+        tokio::time::timeout(Duration::ZERO, outbox.wait_for_transport())
+            .await
+            .is_err()
+    );
+    assert!(
+        tokio::time::timeout(Duration::ZERO, outbox.wait_for_reconciliation())
+            .await
+            .is_err()
+    );
+    assert!(
         outbox
             .mark_handed_off(
                 &reclaimed_request[0],
@@ -327,6 +337,12 @@ async fn invoice_request_is_claimable_directly_and_preserves_delivery_fences() {
             .await
             .unwrap()
     );
+    tokio::time::timeout(Duration::ZERO, outbox.wait_for_transport())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::ZERO, outbox.wait_for_reconciliation())
+        .await
+        .unwrap();
     assert!(
         outbox
             .claim(Uuid::new_v4(), 10, Duration::from_secs(30))

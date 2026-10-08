@@ -182,6 +182,8 @@ impl ClaimedHandoff {
 pub struct OutboxStore {
     pool: PgPool,
     crypto: std::sync::Arc<Crypto>,
+    transport: std::sync::Arc<tokio::sync::Notify>,
+    reconciliation: std::sync::Arc<tokio::sync::Notify>,
 }
 
 impl OutboxStore {
@@ -189,7 +191,19 @@ impl OutboxStore {
         Self {
             pool: pool.clone(),
             crypto,
+            transport: std::sync::Arc::new(tokio::sync::Notify::new()),
+            reconciliation: std::sync::Arc::new(tokio::sync::Notify::new()),
         }
+    }
+
+    /// Waits for a coalesced hint to process durably handed-off SDK work.
+    pub async fn wait_for_transport(&self) {
+        self.transport.notified().await;
+    }
+
+    /// Waits for a coalesced hint to reconcile a committed handoff.
+    pub async fn wait_for_reconciliation(&self) {
+        self.reconciliation.notified().await;
     }
 
     /// Reports aggregate delivery availability without exposing row or Creator identifiers.
@@ -381,6 +395,11 @@ impl OutboxStore {
             .commit()
             .await
             .map_err(|_| PersistenceError::Unavailable)?;
+        if changed.rows_affected() == 1 {
+            // Hints never replace the durable row, due time, or claim fence.
+            self.transport.notify_one();
+            self.reconciliation.notify_one();
+        }
         Ok(changed.rows_affected() == 1)
     }
 
