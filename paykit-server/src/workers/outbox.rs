@@ -43,6 +43,7 @@ pub enum RetryableHandoffCause {
     NotFound,
     PaymentAdapter,
     RecoveryRequired,
+    LinkObservation,
     Policy,
     LinkPending,
     Other,
@@ -57,6 +58,7 @@ impl RetryableHandoffCause {
             Self::NotFound => "not_found",
             Self::PaymentAdapter => "payment_adapter",
             Self::RecoveryRequired => "recovery_required",
+            Self::LinkObservation => "link_observation",
             Self::Policy => "policy",
             Self::LinkPending => "link_pending",
             Self::Other => "other",
@@ -144,7 +146,6 @@ pub trait Adapter: Send + Sync {
     /// The Reader's signed Noise Key Authorization, checked before link setup,
     /// which verifies it again.
     async fn fetch_authorization(&self, reader: &str) -> Result<ReaderAuthorization, HandoffError>;
-    async fn observe_recovery_marker(&self, reader: &str) -> Result<(), HandoffError>;
     async fn ensure_link_with_peer(&self, reader: &str) -> Result<(), HandoffError>;
     async fn propose_payment_request(
         &self,
@@ -238,11 +239,6 @@ async fn handoff_steps_with_claim<A: Adapter + ?Sized>(
             ));
         }
     }
-    check_claim(claim).await?;
-    adapter
-        .observe_recovery_marker(intent.reader_pubky())
-        .await
-        .map_err(|error| at_stage(error, RetryableHandoffStage::RecoveryMarkerObservation))?;
     check_claim(claim).await?;
     adapter
         .ensure_link_with_peer(intent.reader_pubky())

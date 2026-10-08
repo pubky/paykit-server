@@ -15,13 +15,16 @@ At request time the server checks the Reader's App Registry for a Noise key and 
 
 Admission also requires the Reader's identity-signed Noise Key Authorization: missing is setup-pending, and failing verification is `reader_not_payable`. Workers claim fenced rows, decrypt and revalidate the complete intent, and recheck Reader capabilities and the authorization before handoff. A missing or invalid authorization keeps an admitted row retryable (`reader_authorization_missing`, `reader_authorization_invalid`, or `reader_authorization_fetch` on a read failure), because the Reader can still publish or fix it. Link setup verifies the authorization again before any send. Production handoff uses public Paykit SDK APIs backed by encrypted identity-wide homeserver state. PostgreSQL retains server business state and delivery intents, not a second authoritative SDK state.
 
-Before link establishment or enqueue, the worker asks the SDK to observe the Reader's recovery marker under the Creator mutation lock. Confirmed absence continues normally. A fresh marker abandons the old link generation and starts recovery; lookup or prerequisite failures keep the exact outbox row retryable without SDK handoff identifiers. The server does not publish a marker on the Reader's behalf. This check covers handoffs beginning after marker publication, not SDK records already durably `Sent` before it.
-
-The SDK also checks recovery markers during link establishment. The separate
-observation remains necessary for error classification: the SDK's `Protocol`
-error covers both malformed remote markers and terminal protocol failures.
-Observation failures must remain retryable without treating all link protocol
-errors as recoverable.
+Link establishment checks the Reader's recovery marker under the SDK's identity
+and lease guards; the Server does not perform a separate observation first.
+Confirmed absence continues normally. A fresh marker starts recovery from the
+current generation. Invalid recovery or key metadata returns `LinkObservation`,
+keeping the exact outbox row retryable without SDK handoff identifiers. Protocol
+errors returned by the SDK remain permanent; SDK-managed handshake recovery can
+instead report pending, which is not permission to enqueue. Preparation, publication and
+completion each retain their SDK validation boundaries. The Server never
+publishes a marker on the Reader's behalf, and these checks cannot recall a
+message already durably `Sent`.
 
 A successful proposal stores the returned SDK outbound, Event, and Payment Request IDs under the same live fence as `handed_off`. If the SDK transaction commits before this server transition, reclaimed work calls the public API again with the persisted terms and address. That accepted crash window is at-least-once and may create duplicate Payment Request proposals.
 

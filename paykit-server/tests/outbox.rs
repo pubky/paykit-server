@@ -43,7 +43,6 @@ fn registry(capable: bool) -> PaykitAppRegistry {
 struct FakeAdapter {
     registry: PaykitAppRegistry,
     authorization: Result<ReaderAuthorization, HandoffError>,
-    recovery_marker_error: Option<HandoffError>,
     link_error: Option<HandoffError>,
     payment_request_calls: Mutex<usize>,
     calls: Mutex<Vec<&'static str>>,
@@ -65,11 +64,6 @@ impl Adapter for FakeAdapter {
     ) -> Result<ReaderAuthorization, HandoffError> {
         self.calls.lock().unwrap().push("fetch_authorization");
         self.authorization
-    }
-
-    async fn observe_recovery_marker(&self, _reader: &str) -> Result<(), HandoffError> {
-        self.calls.lock().unwrap().push("observe_recovery_marker");
-        self.recovery_marker_error.map_or(Ok(()), Err)
     }
 
     async fn ensure_link_with_peer(&self, _reader: &str) -> Result<(), HandoffError> {
@@ -133,7 +127,6 @@ async fn incapable_registry_is_retryable_without_handoff() {
     let adapter = FakeAdapter {
         registry: changed,
         authorization: Ok(ReaderAuthorization::Verified),
-        recovery_marker_error: None,
         link_error: None,
         payment_request_calls: Mutex::new(0),
         calls: Mutex::new(Vec::new()),
@@ -154,7 +147,6 @@ async fn retry_after_an_ambiguous_handoff_can_propose_twice() {
     let adapter = Arc::new(FakeAdapter {
         registry: selected.clone(),
         authorization: Ok(ReaderAuthorization::Verified),
-        recovery_marker_error: None,
         link_error: None,
         payment_request_calls: Mutex::new(0),
         calls: Mutex::new(Vec::new()),
@@ -177,12 +169,11 @@ async fn retry_after_an_ambiguous_handoff_can_propose_twice() {
 }
 
 #[tokio::test]
-async fn recovery_marker_observation_precedes_link_ensure_and_enqueue() {
+async fn handoff_validates_authorization_and_link_before_enqueue() {
     let selected = registry(true);
     let adapter = FakeAdapter {
         registry: selected,
         authorization: Ok(ReaderAuthorization::Verified),
-        recovery_marker_error: None,
         link_error: None,
         payment_request_calls: Mutex::new(0),
         calls: Mutex::new(Vec::new()),
@@ -195,7 +186,6 @@ async fn recovery_marker_observation_precedes_link_ensure_and_enqueue() {
         [
             "fetch_registry",
             "fetch_authorization",
-            "observe_recovery_marker",
             "ensure_link_with_peer",
             "propose_payment_request",
         ]
@@ -203,13 +193,14 @@ async fn recovery_marker_observation_precedes_link_ensure_and_enqueue() {
 }
 
 #[tokio::test]
-async fn recovery_marker_lookup_failure_never_ensures_or_enqueues() {
+async fn link_observation_failure_never_enqueues() {
     let selected = registry(true);
     let adapter = FakeAdapter {
         registry: selected,
         authorization: Ok(ReaderAuthorization::Verified),
-        recovery_marker_error: Some(HandoffError::Retryable(RetryableHandoffCause::Transport)),
-        link_error: None,
+        link_error: Some(HandoffError::Retryable(
+            RetryableHandoffCause::LinkObservation,
+        )),
         payment_request_calls: Mutex::new(0),
         calls: Mutex::new(Vec::new()),
     };
@@ -217,7 +208,7 @@ async fn recovery_marker_lookup_failure_never_ensures_or_enqueues() {
     assert_eq!(
         handoff(&adapter, &payment_intent()).await,
         Err(HandoffFailure::Retryable(
-            RetryableHandoffStage::RecoveryMarkerObservation
+            RetryableHandoffStage::LinkEstablishment
         ))
     );
     assert_eq!(
@@ -225,35 +216,10 @@ async fn recovery_marker_lookup_failure_never_ensures_or_enqueues() {
         [
             "fetch_registry",
             "fetch_authorization",
-            "observe_recovery_marker"
+            "ensure_link_with_peer"
         ]
     );
     assert_eq!(*adapter.payment_request_calls.lock().unwrap(), 0);
-}
-
-#[tokio::test]
-async fn confirmed_absent_recovery_marker_continues_to_link_ensure() {
-    let selected = registry(true);
-    let adapter = FakeAdapter {
-        registry: selected,
-        authorization: Ok(ReaderAuthorization::Verified),
-        recovery_marker_error: None,
-        link_error: None,
-        payment_request_calls: Mutex::new(0),
-        calls: Mutex::new(Vec::new()),
-    };
-
-    handoff(&adapter, &payment_intent()).await.unwrap();
-
-    assert_eq!(*adapter.payment_request_calls.lock().unwrap(), 1);
-    assert!(
-        adapter
-            .calls
-            .lock()
-            .unwrap()
-            .windows(2)
-            .any(|calls| calls == ["observe_recovery_marker", "ensure_link_with_peer"])
-    );
 }
 
 fn adapter_with_authorization(
@@ -262,7 +228,6 @@ fn adapter_with_authorization(
     FakeAdapter {
         registry: registry(true),
         authorization,
-        recovery_marker_error: None,
         link_error: None,
         payment_request_calls: Mutex::new(0),
         calls: Mutex::new(Vec::new()),

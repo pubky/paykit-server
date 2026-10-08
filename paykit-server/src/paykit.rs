@@ -993,6 +993,9 @@ fn parse_peer(reader: &str) -> Result<PubkyPublicKey, HandoffError> {
 fn classify(error: PaykitSdkError) -> HandoffError {
     match error {
         PaykitSdkError::Protocol { .. } => HandoffError::Permanent,
+        PaykitSdkError::LinkObservation { .. } => {
+            HandoffError::Retryable(RetryableHandoffCause::LinkObservation)
+        }
         PaykitSdkError::Policy { .. } => HandoffError::Retryable(RetryableHandoffCause::Policy),
         PaykitSdkError::Storage { .. } => HandoffError::Retryable(RetryableHandoffCause::Storage),
         PaykitSdkError::Identity { .. } => HandoffError::Retryable(RetryableHandoffCause::Identity),
@@ -1021,13 +1024,6 @@ fn handoff_reader_authorization<T>(
         Err(PaykitSdkError::NotFound { .. }) => Ok(ReaderAuthorization::Missing),
         Err(PaykitSdkError::Protocol { .. }) => Ok(ReaderAuthorization::Invalid),
         Err(error) => Err(classify(error)),
-    }
-}
-
-fn retryable_recovery_observation(error: HandoffError) -> HandoffError {
-    match error {
-        HandoffError::Retryable(cause) => HandoffError::Retryable(cause),
-        HandoffError::Permanent => HandoffError::Retryable(RetryableHandoffCause::Other),
     }
 }
 
@@ -1066,16 +1062,6 @@ impl Adapter for PaykitAdapter {
     ) -> Result<crate::application::create_invoice::ReaderAuthorization, HandoffError> {
         let reader = parse_peer(reader)?;
         handoff_reader_authorization(self.sdk.paykit_noise_key_authorization(reader).await)
-    }
-
-    async fn observe_recovery_marker(&self, reader: &str) -> Result<(), HandoffError> {
-        let reader = parse_peer(reader)?;
-        self.sdk
-            .observe_encrypted_link_recovery_marker(reader)
-            .await
-            .map(|_| ())
-            .map_err(classify)
-            .map_err(retryable_recovery_observation)
     }
 
     async fn ensure_link_with_peer(&self, reader: &str) -> Result<(), HandoffError> {
@@ -1640,10 +1626,12 @@ mod tests {
     }
 
     #[test]
-    fn recovery_marker_observation_normalizes_permanent_sdk_errors_to_retryable() {
+    fn invalid_link_observation_is_retryable() {
         assert_eq!(
-            retryable_recovery_observation(HandoffError::Permanent),
-            HandoffError::Retryable(RetryableHandoffCause::Other)
+            classify(PaykitSdkError::LinkObservation {
+                context: "invalid recovery marker".into()
+            }),
+            HandoffError::Retryable(RetryableHandoffCause::LinkObservation)
         );
     }
 
