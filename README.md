@@ -81,6 +81,12 @@ Shared-state lock contention returns `503 dependency_unavailable`; callers can
 retry the read. Other storage or state-validation failures remain errors, not
 connection-state responses.
 
+Overlapping polls in one Server process for the same Creator and persisted Reader
+share an in-flight SDK read. Each
+request still authenticates and loads its invoice binding; completed observations
+and errors are not cached. Payment authorization, handoff, and verification keep
+their own fresh checks.
+
 `POST /setup/status` is the readiness check for an authenticated Creator. Its closed body is `{"creator":"pubky..."}` with optional `asset: "BTC"`, `"USD"`, or `"USDT"` to check whether approved receiving details can accept that denomination. Every signed route verifies Ed25519 over `b"paykit-http-signature-v1\0" + uppercase_method + b"\0" + exact_query_free_path + b"\0" + exact_raw_body`; there is no body-only fallback. It returns exactly one coarse state: `ready` when the persisted session, delegated key, App Registry entry, and hosted state are usable; `setup_required` when authority is absent or confirmed invalid; and `unavailable` for validation timeouts and storage, rate-limit, server, DNS, or transport failures. Untyped Pubky 401 responses are also `unavailable`: they cannot distinguish revoked grants from recoverable PoP failures. A revoked grant reported this way requires explicit reconnect. Callers must not convert `unavailable` into a new authorization flow.
 
 ### Setup iframe
