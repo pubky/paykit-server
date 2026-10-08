@@ -15,6 +15,13 @@ fn second_key() -> String {
     .to_string()
 }
 
+fn weak_key() -> String {
+    let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&[0; 32]).unwrap();
+    assert!(verifying_key.is_weak());
+    pubky::PublicKey::from(pubky::pkarr::PublicKey::try_from(verifying_key.as_bytes()).unwrap())
+        .to_string()
+}
+
 fn environment() -> ConfigEnvironment {
     ConfigEnvironment {
         database_url: Some("postgres://paykit:secret@localhost/paykit".to_owned()),
@@ -69,9 +76,11 @@ fn trusted_service_allowlist_accepts_two_distinct_canonical_keys() {
 #[test]
 fn trusted_service_allowlist_rejects_empty_invalid_and_duplicate_keys() {
     let duplicate = format!("\"{KEY}\", \"{KEY}\"");
+    let weak = format!("\"{}\"", weak_key());
     let cases = [
         ("", ConfigError::EmptyTrustedServicePublicKeys),
         ("\"not-a-key\"", ConfigError::InvalidTrustedServicePublicKey),
+        (weak.as_str(), ConfigError::InvalidTrustedServicePublicKey),
         (
             duplicate.as_str(),
             ConfigError::DuplicateTrustedServicePublicKey,
@@ -91,10 +100,12 @@ fn legacy_single_locks_key_is_rejected_after_explicit_allowlist_cutover() {
         &format!("[signed_services]\ntrusted_public_keys = [\"{KEY}\"]"),
         &format!("[locks]\ntrusted_public_key = \"{KEY}\""),
     );
-    assert!(matches!(
-        Config::from_toml_and_environment(&legacy, environment()),
-        Err(ConfigError::Toml)
-    ));
+    let error = Config::from_toml_and_environment(&legacy, environment()).unwrap_err();
+    assert_eq!(error, ConfigError::LegacyLocksTrustedPublicKey);
+    assert_eq!(
+        error.to_string(),
+        "[locks] trusted_public_key was replaced by [signed_services] trusted_public_keys"
+    );
 }
 
 #[test]

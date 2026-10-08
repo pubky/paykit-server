@@ -42,7 +42,15 @@ impl Config {
         toml_source: &str,
         environment: ConfigEnvironment,
     ) -> Result<Self, ConfigError> {
-        let raw: RawConfig = toml::from_str(toml_source).map_err(|_| ConfigError::Toml)?;
+        let value: toml::Value = toml::from_str(toml_source).map_err(|_| ConfigError::Toml)?;
+        if value
+            .get("locks")
+            .and_then(toml::Value::as_table)
+            .is_some_and(|locks| locks.contains_key("trusted_public_key"))
+        {
+            return Err(ConfigError::LegacyLocksTrustedPublicKey);
+        }
+        let raw: RawConfig = value.try_into().map_err(|_| ConfigError::Toml)?;
         let database_url = DatabaseUrl::parse(environment.database_url)?;
         let master_key = MasterKey::parse(environment.master_key)?;
         let signed_services = SignedServicesConfig::parse(raw.signed_services)?;
@@ -279,8 +287,11 @@ impl TrustedServicePublicKey {
             return Err(ConfigError::InvalidTrustedServicePublicKey);
         }
         let bytes = public_key.to_bytes();
-        VerifyingKey::from_bytes(&bytes)
+        let verifying_key = VerifyingKey::from_bytes(&bytes)
             .map_err(|_| ConfigError::InvalidTrustedServicePublicKey)?;
+        if verifying_key.is_weak() {
+            return Err(ConfigError::InvalidTrustedServicePublicKey);
+        }
         Ok(Self(bytes))
     }
 
@@ -568,6 +579,8 @@ pub enum ConfigError {
     InvalidUsdtRpc,
     #[error("configuration TOML is invalid")]
     Toml,
+    #[error("[locks] trusted_public_key was replaced by [signed_services] trusted_public_keys")]
+    LegacyLocksTrustedPublicKey,
     #[error("PAYKIT_DATABASE_URL is required")]
     MissingDatabaseUrl,
     #[error("PAYKIT_MASTER_KEY is required")]
@@ -579,7 +592,7 @@ pub enum ConfigError {
     #[error("PAYKIT_MASTER_KEY must be unpadded base64url encoding of exactly 32 bytes")]
     InvalidMasterKey,
     #[error(
-        "signed_services.trusted_public_keys entries must be canonical pubky-prefixed public keys"
+        "signed_services.trusted_public_keys entries must be valid canonical pubky-prefixed public keys"
     )]
     InvalidTrustedServicePublicKey,
     #[error("signed_services.trusted_public_keys must contain at least one key")]

@@ -202,7 +202,9 @@ Changing any of them after database initialization requires resetting the databa
 Trusted service keys are credentials rather than immutable deployment identity.
 Adding, removing, or replacing allowlisted keys does not alter persisted replay
 identity and does not require database reset. During rotation, deploy overlapping
-old and new public keys before removing old key.
+old and new public keys before removing old key. The allowlist is read at startup,
+so restart the server after each rotation step: add the new key, switch the signer,
+then remove the old key.
 
 Persisted application and schema compatibility across releases is intentionally unsupported during this pre-production phase. The `0.1.0-rc6` Paykit Server and `0.1.0-rc6` Locks rollout is coordinated: stop both services, deploy both versions, then start each service and let its one-time SQLx reset migration clear only its dedicated disposable prototype database while preserving `_sqlx_migrations`. Verify both migrations and services before allowing new invoice or verification work, then reacquire any required prototype state. Do not manually drop/recreate either database. Never run these reset migrations against production, staging, an unidentified database, or a database shared with unrelated applications.
 

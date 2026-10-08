@@ -13,6 +13,7 @@ use axum::{
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use ed25519_dalek::{Signer, SigningKey};
 use paykit_server::{
+    Server,
     config::{Config, ConfigEnvironment},
     http::auth::{AuthProcessingObserver, AuthenticatedJson, SignedServiceAuth},
     runtime::{DependencyCheck, Runtime, operational_router},
@@ -148,17 +149,11 @@ async fn every_signed_business_path_accepts_each_trusted_service_key() {
     let first = SigningKey::from_bytes(&[7; 32]);
     let second = SigningKey::from_bytes(&[8; 32]);
     let unlisted = SigningKey::from_bytes(&[9; 32]);
-    let auth = Arc::new(SignedServiceAuth::from_config(&config_for_keys(
-        &[&first, &second],
-        100,
-        200,
-        16 * 1024,
-    )));
-    let mut router = Router::new();
-    for path in SIGNED_PATHS {
-        router = router.route(path, post(test_endpoint));
-    }
-    let router = router.layer(Extension(auth));
+    let config = config_for_keys(&[&first, &second], 100, 200, 16 * 1024);
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .connect_lazy("postgres://127.0.0.1:1/paykit")
+        .unwrap();
+    let router = Server::build(config, pool).await.unwrap().router();
 
     for path in SIGNED_PATHS {
         for key in [&first, &second] {
@@ -171,7 +166,8 @@ async fn every_signed_business_path_accepts_each_trusted_service_key() {
                 ))
                 .await
                 .unwrap();
-            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            assert_ne!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+            assert_ne!(response.status(), StatusCode::NOT_FOUND, "{path}");
         }
         let response = router
             .clone()
