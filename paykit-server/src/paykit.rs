@@ -286,6 +286,26 @@ impl std::fmt::Debug for PaykitAdapter {
 }
 
 impl PaykitAdapter {
+    pub(crate) async fn execute_claimed_handoff_with_guard(
+        &self,
+        guard: &tokio::sync::OwnedMutexGuard<()>,
+        store: &OutboxStore,
+        claim: &ClaimedOutbox,
+        intent: &DeliveryIntentV1,
+    ) -> Result<HandoffResult, HandoffFailure> {
+        assert!(Arc::ptr_eq(
+            &self.mutation_lock,
+            tokio::sync::OwnedMutexGuard::mutex(guard)
+        ));
+        match store.claim_handoff_eligible(claim).await {
+            Ok(true) => handoff_steps(self, intent).await,
+            Ok(false) => Err(HandoffFailure::Permanent),
+            Err(_) => Err(HandoffFailure::Retryable(
+                RetryableHandoffStage::AdapterUnavailable,
+            )),
+        }
+    }
+
     /// Persists the mixed private stream before the SDK sends confirmations.
     /// No request is claimed, accepted, or executed by the server.
     /// Lock or revision contention is deferred to the next poll; other failures take precedence.
@@ -897,7 +917,7 @@ fn check_transport_results(results: &[paykit_sdk::Result<()>]) -> paykit_sdk::Re
 
 type CreatorMutationLock = TokioMutex<()>;
 
-fn creator_mutation_lock(creator_id: Uuid) -> Arc<CreatorMutationLock> {
+pub(crate) fn creator_mutation_lock(creator_id: Uuid) -> Arc<CreatorMutationLock> {
     static LOCKS: OnceLock<StdMutex<HashMap<Uuid, Weak<CreatorMutationLock>>>> = OnceLock::new();
     let registry = LOCKS.get_or_init(|| StdMutex::new(HashMap::new()));
     let mut registry = registry
@@ -965,14 +985,9 @@ impl Adapter for PaykitAdapter {
         claim: &ClaimedOutbox,
         intent: &DeliveryIntentV1,
     ) -> Result<HandoffResult, HandoffFailure> {
-        let _guard = self.mutation_lock.lock().await;
-        match store.claim_handoff_eligible(claim).await {
-            Ok(true) => handoff_steps(self, intent).await,
-            Ok(false) => Err(HandoffFailure::Permanent),
-            Err(_) => Err(HandoffFailure::Retryable(
-                RetryableHandoffStage::AdapterUnavailable,
-            )),
-        }
+        let guard = self.mutation_lock.clone().lock_owned().await;
+        self.execute_claimed_handoff_with_guard(&guard, store, claim, intent)
+            .await
     }
 
     async fn execute_handoff(
