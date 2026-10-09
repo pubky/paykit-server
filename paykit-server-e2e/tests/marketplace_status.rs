@@ -1,4 +1,4 @@
-use std::{str::FromStr, sync::Arc};
+use std::{str::FromStr, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use bitcoin::{OutPoint, Txid};
@@ -186,7 +186,7 @@ async fn status_scopes_owner_and_projects_publication_and_resolution() {
             creator: &creator(),
             invoice_id,
             total_sats: 100,
-            proposal_acceptance_seconds: 30 * 60,
+            proposal_acceptance_window: Duration::from_secs(30 * 60),
         })
         .await
         .unwrap()
@@ -285,7 +285,7 @@ async fn bitcoin_evidence_keeps_identity_amount_and_first_observation_immutable(
             creator: &creator(),
             invoice_id,
             total_sats: 100,
-            proposal_acceptance_seconds: 30 * 60,
+            proposal_acceptance_window: Duration::from_secs(30 * 60),
         })
         .await
         .unwrap()
@@ -568,7 +568,7 @@ async fn malformed_active_relations_fail_closed() {
             creator: &creator(),
             invoice_id,
             total_sats: 100,
-            proposal_acceptance_seconds: 30 * 60,
+            proposal_acceptance_window: Duration::from_secs(30 * 60),
         })
         .await
         .unwrap();
@@ -605,7 +605,7 @@ async fn lifecycle_states_project_and_exception_states_fail_closed() {
                 creator: &creator(),
                 invoice_id,
                 total_sats: 100,
-                proposal_acceptance_seconds: 30 * 60,
+                proposal_acceptance_window: Duration::from_secs(30 * 60),
             })
             .await
             .unwrap()
@@ -641,7 +641,7 @@ async fn lifecycle_states_project_and_exception_states_fail_closed() {
                 creator: &creator(),
                 invoice_id,
                 total_sats: 100,
-                proposal_acceptance_seconds: 30 * 60,
+                proposal_acceptance_window: Duration::from_secs(30 * 60),
             })
             .await
             .unwrap();
@@ -736,7 +736,7 @@ async fn deadline_expiry_underpayment_and_late_match_are_projected() {
             creator: &creator(),
             invoice_id,
             total_sats: 100,
-            proposal_acceptance_seconds: 30 * 60,
+            proposal_acceptance_window: Duration::from_secs(30 * 60),
         })
         .await
         .unwrap()
@@ -865,7 +865,7 @@ async fn observation_waits_for_creator_before_locking_preparation() {
             creator: &creator(),
             invoice_id,
             total_sats: 100,
-            proposal_acceptance_seconds: 30 * 60,
+            proposal_acceptance_window: Duration::from_secs(30 * 60),
         })
         .await
         .unwrap()
@@ -925,7 +925,7 @@ async fn observation_evidence_rejects_direct_rewrite_and_delete() {
             creator: &creator(),
             invoice_id,
             total_sats: 100,
-            proposal_acceptance_seconds: 30 * 60,
+            proposal_acceptance_window: Duration::from_secs(30 * 60),
         })
         .await
         .unwrap()
