@@ -163,6 +163,7 @@ fn account_xpub() -> String {
 
 struct FakeStore {
     preflight: MarketplacePreparationPreflight,
+    prepare_error: Option<PersistenceError>,
     prepare_calls: AtomicUsize,
     captured_reference: Mutex<Option<String>>,
 }
@@ -171,6 +172,16 @@ impl FakeStore {
     fn new(preflight: MarketplacePreparationPreflight) -> Self {
         Self {
             preflight,
+            prepare_error: None,
+            prepare_calls: AtomicUsize::default(),
+            captured_reference: Mutex::new(None),
+        }
+    }
+
+    fn with_prepare_error(error: PersistenceError) -> Self {
+        Self {
+            preflight: MarketplacePreparationPreflight::New,
+            prepare_error: Some(error),
             prepare_calls: AtomicUsize::default(),
             captured_reference: Mutex::new(None),
         }
@@ -193,6 +204,9 @@ impl MarketplacePreparationPersistence for FakeStore {
         input: MarketplacePreparationInput<'_>,
     ) -> Result<MarketplacePreparationResult, PersistenceError> {
         self.prepare_calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(error) = self.prepare_error {
+            return Err(error);
+        }
         if self.preflight == MarketplacePreparationPreflight::New {
             let payloads = input.payloads.for_child_index(0)?;
             *self.captured_reference.lock().unwrap() = Some(
@@ -276,6 +290,36 @@ fn service(preflight: MarketplacePreparationPreflight) -> Deps {
         calls: AtomicUsize::default(),
     });
     let store = Arc::new(FakeStore::new(preflight));
+    let service = Arc::new(PrepareMarketplaceService::new(
+        session.clone(),
+        registries.clone(),
+        credentials.clone(),
+        store.clone(),
+        paykit_lib::PaykitAppId::new("paykit-server").unwrap(),
+        BitcoinNetwork::Mainnet,
+        Duration::from_secs(24 * 60 * 60),
+        Duration::from_secs(15 * 60),
+    ));
+    Deps {
+        service,
+        session,
+        registries,
+        credentials,
+        store,
+    }
+}
+
+fn service_with_prepare_error(error: PersistenceError) -> Deps {
+    let session = Arc::new(FakeSession {
+        calls: AtomicUsize::default(),
+    });
+    let registries = Arc::new(FakeRegistries {
+        calls: AtomicUsize::default(),
+    });
+    let credentials = Arc::new(FakeCredentials {
+        calls: AtomicUsize::default(),
+    });
+    let store = Arc::new(FakeStore::with_prepare_error(error));
     let service = Arc::new(PrepareMarketplaceService::new(
         session.clone(),
         registries.clone(),
@@ -508,4 +552,27 @@ async fn signed_prepare_route_has_closed_request_and_response() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn prepare_route_preserves_binding_conflict_but_not_storage_invariant_failure() {
+    let key = SigningKey::from_bytes(&[11; 32]);
+    let conflict = service(MarketplacePreparationPreflight::Conflict);
+    let conflict_router =
+        marketplace_preparation_router(conflict.service).layer(Extension(signed_auth(&key)));
+    let response = conflict_router
+        .oneshot(signed_request(&key, body(false)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+
+    let invariant = service_with_prepare_error(PersistenceError::CorruptOrMissing);
+    let invariant_router =
+        marketplace_preparation_router(invariant.service).layer(Extension(signed_auth(&key)));
+    let response = invariant_router
+        .oneshot(signed_request(&key, body(false)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_ne!(response.status(), StatusCode::CONFLICT);
 }

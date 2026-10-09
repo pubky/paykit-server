@@ -12,7 +12,8 @@ CREATE TABLE marketplace_payment_preparations (
     prepare_expires_at TIMESTAMPTZ NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE (creator_id, operation_lookup_hash),
+    CONSTRAINT marketplace_preparation_operation_binding_key
+        UNIQUE (creator_id, operation_lookup_hash),
     CONSTRAINT marketplace_preparation_expiry_after_creation
         CHECK (prepare_expires_at > prepared_at)
 );

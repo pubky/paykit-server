@@ -230,3 +230,45 @@ async fn preparation_is_durable_unpublished_and_replay_first() {
 
     database.cleanup().await;
 }
+
+#[tokio::test]
+async fn non_unique_insert_failure_is_not_an_idempotency_conflict() {
+    let database = TestDatabase::create().await;
+    let store = store(&database).await;
+    let creator = creator();
+    let reader = reader();
+
+    sqlx::query(
+        "CREATE FUNCTION reject_marketplace_preparation() RETURNS trigger AS $$
+         BEGIN
+             RAISE EXCEPTION 'forced non-unique insertion failure' USING ERRCODE = '23514';
+         END;
+         $$ LANGUAGE plpgsql",
+    )
+    .execute(database.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER reject_marketplace_preparation
+         BEFORE INSERT ON marketplace_payment_preparations
+         FOR EACH ROW EXECUTE FUNCTION reject_marketplace_preparation()",
+    )
+    .execute(database.pool())
+    .await
+    .unwrap();
+
+    assert_eq!(
+        store
+            .prepare(input(
+                &creator,
+                &reader,
+                "marketplace-payment:order-2:attempt-1",
+                b"request-two",
+            ))
+            .await,
+        Err(PersistenceError::CorruptOrMissing),
+        "a PostgreSQL check/invariant failure must fail closed, not become Conflict/HTTP 409"
+    );
+
+    database.cleanup().await;
+}

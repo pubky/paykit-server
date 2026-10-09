@@ -14,6 +14,8 @@ use crate::{
     persistence::PersistenceError,
 };
 
+const OPERATION_BINDING_UNIQUE_CONSTRAINT: &str = "marketplace_preparation_operation_binding_key";
+
 /// Opaque inputs for one atomic Marketplace preparation.
 pub struct MarketplacePreparationInput<'a> {
     pub creator: &'a CreatorPubky,
@@ -298,7 +300,7 @@ impl MarketplacePreparationStore {
         .bind(prepare_expires_at)
         .execute(&mut *tx)
         .await
-        .map_err(|_| PersistenceError::Conflict)?;
+        .map_err(classify_preparation_insert_error)?;
         sqlx::query(
             "UPDATE creators SET next_child_index = next_child_index + 1, updated_at = NOW()
              WHERE id = $1",
@@ -460,4 +462,30 @@ fn stored_hash(bytes: &[u8]) -> Result<LookupHash, PersistenceError> {
         .try_into()
         .map_err(|_| PersistenceError::CorruptOrMissing)?;
     Ok(LookupHash::from_bytes(bytes))
+}
+
+fn classify_preparation_insert_error(error: sqlx::Error) -> PersistenceError {
+    match error {
+        sqlx::Error::Database(error)
+            if error.is_unique_violation()
+                && error.constraint() == Some(OPERATION_BINDING_UNIQUE_CONSTRAINT) =>
+        {
+            PersistenceError::Conflict
+        }
+        sqlx::Error::Database(_) => PersistenceError::CorruptOrMissing,
+        _ => PersistenceError::Unavailable,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn insert_transport_failure_is_unavailable() {
+        assert_eq!(
+            classify_preparation_insert_error(sqlx::Error::PoolClosed),
+            PersistenceError::Unavailable
+        );
+    }
 }
