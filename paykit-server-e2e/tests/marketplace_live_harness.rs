@@ -333,6 +333,10 @@ async fn serve_for_marketplace() {
     let _ = shutdown_tx.send(());
     running.await.unwrap().unwrap();
     drop(testnet);
+    // Homeserver tasks release their final database handles after cancellation
+    // is observed by the runtime; let those destructors register the test DB.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    pubky_testnet::drop_test_databases().await;
     pool.close().await;
     database.cleanup().await;
     let _ = std::fs::remove_file(&handoff);
