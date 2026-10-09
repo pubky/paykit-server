@@ -29,11 +29,8 @@ struct StatusBody {
 #[derive(Serialize)]
 struct BitcoinResponse {
     txid: String,
-    vout: u32,
     observed_sats: u64,
-    first_observed_at: String,
     confirmations: u32,
-    present: bool,
     amount_matched: bool,
     paid_on_time: bool,
 }
@@ -94,23 +91,20 @@ fn response(status: MarketplaceInvoiceStatus) -> Result<StatusResponse, ApiError
         payment_state: status.payment_state,
         activated_at: format_optional(status.activated_at)?,
         payment_deadline: format_optional(status.payment_deadline)?,
-        bitcoin: status.bitcoin.map(bitcoin_response).transpose()?,
+        bitcoin: status.bitcoin.map(bitcoin_response),
         outcome: status.outcome,
         resolved_at: format_optional(status.resolved_at)?,
     })
 }
 
-fn bitcoin_response(status: MarketplaceBitcoinStatus) -> Result<BitcoinResponse, ApiError> {
-    Ok(BitcoinResponse {
+fn bitcoin_response(status: MarketplaceBitcoinStatus) -> BitcoinResponse {
+    BitcoinResponse {
         txid: status.txid,
-        vout: status.vout,
         observed_sats: status.observed_sats,
-        first_observed_at: format(status.first_observed_at)?,
         confirmations: status.confirmations,
-        present: status.present,
         amount_matched: status.amount_matched,
         paid_on_time: status.paid_on_time,
-    })
+    }
 }
 
 fn format_optional(value: Option<OffsetDateTime>) -> Result<Option<String>, ApiError> {
@@ -118,7 +112,7 @@ fn format_optional(value: Option<OffsetDateTime>) -> Result<Option<String>, ApiE
 }
 
 fn format(value: OffsetDateTime) -> Result<String, ApiError> {
-    value.format(&Rfc3339).map_err(|_| ApiError::InternalError)
+    value.format(&Rfc3339).map_err(|_| ApiError::Unavailable)
 }
 
 fn parse_uuid(value: &str) -> Result<Uuid, ApiError> {

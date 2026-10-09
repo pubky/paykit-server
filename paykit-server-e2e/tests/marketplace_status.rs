@@ -6,7 +6,7 @@ use paykit_sdk::PaykitIdentitySecretKey;
 use paykit_server::{
     application::marketplace_status::{
         MarketplaceBitcoinStatus, MarketplaceInvoiceStatus, MarketplaceStatusError,
-        MarketplaceStatusPersistence,
+        MarketplaceStatusPersistence, MarketplaceStatusService,
     },
     bitcoin::{ObservationTarget, ObservedOutput},
     config::BitcoinNetwork,
@@ -98,6 +98,13 @@ async fn store(database: &TestDatabase) -> MarketplacePreparationStore {
 async fn prepare(
     store: &MarketplacePreparationStore,
 ) -> paykit_server::persistence::MarketplacePreparationResult {
+    prepare_with_window(store, 24 * 60 * 60).await
+}
+
+async fn prepare_with_window(
+    store: &MarketplacePreparationStore,
+    payment_window_seconds: u64,
+) -> paykit_server::persistence::MarketplacePreparationResult {
     store
         .prepare(MarketplacePreparationInput {
             creator: &creator(),
@@ -106,12 +113,28 @@ async fn prepare(
             operation_id: "marketplace-payment:order-1:attempt-1",
             request_binding: b"request-one",
             total_sats: 100,
-            payment_window_seconds: 24 * 60 * 60,
+            payment_window_seconds,
             prepare_ttl_seconds: 15 * 60,
             payloads: &Payloads,
         })
         .await
         .unwrap()
+}
+
+async fn insert_lifecycle(database: &TestDatabase, invoice_id: uuid::Uuid, state: &str) {
+    sqlx::query(
+        "INSERT INTO payment_request_lifecycles (
+             marketplace_preparation_id, sdk_payment_request_id, request_state,
+             state_event_id, last_stream_item_id, last_event_at
+         ) VALUES ($1, $2, $3, $4, 1, clock_timestamp())",
+    )
+    .bind(invoice_id)
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(state)
+    .bind(uuid::Uuid::new_v4().to_string())
+    .execute(database.pool())
+    .await
+    .unwrap();
 }
 
 struct FixedBatch(Vec<ObservedOutput>);
@@ -564,6 +587,73 @@ async fn malformed_active_relations_fail_closed() {
 }
 
 #[tokio::test]
+async fn lifecycle_states_project_and_exception_states_fail_closed() {
+    for state in [
+        "proposed",
+        "proposal_expired",
+        "accepted",
+        "rejected",
+        "canceled",
+        "proof_submitted",
+        "active_recurring",
+    ] {
+        let database = TestDatabase::create().await;
+        let store = store(&database).await;
+        let invoice_id = prepare(&store).await.invoice_id();
+        let activated = store
+            .activate(MarketplaceActivationInput {
+                creator: &creator(),
+                invoice_id,
+                total_sats: 100,
+                proposal_acceptance_seconds: 30 * 60,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        insert_lifecycle(&database, invoice_id, state).await;
+
+        assert_eq!(
+            store.status(&creator(), invoice_id).await.unwrap(),
+            Some(MarketplaceInvoiceStatus::active(
+                invoice_id,
+                "pending",
+                Some(state),
+                "undetected",
+                activated.activated_at(),
+                activated.payment_deadline(),
+                None,
+                None,
+                None,
+            ))
+        );
+        database.cleanup().await;
+    }
+
+    for (state, expected) in [
+        ("recovery_required", MarketplaceStatusError::Unavailable),
+        ("invalid_conflict", MarketplaceStatusError::Conflict),
+    ] {
+        let database = TestDatabase::create().await;
+        let store = store(&database).await;
+        let invoice_id = prepare(&store).await.invoice_id();
+        store
+            .activate(MarketplaceActivationInput {
+                creator: &creator(),
+                invoice_id,
+                total_sats: 100,
+                proposal_acceptance_seconds: 30 * 60,
+            })
+            .await
+            .unwrap();
+        insert_lifecycle(&database, invoice_id, state).await;
+        let service = MarketplaceStatusService::new(Arc::new(store));
+
+        assert_eq!(service.status(&creator(), invoice_id).await, Err(expected));
+        database.cleanup().await;
+    }
+}
+
+#[tokio::test]
 async fn inactive_resolution_and_encrypted_address_reconciliation_are_projected() {
     let database = TestDatabase::create().await;
     let store = store(&database).await;
@@ -632,6 +722,194 @@ async fn inactive_resolution_and_encrypted_address_reconciliation_are_projected(
         store.reconcile_bitcoin_address_hashes().await,
         Err(PersistenceError::CorruptOrMissing)
     );
+
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn deadline_expiry_underpayment_and_late_match_are_projected() {
+    let database = TestDatabase::create().await;
+    let store = store(&database).await;
+    let invoice_id = prepare_with_window(&store, 2).await.invoice_id();
+    let activated = store
+        .activate(MarketplaceActivationInput {
+            creator: &creator(),
+            invoice_id,
+            total_sats: 100,
+            proposal_acceptance_seconds: 30 * 60,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    let deadline = activated.payment_deadline();
+
+    let targets = store.observation_targets().await.unwrap();
+    let underpaid = outpoint(20);
+    observe_marketplace_once_at(
+        &FixedBatch(vec![ObservedOutput {
+            network: BitcoinNetwork::Regtest,
+            address: ADDRESS.into(),
+            outpoint: underpaid,
+            sats: 99,
+            confirmations: 1,
+            present: true,
+        }]),
+        &store,
+        &BitcoinNetwork::Regtest,
+        &targets,
+        activated.activated_at() + time::Duration::milliseconds(500),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        store.status(&creator(), invoice_id).await.unwrap(),
+        Some(MarketplaceInvoiceStatus::active(
+            invoice_id,
+            "pending",
+            None,
+            "confirmed",
+            activated.activated_at(),
+            deadline,
+            Some(MarketplaceBitcoinStatus::new(
+                underpaid.txid.to_string(),
+                underpaid.vout,
+                99,
+                activated.activated_at() + time::Duration::milliseconds(500),
+                1,
+                true,
+                false,
+                false,
+            )),
+            None,
+            None,
+        ))
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(2_100)).await;
+    assert_eq!(
+        store.status(&creator(), invoice_id).await.unwrap(),
+        Some(MarketplaceInvoiceStatus::active(
+            invoice_id,
+            "pending",
+            None,
+            "expired",
+            activated.activated_at(),
+            deadline,
+            Some(MarketplaceBitcoinStatus::new(
+                underpaid.txid.to_string(),
+                underpaid.vout,
+                99,
+                activated.activated_at() + time::Duration::milliseconds(500),
+                1,
+                true,
+                false,
+                false,
+            )),
+            None,
+            None,
+        ))
+    );
+
+    let late = outpoint(21);
+    let targets = store.observation_targets().await.unwrap();
+    observe_marketplace_once_at(
+        &FixedBatch(vec![ObservedOutput {
+            network: BitcoinNetwork::Regtest,
+            address: ADDRESS.into(),
+            outpoint: late,
+            sats: 100,
+            confirmations: 1,
+            present: true,
+        }]),
+        &store,
+        &BitcoinNetwork::Regtest,
+        &targets,
+        deadline + time::Duration::seconds(1),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        store.status(&creator(), invoice_id).await.unwrap(),
+        Some(MarketplaceInvoiceStatus::active(
+            invoice_id,
+            "pending",
+            None,
+            "expired",
+            activated.activated_at(),
+            deadline,
+            Some(MarketplaceBitcoinStatus::new(
+                late.txid.to_string(),
+                late.vout,
+                100,
+                deadline + time::Duration::seconds(1),
+                1,
+                true,
+                true,
+                false,
+            )),
+            None,
+            None,
+        ))
+    );
+
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn observation_waits_for_creator_before_locking_preparation() {
+    let database = TestDatabase::create().await;
+    let store = store(&database).await;
+    let invoice_id = prepare(&store).await.invoice_id();
+    let activated = store
+        .activate(MarketplaceActivationInput {
+            creator: &creator(),
+            invoice_id,
+            total_sats: 100,
+            proposal_acceptance_seconds: 30 * 60,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    let creator_id: uuid::Uuid =
+        sqlx::query_scalar("SELECT creator_id FROM marketplace_payment_preparations WHERE id = $1")
+            .bind(invoice_id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    let mut blocker = database.pool().begin().await.unwrap();
+    sqlx::query("SELECT id FROM creators WHERE id = $1 FOR UPDATE")
+        .bind(creator_id)
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+
+    let observed_at = activated.activated_at() + time::Duration::seconds(1);
+    let store_for_task = store.clone();
+    let mut task = tokio::spawn(async move {
+        let targets = store_for_task.observation_targets().await.unwrap();
+        observe_marketplace_once_at(
+            &FixedBatch(vec![ObservedOutput {
+                network: BitcoinNetwork::Regtest,
+                address: ADDRESS.into(),
+                outpoint: outpoint(30),
+                sats: 100,
+                confirmations: 0,
+                present: true,
+            }]),
+            &store_for_task,
+            &BitcoinNetwork::Regtest,
+            &targets,
+            observed_at,
+        )
+        .await
+    });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(500), &mut task)
+            .await
+            .is_err()
+    );
+    blocker.rollback().await.unwrap();
+    assert_eq!(task.await.unwrap(), Ok(1));
 
     database.cleanup().await;
 }

@@ -148,12 +148,9 @@ async fn signed_status_has_exact_closed_active_fixture() {
             "bitcoin":{
                 "amount_matched":true,
                 "confirmations":3,
-                "first_observed_at":"1970-01-01T01:00:00Z",
                 "observed_sats":50000,
                 "paid_on_time":true,
-                "present":true,
-                "txid":"0000000000000000000000000000000000000000000000000000000000000001",
-                "vout":2
+                "txid":"0000000000000000000000000000000000000000000000000000000000000001"
             },
             "invoice_id":INVOICE_ID,
             "outcome":"paid_manually",
@@ -165,6 +162,41 @@ async fn signed_status_has_exact_closed_active_fixture() {
             "state":"active"
         })
     );
+}
+
+#[tokio::test]
+async fn unrepresentable_persisted_timestamp_is_unavailable() {
+    let key = SigningKey::from_bytes(&[11; 32]);
+    let unrepresentable = time::Date::from_calendar_date(-1, time::Month::January, 1)
+        .unwrap()
+        .midnight()
+        .assume_utc();
+    let status = MarketplaceInvoiceStatus::active(
+        INVOICE_ID,
+        "delivered",
+        Some("accepted"),
+        "confirmed",
+        unrepresentable,
+        unrepresentable,
+        None,
+        None,
+        None,
+    );
+    let response = marketplace_status_router(Arc::new(MarketplaceStatusService::new(Arc::new(
+        FakeStore {
+            result: Ok(Some(status)),
+        },
+    ))))
+    .layer(Extension(signed_auth(&key)))
+    .oneshot(request(
+        &key,
+        serde_json::json!({"creator":CREATOR,"invoice_id":INVOICE_ID}),
+    ))
+    .await
+    .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body(response).await["error"]["code"], "unavailable");
 }
 
 #[tokio::test]
