@@ -36,6 +36,7 @@ enum Outcome {
     Success,
     Conflict,
     NotFound,
+    Corrupt,
 }
 
 struct FakeStore {
@@ -58,6 +59,7 @@ impl MarketplaceLifecyclePersistence for FakeStore {
             ))),
             Outcome::Conflict => Err(PersistenceError::Conflict),
             Outcome::NotFound => Ok(None),
+            Outcome::Corrupt => Err(PersistenceError::CorruptOrMissing),
         }
     }
 
@@ -74,6 +76,7 @@ impl MarketplaceLifecyclePersistence for FakeStore {
             ))),
             Outcome::Conflict => Err(PersistenceError::Conflict),
             Outcome::NotFound => Ok(None),
+            Outcome::Corrupt => Err(PersistenceError::CorruptOrMissing),
         }
     }
 }
@@ -226,7 +229,7 @@ async fn signed_activate_and_void_have_closed_success_fixtures() {
 }
 
 #[tokio::test]
-async fn lifecycle_conflict_and_not_found_use_stable_error_fixtures() {
+async fn lifecycle_failures_use_stable_error_fixtures() {
     let key = SigningKey::from_bytes(&[11; 32]);
     let path = "/marketplace/payment-requests/activate";
     let body = || {
@@ -261,6 +264,20 @@ async fn lifecycle_conflict_and_not_found_use_stable_error_fixtures() {
         serde_json::json!({"error":{
             "code":"not_found",
             "message":"requested resource was not found"
+        }})
+    );
+
+    let corrupt = marketplace_lifecycle_router(service(Outcome::Corrupt))
+        .layer(Extension(signed_auth(&key)))
+        .oneshot(signed_request(&key, path, body()))
+        .await
+        .unwrap();
+    assert_eq!(corrupt.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        json(corrupt).await,
+        serde_json::json!({"error":{
+            "code":"dependency_unavailable",
+            "message":"dependency is unavailable"
         }})
     );
 }

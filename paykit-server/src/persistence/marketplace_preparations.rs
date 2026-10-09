@@ -503,13 +503,18 @@ impl MarketplacePreparationStore {
         let payment_deadline = now
             .checked_add(Duration::seconds(window_seconds))
             .ok_or(PersistenceError::InvalidInput)?;
-        let proposal_seconds = input
-            .proposal_acceptance_seconds
-            .min(envelope.payment_window_seconds.saturating_sub(1));
-        let proposal_seconds =
-            i64::try_from(proposal_seconds).map_err(|_| PersistenceError::InvalidInput)?;
+        let proposal_duration = if window_seconds == 1 {
+            Duration::milliseconds(500)
+        } else {
+            let proposal_seconds = input
+                .proposal_acceptance_seconds
+                .min(envelope.payment_window_seconds - 1);
+            let proposal_seconds =
+                i64::try_from(proposal_seconds).map_err(|_| PersistenceError::InvalidInput)?;
+            Duration::seconds(proposal_seconds)
+        };
         let proposal_expires_at = now
-            .checked_add(Duration::seconds(proposal_seconds))
+            .checked_add(proposal_duration)
             .ok_or(PersistenceError::InvalidInput)?;
         envelope
             .payment_request_intent
@@ -801,7 +806,8 @@ impl MarketplacePreparationStore {
             &parse_reader(&envelope.reader).map_err(|_| PersistenceError::CorruptOrMissing)?,
             &envelope.reference,
             envelope.total_sats,
-        )?;
+        )
+        .map_err(|_| PersistenceError::CorruptOrMissing)?;
         Ok(envelope)
     }
 

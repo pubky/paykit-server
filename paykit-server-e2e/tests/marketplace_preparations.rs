@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use paykit_sdk::PaykitIdentitySecretKey;
 use paykit_server::{
-    crypto::Crypto,
+    application::semantic_intent::DeliveryIntentV1,
+    crypto::{Crypto, EncryptedEnvelope, EnvelopeContext},
     domain::locks::{CreatorPubky, ReaderPubky, parse_creator, parse_reader},
     persistence::{
         CreatorCredentials, CreatorStore, MarketplaceActivationInput, MarketplacePreparationInput,
@@ -11,6 +12,8 @@ use paykit_server::{
     },
 };
 use paykit_server_e2e::postgres::TestDatabase;
+use serde::{Deserialize, Serialize};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 mod common;
 
@@ -36,6 +39,22 @@ fn crypto() -> Arc<Crypto> {
 }
 
 struct Payloads;
+
+#[derive(Serialize, Deserialize)]
+struct StoredPreparationEnvelopeV1 {
+    version: u8,
+    operation_id: String,
+    request_binding: Vec<u8>,
+    reader: String,
+    reference: String,
+    total_sats: u64,
+    payment_window_seconds: u64,
+    prepare_ttl_seconds: u64,
+    prepared_at: OffsetDateTime,
+    prepare_expires_at: OffsetDateTime,
+    child_index: i64,
+    payment_request_intent: DeliveryIntentV1,
+}
 
 impl MarketplacePreparationPayloadFactory for Payloads {
     fn for_child_index(
@@ -86,6 +105,24 @@ fn input_with_ttl<'a>(
     request_binding: &'a [u8],
     prepare_ttl_seconds: u64,
 ) -> MarketplacePreparationInput<'a> {
+    input_with_ttl_and_window(
+        creator,
+        reader,
+        operation_id,
+        request_binding,
+        prepare_ttl_seconds,
+        24 * 60 * 60,
+    )
+}
+
+fn input_with_ttl_and_window<'a>(
+    creator: &'a CreatorPubky,
+    reader: &'a ReaderPubky,
+    operation_id: &'a str,
+    request_binding: &'a [u8],
+    prepare_ttl_seconds: u64,
+    payment_window_seconds: u64,
+) -> MarketplacePreparationInput<'a> {
     MarketplacePreparationInput {
         creator,
         reader,
@@ -93,7 +130,7 @@ fn input_with_ttl<'a>(
         operation_id,
         request_binding,
         total_sats: 100,
-        payment_window_seconds: 24 * 60 * 60,
+        payment_window_seconds,
         prepare_ttl_seconds,
         payloads: &Payloads,
     }
@@ -512,6 +549,118 @@ async fn activation_rejects_wrong_total_expiry_and_prepared_resolution_without_p
             .await
             .unwrap(),
         0
+    );
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn shortest_payment_window_still_has_a_usable_proposal_interval() {
+    let database = TestDatabase::create().await;
+    let store = store(&database).await;
+    let creator = creator();
+    let reader = reader();
+    let prepared = store
+        .prepare(input_with_ttl_and_window(
+            &creator,
+            &reader,
+            "marketplace-payment:short-window:attempt-1",
+            b"short-window",
+            60,
+            1,
+        ))
+        .await
+        .unwrap();
+
+    let activated = store
+        .activate(MarketplaceActivationInput {
+            creator: &creator,
+            invoice_id: prepared.invoice_id(),
+            total_sats: 100,
+            proposal_acceptance_seconds: 30 * 60,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    let outbox = OutboxStore::new(database.pool(), crypto());
+    let claims = outbox
+        .claim(uuid::Uuid::new_v4(), 1, std::time::Duration::from_secs(30))
+        .await
+        .unwrap();
+    let intent = outbox.delivery_intent(&claims[0]).unwrap();
+    let proposal_expires_at = OffsetDateTime::parse(
+        intent
+            .terms()
+            .unwrap()
+            .proposal_expires_at
+            .as_deref()
+            .unwrap(),
+        &Rfc3339,
+    )
+    .unwrap();
+
+    assert!(activated.activated_at() < proposal_expires_at);
+    assert!(proposal_expires_at < activated.payment_deadline());
+    assert_eq!(
+        activated.payment_deadline() - activated.activated_at(),
+        time::Duration::seconds(1)
+    );
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn authenticated_invalid_stored_intent_is_corrupt_not_caller_input() {
+    let database = TestDatabase::create().await;
+    let store = store(&database).await;
+    let creator = creator();
+    let reader = reader();
+    let prepared = store
+        .prepare(input(
+            &creator,
+            &reader,
+            "marketplace-payment:invalid-stored-intent:attempt-1",
+            b"invalid-stored-intent",
+        ))
+        .await
+        .unwrap();
+    let encrypted: Vec<u8> = sqlx::query_scalar(
+        "SELECT preparation_envelope FROM marketplace_payment_preparations WHERE id = $1",
+    )
+    .bind(prepared.invoice_id())
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    let crypto = crypto();
+    let context = EnvelopeContext::marketplace_preparation(
+        crypto.lookup_hash(creator.to_string().as_bytes()),
+        prepared.invoice_id(),
+    );
+    let plaintext = crypto
+        .decrypt(&context, &EncryptedEnvelope::from_bytes(encrypted))
+        .unwrap();
+    let mut envelope: StoredPreparationEnvelopeV1 = postcard::from_bytes(&plaintext).unwrap();
+    envelope.reference = "53efc9fd-72b2-47b7-94c4-1d66dcad0018".into();
+    let tampered = crypto
+        .encrypt(&context, &postcard::to_allocvec(&envelope).unwrap())
+        .unwrap();
+    sqlx::query(
+        "UPDATE marketplace_payment_preparations SET preparation_envelope = $2 WHERE id = $1",
+    )
+    .bind(prepared.invoice_id())
+    .bind(tampered.as_bytes())
+    .execute(database.pool())
+    .await
+    .unwrap();
+
+    assert_eq!(
+        store
+            .activate(MarketplaceActivationInput {
+                creator: &creator,
+                invoice_id: prepared.invoice_id(),
+                total_sats: 100,
+                proposal_acceptance_seconds: 30 * 60,
+            })
+            .await,
+        Err(PersistenceError::CorruptOrMissing)
     );
     database.cleanup().await;
 }
