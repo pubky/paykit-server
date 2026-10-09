@@ -54,7 +54,14 @@ async fn prepare(
         Ok(result) => {
             let prepare_expires_at = match result.prepare_expires_at().format(&Rfc3339) {
                 Ok(value) => value,
-                Err(_) => return ApiError::InternalError.into_response(),
+                Err(_) => {
+                    crate::diagnostics::failure(
+                        "marketplace_prepare",
+                        "response_serialization",
+                        "invalid_prepare_expires_at",
+                    );
+                    return ApiError::InternalError.into_response();
+                }
             };
             (
                 StatusCode::OK,
@@ -67,7 +74,14 @@ async fn prepare(
             )
                 .into_response()
         }
-        Err(error) => map_error(error).into_response(),
+        Err(error) => {
+            crate::diagnostics::failure(
+                "marketplace_prepare",
+                "application_service",
+                error.diagnostic_label(),
+            );
+            map_error(error).into_response()
+        }
     }
 }
 
@@ -85,13 +99,15 @@ fn parse(body: PrepareBody) -> Result<PrepareMarketplaceRequest, ApiError> {
 fn map_error(error: PrepareMarketplaceError) -> ApiError {
     match error {
         PrepareMarketplaceError::InvalidRequest => ApiError::InvalidRequest,
-        PrepareMarketplaceError::Conflict => ApiError::Conflict,
+        PrepareMarketplaceError::Conflict => ApiError::OperationConflict,
         PrepareMarketplaceError::CreatorSessionInvalid => ApiError::CreatorSessionInvalid,
         PrepareMarketplaceError::CreatorSessionUnavailable => ApiError::CreatorSessionUnavailable,
         PrepareMarketplaceError::ReaderSetupPending => ApiError::ReaderSetupPending,
         PrepareMarketplaceError::ReaderNotPayable => ApiError::ReaderNotPayable,
         PrepareMarketplaceError::ReaderRegistryUnavailable => ApiError::ReaderRegistryUnavailable,
         PrepareMarketplaceError::ReaderRegistryMalformed => ApiError::ReaderRegistryMalformed,
+        PrepareMarketplaceError::SellerSetupPending => ApiError::SellerSetupPending,
+        PrepareMarketplaceError::DeadlineExceeded => ApiError::DependencyTimeout,
         PrepareMarketplaceError::Unavailable => ApiError::DependencyUnavailable,
     }
 }

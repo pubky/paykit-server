@@ -20,6 +20,19 @@ fn creator() -> CreatorPubky {
     parse_creator(CREATOR).unwrap()
 }
 
+fn other_creator() -> CreatorPubky {
+    for replacement in "ybndrfg8ejkmcpqxot1uwisza345h769".chars() {
+        let mut candidate = CREATOR.to_owned();
+        candidate.replace_range(6..7, &replacement.to_string());
+        if let Ok(parsed) = parse_creator(&candidate)
+            && parsed != creator()
+        {
+            return parsed;
+        }
+    }
+    panic!("valid second creator fixture")
+}
+
 fn reader() -> ReaderPubky {
     for replacement in "ybndrfg8ejkmcpqxot1uwisza345h769".chars() {
         let mut candidate = CREATOR.to_owned();
@@ -54,11 +67,21 @@ impl MarketplacePreparationPayloadFactory for Payloads {
 
 async fn store(database: &TestDatabase) -> MarketplacePreparationStore {
     run_migrations(database.pool()).await.unwrap();
+    create_creator(database, creator(), "session-secret", 9).await;
+    MarketplacePreparationStore::new(database.pool(), crypto())
+}
+
+async fn create_creator(
+    database: &TestDatabase,
+    creator: CreatorPubky,
+    session_secret: &str,
+    key_byte: u8,
+) {
     CreatorStore::new(database.pool(), crypto())
         .create(&CreatorCredentials::new(
-            creator(),
-            "session-secret".into(),
-            PaykitIdentitySecretKey::new([9; 32], 1).unwrap(),
+            creator,
+            session_secret.into(),
+            PaykitIdentitySecretKey::new([key_byte; 32], 1).unwrap(),
             Some(paykit_server::domain::receiving::BitcoinAccount {
                 xpub: "xpub-secret".to_owned().into(),
                 account_index: 0,
@@ -67,7 +90,6 @@ async fn store(database: &TestDatabase) -> MarketplacePreparationStore {
         ))
         .await
         .unwrap();
-    MarketplacePreparationStore::new(database.pool(), crypto())
 }
 
 fn input<'a>(
@@ -269,6 +291,144 @@ async fn non_unique_insert_failure_is_not_an_idempotency_conflict() {
         Err(PersistenceError::CorruptOrMissing),
         "a PostgreSQL check/invariant failure must fail closed, not become Conflict/HTTP 409"
     );
+
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn independent_stores_serialize_same_operation_and_binding() {
+    let database = TestDatabase::create().await;
+    let first_store = store(&database).await;
+    let second_store = MarketplacePreparationStore::new(database.pool(), crypto());
+    let creator = creator();
+    let reader = reader();
+
+    let (first, second) = tokio::join!(
+        first_store.prepare(input(
+            &creator,
+            &reader,
+            "shared-operation",
+            b"same-binding"
+        )),
+        second_store.prepare(input(
+            &creator,
+            &reader,
+            "shared-operation",
+            b"same-binding"
+        )),
+    );
+    let first = first.unwrap();
+    let second = second.unwrap();
+    assert_eq!(first.invoice_id(), second.invoice_id());
+    assert_ne!(first.replayed(), second.replayed());
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM marketplace_payment_preparations")
+            .fetch_one(database.pool())
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT next_child_index FROM creators")
+            .fetch_one(database.pool())
+            .await
+            .unwrap(),
+        1,
+        "concurrent exact retry allocated a duplicate address"
+    );
+
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn independent_stores_conflict_on_changed_binding() {
+    let database = TestDatabase::create().await;
+    let first_store = store(&database).await;
+    let second_store = MarketplacePreparationStore::new(database.pool(), crypto());
+    let creator = creator();
+    let reader = reader();
+
+    let (first, second) = tokio::join!(
+        first_store.prepare(input(
+            &creator,
+            &reader,
+            "shared-operation",
+            b"first-binding"
+        )),
+        second_store.prepare(input(
+            &creator,
+            &reader,
+            "shared-operation",
+            b"second-binding"
+        )),
+    );
+    assert!(matches!(
+        (first, second),
+        (Ok(_), Err(PersistenceError::Conflict)) | (Err(PersistenceError::Conflict), Ok(_))
+    ));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM marketplace_payment_preparations")
+            .fetch_one(database.pool())
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT next_child_index FROM creators")
+            .fetch_one(database.pool())
+            .await
+            .unwrap(),
+        1
+    );
+
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn same_operation_id_is_independent_across_creators() {
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let first_creator = creator();
+    let second_creator = other_creator();
+    create_creator(&database, first_creator.clone(), "first-session", 9).await;
+    create_creator(&database, second_creator.clone(), "second-session", 10).await;
+    let first_store = MarketplacePreparationStore::new(database.pool(), crypto());
+    let second_store = MarketplacePreparationStore::new(database.pool(), crypto());
+    let reader = reader();
+
+    let (first, second) = tokio::join!(
+        first_store.prepare(input(
+            &first_creator,
+            &reader,
+            "shared-operation",
+            b"same-binding"
+        )),
+        second_store.prepare(input(
+            &second_creator,
+            &reader,
+            "shared-operation",
+            b"same-binding"
+        )),
+    );
+    let first = first.unwrap();
+    let second = second.unwrap();
+    assert_ne!(first.invoice_id(), second.invoice_id());
+    assert!(!first.replayed());
+    assert!(!second.replayed());
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM marketplace_payment_preparations")
+            .fetch_one(database.pool())
+            .await
+            .unwrap(),
+        2
+    );
+    let child_indexes = sqlx::query_scalar::<_, i64>(
+        "SELECT next_child_index FROM creators ORDER BY creator_lookup_hash",
+    )
+    .fetch_all(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(child_indexes, vec![1, 1]);
 
     database.cleanup().await;
 }
