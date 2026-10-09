@@ -3,7 +3,7 @@
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex as StdMutex, OnceLock, Weak},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
@@ -15,8 +15,9 @@ use paykit_lib::{
 use crate::{
     application::{
         create_invoice::{
-            AppRegistryDiscovery, CreatorReceivingProvider, ReaderAuthorization,
-            RegistryDiscoveryError, SessionValidationError, SessionValidator,
+            AppRegistryDiscovery, CreatorReceivingProvider, FullJitterRegistryRetryDelay,
+            REGISTRY_READ_ATTEMPTS, REQUEST_DEADLINE, ReaderAuthorization, RegistryDiscoveryError,
+            RegistryRetryDelay, SessionValidationError, SessionValidator,
             derive_bip84_p2wpkh_address,
         },
         reader_registry::reader_is_capable,
@@ -50,7 +51,27 @@ pub enum PrepareMarketplaceError {
     ReaderNotPayable,
     ReaderRegistryUnavailable,
     ReaderRegistryMalformed,
+    SellerSetupPending,
+    DeadlineExceeded,
     Unavailable,
+}
+
+impl PrepareMarketplaceError {
+    pub(crate) const fn diagnostic_label(self) -> &'static str {
+        match self {
+            Self::InvalidRequest => "invalid_request",
+            Self::Conflict => "operation_conflict",
+            Self::CreatorSessionInvalid => "creator_session_invalid",
+            Self::CreatorSessionUnavailable => "creator_session_unavailable",
+            Self::ReaderSetupPending => "reader_setup_pending",
+            Self::ReaderNotPayable => "reader_not_payable",
+            Self::ReaderRegistryUnavailable => "reader_registry_unavailable",
+            Self::ReaderRegistryMalformed => "reader_registry_malformed",
+            Self::SellerSetupPending => "seller_setup_pending",
+            Self::DeadlineExceeded => "deadline_exceeded",
+            Self::Unavailable => "unavailable",
+        }
+    }
 }
 
 #[async_trait]
@@ -96,6 +117,8 @@ pub struct PrepareMarketplaceService {
     bitcoin_network: BitcoinNetwork,
     payment_window_cap: Duration,
     prepare_ttl: Duration,
+    registry_retry_delay: Arc<dyn RegistryRetryDelay>,
+    request_deadline: Duration,
 }
 
 impl PrepareMarketplaceService {
@@ -119,29 +142,54 @@ impl PrepareMarketplaceService {
             bitcoin_network,
             payment_window_cap,
             prepare_ttl,
+            registry_retry_delay: Arc::new(FullJitterRegistryRetryDelay),
+            request_deadline: REQUEST_DEADLINE,
         }
+    }
+
+    pub fn with_registry_retry_delay(
+        mut self,
+        registry_retry_delay: Arc<dyn RegistryRetryDelay>,
+    ) -> Self {
+        self.registry_retry_delay = registry_retry_delay;
+        self
+    }
+
+    pub fn with_request_deadline(mut self, request_deadline: Duration) -> Self {
+        self.request_deadline = request_deadline;
+        self
     }
 
     pub async fn prepare(
         &self,
         request: PrepareMarketplaceRequest,
     ) -> Result<MarketplacePreparationResult, PrepareMarketplaceError> {
-        let request_binding = request_binding(&request)?;
-        // Horizontal replicas are unsupported. Serialize one scoped operation in
-        // this process so concurrent retries cannot both observe `New` and repeat
-        // mutable external checks before persistence resolves replay or conflict.
+        let started = Instant::now();
+        let request_binding = request_binding(&request).inspect_err(|&error| {
+            diagnose("request_binding", error);
+        })?;
+        // PostgreSQL creator-row locking serializes commits across processes. This
+        // process-local lock only prevents duplicate mutable external reads here.
         let operation_lock = marketplace_operation_lock(&request.creator, &request.operation_id);
-        let _operation_guard = operation_lock.lock().await;
-        match self
-            .store
-            .preflight(&request.creator, &request.operation_id, &request_binding)
-            .await
-            .map_err(map_store)?
-        {
+        let _operation_guard = tokio::time::timeout(
+            remaining_at(started, self.request_deadline, "operation_lock")?,
+            operation_lock.lock(),
+        )
+        .await
+        .map_err(|_| deadline("operation_lock"))?;
+        let preflight = tokio::time::timeout(
+            remaining_at(started, self.request_deadline, "preflight")?,
+            self.store
+                .preflight(&request.creator, &request.operation_id, &request_binding),
+        )
+        .await
+        .map_err(|_| deadline("preflight"))?
+        .map_err(|error| store_failure("preflight", error))?;
+        match preflight {
             MarketplacePreparationPreflight::ExactReplay => {
-                return self
-                    .store
-                    .prepare(MarketplacePreparationInput {
+                return tokio::time::timeout(
+                    remaining_at(started, self.request_deadline, "exact_replay")?,
+                    self.store.prepare(MarketplacePreparationInput {
                         creator: &request.creator,
                         reader: &request.reader,
                         reference: &request.reference,
@@ -151,58 +199,119 @@ impl PrepareMarketplaceService {
                         payment_window_seconds: request.payment_window_seconds,
                         prepare_ttl_seconds: self.prepare_ttl.as_secs(),
                         payloads: &ReplayOnlyPayloads,
-                    })
-                    .await
-                    .map_err(map_store);
+                    }),
+                )
+                .await
+                .map_err(|_| deadline("exact_replay"))?
+                .map_err(|error| store_failure("exact_replay", error));
             }
             MarketplacePreparationPreflight::Conflict => {
+                diagnose("preflight", PrepareMarketplaceError::Conflict);
                 return Err(PrepareMarketplaceError::Conflict);
             }
             MarketplacePreparationPreflight::New => {}
         }
 
-        validate_request(&request, self.payment_window_cap)?;
+        validate_request(&request, self.payment_window_cap).inspect_err(|&error| {
+            diagnose("request_validation", error);
+        })?;
 
-        self.sessions
-            .validate(&request.creator)
+        tokio::time::timeout(
+            remaining_at(started, self.request_deadline, "creator_session")?,
+            self.sessions.validate(&request.creator),
+        )
+        .await
+        .map_err(|_| deadline("creator_session"))?
+        .map_err(|error| match error {
+            SessionValidationError::Invalid => {
+                diagnose(
+                    "creator_session",
+                    PrepareMarketplaceError::CreatorSessionInvalid,
+                );
+                PrepareMarketplaceError::CreatorSessionInvalid
+            }
+            SessionValidationError::Unavailable => {
+                diagnose(
+                    "creator_session",
+                    PrepareMarketplaceError::CreatorSessionUnavailable,
+                );
+                PrepareMarketplaceError::CreatorSessionUnavailable
+            }
+        })?;
+        let mut registry_attempt = 1;
+        let registry = loop {
+            let result = tokio::time::timeout(
+                remaining_at(started, self.request_deadline, "reader_app_registry")?,
+                self.registries.discover(&request.reader),
+            )
             .await
-            .map_err(|error| match error {
-                SessionValidationError::Invalid => PrepareMarketplaceError::CreatorSessionInvalid,
-                SessionValidationError::Unavailable => {
-                    PrepareMarketplaceError::CreatorSessionUnavailable
+            .map_err(|_| deadline("reader_app_registry"))?;
+            match result {
+                Ok(Some(registry)) => break registry,
+                Ok(None) if registry_attempt < REGISTRY_READ_ATTEMPTS => {
+                    tokio::time::timeout(
+                        remaining_at(started, self.request_deadline, "reader_app_registry_retry")?,
+                        self.registry_retry_delay.wait(registry_attempt - 1),
+                    )
+                    .await
+                    .map_err(|_| deadline("reader_app_registry_retry"))?;
+                    registry_attempt += 1;
                 }
-            })?;
-        let registry = self
-            .registries
-            .discover(&request.reader)
-            .await
-            .map_err(map_registry)?
-            .ok_or(PrepareMarketplaceError::ReaderSetupPending)?;
+                Ok(None) => {
+                    diagnose(
+                        "reader_app_registry_check",
+                        PrepareMarketplaceError::ReaderSetupPending,
+                    );
+                    return Err(PrepareMarketplaceError::ReaderSetupPending);
+                }
+                Err(error) => return Err(registry_failure("reader_app_registry", error)),
+            }
+        };
         if !reader_is_capable(&registry) {
+            diagnose(
+                "reader_app_registry_check",
+                PrepareMarketplaceError::ReaderNotPayable,
+            );
             return Err(PrepareMarketplaceError::ReaderNotPayable);
         }
-        match self
-            .registries
-            .authorization(&request.reader)
-            .await
-            .map_err(map_registry)?
-        {
+        let authorization = tokio::time::timeout(
+            remaining_at(started, self.request_deadline, "reader_authorization")?,
+            self.registries.authorization(&request.reader),
+        )
+        .await
+        .map_err(|_| deadline("reader_authorization"))?
+        .map_err(|error| registry_failure("reader_authorization", error))?;
+        match authorization {
             ReaderAuthorization::Verified => {}
             ReaderAuthorization::Missing => {
+                diagnose(
+                    "reader_authorization_check",
+                    PrepareMarketplaceError::ReaderSetupPending,
+                );
                 return Err(PrepareMarketplaceError::ReaderSetupPending);
             }
             ReaderAuthorization::Invalid => {
+                diagnose(
+                    "reader_authorization_check",
+                    PrepareMarketplaceError::ReaderNotPayable,
+                );
                 return Err(PrepareMarketplaceError::ReaderNotPayable);
             }
         }
-        let receiving = self
-            .credentials
-            .receiving(&request.creator)
-            .await
-            .map_err(map_store)?;
-        let bitcoin = receiving
-            .bitcoin
-            .ok_or(PrepareMarketplaceError::InvalidRequest)?;
+        let receiving = tokio::time::timeout(
+            remaining_at(started, self.request_deadline, "seller_receiving_details")?,
+            self.credentials.receiving(&request.creator),
+        )
+        .await
+        .map_err(|_| deadline("seller_receiving_details"))?
+        .map_err(|error| store_failure("seller_receiving_details", error))?;
+        let bitcoin = receiving.bitcoin.ok_or_else(|| {
+            diagnose(
+                "seller_receiving_details_check",
+                PrepareMarketplaceError::SellerSetupPending,
+            );
+            PrepareMarketplaceError::SellerSetupPending
+        })?;
         let payloads = MarketplacePayloads {
             reader: &request.reader,
             reference: &request.reference,
@@ -212,7 +321,13 @@ impl PrepareMarketplaceService {
             xpub: &bitcoin.xpub,
             account_index: bitcoin.account_index,
         };
-        self.store
+        remaining_at(started, self.request_deadline, "prepare_store")?;
+        // Do not cancel a PostgreSQL mutation at the HTTP deadline: COMMIT may
+        // otherwise win while this request reports timeout. Await one factual
+        // commit/rollback result, then report a late successful commit as timeout;
+        // its exact retry will replay the committed result.
+        let result = self
+            .store
             .prepare(MarketplacePreparationInput {
                 creator: &request.creator,
                 reader: &request.reader,
@@ -225,7 +340,11 @@ impl PrepareMarketplaceService {
                 payloads: &payloads,
             })
             .await
-            .map_err(map_store)
+            .map_err(|error| store_failure("prepare_store", error))?;
+        if started.elapsed() >= self.request_deadline {
+            return Err(deadline("prepare_store"));
+        }
+        Ok(result)
     }
 }
 
@@ -358,12 +477,14 @@ fn endpoint_identifier(network: &BitcoinNetwork) -> &'static str {
     }
 }
 
-fn map_registry(error: RegistryDiscoveryError) -> PrepareMarketplaceError {
-    match error {
+fn registry_failure(stage: &'static str, error: RegistryDiscoveryError) -> PrepareMarketplaceError {
+    let mapped = match error {
         RegistryDiscoveryError::InvalidRequest => PrepareMarketplaceError::InvalidRequest,
         RegistryDiscoveryError::Unavailable => PrepareMarketplaceError::ReaderRegistryUnavailable,
         RegistryDiscoveryError::Malformed => PrepareMarketplaceError::ReaderRegistryMalformed,
-    }
+    };
+    diagnose(stage, mapped);
+    mapped
 }
 
 fn map_store(error: PersistenceError) -> PrepareMarketplaceError {
@@ -375,4 +496,30 @@ fn map_store(error: PersistenceError) -> PrepareMarketplaceError {
         | PersistenceError::ReauthenticationMismatch
         | PersistenceError::Unavailable => PrepareMarketplaceError::Unavailable,
     }
+}
+
+fn store_failure(stage: &'static str, error: PersistenceError) -> PrepareMarketplaceError {
+    crate::diagnostics::failure("marketplace_prepare", stage, error.diagnostic_label());
+    map_store(error)
+}
+
+fn remaining_at(
+    started: Instant,
+    request_deadline: Duration,
+    stage: &'static str,
+) -> Result<Duration, PrepareMarketplaceError> {
+    let remaining = request_deadline
+        .checked_sub(started.elapsed())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| deadline(stage))?;
+    Ok(remaining)
+}
+
+fn deadline(stage: &'static str) -> PrepareMarketplaceError {
+    diagnose(stage, PrepareMarketplaceError::DeadlineExceeded);
+    PrepareMarketplaceError::DeadlineExceeded
+}
+
+fn diagnose(stage: &'static str, error: PrepareMarketplaceError) {
+    crate::diagnostics::failure("marketplace_prepare", stage, error.diagnostic_label());
 }

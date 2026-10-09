@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
+use thiserror::Error;
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
@@ -34,7 +35,24 @@ pub struct MarketplaceActivationInput<'a> {
     pub creator: &'a CreatorPubky,
     pub invoice_id: Uuid,
     pub total_sats: u64,
-    pub proposal_acceptance_seconds: u64,
+    pub proposal_acceptance_window: std::time::Duration,
+}
+
+/// Closed lifecycle failures used to preserve caller recovery semantics.
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+pub enum MarketplaceLifecyclePersistenceError {
+    /// Prepared invoice expired before activation and needs a new attempt.
+    #[error("marketplace payment preparation expired")]
+    PrepareExpired,
+    /// A terminal lifecycle transition already won.
+    #[error("marketplace payment lifecycle is terminal")]
+    LifecycleTerminal,
+    /// Caller total differs from the authoritative prepared total.
+    #[error("marketplace payment total does not match")]
+    TotalMismatch,
+    /// Generic persistence or validation failure.
+    #[error(transparent)]
+    Persistence(#[from] PersistenceError),
 }
 
 /// Complete private proposal material derived after the transaction reserves an address index.
@@ -420,9 +438,9 @@ impl MarketplacePreparationStore {
     pub async fn activate(
         &self,
         input: MarketplaceActivationInput<'_>,
-    ) -> Result<Option<MarketplaceActivationResult>, PersistenceError> {
-        if input.total_sats == 0 || input.proposal_acceptance_seconds == 0 {
-            return Err(PersistenceError::InvalidInput);
+    ) -> Result<Option<MarketplaceActivationResult>, MarketplaceLifecyclePersistenceError> {
+        if input.total_sats == 0 || input.proposal_acceptance_window.is_zero() {
+            return Err(PersistenceError::InvalidInput.into());
         }
         let mut tx = self
             .pool
@@ -440,15 +458,15 @@ impl MarketplacePreparationStore {
         };
         let creator_hash = stored_hash(&row.creator_lookup_hash)?;
         let mut envelope = self.decode_lifecycle_envelope(creator_hash, &row)?;
-        if envelope.total_sats != input.total_sats {
-            return Err(PersistenceError::Conflict);
-        }
         match row.state.as_str() {
             "active" => {
+                if envelope.total_sats != input.total_sats {
+                    return Err(MarketplaceLifecyclePersistenceError::TotalMismatch);
+                }
                 let (Some(activated_at), Some(payment_deadline)) =
                     (row.activated_at, row.payment_deadline)
                 else {
-                    return Err(PersistenceError::CorruptOrMissing);
+                    return Err(PersistenceError::CorruptOrMissing.into());
                 };
                 let outbox_count: i64 = sqlx::query_scalar(
                     "SELECT count(*) FROM outbox
@@ -463,7 +481,7 @@ impl MarketplacePreparationStore {
                 .await
                 .map_err(|_| PersistenceError::Unavailable)?;
                 if outbox_count != 1 {
-                    return Err(PersistenceError::CorruptOrMissing);
+                    return Err(PersistenceError::CorruptOrMissing.into());
                 }
                 tx.commit()
                     .await
@@ -477,8 +495,8 @@ impl MarketplacePreparationStore {
                 }));
             }
             "prepared" => {}
-            "voided" => return Err(PersistenceError::Conflict),
-            _ => return Err(PersistenceError::CorruptOrMissing),
+            "voided" => return Err(MarketplaceLifecyclePersistenceError::LifecycleTerminal),
+            _ => return Err(PersistenceError::CorruptOrMissing.into()),
         }
         if row.activated_at.is_some()
             || row.payment_deadline.is_some()
@@ -486,9 +504,9 @@ impl MarketplacePreparationStore {
             || row.resolved_at.is_some()
         {
             return Err(if row.resolved_at.is_some() {
-                PersistenceError::Conflict
+                MarketplaceLifecyclePersistenceError::LifecycleTerminal
             } else {
-                PersistenceError::CorruptOrMissing
+                PersistenceError::CorruptOrMissing.into()
             });
         }
         let now: OffsetDateTime = sqlx::query_scalar("SELECT clock_timestamp()")
@@ -496,23 +514,20 @@ impl MarketplacePreparationStore {
             .await
             .map_err(|_| PersistenceError::Unavailable)?;
         if now >= row.prepare_expires_at {
-            return Err(PersistenceError::Conflict);
+            return Err(MarketplaceLifecyclePersistenceError::PrepareExpired);
+        }
+        if envelope.total_sats != input.total_sats {
+            return Err(MarketplaceLifecyclePersistenceError::TotalMismatch);
         }
         let window_seconds = i64::try_from(envelope.payment_window_seconds)
             .map_err(|_| PersistenceError::CorruptOrMissing)?;
         let payment_deadline = now
             .checked_add(Duration::seconds(window_seconds))
             .ok_or(PersistenceError::InvalidInput)?;
-        let proposal_duration = if window_seconds == 1 {
-            Duration::milliseconds(500)
-        } else {
-            let proposal_seconds = input
-                .proposal_acceptance_seconds
-                .min(envelope.payment_window_seconds - 1);
-            let proposal_seconds =
-                i64::try_from(proposal_seconds).map_err(|_| PersistenceError::InvalidInput)?;
-            Duration::seconds(proposal_seconds)
-        };
+        let configured_proposal_duration = Duration::try_from(input.proposal_acceptance_window)
+            .map_err(|_| PersistenceError::InvalidInput)?;
+        let proposal_duration =
+            configured_proposal_duration.min(Duration::seconds(window_seconds) / 2);
         let proposal_expires_at = now
             .checked_add(proposal_duration)
             .ok_or(PersistenceError::InvalidInput)?;
@@ -577,7 +592,7 @@ impl MarketplacePreparationStore {
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
         if inserted.rows_affected() != 1 {
-            return Err(PersistenceError::CorruptOrMissing);
+            return Err(PersistenceError::CorruptOrMissing.into());
         }
         tx.commit()
             .await
@@ -596,7 +611,7 @@ impl MarketplacePreparationStore {
         &self,
         creator: &CreatorPubky,
         invoice_id: Uuid,
-    ) -> Result<Option<MarketplaceVoidResult>, PersistenceError> {
+    ) -> Result<Option<MarketplaceVoidResult>, MarketplaceLifecyclePersistenceError> {
         let mut tx = self
             .pool
             .begin()
@@ -616,7 +631,7 @@ impl MarketplacePreparationStore {
         match row.state.as_str() {
             "voided" => {
                 let Some(voided_at) = row.voided_at else {
-                    return Err(PersistenceError::CorruptOrMissing);
+                    return Err(PersistenceError::CorruptOrMissing.into());
                 };
                 tx.commit()
                     .await
@@ -628,11 +643,11 @@ impl MarketplacePreparationStore {
                 }));
             }
             "prepared" => {}
-            "active" => return Err(PersistenceError::Conflict),
-            _ => return Err(PersistenceError::CorruptOrMissing),
+            "active" => return Err(MarketplaceLifecyclePersistenceError::LifecycleTerminal),
+            _ => return Err(PersistenceError::CorruptOrMissing.into()),
         }
         if row.activated_at.is_some() || row.payment_deadline.is_some() || row.voided_at.is_some() {
-            return Err(PersistenceError::CorruptOrMissing);
+            return Err(PersistenceError::CorruptOrMissing.into());
         }
         let voided_at: OffsetDateTime = sqlx::query_scalar("SELECT clock_timestamp()")
             .fetch_one(&mut *tx)

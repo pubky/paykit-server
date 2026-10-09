@@ -16,6 +16,10 @@ pub enum ApiError {
     DependencyUnavailable,
     DependencyTimeout,
     Conflict,
+    OperationConflict,
+    PrepareExpired,
+    LifecycleTerminal,
+    TotalMismatch,
     Unavailable,
     InvoiceConflict,
     InvoiceNotFound,
@@ -26,6 +30,7 @@ pub enum ApiError {
     ReaderNotPayable,
     ReaderRegistryUnavailable,
     ReaderRegistryMalformed,
+    SellerSetupPending,
 }
 
 #[derive(Serialize)]
@@ -91,6 +96,26 @@ impl ApiError {
                 "conflict",
                 "request conflicts with persisted payment state",
             ),
+            Self::OperationConflict => (
+                StatusCode::CONFLICT,
+                "operation_conflict",
+                "operation binding conflicts with persisted payment state",
+            ),
+            Self::PrepareExpired => (
+                StatusCode::CONFLICT,
+                "prepare_expired",
+                "payment preparation expired",
+            ),
+            Self::LifecycleTerminal => (
+                StatusCode::CONFLICT,
+                "lifecycle_terminal",
+                "payment lifecycle is already terminal",
+            ),
+            Self::TotalMismatch => (
+                StatusCode::CONFLICT,
+                "total_mismatch",
+                "total does not match prepared payment",
+            ),
             Self::Unavailable => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "unavailable",
@@ -140,6 +165,11 @@ impl ApiError {
                 StatusCode::BAD_GATEWAY,
                 "reader_registry_malformed",
                 "reader registry is malformed",
+            ),
+            Self::SellerSetupPending => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "seller_setup_pending",
+                "seller Bitcoin receiving setup is needed",
             ),
         }
     }

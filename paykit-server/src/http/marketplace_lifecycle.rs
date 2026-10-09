@@ -147,7 +147,9 @@ fn parse_uuid(value: &str) -> Result<Uuid, ApiError> {
 fn map_error(error: MarketplaceLifecycleError) -> ApiError {
     match error {
         MarketplaceLifecycleError::InvalidRequest => ApiError::InvalidRequest,
-        MarketplaceLifecycleError::Conflict => ApiError::Conflict,
+        MarketplaceLifecycleError::PrepareExpired => ApiError::PrepareExpired,
+        MarketplaceLifecycleError::LifecycleTerminal => ApiError::LifecycleTerminal,
+        MarketplaceLifecycleError::TotalMismatch => ApiError::TotalMismatch,
         MarketplaceLifecycleError::NotFound => ApiError::InvoiceNotFound,
         MarketplaceLifecycleError::Unavailable => ApiError::DependencyUnavailable,
     }

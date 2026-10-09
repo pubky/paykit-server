@@ -8,8 +8,9 @@ use uuid::Uuid;
 use crate::{
     domain::locks::CreatorPubky,
     persistence::{
-        MarketplaceActivationInput, MarketplaceActivationResult, MarketplacePreparationStore,
-        MarketplaceVoidResult, PersistenceError,
+        MarketplaceActivationInput, MarketplaceActivationResult,
+        MarketplaceLifecyclePersistenceError, MarketplacePreparationStore, MarketplaceVoidResult,
+        PersistenceError,
     },
 };
 
@@ -27,7 +28,9 @@ pub struct VoidMarketplaceRequest {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MarketplaceLifecycleError {
     InvalidRequest,
-    Conflict,
+    PrepareExpired,
+    LifecycleTerminal,
+    TotalMismatch,
     NotFound,
     Unavailable,
 }
@@ -37,13 +40,13 @@ pub trait MarketplaceLifecyclePersistence: Send + Sync {
     async fn activate(
         &self,
         input: MarketplaceActivationInput<'_>,
-    ) -> Result<Option<MarketplaceActivationResult>, PersistenceError>;
+    ) -> Result<Option<MarketplaceActivationResult>, MarketplaceLifecyclePersistenceError>;
 
     async fn void(
         &self,
         creator: &CreatorPubky,
         invoice_id: Uuid,
-    ) -> Result<Option<MarketplaceVoidResult>, PersistenceError>;
+    ) -> Result<Option<MarketplaceVoidResult>, MarketplaceLifecyclePersistenceError>;
 }
 
 #[async_trait]
@@ -51,7 +54,7 @@ impl MarketplaceLifecyclePersistence for MarketplacePreparationStore {
     async fn activate(
         &self,
         input: MarketplaceActivationInput<'_>,
-    ) -> Result<Option<MarketplaceActivationResult>, PersistenceError> {
+    ) -> Result<Option<MarketplaceActivationResult>, MarketplaceLifecyclePersistenceError> {
         MarketplacePreparationStore::activate(self, input).await
     }
 
@@ -59,7 +62,7 @@ impl MarketplaceLifecyclePersistence for MarketplacePreparationStore {
         &self,
         creator: &CreatorPubky,
         invoice_id: Uuid,
-    ) -> Result<Option<MarketplaceVoidResult>, PersistenceError> {
+    ) -> Result<Option<MarketplaceVoidResult>, MarketplaceLifecyclePersistenceError> {
         MarketplacePreparationStore::void(self, creator, invoice_id).await
     }
 }
@@ -92,7 +95,7 @@ impl MarketplaceLifecycleService {
                 creator: &request.creator,
                 invoice_id: request.invoice_id,
                 total_sats: request.total_sats,
-                proposal_acceptance_seconds: self.proposal_acceptance_window.as_secs(),
+                proposal_acceptance_window: self.proposal_acceptance_window,
             })
             .await
             .map_err(map_store)?
@@ -111,13 +114,26 @@ impl MarketplaceLifecycleService {
     }
 }
 
-fn map_store(error: PersistenceError) -> MarketplaceLifecycleError {
+fn map_store(error: MarketplaceLifecyclePersistenceError) -> MarketplaceLifecycleError {
     match error {
-        PersistenceError::InvalidInput => MarketplaceLifecycleError::InvalidRequest,
-        PersistenceError::Conflict => MarketplaceLifecycleError::Conflict,
-        PersistenceError::DeploymentMismatch
-        | PersistenceError::CorruptOrMissing
-        | PersistenceError::ReauthenticationMismatch
-        | PersistenceError::Unavailable => MarketplaceLifecycleError::Unavailable,
+        MarketplaceLifecyclePersistenceError::PrepareExpired => {
+            MarketplaceLifecycleError::PrepareExpired
+        }
+        MarketplaceLifecyclePersistenceError::LifecycleTerminal => {
+            MarketplaceLifecycleError::LifecycleTerminal
+        }
+        MarketplaceLifecyclePersistenceError::TotalMismatch => {
+            MarketplaceLifecycleError::TotalMismatch
+        }
+        MarketplaceLifecyclePersistenceError::Persistence(PersistenceError::InvalidInput) => {
+            MarketplaceLifecycleError::InvalidRequest
+        }
+        MarketplaceLifecyclePersistenceError::Persistence(
+            PersistenceError::DeploymentMismatch
+            | PersistenceError::CorruptOrMissing
+            | PersistenceError::ReauthenticationMismatch
+            | PersistenceError::Unavailable
+            | PersistenceError::Conflict,
+        ) => MarketplaceLifecycleError::Unavailable,
     }
 }

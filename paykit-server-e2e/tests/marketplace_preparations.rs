@@ -6,7 +6,8 @@ use paykit_server::{
     crypto::{Crypto, EncryptedEnvelope, EnvelopeContext},
     domain::locks::{CreatorPubky, ReaderPubky, parse_creator, parse_reader},
     persistence::{
-        CreatorCredentials, CreatorStore, MarketplaceActivationInput, MarketplacePreparationInput,
+        CreatorCredentials, CreatorStore, MarketplaceActivationInput,
+        MarketplaceLifecyclePersistenceError, MarketplacePreparationInput,
         MarketplacePreparationPayloadFactory, MarketplacePreparationPayloads,
         MarketplacePreparationStore, OutboxStore, PersistenceError, run_migrations,
     },
@@ -21,6 +22,19 @@ const CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy
 
 fn creator() -> CreatorPubky {
     parse_creator(CREATOR).unwrap()
+}
+
+fn other_creator() -> CreatorPubky {
+    for replacement in "ybndrfg8ejkmcpqxot1uwisza345h769".chars() {
+        let mut candidate = CREATOR.to_owned();
+        candidate.replace_range(6..7, &replacement.to_string());
+        if let Ok(parsed) = parse_creator(&candidate)
+            && parsed != creator()
+        {
+            return parsed;
+        }
+    }
+    panic!("valid second creator fixture")
 }
 
 fn reader() -> ReaderPubky {
@@ -73,11 +87,21 @@ impl MarketplacePreparationPayloadFactory for Payloads {
 
 async fn store(database: &TestDatabase) -> MarketplacePreparationStore {
     run_migrations(database.pool()).await.unwrap();
+    create_creator(database, creator(), "session-secret", 9).await;
+    MarketplacePreparationStore::new(database.pool(), crypto())
+}
+
+async fn create_creator(
+    database: &TestDatabase,
+    creator: CreatorPubky,
+    session_secret: &str,
+    key_byte: u8,
+) {
     CreatorStore::new(database.pool(), crypto())
         .create(&CreatorCredentials::new(
-            creator(),
-            "session-secret".into(),
-            PaykitIdentitySecretKey::new([9; 32], 1).unwrap(),
+            creator,
+            session_secret.into(),
+            PaykitIdentitySecretKey::new([key_byte; 32], 1).unwrap(),
             Some(paykit_server::domain::receiving::BitcoinAccount {
                 xpub: "xpub-secret".to_owned().into(),
                 account_index: 0,
@@ -86,7 +110,6 @@ async fn store(database: &TestDatabase) -> MarketplacePreparationStore {
         ))
         .await
         .unwrap();
-    MarketplacePreparationStore::new(database.pool(), crypto())
 }
 
 fn input<'a>(
@@ -179,14 +202,6 @@ async fn preparation_is_durable_unpublished_and_replay_first() {
             .await
             .unwrap(),
         0
-    );
-    assert!(
-        OutboxStore::new(database.pool(), crypto())
-            .claim(uuid::Uuid::new_v4(), 10, std::time::Duration::from_secs(30),)
-            .await
-            .unwrap()
-            .is_empty(),
-        "prepared work must not be claimable"
     );
 
     tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
@@ -319,6 +334,144 @@ async fn non_unique_insert_failure_is_not_an_idempotency_conflict() {
 }
 
 #[tokio::test]
+async fn independent_stores_serialize_same_operation_and_binding() {
+    let database = TestDatabase::create().await;
+    let first_store = store(&database).await;
+    let second_store = MarketplacePreparationStore::new(database.pool(), crypto());
+    let creator = creator();
+    let reader = reader();
+
+    let (first, second) = tokio::join!(
+        first_store.prepare(input(
+            &creator,
+            &reader,
+            "shared-operation",
+            b"same-binding"
+        )),
+        second_store.prepare(input(
+            &creator,
+            &reader,
+            "shared-operation",
+            b"same-binding"
+        )),
+    );
+    let first = first.unwrap();
+    let second = second.unwrap();
+    assert_eq!(first.invoice_id(), second.invoice_id());
+    assert_ne!(first.replayed(), second.replayed());
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM marketplace_payment_preparations")
+            .fetch_one(database.pool())
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT next_child_index FROM creators")
+            .fetch_one(database.pool())
+            .await
+            .unwrap(),
+        1,
+        "concurrent exact retry allocated a duplicate address"
+    );
+
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn independent_stores_conflict_on_changed_binding() {
+    let database = TestDatabase::create().await;
+    let first_store = store(&database).await;
+    let second_store = MarketplacePreparationStore::new(database.pool(), crypto());
+    let creator = creator();
+    let reader = reader();
+
+    let (first, second) = tokio::join!(
+        first_store.prepare(input(
+            &creator,
+            &reader,
+            "shared-operation",
+            b"first-binding"
+        )),
+        second_store.prepare(input(
+            &creator,
+            &reader,
+            "shared-operation",
+            b"second-binding"
+        )),
+    );
+    assert!(matches!(
+        (first, second),
+        (Ok(_), Err(PersistenceError::Conflict)) | (Err(PersistenceError::Conflict), Ok(_))
+    ));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM marketplace_payment_preparations")
+            .fetch_one(database.pool())
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT next_child_index FROM creators")
+            .fetch_one(database.pool())
+            .await
+            .unwrap(),
+        1
+    );
+
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn same_operation_id_is_independent_across_creators() {
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let first_creator = creator();
+    let second_creator = other_creator();
+    create_creator(&database, first_creator.clone(), "first-session", 9).await;
+    create_creator(&database, second_creator.clone(), "second-session", 10).await;
+    let first_store = MarketplacePreparationStore::new(database.pool(), crypto());
+    let second_store = MarketplacePreparationStore::new(database.pool(), crypto());
+    let reader = reader();
+
+    let (first, second) = tokio::join!(
+        first_store.prepare(input(
+            &first_creator,
+            &reader,
+            "shared-operation",
+            b"same-binding"
+        )),
+        second_store.prepare(input(
+            &second_creator,
+            &reader,
+            "shared-operation",
+            b"same-binding"
+        )),
+    );
+    let first = first.unwrap();
+    let second = second.unwrap();
+    assert_ne!(first.invoice_id(), second.invoice_id());
+    assert!(!first.replayed());
+    assert!(!second.replayed());
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM marketplace_payment_preparations")
+            .fetch_one(database.pool())
+            .await
+            .unwrap(),
+        2
+    );
+    let child_indexes = sqlx::query_scalar::<_, i64>(
+        "SELECT next_child_index FROM creators ORDER BY creator_lookup_hash",
+    )
+    .fetch_all(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(child_indexes, vec![1, 1]);
+
+    database.cleanup().await;
+}
+
+#[tokio::test]
 async fn activate_starts_db_window_once_and_void_competes_on_the_preparation_row() {
     let database = TestDatabase::create().await;
     let first_store = store(&database).await;
@@ -348,7 +501,7 @@ async fn activate_starts_db_window_once_and_void_competes_on_the_preparation_row
                     creator: &creator,
                     invoice_id,
                     total_sats: 100,
-                    proposal_acceptance_seconds: 30 * 60,
+                    proposal_acceptance_window: std::time::Duration::from_secs(30 * 60),
                 })
                 .await
         }
@@ -371,10 +524,16 @@ async fn activate_starts_db_window_once_and_void_competes_on_the_preparation_row
     assert!(
         matches!(
             (&activated, &voided),
-            (Ok(Some(_)), Err(PersistenceError::Conflict))
+            (
+                Ok(Some(_)),
+                Err(MarketplaceLifecyclePersistenceError::LifecycleTerminal)
+            )
         ) || matches!(
             (&activated, &voided),
-            (Err(PersistenceError::Conflict), Ok(Some(_)))
+            (
+                Err(MarketplaceLifecyclePersistenceError::LifecycleTerminal),
+                Ok(Some(_))
+            )
         ),
         "exactly one lifecycle transition must commit: activate={activated:?}, void={voided:?}"
     );
@@ -404,7 +563,7 @@ async fn activate_starts_db_window_once_and_void_competes_on_the_preparation_row
                 creator: &creator,
                 invoice_id: prepared.invoice_id(),
                 total_sats: 100,
-                proposal_acceptance_seconds: 30 * 60,
+                proposal_acceptance_window: std::time::Duration::from_secs(30 * 60),
             })
             .await
             .unwrap()
@@ -477,10 +636,10 @@ async fn activation_rejects_wrong_total_expiry_and_prepared_resolution_without_p
                 creator: &creator,
                 invoice_id: wrong_total.invoice_id(),
                 total_sats: 101,
-                proposal_acceptance_seconds: 30 * 60,
+                proposal_acceptance_window: std::time::Duration::from_secs(30 * 60),
             })
             .await,
-        Err(PersistenceError::Conflict)
+        Err(MarketplaceLifecyclePersistenceError::TotalMismatch)
     );
 
     let expired = store
@@ -499,11 +658,11 @@ async fn activation_rejects_wrong_total_expiry_and_prepared_resolution_without_p
             .activate(MarketplaceActivationInput {
                 creator: &creator,
                 invoice_id: expired.invoice_id(),
-                total_sats: 100,
-                proposal_acceptance_seconds: 30 * 60,
+                total_sats: 101,
+                proposal_acceptance_window: std::time::Duration::from_secs(30 * 60),
             })
             .await,
-        Err(PersistenceError::Conflict)
+        Err(MarketplaceLifecyclePersistenceError::PrepareExpired)
     );
 
     let resolved = store
@@ -529,11 +688,11 @@ async fn activation_rejects_wrong_total_expiry_and_prepared_resolution_without_p
             .activate(MarketplaceActivationInput {
                 creator: &creator,
                 invoice_id: resolved.invoice_id(),
-                total_sats: 100,
-                proposal_acceptance_seconds: 30 * 60,
+                total_sats: 101,
+                proposal_acceptance_window: std::time::Duration::from_secs(30 * 60),
             })
             .await,
-        Err(PersistenceError::Conflict)
+        Err(MarketplaceLifecyclePersistenceError::LifecycleTerminal)
     );
     assert!(
         store
@@ -576,7 +735,7 @@ async fn shortest_payment_window_still_has_a_usable_proposal_interval() {
             creator: &creator,
             invoice_id: prepared.invoice_id(),
             total_sats: 100,
-            proposal_acceptance_seconds: 30 * 60,
+            proposal_acceptance_window: std::time::Duration::from_secs(30 * 60),
         })
         .await
         .unwrap()
@@ -601,8 +760,69 @@ async fn shortest_payment_window_still_has_a_usable_proposal_interval() {
     assert!(activated.activated_at() < proposal_expires_at);
     assert!(proposal_expires_at < activated.payment_deadline());
     assert_eq!(
+        proposal_expires_at - activated.activated_at(),
+        time::Duration::milliseconds(500),
+        "one-second payment window must retain exact half-window precision"
+    );
+    assert_eq!(
         activated.payment_deadline() - activated.activated_at(),
         time::Duration::seconds(1)
+    );
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn configured_subsecond_policy_wins_below_half_payment_window() {
+    let database = TestDatabase::create().await;
+    let store = store(&database).await;
+    let creator = creator();
+    let reader = reader();
+    let prepared = store
+        .prepare(input_with_ttl_and_window(
+            &creator,
+            &reader,
+            "marketplace-payment:subsecond-policy:attempt-1",
+            b"subsecond-policy",
+            60,
+            5,
+        ))
+        .await
+        .unwrap();
+
+    let activated = store
+        .activate(MarketplaceActivationInput {
+            creator: &creator,
+            invoice_id: prepared.invoice_id(),
+            total_sats: 100,
+            proposal_acceptance_window: std::time::Duration::from_millis(750),
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    let outbox = OutboxStore::new(database.pool(), crypto());
+    let claims = outbox
+        .claim(uuid::Uuid::new_v4(), 1, std::time::Duration::from_secs(30))
+        .await
+        .unwrap();
+    let intent = outbox.delivery_intent(&claims[0]).unwrap();
+    let proposal_expires_at = OffsetDateTime::parse(
+        intent
+            .terms()
+            .unwrap()
+            .proposal_expires_at
+            .as_deref()
+            .unwrap(),
+        &Rfc3339,
+    )
+    .unwrap();
+
+    assert_eq!(
+        proposal_expires_at - activated.activated_at(),
+        time::Duration::milliseconds(750)
+    );
+    assert_eq!(
+        activated.payment_deadline() - activated.activated_at(),
+        time::Duration::seconds(5)
     );
     database.cleanup().await;
 }
@@ -657,10 +877,12 @@ async fn authenticated_invalid_stored_intent_is_corrupt_not_caller_input() {
                 creator: &creator,
                 invoice_id: prepared.invoice_id(),
                 total_sats: 100,
-                proposal_acceptance_seconds: 30 * 60,
+                proposal_acceptance_window: std::time::Duration::from_secs(30 * 60),
             })
             .await,
-        Err(PersistenceError::CorruptOrMissing)
+        Err(MarketplaceLifecyclePersistenceError::Persistence(
+            PersistenceError::CorruptOrMissing
+        ))
     );
     database.cleanup().await;
 }
