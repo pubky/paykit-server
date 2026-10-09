@@ -106,6 +106,12 @@ outcome conflicts. Resolution never changes payment-request or Bitcoin facts and
 never invokes SDK cancellation. Resolving a prepared invoice blocks activation but
 still permits void.
 
+Marketplace lifecycle conflicts use recovery-specific `409` codes. `prepare_expired`
+requires a new preparation attempt; `lifecycle_terminal` means activation or void
+lost to a terminal transition and must stop; `total_mismatch` means the caller total
+differs from Paykit Server's authoritative prepared total and requires operator
+attention. Exact activation and void replay still return their stored `200` response.
+
 `POST /setup/status` is the readiness check for an authenticated Creator. Its closed body is `{"creator":"pubky..."}` with optional `asset: "BTC"`, `"USD"`, or `"USDT"` to check whether approved receiving details can accept that denomination. Every signed route verifies Ed25519 over `b"paykit-http-signature-v1\0" + uppercase_method + b"\0" + exact_query_free_path + b"\0" + exact_raw_body`; there is no body-only fallback. It returns exactly one coarse state: `ready` when the persisted session, delegated key, App Registry entry, and hosted state are usable; `setup_required` when authority is absent or confirmed invalid; and `unavailable` for validation timeouts and storage, rate-limit, server, DNS, or transport failures. Untyped Pubky 401 responses are also `unavailable`: they cannot distinguish revoked grants from recoverable PoP failures. A revoked grant reported this way requires explicit reconnect. Callers must not convert `unavailable` into a new authorization flow.
 
 ### Setup iframe

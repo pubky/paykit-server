@@ -16,7 +16,7 @@ use paykit_server::{
     application::{
         create_invoice::{
             AppRegistryDiscovery, CreatorReceivingProvider, ReaderAuthorization, ReceivingDetails,
-            RegistryDiscoveryError, SessionValidationError, SessionValidator,
+            RegistryDiscoveryError, RegistryRetryDelay, SessionValidationError, SessionValidator,
         },
         marketplace_preparation::{
             MarketplacePreparationPersistence, PrepareMarketplaceError, PrepareMarketplaceRequest,
@@ -33,12 +33,55 @@ use paykit_server::{
         MarketplacePreparationInput, MarketplacePreparationPreflight, MarketplacePreparationResult,
         PersistenceError,
     },
+    runtime::{DependencyCheck, Runtime, operational_router},
 };
 use tower::ServiceExt;
+use tracing::{Event, Subscriber, instrument::WithSubscriber};
+use tracing_subscriber::{Layer, layer::Context, prelude::*};
 
 const CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
 const REFERENCE: &str = "7cceb26d-9042-4ea6-bfcb-01bbd778d76e";
 const PATH: &str = "/marketplace/payment-requests/prepare";
+
+type CapturedEvents = Vec<Vec<(String, String)>>;
+
+#[derive(Clone, Default)]
+struct EventCapture(Arc<Mutex<CapturedEvents>>);
+
+impl<S> Layer<S> for EventCapture
+where
+    S: Subscriber,
+{
+    fn on_event(&self, event: &Event<'_>, _context: Context<'_, S>) {
+        let mut fields = Vec::new();
+        event.record(&mut FieldVisitor(&mut fields));
+        self.0.lock().unwrap().push(fields);
+    }
+}
+
+struct FieldVisitor<'a>(&'a mut Vec<(String, String)>);
+
+impl tracing::field::Visit for FieldVisitor<'_> {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn core::fmt::Debug) {
+        self.0.push((field.name().to_owned(), format!("{value:?}")));
+    }
+}
+
+fn event_field<'a>(fields: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    fields
+        .iter()
+        .find(|(field, _)| field == name)
+        .map(|(_, value)| value.trim_matches('"'))
+}
+
+struct ReadyDependency;
+
+#[async_trait]
+impl DependencyCheck for ReadyDependency {
+    async fn postgres_ready(&self) -> bool {
+        true
+    }
+}
 
 fn reader() -> String {
     for replacement in "ybndrfg8ejkmcpqxot1uwisza345h769".chars() {
@@ -71,6 +114,18 @@ impl SessionValidator for FakeSession {
     async fn validate(&self, _creator: &CreatorPubky) -> Result<(), SessionValidationError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(())
+    }
+}
+
+struct PendingSession {
+    entered: tokio::sync::Notify,
+}
+
+#[async_trait]
+impl SessionValidator for PendingSession {
+    async fn validate(&self, _creator: &CreatorPubky) -> Result<(), SessionValidationError> {
+        self.entered.notify_waiters();
+        std::future::pending().await
     }
 }
 
@@ -119,6 +174,36 @@ impl AppRegistryDiscovery for FakeRegistries {
     }
 }
 
+struct MissingThenPresentRegistries {
+    discoveries: AtomicUsize,
+    present_after: usize,
+}
+
+#[async_trait]
+impl AppRegistryDiscovery for MissingThenPresentRegistries {
+    async fn discover(
+        &self,
+        _reader: &paykit_server::domain::locks::ReaderPubky,
+    ) -> Result<Option<paykit_lib::PaykitAppRegistry>, RegistryDiscoveryError> {
+        let attempt = self.discoveries.fetch_add(1, Ordering::SeqCst) + 1;
+        Ok((attempt > self.present_after).then(capable_registry))
+    }
+
+    async fn authorization(
+        &self,
+        _reader: &paykit_server::domain::locks::ReaderPubky,
+    ) -> Result<ReaderAuthorization, RegistryDiscoveryError> {
+        Ok(ReaderAuthorization::Verified)
+    }
+}
+
+struct NoRegistryRetryDelay;
+
+#[async_trait]
+impl RegistryRetryDelay for NoRegistryRetryDelay {
+    async fn wait(&self, _retry_index: usize) {}
+}
+
 struct FakeCredentials {
     calls: AtomicUsize,
 }
@@ -135,6 +220,21 @@ impl CreatorReceivingProvider for FakeCredentials {
                 xpub: account_xpub().into(),
                 account_index: 0,
             }),
+            usdt: None,
+        })
+    }
+}
+
+struct MissingBitcoinCredentials;
+
+#[async_trait]
+impl CreatorReceivingProvider for MissingBitcoinCredentials {
+    async fn receiving(
+        &self,
+        _creator: &CreatorPubky,
+    ) -> Result<ReceivingDetails, PersistenceError> {
+        Ok(ReceivingDetails {
+            bitcoin: None,
             usdt: None,
         })
     }
@@ -164,6 +264,7 @@ fn account_xpub() -> String {
 struct FakeStore {
     preflight: MarketplacePreparationPreflight,
     prepare_error: Option<PersistenceError>,
+    preflight_calls: AtomicUsize,
     prepare_calls: AtomicUsize,
     captured_reference: Mutex<Option<String>>,
 }
@@ -173,6 +274,7 @@ impl FakeStore {
         Self {
             preflight,
             prepare_error: None,
+            preflight_calls: AtomicUsize::default(),
             prepare_calls: AtomicUsize::default(),
             captured_reference: Mutex::new(None),
         }
@@ -182,6 +284,7 @@ impl FakeStore {
         Self {
             preflight: MarketplacePreparationPreflight::New,
             prepare_error: Some(error),
+            preflight_calls: AtomicUsize::default(),
             prepare_calls: AtomicUsize::default(),
             captured_reference: Mutex::new(None),
         }
@@ -196,6 +299,7 @@ impl MarketplacePreparationPersistence for FakeStore {
         _operation_id: &str,
         _request_binding: &[u8],
     ) -> Result<MarketplacePreparationPreflight, PersistenceError> {
+        self.preflight_calls.fetch_add(1, Ordering::SeqCst);
         Ok(self.preflight)
     }
 
@@ -375,6 +479,171 @@ async fn new_preparation_validates_dependencies_and_builds_caller_reference() {
     assert_eq!(
         deps.store.captured_reference.lock().unwrap().as_deref(),
         Some(REFERENCE)
+    );
+}
+
+#[tokio::test]
+async fn registry_discovery_retries_missing_records_three_times() {
+    for (present_after, expected) in [
+        (1, Ok(())),
+        (usize::MAX, Err(PrepareMarketplaceError::ReaderSetupPending)),
+    ] {
+        let session = Arc::new(FakeSession {
+            calls: AtomicUsize::default(),
+        });
+        let registries = Arc::new(MissingThenPresentRegistries {
+            discoveries: AtomicUsize::default(),
+            present_after,
+        });
+        let credentials = Arc::new(FakeCredentials {
+            calls: AtomicUsize::default(),
+        });
+        let store = Arc::new(FakeStore::new(MarketplacePreparationPreflight::New));
+        let service = PrepareMarketplaceService::new(
+            session,
+            registries.clone(),
+            credentials,
+            store,
+            paykit_lib::PaykitAppId::new("paykit-server").unwrap(),
+            BitcoinNetwork::Mainnet,
+            Duration::from_secs(24 * 60 * 60),
+            Duration::from_secs(15 * 60),
+        )
+        .with_registry_retry_delay(Arc::new(NoRegistryRetryDelay));
+
+        assert_eq!(service.prepare(request(86_400)).await.map(|_| ()), expected);
+        assert_eq!(
+            registries.discoveries.load(Ordering::SeqCst),
+            if present_after == 1 { 2 } else { 3 }
+        );
+    }
+}
+
+#[tokio::test]
+async fn pending_external_work_obeys_request_deadline() {
+    let service = PrepareMarketplaceService::new(
+        Arc::new(PendingSession {
+            entered: tokio::sync::Notify::new(),
+        }),
+        Arc::new(FakeRegistries {
+            calls: AtomicUsize::default(),
+        }),
+        Arc::new(FakeCredentials {
+            calls: AtomicUsize::default(),
+        }),
+        Arc::new(FakeStore::new(MarketplacePreparationPreflight::New)),
+        paykit_lib::PaykitAppId::new("paykit-server").unwrap(),
+        BitcoinNetwork::Mainnet,
+        Duration::from_secs(24 * 60 * 60),
+        Duration::from_secs(15 * 60),
+    )
+    .with_request_deadline(Duration::from_millis(20));
+
+    assert_eq!(
+        service.prepare(request(86_400)).await,
+        Err(PrepareMarketplaceError::DeadlineExceeded)
+    );
+}
+
+#[tokio::test]
+async fn pending_external_route_returns_stable_dependency_timeout() {
+    let key = SigningKey::from_bytes(&[11; 32]);
+    let service = Arc::new(
+        PrepareMarketplaceService::new(
+            Arc::new(PendingSession {
+                entered: tokio::sync::Notify::new(),
+            }),
+            Arc::new(FakeRegistries {
+                calls: AtomicUsize::default(),
+            }),
+            Arc::new(FakeCredentials {
+                calls: AtomicUsize::default(),
+            }),
+            Arc::new(FakeStore::new(MarketplacePreparationPreflight::New)),
+            paykit_lib::PaykitAppId::new("paykit-server").unwrap(),
+            BitcoinNetwork::Mainnet,
+            Duration::from_secs(24 * 60 * 60),
+            Duration::from_secs(15 * 60),
+        )
+        .with_request_deadline(Duration::from_millis(20)),
+    );
+    let router = marketplace_preparation_router(service).layer(Extension(signed_auth(&key)));
+
+    let response = router
+        .oneshot(signed_request(&key, body(false)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let response_body = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&response_body).unwrap(),
+        serde_json::json!({"error":{"code":"dependency_timeout","message":"request deadline exceeded"}})
+    );
+}
+
+#[tokio::test]
+async fn operation_lock_wait_obeys_request_deadline() {
+    let session = Arc::new(PendingSession {
+        entered: tokio::sync::Notify::new(),
+    });
+    let registries = Arc::new(FakeRegistries {
+        calls: AtomicUsize::default(),
+    });
+    let credentials = Arc::new(FakeCredentials {
+        calls: AtomicUsize::default(),
+    });
+    let store = Arc::new(FakeStore::new(MarketplacePreparationPreflight::New));
+    let build = |deadline| {
+        PrepareMarketplaceService::new(
+            session.clone(),
+            registries.clone(),
+            credentials.clone(),
+            store.clone(),
+            paykit_lib::PaykitAppId::new("paykit-server").unwrap(),
+            BitcoinNetwork::Mainnet,
+            Duration::from_secs(24 * 60 * 60),
+            Duration::from_secs(15 * 60),
+        )
+        .with_request_deadline(deadline)
+    };
+    let holder = Arc::new(build(Duration::from_secs(1)));
+    let waiter = build(Duration::from_millis(20));
+    let holder_task = tokio::spawn({
+        let holder = holder.clone();
+        async move { holder.prepare(request(86_400)).await }
+    });
+    session.entered.notified().await;
+
+    assert_eq!(
+        waiter.prepare(request(86_400)).await,
+        Err(PrepareMarketplaceError::DeadlineExceeded)
+    );
+    assert_eq!(store.preflight_calls.load(Ordering::SeqCst), 1);
+    holder_task.abort();
+}
+
+#[tokio::test]
+async fn missing_seller_bitcoin_details_is_typed_setup_pending() {
+    let service = PrepareMarketplaceService::new(
+        Arc::new(FakeSession {
+            calls: AtomicUsize::default(),
+        }),
+        Arc::new(FakeRegistries {
+            calls: AtomicUsize::default(),
+        }),
+        Arc::new(MissingBitcoinCredentials),
+        Arc::new(FakeStore::new(MarketplacePreparationPreflight::New)),
+        paykit_lib::PaykitAppId::new("paykit-server").unwrap(),
+        BitcoinNetwork::Mainnet,
+        Duration::from_secs(24 * 60 * 60),
+        Duration::from_secs(15 * 60),
+    );
+
+    assert_eq!(
+        service.prepare(request(86_400)).await,
+        Err(PrepareMarketplaceError::SellerSetupPending)
     );
 }
 
@@ -565,6 +834,13 @@ async fn prepare_route_preserves_binding_conflict_but_not_storage_invariant_fail
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::CONFLICT);
+    let response_body = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&response_body).unwrap(),
+        serde_json::json!({"error":{"code":"operation_conflict","message":"operation binding conflicts with persisted payment state"}})
+    );
 
     let invariant = service_with_prepare_error(PersistenceError::CorruptOrMissing);
     let invariant_router =
@@ -575,4 +851,108 @@ async fn prepare_route_preserves_binding_conflict_but_not_storage_invariant_fail
         .unwrap();
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_ne!(response.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn prepare_route_distinguishes_seller_setup_from_invalid_request() {
+    let key = SigningKey::from_bytes(&[11; 32]);
+    let service = Arc::new(PrepareMarketplaceService::new(
+        Arc::new(FakeSession {
+            calls: AtomicUsize::default(),
+        }),
+        Arc::new(FakeRegistries {
+            calls: AtomicUsize::default(),
+        }),
+        Arc::new(MissingBitcoinCredentials),
+        Arc::new(FakeStore::new(MarketplacePreparationPreflight::New)),
+        paykit_lib::PaykitAppId::new("paykit-server").unwrap(),
+        BitcoinNetwork::Mainnet,
+        Duration::from_secs(24 * 60 * 60),
+        Duration::from_secs(15 * 60),
+    ));
+    let router = marketplace_preparation_router(service).layer(Extension(signed_auth(&key)));
+
+    let response = router
+        .oneshot(signed_request(&key, body(false)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let response_body = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&response_body).unwrap(),
+        serde_json::json!({"error":{"code":"seller_setup_pending","message":"seller Bitcoin receiving setup is needed"}})
+    );
+}
+
+#[tokio::test]
+async fn setup_pending_emits_exact_redacted_failure_stage() {
+    let request_id = "d9428888-122b-4b85-bc8f-2c2e0bf7c874";
+    let key = SigningKey::from_bytes(&[11; 32]);
+    let service = PrepareMarketplaceService::new(
+        Arc::new(FakeSession {
+            calls: AtomicUsize::default(),
+        }),
+        Arc::new(MissingThenPresentRegistries {
+            discoveries: AtomicUsize::default(),
+            present_after: usize::MAX,
+        }),
+        Arc::new(FakeCredentials {
+            calls: AtomicUsize::default(),
+        }),
+        Arc::new(FakeStore::new(MarketplacePreparationPreflight::New)),
+        paykit_lib::PaykitAppId::new("paykit-server").unwrap(),
+        BitcoinNetwork::Mainnet,
+        Duration::from_secs(24 * 60 * 60),
+        Duration::from_secs(15 * 60),
+    )
+    .with_registry_retry_delay(Arc::new(NoRegistryRetryDelay));
+    let router = operational_router(
+        marketplace_preparation_router(Arc::new(service)).layer(Extension(signed_auth(&key))),
+        Arc::new(Runtime::new(Arc::new(ReadyDependency), 1)),
+    );
+    let mut request = signed_request(&key, body(false));
+    request
+        .headers_mut()
+        .insert("x-request-id", request_id.parse().unwrap());
+    let capture = EventCapture::default();
+    let subscriber = tracing_subscriber::registry().with(capture.clone());
+
+    let response = router
+        .oneshot(request)
+        .with_subscriber(subscriber)
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.headers()["x-request-id"], request_id);
+    let events: Vec<_> = capture
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| event_field(event, "event") == Some("paykit_request_failure"))
+        .cloned()
+        .collect();
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        event_field(&events[0], "operation"),
+        Some("marketplace_prepare")
+    );
+    assert_eq!(
+        event_field(&events[0], "stage"),
+        Some("reader_app_registry_check")
+    );
+    assert_eq!(
+        event_field(&events[0], "category"),
+        Some("reader_setup_pending")
+    );
+    assert_eq!(event_field(&events[0], "request_id"), Some(request_id));
+    assert!(events[0].iter().all(|(name, _)| {
+        matches!(
+            name.as_str(),
+            "message" | "event" | "operation" | "stage" | "category" | "request_id"
+        )
+    }));
 }

@@ -198,6 +198,8 @@ pub enum EnvelopeType {
     PaymentDrain,
     /// Durable unpublished Marketplace invoice preparation.
     MarketplacePreparation,
+    /// Encrypted Bitcoin settlement record for an activated Marketplace preparation.
+    MarketplaceSettlementPaymentRecord,
 }
 
 impl EnvelopeType {
@@ -212,6 +214,7 @@ impl EnvelopeType {
             Self::OutboxSemanticIntent => b"outbox-semantic-intent",
             Self::PaymentDrain => b"payment-drain",
             Self::MarketplacePreparation => b"marketplace-preparation",
+            Self::MarketplaceSettlementPaymentRecord => b"marketplace-settlement-payment-record",
         }
     }
 }
@@ -307,6 +310,18 @@ impl EnvelopeContext {
             EnvelopeType::MarketplacePreparation,
             creator_lookup_hash,
             row_id,
+        )
+    }
+
+    /// Creates the binding context for one activated Marketplace settlement record.
+    pub fn marketplace_settlement_payment_record(
+        creator_lookup_hash: LookupHash,
+        preparation_id: Uuid,
+    ) -> Self {
+        Self::new(
+            EnvelopeType::MarketplaceSettlementPaymentRecord,
+            creator_lookup_hash,
+            preparation_id,
         )
     }
 

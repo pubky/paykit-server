@@ -69,22 +69,25 @@ pub struct InvoicePayloads {
     pub payment_request_intent: DeliveryIntentV1,
 }
 
-#[derive(Serialize, Deserialize)]
-struct InvoicePaymentRecordV1 {
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct InvoicePaymentRecordV1 {
     version: u8,
     derivation_index: i64,
     bitcoin: Option<PaymentDestination>,
     usdt: Option<PaymentDestination>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
 struct PaymentDestination {
     address: String,
     required_amount: u64,
 }
 
 impl InvoicePaymentRecordV1 {
-    fn from_intent(index: i64, intent: &DeliveryIntentV1) -> Result<Self, PersistenceError> {
+    pub(crate) fn from_intent(
+        index: i64,
+        intent: &DeliveryIntentV1,
+    ) -> Result<Self, PersistenceError> {
         let terms = intent
             .terms()
             .map_err(|_| PersistenceError::CorruptOrMissing)?;
@@ -138,6 +141,17 @@ impl InvoicePaymentRecordV1 {
             });
         }
         Ok(record)
+    }
+
+    pub(crate) fn derivation_index(&self) -> i64 {
+        self.derivation_index
+    }
+
+    pub(crate) fn bitcoin_address(&self) -> Result<&str, PersistenceError> {
+        self.bitcoin
+            .as_ref()
+            .map(|destination| destination.address.as_str())
+            .ok_or(PersistenceError::InvalidInput)
     }
 }
 

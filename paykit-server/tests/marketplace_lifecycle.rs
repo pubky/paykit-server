@@ -20,7 +20,8 @@ use paykit_server::{
         marketplace_lifecycle::marketplace_lifecycle_router,
     },
     persistence::{
-        MarketplaceActivationInput, MarketplaceActivationResult, MarketplaceResolutionOutcome,
+        MarketplaceActivationInput, MarketplaceActivationResult,
+        MarketplaceLifecyclePersistenceError, MarketplaceResolutionOutcome,
         MarketplaceResolutionResult, MarketplaceVoidResult, PersistenceError,
     },
 };
@@ -34,6 +35,9 @@ const INVOICE_ID: Uuid = Uuid::from_u128(0x4c6e66c7_8a8b_4d54_b97b_340cedb3e1d0)
 #[derive(Clone, Copy)]
 enum Outcome {
     Success,
+    PrepareExpired,
+    LifecycleTerminal,
+    TotalMismatch,
     Conflict,
     NotFound,
     Corrupt,
@@ -48,7 +52,7 @@ impl MarketplaceLifecyclePersistence for FakeStore {
     async fn activate(
         &self,
         input: MarketplaceActivationInput<'_>,
-    ) -> Result<Option<MarketplaceActivationResult>, PersistenceError> {
+    ) -> Result<Option<MarketplaceActivationResult>, MarketplaceLifecyclePersistenceError> {
         match self.outcome {
             Outcome::Success => Ok(Some(MarketplaceActivationResult::new(
                 input.invoice_id,
@@ -57,9 +61,14 @@ impl MarketplaceLifecyclePersistence for FakeStore {
                 input.total_sats,
                 true,
             ))),
-            Outcome::Conflict => Err(PersistenceError::Conflict),
+            Outcome::PrepareExpired => Err(MarketplaceLifecyclePersistenceError::PrepareExpired),
+            Outcome::LifecycleTerminal => {
+                Err(MarketplaceLifecyclePersistenceError::LifecycleTerminal)
+            }
+            Outcome::TotalMismatch => Err(MarketplaceLifecyclePersistenceError::TotalMismatch),
+            Outcome::Conflict => Err(PersistenceError::Conflict.into()),
             Outcome::NotFound => Ok(None),
-            Outcome::Corrupt => Err(PersistenceError::CorruptOrMissing),
+            Outcome::Corrupt => Err(PersistenceError::CorruptOrMissing.into()),
         }
     }
 
@@ -67,16 +76,21 @@ impl MarketplaceLifecyclePersistence for FakeStore {
         &self,
         _creator: &CreatorPubky,
         invoice_id: Uuid,
-    ) -> Result<Option<MarketplaceVoidResult>, PersistenceError> {
+    ) -> Result<Option<MarketplaceVoidResult>, MarketplaceLifecyclePersistenceError> {
         match self.outcome {
             Outcome::Success => Ok(Some(MarketplaceVoidResult::new(
                 invoice_id,
                 OffsetDateTime::UNIX_EPOCH,
                 true,
             ))),
-            Outcome::Conflict => Err(PersistenceError::Conflict),
+            Outcome::PrepareExpired => Err(MarketplaceLifecyclePersistenceError::PrepareExpired),
+            Outcome::LifecycleTerminal => {
+                Err(MarketplaceLifecyclePersistenceError::LifecycleTerminal)
+            }
+            Outcome::TotalMismatch => Err(MarketplaceLifecyclePersistenceError::TotalMismatch),
+            Outcome::Conflict => Err(PersistenceError::Conflict.into()),
             Outcome::NotFound => Ok(None),
-            Outcome::Corrupt => Err(PersistenceError::CorruptOrMissing),
+            Outcome::Corrupt => Err(PersistenceError::CorruptOrMissing.into()),
         }
     }
 
@@ -85,7 +99,7 @@ impl MarketplaceLifecyclePersistence for FakeStore {
         _creator: &CreatorPubky,
         invoice_id: Uuid,
         outcome: MarketplaceResolutionOutcome,
-    ) -> Result<Option<MarketplaceResolutionResult>, PersistenceError> {
+    ) -> Result<Option<MarketplaceResolutionResult>, MarketplaceLifecyclePersistenceError> {
         match self.outcome {
             Outcome::Success => Ok(Some(MarketplaceResolutionResult::new(
                 invoice_id,
@@ -93,9 +107,14 @@ impl MarketplaceLifecyclePersistence for FakeStore {
                 OffsetDateTime::UNIX_EPOCH,
                 true,
             ))),
-            Outcome::Conflict => Err(PersistenceError::Conflict),
+            Outcome::Conflict => Err(MarketplaceLifecyclePersistenceError::ResolutionConflict),
             Outcome::NotFound => Ok(None),
-            Outcome::Corrupt => Err(PersistenceError::CorruptOrMissing),
+            Outcome::Corrupt => Err(PersistenceError::CorruptOrMissing.into()),
+            Outcome::PrepareExpired => Err(MarketplaceLifecyclePersistenceError::PrepareExpired),
+            Outcome::LifecycleTerminal => {
+                Err(MarketplaceLifecyclePersistenceError::LifecycleTerminal)
+            }
+            Outcome::TotalMismatch => Err(MarketplaceLifecyclePersistenceError::TotalMismatch),
         }
     }
 }
@@ -303,8 +322,8 @@ async fn signed_resolve_has_closed_success_and_error_fixtures() {
     assert_eq!(
         json(conflict).await,
         serde_json::json!({"error":{
-            "code":"conflict",
-            "message":"request conflicts with persisted payment state"
+            "code":"resolution_conflict",
+            "message":"business resolution conflicts with persisted outcome"
         }})
     );
 }
@@ -320,17 +339,51 @@ async fn lifecycle_failures_use_stable_error_fixtures() {
             "total_sats": 50_000,
         })
     };
-    let conflict = marketplace_lifecycle_router(service(Outcome::Conflict))
+    for (outcome, code, message) in [
+        (
+            Outcome::PrepareExpired,
+            "prepare_expired",
+            "payment preparation expired",
+        ),
+        (
+            Outcome::LifecycleTerminal,
+            "lifecycle_terminal",
+            "payment lifecycle is already terminal",
+        ),
+        (
+            Outcome::TotalMismatch,
+            "total_mismatch",
+            "total does not match prepared payment",
+        ),
+    ] {
+        let conflict = marketplace_lifecycle_router(service(outcome))
+            .layer(Extension(signed_auth(&key)))
+            .oneshot(signed_request(&key, path, body()))
+            .await
+            .unwrap();
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            json(conflict).await,
+            serde_json::json!({"error":{"code":code,"message":message}})
+        );
+    }
+
+    let void_path = "/marketplace/payment-requests/void";
+    let terminal_void = marketplace_lifecycle_router(service(Outcome::LifecycleTerminal))
         .layer(Extension(signed_auth(&key)))
-        .oneshot(signed_request(&key, path, body()))
+        .oneshot(signed_request(
+            &key,
+            void_path,
+            serde_json::json!({"creator": CREATOR, "invoice_id": INVOICE_ID}),
+        ))
         .await
         .unwrap();
-    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    assert_eq!(terminal_void.status(), StatusCode::CONFLICT);
     assert_eq!(
-        json(conflict).await,
+        json(terminal_void).await,
         serde_json::json!({"error":{
-            "code":"conflict",
-            "message":"request conflicts with persisted payment state"
+            "code":"lifecycle_terminal",
+            "message":"payment lifecycle is already terminal"
         }})
     );
 

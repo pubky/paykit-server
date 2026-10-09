@@ -8,7 +8,8 @@ use uuid::Uuid;
 use crate::{
     domain::locks::CreatorPubky,
     persistence::{
-        MarketplaceActivationInput, MarketplaceActivationResult, MarketplacePreparationStore,
+        MarketplaceActivationInput, MarketplaceActivationResult,
+        MarketplaceLifecyclePersistenceError, MarketplacePreparationStore,
         MarketplaceResolutionOutcome, MarketplaceResolutionResult, MarketplaceVoidResult,
         PersistenceError,
     },
@@ -34,7 +35,10 @@ pub struct ResolveMarketplaceRequest {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MarketplaceLifecycleError {
     InvalidRequest,
-    Conflict,
+    PrepareExpired,
+    LifecycleTerminal,
+    TotalMismatch,
+    ResolutionConflict,
     NotFound,
     Unavailable,
 }
@@ -44,20 +48,20 @@ pub trait MarketplaceLifecyclePersistence: Send + Sync {
     async fn activate(
         &self,
         input: MarketplaceActivationInput<'_>,
-    ) -> Result<Option<MarketplaceActivationResult>, PersistenceError>;
+    ) -> Result<Option<MarketplaceActivationResult>, MarketplaceLifecyclePersistenceError>;
 
     async fn void(
         &self,
         creator: &CreatorPubky,
         invoice_id: Uuid,
-    ) -> Result<Option<MarketplaceVoidResult>, PersistenceError>;
+    ) -> Result<Option<MarketplaceVoidResult>, MarketplaceLifecyclePersistenceError>;
 
     async fn resolve(
         &self,
         creator: &CreatorPubky,
         invoice_id: Uuid,
         outcome: MarketplaceResolutionOutcome,
-    ) -> Result<Option<MarketplaceResolutionResult>, PersistenceError>;
+    ) -> Result<Option<MarketplaceResolutionResult>, MarketplaceLifecyclePersistenceError>;
 }
 
 #[async_trait]
@@ -65,7 +69,7 @@ impl MarketplaceLifecyclePersistence for MarketplacePreparationStore {
     async fn activate(
         &self,
         input: MarketplaceActivationInput<'_>,
-    ) -> Result<Option<MarketplaceActivationResult>, PersistenceError> {
+    ) -> Result<Option<MarketplaceActivationResult>, MarketplaceLifecyclePersistenceError> {
         MarketplacePreparationStore::activate(self, input).await
     }
 
@@ -73,7 +77,7 @@ impl MarketplaceLifecyclePersistence for MarketplacePreparationStore {
         &self,
         creator: &CreatorPubky,
         invoice_id: Uuid,
-    ) -> Result<Option<MarketplaceVoidResult>, PersistenceError> {
+    ) -> Result<Option<MarketplaceVoidResult>, MarketplaceLifecyclePersistenceError> {
         MarketplacePreparationStore::void(self, creator, invoice_id).await
     }
 
@@ -82,7 +86,7 @@ impl MarketplaceLifecyclePersistence for MarketplacePreparationStore {
         creator: &CreatorPubky,
         invoice_id: Uuid,
         outcome: MarketplaceResolutionOutcome,
-    ) -> Result<Option<MarketplaceResolutionResult>, PersistenceError> {
+    ) -> Result<Option<MarketplaceResolutionResult>, MarketplaceLifecyclePersistenceError> {
         MarketplacePreparationStore::resolve(self, creator, invoice_id, outcome).await
     }
 }
@@ -115,7 +119,7 @@ impl MarketplaceLifecycleService {
                 creator: &request.creator,
                 invoice_id: request.invoice_id,
                 total_sats: request.total_sats,
-                proposal_acceptance_seconds: self.proposal_acceptance_window.as_secs(),
+                proposal_acceptance_window: self.proposal_acceptance_window,
             })
             .await
             .map_err(map_store)?
@@ -145,13 +149,29 @@ impl MarketplaceLifecycleService {
     }
 }
 
-fn map_store(error: PersistenceError) -> MarketplaceLifecycleError {
+fn map_store(error: MarketplaceLifecyclePersistenceError) -> MarketplaceLifecycleError {
     match error {
-        PersistenceError::InvalidInput => MarketplaceLifecycleError::InvalidRequest,
-        PersistenceError::Conflict => MarketplaceLifecycleError::Conflict,
-        PersistenceError::DeploymentMismatch
-        | PersistenceError::CorruptOrMissing
-        | PersistenceError::ReauthenticationMismatch
-        | PersistenceError::Unavailable => MarketplaceLifecycleError::Unavailable,
+        MarketplaceLifecyclePersistenceError::PrepareExpired => {
+            MarketplaceLifecycleError::PrepareExpired
+        }
+        MarketplaceLifecyclePersistenceError::LifecycleTerminal => {
+            MarketplaceLifecycleError::LifecycleTerminal
+        }
+        MarketplaceLifecyclePersistenceError::TotalMismatch => {
+            MarketplaceLifecycleError::TotalMismatch
+        }
+        MarketplaceLifecyclePersistenceError::ResolutionConflict => {
+            MarketplaceLifecycleError::ResolutionConflict
+        }
+        MarketplaceLifecyclePersistenceError::Persistence(PersistenceError::InvalidInput) => {
+            MarketplaceLifecycleError::InvalidRequest
+        }
+        MarketplaceLifecyclePersistenceError::Persistence(
+            PersistenceError::DeploymentMismatch
+            | PersistenceError::CorruptOrMissing
+            | PersistenceError::ReauthenticationMismatch
+            | PersistenceError::Unavailable
+            | PersistenceError::Conflict,
+        ) => MarketplaceLifecycleError::Unavailable,
     }
 }

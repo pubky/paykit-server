@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
+use thiserror::Error;
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
@@ -11,7 +12,7 @@ use crate::{
     application::semantic_intent::DeliveryIntentV1,
     crypto::{Crypto, EncryptedEnvelope, EnvelopeContext, LookupHash},
     domain::locks::{CreatorPubky, ReaderPubky, parse_reader},
-    persistence::PersistenceError,
+    persistence::{PersistenceError, invoices::InvoicePaymentRecordV1},
 };
 
 const OPERATION_BINDING_UNIQUE_CONSTRAINT: &str = "marketplace_preparation_operation_binding_key";
@@ -34,7 +35,27 @@ pub struct MarketplaceActivationInput<'a> {
     pub creator: &'a CreatorPubky,
     pub invoice_id: Uuid,
     pub total_sats: u64,
-    pub proposal_acceptance_seconds: u64,
+    pub proposal_acceptance_window: std::time::Duration,
+}
+
+/// Closed lifecycle failures used to preserve caller recovery semantics.
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+pub enum MarketplaceLifecyclePersistenceError {
+    /// Prepared invoice expired before activation and needs a new attempt.
+    #[error("marketplace payment preparation expired")]
+    PrepareExpired,
+    /// A terminal lifecycle transition already won.
+    #[error("marketplace payment lifecycle is terminal")]
+    LifecycleTerminal,
+    /// Caller total differs from the authoritative prepared total.
+    #[error("marketplace payment total does not match")]
+    TotalMismatch,
+    /// A different immutable business outcome was already recorded.
+    #[error("marketplace business resolution conflicts with persisted outcome")]
+    ResolutionConflict,
+    /// Generic persistence or validation failure.
+    #[error(transparent)]
+    Persistence(#[from] PersistenceError),
 }
 
 /// Complete private proposal material derived after the transaction reserves an address index.
@@ -487,9 +508,9 @@ impl MarketplacePreparationStore {
     pub async fn activate(
         &self,
         input: MarketplaceActivationInput<'_>,
-    ) -> Result<Option<MarketplaceActivationResult>, PersistenceError> {
-        if input.total_sats == 0 || input.proposal_acceptance_seconds == 0 {
-            return Err(PersistenceError::InvalidInput);
+    ) -> Result<Option<MarketplaceActivationResult>, MarketplaceLifecyclePersistenceError> {
+        if input.total_sats == 0 || input.proposal_acceptance_window.is_zero() {
+            return Err(PersistenceError::InvalidInput.into());
         }
         let mut tx = self
             .pool
@@ -507,15 +528,15 @@ impl MarketplacePreparationStore {
         };
         let creator_hash = stored_hash(&row.creator_lookup_hash)?;
         let mut envelope = self.decode_lifecycle_envelope(creator_hash, &row)?;
-        if envelope.total_sats != input.total_sats {
-            return Err(PersistenceError::Conflict);
-        }
         match row.state.as_str() {
             "active" => {
+                if envelope.total_sats != input.total_sats {
+                    return Err(MarketplaceLifecyclePersistenceError::TotalMismatch);
+                }
                 let (Some(activated_at), Some(payment_deadline)) =
                     (row.activated_at, row.payment_deadline)
                 else {
-                    return Err(PersistenceError::CorruptOrMissing);
+                    return Err(PersistenceError::CorruptOrMissing.into());
                 };
                 let outbox_count: i64 = sqlx::query_scalar(
                     "SELECT count(*) FROM outbox
@@ -530,8 +551,10 @@ impl MarketplacePreparationStore {
                 .await
                 .map_err(|_| PersistenceError::Unavailable)?;
                 if outbox_count != 1 {
-                    return Err(PersistenceError::CorruptOrMissing);
+                    return Err(PersistenceError::CorruptOrMissing.into());
                 }
+                self.validate_settlement(&mut tx, creator_hash, &row, &envelope)
+                    .await?;
                 tx.commit()
                     .await
                     .map_err(|_| PersistenceError::Unavailable)?;
@@ -544,8 +567,8 @@ impl MarketplacePreparationStore {
                 }));
             }
             "prepared" => {}
-            "voided" => return Err(PersistenceError::Conflict),
-            _ => return Err(PersistenceError::CorruptOrMissing),
+            "voided" => return Err(MarketplaceLifecyclePersistenceError::LifecycleTerminal),
+            _ => return Err(PersistenceError::CorruptOrMissing.into()),
         }
         if row.activated_at.is_some()
             || row.payment_deadline.is_some()
@@ -553,9 +576,9 @@ impl MarketplacePreparationStore {
             || row.resolved_at.is_some()
         {
             return Err(if row.resolved_at.is_some() {
-                PersistenceError::Conflict
+                MarketplaceLifecyclePersistenceError::LifecycleTerminal
             } else {
-                PersistenceError::CorruptOrMissing
+                PersistenceError::CorruptOrMissing.into()
             });
         }
         let now: OffsetDateTime = sqlx::query_scalar("SELECT clock_timestamp()")
@@ -563,23 +586,20 @@ impl MarketplacePreparationStore {
             .await
             .map_err(|_| PersistenceError::Unavailable)?;
         if now >= row.prepare_expires_at {
-            return Err(PersistenceError::Conflict);
+            return Err(MarketplaceLifecyclePersistenceError::PrepareExpired);
+        }
+        if envelope.total_sats != input.total_sats {
+            return Err(MarketplaceLifecyclePersistenceError::TotalMismatch);
         }
         let window_seconds = i64::try_from(envelope.payment_window_seconds)
             .map_err(|_| PersistenceError::CorruptOrMissing)?;
         let payment_deadline = now
             .checked_add(Duration::seconds(window_seconds))
             .ok_or(PersistenceError::InvalidInput)?;
-        let proposal_duration = if window_seconds == 1 {
-            Duration::milliseconds(500)
-        } else {
-            let proposal_seconds = input
-                .proposal_acceptance_seconds
-                .min(envelope.payment_window_seconds - 1);
-            let proposal_seconds =
-                i64::try_from(proposal_seconds).map_err(|_| PersistenceError::InvalidInput)?;
-            Duration::seconds(proposal_seconds)
-        };
+        let configured_proposal_duration = Duration::try_from(input.proposal_acceptance_window)
+            .map_err(|_| PersistenceError::InvalidInput)?;
+        let proposal_duration =
+            configured_proposal_duration.min(Duration::seconds(window_seconds) / 2);
         let proposal_expires_at = now
             .checked_add(proposal_duration)
             .ok_or(PersistenceError::InvalidInput)?;
@@ -629,6 +649,41 @@ impl MarketplacePreparationStore {
         .execute(&mut *tx)
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
+        let payment_record = InvoicePaymentRecordV1::from_intent(
+            envelope.child_index,
+            &envelope.payment_request_intent,
+        )?;
+        let bitcoin_address_hash = self
+            .crypto
+            .bitcoin_address_lookup_hash(payment_record.bitcoin_address()?.as_bytes());
+        let derivation_index_hash = self
+            .crypto
+            .bitcoin_derivation_index_lookup_hash(creator_hash, payment_record.derivation_index());
+        let payment_record_plaintext = postcard::to_allocvec(&payment_record)
+            .map_err(|_| PersistenceError::CorruptOrMissing)?;
+        let payment_record_envelope = self
+            .crypto
+            .encrypt(
+                &EnvelopeContext::marketplace_settlement_payment_record(creator_hash, row.id),
+                &payment_record_plaintext,
+            )
+            .map_err(|_| PersistenceError::CorruptOrMissing)?;
+        sqlx::query(
+            "INSERT INTO marketplace_settlements (
+                 preparation_id, creator_id, payment_record_envelope,
+                 bitcoin_address_lookup_hash, derivation_index_lookup_hash,
+                 payment_status, confirmation_count, amount_matched
+             )
+             SELECT id, creator_id, $2, $3, $4, 'undetected', 0, FALSE
+             FROM marketplace_payment_preparations WHERE id = $1",
+        )
+        .bind(row.id)
+        .bind(payment_record_envelope.as_bytes())
+        .bind(bitcoin_address_hash.as_bytes().as_slice())
+        .bind(derivation_index_hash.as_bytes().as_slice())
+        .execute(&mut *tx)
+        .await
+        .map_err(classify_settlement_insert_error)?;
         let inserted = sqlx::query(
             "INSERT INTO outbox
              (id, creator_id, marketplace_preparation_id, intent_envelope, intent_kind,
@@ -644,7 +699,7 @@ impl MarketplacePreparationStore {
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
         if inserted.rows_affected() != 1 {
-            return Err(PersistenceError::CorruptOrMissing);
+            return Err(PersistenceError::CorruptOrMissing.into());
         }
         tx.commit()
             .await
@@ -663,7 +718,7 @@ impl MarketplacePreparationStore {
         &self,
         creator: &CreatorPubky,
         invoice_id: Uuid,
-    ) -> Result<Option<MarketplaceVoidResult>, PersistenceError> {
+    ) -> Result<Option<MarketplaceVoidResult>, MarketplaceLifecyclePersistenceError> {
         let mut tx = self
             .pool
             .begin()
@@ -683,7 +738,7 @@ impl MarketplacePreparationStore {
         match row.state.as_str() {
             "voided" => {
                 let Some(voided_at) = row.voided_at else {
-                    return Err(PersistenceError::CorruptOrMissing);
+                    return Err(PersistenceError::CorruptOrMissing.into());
                 };
                 tx.commit()
                     .await
@@ -695,11 +750,11 @@ impl MarketplacePreparationStore {
                 }));
             }
             "prepared" => {}
-            "active" => return Err(PersistenceError::Conflict),
-            _ => return Err(PersistenceError::CorruptOrMissing),
+            "active" => return Err(MarketplaceLifecyclePersistenceError::LifecycleTerminal),
+            _ => return Err(PersistenceError::CorruptOrMissing.into()),
         }
         if row.activated_at.is_some() || row.payment_deadline.is_some() || row.voided_at.is_some() {
-            return Err(PersistenceError::CorruptOrMissing);
+            return Err(PersistenceError::CorruptOrMissing.into());
         }
         let voided_at: OffsetDateTime = sqlx::query_scalar("SELECT clock_timestamp()")
             .fetch_one(&mut *tx)
@@ -731,7 +786,7 @@ impl MarketplacePreparationStore {
         creator: &CreatorPubky,
         invoice_id: Uuid,
         outcome: MarketplaceResolutionOutcome,
-    ) -> Result<Option<MarketplaceResolutionResult>, PersistenceError> {
+    ) -> Result<Option<MarketplaceResolutionResult>, MarketplaceLifecyclePersistenceError> {
         let mut tx = self
             .pool
             .begin()
@@ -749,14 +804,14 @@ impl MarketplacePreparationStore {
         let creator_hash = stored_hash(&row.creator_lookup_hash)?;
         self.decode_lifecycle_envelope(creator_hash, &row)?;
         if !matches!(row.state.as_str(), "prepared" | "active" | "voided") {
-            return Err(PersistenceError::CorruptOrMissing);
+            return Err(PersistenceError::CorruptOrMissing.into());
         }
         match (&row.business_outcome, row.resolved_at) {
             (Some(existing), Some(resolved_at)) => {
                 let existing = MarketplaceResolutionOutcome::parse(existing)
                     .ok_or(PersistenceError::CorruptOrMissing)?;
                 if existing != outcome {
-                    return Err(PersistenceError::Conflict);
+                    return Err(MarketplaceLifecyclePersistenceError::ResolutionConflict);
                 }
                 tx.commit()
                     .await
@@ -769,7 +824,7 @@ impl MarketplacePreparationStore {
                 )));
             }
             (None, None) => {}
-            _ => return Err(PersistenceError::CorruptOrMissing),
+            _ => return Err(PersistenceError::CorruptOrMissing.into()),
         }
         let resolved_at: OffsetDateTime = sqlx::query_scalar("SELECT clock_timestamp()")
             .fetch_one(&mut *tx)
@@ -787,7 +842,7 @@ impl MarketplacePreparationStore {
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
         if updated.rows_affected() != 1 {
-            return Err(PersistenceError::CorruptOrMissing);
+            return Err(PersistenceError::CorruptOrMissing.into());
         }
         tx.commit()
             .await
@@ -957,6 +1012,59 @@ impl MarketplacePreparationStore {
         Ok(envelope)
     }
 
+    async fn validate_settlement(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        creator_hash: LookupHash,
+        row: &LifecycleRow,
+        preparation: &PreparationEnvelopeV1,
+    ) -> Result<(), PersistenceError> {
+        let stored: Option<(Vec<u8>, Vec<u8>, Vec<u8>)> = sqlx::query_as(
+            "SELECT payment_record_envelope, bitcoin_address_lookup_hash,
+                    derivation_index_lookup_hash
+             FROM marketplace_settlements
+             WHERE preparation_id = $1 AND creator_id = (
+                 SELECT creator_id FROM marketplace_payment_preparations WHERE id = $1
+             )",
+        )
+        .bind(row.id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        let Some((encrypted, address_hash, derivation_hash)) = stored else {
+            return Err(PersistenceError::CorruptOrMissing);
+        };
+        let plaintext = self
+            .crypto
+            .decrypt(
+                &EnvelopeContext::marketplace_settlement_payment_record(creator_hash, row.id),
+                &EncryptedEnvelope::from_bytes(encrypted),
+            )
+            .map_err(|_| PersistenceError::CorruptOrMissing)?;
+        let actual: InvoicePaymentRecordV1 =
+            postcard::from_bytes(&plaintext).map_err(|_| PersistenceError::CorruptOrMissing)?;
+        let expected = InvoicePaymentRecordV1::from_intent(
+            preparation.child_index,
+            &preparation.payment_request_intent,
+        )
+        .map_err(|_| PersistenceError::CorruptOrMissing)?;
+        if actual != expected
+            || address_hash.as_slice()
+                != self
+                    .crypto
+                    .bitcoin_address_lookup_hash(expected.bitcoin_address()?.as_bytes())
+                    .as_bytes()
+            || derivation_hash.as_slice()
+                != self
+                    .crypto
+                    .bitcoin_derivation_index_lookup_hash(creator_hash, expected.derivation_index())
+                    .as_bytes()
+        {
+            return Err(PersistenceError::CorruptOrMissing);
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn validate_replay(
         &self,
@@ -1057,6 +1165,13 @@ fn classify_preparation_insert_error(error: sqlx::Error) -> PersistenceError {
         {
             PersistenceError::Conflict
         }
+        sqlx::Error::Database(_) => PersistenceError::CorruptOrMissing,
+        _ => PersistenceError::Unavailable,
+    }
+}
+
+fn classify_settlement_insert_error(error: sqlx::Error) -> PersistenceError {
+    match error {
         sqlx::Error::Database(_) => PersistenceError::CorruptOrMissing,
         _ => PersistenceError::Unavailable,
     }

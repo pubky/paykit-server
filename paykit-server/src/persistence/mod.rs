@@ -17,10 +17,11 @@ pub use invoices::{
     InvoicePreflight, InvoiceStore, PendingBuyerContact,
 };
 pub use marketplace_preparations::{
-    MarketplaceActivationInput, MarketplaceActivationResult, MarketplacePreparationInput,
-    MarketplacePreparationPayloadFactory, MarketplacePreparationPayloads,
-    MarketplacePreparationPreflight, MarketplacePreparationResult, MarketplacePreparationStore,
-    MarketplaceResolutionOutcome, MarketplaceResolutionResult, MarketplaceVoidResult,
+    MarketplaceActivationInput, MarketplaceActivationResult, MarketplaceLifecyclePersistenceError,
+    MarketplacePreparationInput, MarketplacePreparationPayloadFactory,
+    MarketplacePreparationPayloads, MarketplacePreparationPreflight, MarketplacePreparationResult,
+    MarketplacePreparationStore, MarketplaceResolutionOutcome, MarketplaceResolutionResult,
+    MarketplaceVoidResult,
 };
 pub use migrations::{MIGRATION_ADVISORY_LOCK_KEY, MigrationLock, run_migrations};
 pub use outbox::{ClaimedHandoff, ClaimedOutbox, HandoffResult, OutboxRetryClass, OutboxStore};
