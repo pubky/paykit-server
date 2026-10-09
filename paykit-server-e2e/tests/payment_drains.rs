@@ -1185,7 +1185,7 @@ async fn concurrent_lifecycle_projection_precedes_status_freshness_decision() {
     });
     wait_for_lock_wait(
         &database,
-        "SELECT id FROM invoices WHERE id = $1 FOR UPDATE",
+        "SELECT id FROM invoices WHERE id = $1 AND creator_id = $2 FOR UPDATE",
     )
     .await;
 
