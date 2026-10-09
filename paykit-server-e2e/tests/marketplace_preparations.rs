@@ -8,7 +8,8 @@ use paykit_server::{
     persistence::{
         CreatorCredentials, CreatorStore, MarketplaceActivationInput, MarketplacePreparationInput,
         MarketplacePreparationPayloadFactory, MarketplacePreparationPayloads,
-        MarketplacePreparationStore, OutboxStore, PersistenceError, run_migrations,
+        MarketplacePreparationStore, MarketplaceResolutionOutcome, OutboxStore, PersistenceError,
+        run_migrations,
     },
 };
 use paykit_server_e2e::postgres::TestDatabase;
@@ -18,6 +19,14 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 mod common;
 
 const CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
+
+type MarketplaceLifecycleFacts = (
+    uuid::Uuid,
+    String,
+    Option<OffsetDateTime>,
+    Option<OffsetDateTime>,
+    Option<OffsetDateTime>,
+);
 
 fn creator() -> CreatorPubky {
     parse_creator(CREATOR).unwrap()
@@ -515,15 +524,15 @@ async fn activation_rejects_wrong_total_expiry_and_prepared_resolution_without_p
         ))
         .await
         .unwrap();
-    sqlx::query(
-        "UPDATE marketplace_payment_preparations
-         SET business_outcome = 'abandoned', resolved_at = clock_timestamp()
-         WHERE id = $1",
-    )
-    .bind(resolved.invoice_id())
-    .execute(database.pool())
-    .await
-    .unwrap();
+    store
+        .resolve(
+            &creator,
+            resolved.invoice_id(),
+            MarketplaceResolutionOutcome::Abandoned,
+        )
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(
         store
             .activate(MarketplaceActivationInput {
@@ -550,6 +559,328 @@ async fn activation_rejects_wrong_total_expiry_and_prepared_resolution_without_p
             .unwrap(),
         0
     );
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn resolution_annotates_prepared_active_and_voided_without_changing_lifecycle_facts() {
+    let database = TestDatabase::create().await;
+    let store = store(&database).await;
+    let creator = creator();
+    let reader = reader();
+    let prepared = store
+        .prepare(input(
+            &creator,
+            &reader,
+            "marketplace-payment:resolve-prepared:attempt-1",
+            b"resolve-prepared",
+        ))
+        .await
+        .unwrap();
+    let active = store
+        .prepare(input(
+            &creator,
+            &reader,
+            "marketplace-payment:resolve-active:attempt-1",
+            b"resolve-active",
+        ))
+        .await
+        .unwrap();
+    let activated = store
+        .activate(MarketplaceActivationInput {
+            creator: &creator,
+            invoice_id: active.invoice_id(),
+            total_sats: 100,
+            proposal_acceptance_seconds: 30 * 60,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    let voided = store
+        .prepare(input(
+            &creator,
+            &reader,
+            "marketplace-payment:resolve-voided:attempt-1",
+            b"resolve-voided",
+        ))
+        .await
+        .unwrap();
+    let void_result = store
+        .void(&creator, voided.invoice_id())
+        .await
+        .unwrap()
+        .unwrap();
+
+    for (invoice_id, outcome) in [
+        (
+            prepared.invoice_id(),
+            MarketplaceResolutionOutcome::Abandoned,
+        ),
+        (
+            active.invoice_id(),
+            MarketplaceResolutionOutcome::PaidManually,
+        ),
+        (voided.invoice_id(), MarketplaceResolutionOutcome::Refunded),
+    ] {
+        let result = store
+            .resolve(&creator, invoice_id, outcome)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.invoice_id(), invoice_id);
+        assert_eq!(result.outcome(), outcome);
+        assert!(!result.replayed());
+    }
+
+    let rows: Vec<MarketplaceLifecycleFacts> = sqlx::query_as(
+        "SELECT id, state, activated_at, payment_deadline, voided_at
+             FROM marketplace_payment_preparations ORDER BY prepared_at",
+    )
+    .fetch_all(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        rows[0],
+        (prepared.invoice_id(), "prepared".into(), None, None, None)
+    );
+    assert_eq!(
+        rows[1],
+        (
+            active.invoice_id(),
+            "active".into(),
+            Some(activated.activated_at()),
+            Some(activated.payment_deadline()),
+            None,
+        )
+    );
+    assert_eq!(
+        rows[2],
+        (
+            voided.invoice_id(),
+            "voided".into(),
+            None,
+            None,
+            Some(void_result.voided_at()),
+        )
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM outbox")
+            .fetch_one(database.pool())
+            .await
+            .unwrap(),
+        1,
+        "resolution must not add publication or cancellation work"
+    );
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn concurrent_same_resolution_replays_one_db_timestamp() {
+    let database = TestDatabase::create().await;
+    let first_store = store(&database).await;
+    let second_store = MarketplacePreparationStore::new(database.pool(), crypto());
+    let creator = creator();
+    let prepared = first_store
+        .prepare(input(
+            &creator,
+            &reader(),
+            "marketplace-payment:resolve-replay:attempt-1",
+            b"resolve-replay",
+        ))
+        .await
+        .unwrap();
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
+    let first = tokio::spawn({
+        let barrier = barrier.clone();
+        let creator = creator.clone();
+        async move {
+            barrier.wait().await;
+            first_store
+                .resolve(
+                    &creator,
+                    prepared.invoice_id(),
+                    MarketplaceResolutionOutcome::PaidManually,
+                )
+                .await
+        }
+    });
+    let second = tokio::spawn({
+        let barrier = barrier.clone();
+        let creator = creator.clone();
+        async move {
+            barrier.wait().await;
+            second_store
+                .resolve(
+                    &creator,
+                    prepared.invoice_id(),
+                    MarketplaceResolutionOutcome::PaidManually,
+                )
+                .await
+        }
+    });
+    barrier.wait().await;
+    let first = first.await.unwrap().unwrap().unwrap();
+    let second = second.await.unwrap().unwrap().unwrap();
+
+    assert_ne!(first.replayed(), second.replayed());
+    assert_eq!(first.resolved_at(), second.resolved_at());
+    assert_eq!(first.outcome(), MarketplaceResolutionOutcome::PaidManually);
+    assert_eq!(second.outcome(), MarketplaceResolutionOutcome::PaidManually);
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn concurrent_different_resolutions_commit_one_immutable_outcome() {
+    let database = TestDatabase::create().await;
+    let first_store = store(&database).await;
+    let second_store = MarketplacePreparationStore::new(database.pool(), crypto());
+    let creator = creator();
+    let prepared = first_store
+        .prepare(input(
+            &creator,
+            &reader(),
+            "marketplace-payment:resolve-conflict:attempt-1",
+            b"resolve-conflict",
+        ))
+        .await
+        .unwrap();
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
+    let first = tokio::spawn({
+        let barrier = barrier.clone();
+        let creator = creator.clone();
+        async move {
+            barrier.wait().await;
+            first_store
+                .resolve(
+                    &creator,
+                    prepared.invoice_id(),
+                    MarketplaceResolutionOutcome::Refunded,
+                )
+                .await
+        }
+    });
+    let second = tokio::spawn({
+        let barrier = barrier.clone();
+        let creator = creator.clone();
+        async move {
+            barrier.wait().await;
+            second_store
+                .resolve(
+                    &creator,
+                    prepared.invoice_id(),
+                    MarketplaceResolutionOutcome::Abandoned,
+                )
+                .await
+        }
+    });
+    barrier.wait().await;
+    let (first, second) = (first.await.unwrap(), second.await.unwrap());
+    assert!(
+        matches!(
+            (&first, &second),
+            (Ok(Some(_)), Err(PersistenceError::Conflict))
+        ) || matches!(
+            (&first, &second),
+            (Err(PersistenceError::Conflict), Ok(Some(_)))
+        ),
+        "exactly one outcome must commit: first={first:?}, second={second:?}"
+    );
+    let stored: String = sqlx::query_scalar(
+        "SELECT business_outcome FROM marketplace_payment_preparations WHERE id = $1",
+    )
+    .bind(prepared.invoice_id())
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert!(matches!(stored.as_str(), "refunded" | "abandoned"));
+    let rewrite = sqlx::query(
+        "UPDATE marketplace_payment_preparations
+         SET business_outcome = 'paid_manually', resolved_at = clock_timestamp()
+         WHERE id = $1",
+    )
+    .bind(prepared.invoice_id())
+    .execute(database.pool())
+    .await
+    .unwrap_err();
+    assert_eq!(
+        rewrite.as_database_error().unwrap().code().as_deref(),
+        Some("23514")
+    );
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn prepared_resolution_and_activation_serialize_without_unresolved_publication() {
+    let database = TestDatabase::create().await;
+    let activation_store = store(&database).await;
+    let resolution_store = MarketplacePreparationStore::new(database.pool(), crypto());
+    let creator = creator();
+    let prepared = activation_store
+        .prepare(input(
+            &creator,
+            &reader(),
+            "marketplace-payment:resolve-activate:attempt-1",
+            b"resolve-activate",
+        ))
+        .await
+        .unwrap();
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
+    let activate = tokio::spawn({
+        let barrier = barrier.clone();
+        let creator = creator.clone();
+        async move {
+            barrier.wait().await;
+            activation_store
+                .activate(MarketplaceActivationInput {
+                    creator: &creator,
+                    invoice_id: prepared.invoice_id(),
+                    total_sats: 100,
+                    proposal_acceptance_seconds: 30 * 60,
+                })
+                .await
+        }
+    });
+    let resolve = tokio::spawn({
+        let barrier = barrier.clone();
+        let creator = creator.clone();
+        async move {
+            barrier.wait().await;
+            resolution_store
+                .resolve(
+                    &creator,
+                    prepared.invoice_id(),
+                    MarketplaceResolutionOutcome::Abandoned,
+                )
+                .await
+        }
+    });
+    barrier.wait().await;
+    let activated = activate.await.unwrap();
+    let resolved = resolve.await.unwrap().unwrap().unwrap();
+    assert!(!resolved.replayed());
+    let state: String =
+        sqlx::query_scalar("SELECT state FROM marketplace_payment_preparations WHERE id = $1")
+            .bind(prepared.invoice_id())
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    let outbox_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM outbox WHERE marketplace_preparation_id = $1")
+            .bind(prepared.invoice_id())
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    match activated {
+        Ok(Some(_)) => {
+            assert_eq!(state, "active");
+            assert_eq!(outbox_count, 1);
+        }
+        Err(PersistenceError::Conflict) => {
+            assert_eq!(state, "prepared");
+            assert_eq!(outbox_count, 0);
+        }
+        other => panic!("unexpected activation result: {other:?}"),
+    }
     database.cleanup().await;
 }
 

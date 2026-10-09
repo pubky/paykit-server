@@ -20,8 +20,8 @@ use paykit_server::{
         marketplace_lifecycle::marketplace_lifecycle_router,
     },
     persistence::{
-        MarketplaceActivationInput, MarketplaceActivationResult, MarketplaceVoidResult,
-        PersistenceError,
+        MarketplaceActivationInput, MarketplaceActivationResult, MarketplaceResolutionOutcome,
+        MarketplaceResolutionResult, MarketplaceVoidResult, PersistenceError,
     },
 };
 use time::OffsetDateTime;
@@ -71,6 +71,25 @@ impl MarketplaceLifecyclePersistence for FakeStore {
         match self.outcome {
             Outcome::Success => Ok(Some(MarketplaceVoidResult::new(
                 invoice_id,
+                OffsetDateTime::UNIX_EPOCH,
+                true,
+            ))),
+            Outcome::Conflict => Err(PersistenceError::Conflict),
+            Outcome::NotFound => Ok(None),
+            Outcome::Corrupt => Err(PersistenceError::CorruptOrMissing),
+        }
+    }
+
+    async fn resolve(
+        &self,
+        _creator: &CreatorPubky,
+        invoice_id: Uuid,
+        outcome: MarketplaceResolutionOutcome,
+    ) -> Result<Option<MarketplaceResolutionResult>, PersistenceError> {
+        match self.outcome {
+            Outcome::Success => Ok(Some(MarketplaceResolutionResult::new(
+                invoice_id,
+                outcome,
                 OffsetDateTime::UNIX_EPOCH,
                 true,
             ))),
@@ -226,6 +245,68 @@ async fn signed_activate_and_void_have_closed_success_fixtures() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn signed_resolve_has_closed_success_and_error_fixtures() {
+    let key = SigningKey::from_bytes(&[11; 32]);
+    let path = "/marketplace/payment-requests/resolve";
+    let body = || {
+        serde_json::json!({
+            "creator": CREATOR,
+            "invoice_id": INVOICE_ID,
+            "outcome": "abandoned",
+        })
+    };
+    let response = marketplace_lifecycle_router(service(Outcome::Success))
+        .layer(Extension(signed_auth(&key)))
+        .oneshot(signed_request(&key, path, body()))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        json(response).await,
+        serde_json::json!({
+            "invoice_id": INVOICE_ID,
+            "outcome": "abandoned",
+            "resolved_at": "1970-01-01T00:00:00Z",
+        })
+    );
+
+    for invalid in [
+        serde_json::json!({
+            "creator": CREATOR,
+            "invoice_id": INVOICE_ID,
+            "outcome": "cancelled",
+        }),
+        serde_json::json!({
+            "creator": CREATOR,
+            "invoice_id": INVOICE_ID,
+            "outcome": "abandoned",
+            "resolved_at": "1970-01-01T00:00:00Z",
+        }),
+    ] {
+        let response = marketplace_lifecycle_router(service(Outcome::Success))
+            .layer(Extension(signed_auth(&key)))
+            .oneshot(signed_request(&key, path, invalid))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    let conflict = marketplace_lifecycle_router(service(Outcome::Conflict))
+        .layer(Extension(signed_auth(&key)))
+        .oneshot(signed_request(&key, path, body()))
+        .await
+        .unwrap();
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json(conflict).await,
+        serde_json::json!({"error":{
+            "code":"conflict",
+            "message":"request conflicts with persisted payment state"
+        }})
+    );
 }
 
 #[tokio::test]

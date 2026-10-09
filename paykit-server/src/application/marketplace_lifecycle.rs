@@ -9,7 +9,8 @@ use crate::{
     domain::locks::CreatorPubky,
     persistence::{
         MarketplaceActivationInput, MarketplaceActivationResult, MarketplacePreparationStore,
-        MarketplaceVoidResult, PersistenceError,
+        MarketplaceResolutionOutcome, MarketplaceResolutionResult, MarketplaceVoidResult,
+        PersistenceError,
     },
 };
 
@@ -22,6 +23,12 @@ pub struct ActivateMarketplaceRequest {
 pub struct VoidMarketplaceRequest {
     pub creator: CreatorPubky,
     pub invoice_id: Uuid,
+}
+
+pub struct ResolveMarketplaceRequest {
+    pub creator: CreatorPubky,
+    pub invoice_id: Uuid,
+    pub outcome: MarketplaceResolutionOutcome,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,6 +51,13 @@ pub trait MarketplaceLifecyclePersistence: Send + Sync {
         creator: &CreatorPubky,
         invoice_id: Uuid,
     ) -> Result<Option<MarketplaceVoidResult>, PersistenceError>;
+
+    async fn resolve(
+        &self,
+        creator: &CreatorPubky,
+        invoice_id: Uuid,
+        outcome: MarketplaceResolutionOutcome,
+    ) -> Result<Option<MarketplaceResolutionResult>, PersistenceError>;
 }
 
 #[async_trait]
@@ -61,6 +75,15 @@ impl MarketplaceLifecyclePersistence for MarketplacePreparationStore {
         invoice_id: Uuid,
     ) -> Result<Option<MarketplaceVoidResult>, PersistenceError> {
         MarketplacePreparationStore::void(self, creator, invoice_id).await
+    }
+
+    async fn resolve(
+        &self,
+        creator: &CreatorPubky,
+        invoice_id: Uuid,
+        outcome: MarketplaceResolutionOutcome,
+    ) -> Result<Option<MarketplaceResolutionResult>, PersistenceError> {
+        MarketplacePreparationStore::resolve(self, creator, invoice_id, outcome).await
     }
 }
 
@@ -105,6 +128,17 @@ impl MarketplaceLifecycleService {
     ) -> Result<MarketplaceVoidResult, MarketplaceLifecycleError> {
         self.store
             .void(&request.creator, request.invoice_id)
+            .await
+            .map_err(map_store)?
+            .ok_or(MarketplaceLifecycleError::NotFound)
+    }
+
+    pub async fn resolve(
+        &self,
+        request: ResolveMarketplaceRequest,
+    ) -> Result<MarketplaceResolutionResult, MarketplaceLifecycleError> {
+        self.store
+            .resolve(&request.creator, request.invoice_id, request.outcome)
             .await
             .map_err(map_store)?
             .ok_or(MarketplaceLifecycleError::NotFound)

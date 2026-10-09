@@ -181,6 +181,72 @@ impl MarketplaceVoidResult {
     }
 }
 
+/// Closed Marketplace business outcome vocabulary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MarketplaceResolutionOutcome {
+    PaidManually,
+    Refunded,
+    Abandoned,
+}
+
+impl MarketplaceResolutionOutcome {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "paid_manually" => Some(Self::PaidManually),
+            "refunded" => Some(Self::Refunded),
+            "abandoned" => Some(Self::Abandoned),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PaidManually => "paid_manually",
+            Self::Refunded => "refunded",
+            Self::Abandoned => "abandoned",
+        }
+    }
+}
+
+/// Secret-free stored Marketplace resolution response.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MarketplaceResolutionResult {
+    invoice_id: Uuid,
+    outcome: MarketplaceResolutionOutcome,
+    resolved_at: OffsetDateTime,
+    replayed: bool,
+}
+
+impl MarketplaceResolutionResult {
+    /// Builds a result returned by an injected persistence adapter.
+    pub fn new(
+        invoice_id: Uuid,
+        outcome: MarketplaceResolutionOutcome,
+        resolved_at: OffsetDateTime,
+        replayed: bool,
+    ) -> Self {
+        Self {
+            invoice_id,
+            outcome,
+            resolved_at,
+            replayed,
+        }
+    }
+
+    pub fn invoice_id(&self) -> Uuid {
+        self.invoice_id
+    }
+    pub fn outcome(&self) -> MarketplaceResolutionOutcome {
+        self.outcome
+    }
+    pub fn resolved_at(&self) -> OffsetDateTime {
+        self.resolved_at
+    }
+    pub fn replayed(&self) -> bool {
+        self.replayed
+    }
+}
+
 /// PostgreSQL-backed Marketplace preparation store.
 #[derive(Clone, Debug)]
 pub struct MarketplacePreparationStore {
@@ -230,6 +296,7 @@ struct LifecycleRow {
     activated_at: Option<OffsetDateTime>,
     payment_deadline: Option<OffsetDateTime>,
     voided_at: Option<OffsetDateTime>,
+    business_outcome: Option<String>,
     resolved_at: Option<OffsetDateTime>,
 }
 
@@ -658,6 +725,81 @@ impl MarketplacePreparationStore {
         }))
     }
 
+    /// Records one immutable business outcome without changing protocol or payment facts.
+    pub async fn resolve(
+        &self,
+        creator: &CreatorPubky,
+        invoice_id: Uuid,
+        outcome: MarketplaceResolutionOutcome,
+    ) -> Result<Option<MarketplaceResolutionResult>, PersistenceError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        let Some(row) = self
+            .load_lifecycle_locked(&mut tx, creator, invoice_id)
+            .await?
+        else {
+            tx.commit()
+                .await
+                .map_err(|_| PersistenceError::Unavailable)?;
+            return Ok(None);
+        };
+        let creator_hash = stored_hash(&row.creator_lookup_hash)?;
+        self.decode_lifecycle_envelope(creator_hash, &row)?;
+        if !matches!(row.state.as_str(), "prepared" | "active" | "voided") {
+            return Err(PersistenceError::CorruptOrMissing);
+        }
+        match (&row.business_outcome, row.resolved_at) {
+            (Some(existing), Some(resolved_at)) => {
+                let existing = MarketplaceResolutionOutcome::parse(existing)
+                    .ok_or(PersistenceError::CorruptOrMissing)?;
+                if existing != outcome {
+                    return Err(PersistenceError::Conflict);
+                }
+                tx.commit()
+                    .await
+                    .map_err(|_| PersistenceError::Unavailable)?;
+                return Ok(Some(MarketplaceResolutionResult::new(
+                    row.id,
+                    existing,
+                    resolved_at,
+                    true,
+                )));
+            }
+            (None, None) => {}
+            _ => return Err(PersistenceError::CorruptOrMissing),
+        }
+        let resolved_at: OffsetDateTime = sqlx::query_scalar("SELECT clock_timestamp()")
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        let updated = sqlx::query(
+            "UPDATE marketplace_payment_preparations
+             SET business_outcome = $2, resolved_at = $3, updated_at = clock_timestamp()
+             WHERE id = $1 AND business_outcome IS NULL AND resolved_at IS NULL",
+        )
+        .bind(row.id)
+        .bind(outcome.as_str())
+        .bind(resolved_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        if updated.rows_affected() != 1 {
+            return Err(PersistenceError::CorruptOrMissing);
+        }
+        tx.commit()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        Ok(Some(MarketplaceResolutionResult::new(
+            row.id,
+            outcome,
+            resolved_at,
+            false,
+        )))
+    }
+
     async fn load_locked(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -728,6 +870,7 @@ impl MarketplacePreparationStore {
                 Option<OffsetDateTime>,
                 Option<OffsetDateTime>,
                 Option<OffsetDateTime>,
+                Option<String>,
                 Option<OffsetDateTime>,
             ),
         >(
@@ -735,7 +878,8 @@ impl MarketplacePreparationStore {
                     preparation.preparation_envelope, preparation.state,
                     preparation.prepared_at, preparation.prepare_expires_at,
                     preparation.activated_at, preparation.payment_deadline,
-                    preparation.voided_at, preparation.resolved_at
+                    preparation.voided_at, preparation.business_outcome,
+                    preparation.resolved_at
              FROM marketplace_payment_preparations AS preparation
              JOIN creators ON creators.id = preparation.creator_id
              WHERE preparation.id = $1 AND creators.creator_lookup_hash = $2
@@ -757,6 +901,7 @@ impl MarketplacePreparationStore {
                     activated_at,
                     payment_deadline,
                     voided_at,
+                    business_outcome,
                     resolved_at,
                 )| LifecycleRow {
                     id,
@@ -768,6 +913,7 @@ impl MarketplacePreparationStore {
                     activated_at,
                     payment_deadline,
                     voided_at,
+                    business_outcome,
                     resolved_at,
                 },
             )

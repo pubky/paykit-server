@@ -14,10 +14,11 @@ use uuid::Uuid;
 use crate::{
     application::marketplace_lifecycle::{
         ActivateMarketplaceRequest, MarketplaceLifecycleError, MarketplaceLifecycleService,
-        VoidMarketplaceRequest,
+        ResolveMarketplaceRequest, VoidMarketplaceRequest,
     },
     domain::locks::parse_creator,
     http::{auth::AuthenticatedJson, error::ApiError},
+    persistence::MarketplaceResolutionOutcome,
 };
 
 #[derive(Deserialize)]
@@ -31,6 +32,13 @@ struct ActivateBody {
 struct VoidBody {
     creator: String,
     invoice_id: String,
+}
+
+#[derive(Deserialize)]
+struct ResolveBody {
+    creator: String,
+    invoice_id: String,
+    outcome: String,
 }
 
 #[derive(Serialize)]
@@ -49,10 +57,18 @@ struct VoidResponse {
     voided_at: String,
 }
 
+#[derive(Serialize)]
+struct ResolveResponse {
+    invoice_id: String,
+    outcome: &'static str,
+    resolved_at: String,
+}
+
 pub fn marketplace_lifecycle_router(service: Arc<MarketplaceLifecycleService>) -> Router {
     Router::new()
         .route("/marketplace/payment-requests/activate", post(activate))
         .route("/marketplace/payment-requests/void", post(void))
+        .route("/marketplace/payment-requests/resolve", post(resolve))
         .with_state(service)
 }
 
@@ -118,6 +134,34 @@ async fn void(
     }
 }
 
+async fn resolve(
+    State(service): State<Arc<MarketplaceLifecycleService>>,
+    AuthenticatedJson(body): AuthenticatedJson<ResolveBody>,
+) -> Response {
+    let request = match parse_resolve(body) {
+        Ok(request) => request,
+        Err(error) => return error.into_response(),
+    };
+    match service.resolve(request).await {
+        Ok(result) => {
+            let resolved_at = match result.resolved_at().format(&Rfc3339) {
+                Ok(value) => value,
+                Err(_) => return ApiError::InternalError.into_response(),
+            };
+            (
+                StatusCode::OK,
+                axum::Json(ResolveResponse {
+                    invoice_id: result.invoice_id().hyphenated().to_string(),
+                    outcome: result.outcome().as_str(),
+                    resolved_at,
+                }),
+            )
+                .into_response()
+        }
+        Err(error) => map_error(error).into_response(),
+    }
+}
+
 fn parse_activate(body: ActivateBody) -> Result<ActivateMarketplaceRequest, ApiError> {
     Ok(ActivateMarketplaceRequest {
         creator: parse_creator(&body.creator).map_err(|_| ApiError::InvalidRequest)?,
@@ -130,6 +174,15 @@ fn parse_void(body: VoidBody) -> Result<VoidMarketplaceRequest, ApiError> {
     Ok(VoidMarketplaceRequest {
         creator: parse_creator(&body.creator).map_err(|_| ApiError::InvalidRequest)?,
         invoice_id: parse_uuid(&body.invoice_id)?,
+    })
+}
+
+fn parse_resolve(body: ResolveBody) -> Result<ResolveMarketplaceRequest, ApiError> {
+    Ok(ResolveMarketplaceRequest {
+        creator: parse_creator(&body.creator).map_err(|_| ApiError::InvalidRequest)?,
+        invoice_id: parse_uuid(&body.invoice_id)?,
+        outcome: MarketplaceResolutionOutcome::parse(&body.outcome)
+            .ok_or(ApiError::InvalidRequest)?,
     })
 }
 

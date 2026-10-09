@@ -1,6 +1,6 @@
 # Marketplace Payment Lifecycle Decision Ledger
 
-Status: preparation, activation, and void slices authorized; resolution deferred.
+Status: preparation, activation, void, and resolution slices authorized.
 
 ## Authority and baseline
 
@@ -64,10 +64,18 @@ Accepted behavior:
 - Prepared rows have no outbox work. Activation updates lifecycle state and inserts one encrypted proposal outbox intent in one PostgreSQL transaction. Marketplace outbox ownership remains separate from Locks invoice and drain linkage.
 - Activation applies the existing configured proposal-acceptance window, bounded below the selected payment deadline for short caller-bound payment windows. Stable outbox UUID remains the SDK Payment Request ID on every worker retry.
 
-## Deferred lifecycle contract
+## Resolution contract — current implementation slice
 
 - Resolve: closed `{creator, invoice_id, outcome}` request where outcome is `paid_manually`, `refunded`, or `abandoned`; DB owns `resolved_at`; same outcome replays and a different outcome conflicts; annotation never rewrites protocol or Bitcoin facts.
 - Resolution of a prepared invoice blocks later activation but does not block void.
+
+## Verification required for resolution slice
+
+- Signed production route and closed request/response/error fixtures.
+- PostgreSQL-backed same-outcome replay and different-outcome conflict races across independent stores.
+- DB-authoritative stored timestamp and schema-level outcome immutability.
+- Prepared resolution versus activation serialization; no publication when resolution wins first.
+- Resolution on prepared, active, and voided rows without Payment Request, Bitcoin observation, or SDK cancellation mutation.
 
 ## Verification required for preparation slice
 
