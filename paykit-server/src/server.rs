@@ -10,6 +10,7 @@ use crate::{
             PaykitIntentBuilder, ReaderAuthorization, RegistryDiscoveryError,
             SessionValidationError, SessionValidator,
         },
+        marketplace_lifecycle::MarketplaceLifecycleService,
         marketplace_preparation::PrepareMarketplaceService,
         payment_drain::{
             PaymentDrainCleanupToken, PaymentDrainError, PaymentDrainOperations,
@@ -175,7 +176,8 @@ impl Server {
         let outbox = OutboxStore::new(&pool, crypto.clone());
         let payment_request_lifecycles = PaymentRequestLifecycleStore::new(&pool, crypto.clone());
         let payment_drains = PaymentDrainStore::new(&pool, crypto.clone());
-        let marketplace_preparations = MarketplacePreparationStore::new(&pool, crypto.clone());
+        let marketplace_preparations =
+            Arc::new(MarketplacePreparationStore::new(&pool, crypto.clone()));
 
         let bootstrap = setup_bootstrap(
             pubky.clone(),
@@ -260,11 +262,15 @@ impl Server {
                 storage: pubky.public_storage(),
             }),
             Arc::new(creators.clone()),
-            Arc::new(marketplace_preparations),
+            marketplace_preparations.clone(),
             config.paykit.app_id.clone(),
             config.deployment_invariants().bitcoin_network.clone(),
             config.paykit.payment_window,
             config.paykit.marketplace_prepare_ttl,
+        ));
+        let marketplace_lifecycle_service = Arc::new(MarketplaceLifecycleService::new(
+            marketplace_preparations,
+            config.paykit.proposal_acceptance_window,
         ));
         let connection_status_service = Arc::new(ConnectionStatusService::new(
             Arc::new(invoices.clone()),
@@ -310,6 +316,9 @@ impl Server {
                         marketplace_preparation_service,
                     ),
                 )
+                .merge(http::marketplace_lifecycle::marketplace_lifecycle_router(
+                    marketplace_lifecycle_service,
+                ))
                 .merge(http::status::status_router(status_service))
                 .merge(http::payment_drains::payment_drains_router(
                     payment_drain_operations,

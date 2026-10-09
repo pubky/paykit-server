@@ -1,6 +1,6 @@
 # Marketplace Payment Lifecycle Decision Ledger
 
-Status: preparation slice authorized; activation, void, and resolution deferred.
+Status: preparation, activation, and void slices authorized; resolution deferred.
 
 ## Authority and baseline
 
@@ -56,10 +56,16 @@ Accepted behavior:
 9. Do not return a payment deadline during preparation. Payment window begins only when activation commits.
 10. Reject unknown fields and fork-only fields including `stack_id`, `allocation_mode`, `nonce_sats`, address fingerprint, and caller-provided `resolved_at`.
 
-## Deferred lifecycle contract
+## Activation and void contract — current implementation slice
 
 - Activate: closed `{creator, invoice_id, total_sats}` request; DB-clock activation starts the bound payment window; atomically wins against void; inserts publication work once; replay returns stored success.
 - Void: closed `{creator, invoice_id}` request; only prepared invoices transition; no publication or SDK cancellation; replay returns stored success.
+- Activation at or after `prepare_expires_at`, after void, or after prepared-state resolution conflicts. The authoritative stored total must match. Void remains permitted for a resolved preparation.
+- Prepared rows have no outbox work. Activation updates lifecycle state and inserts one encrypted proposal outbox intent in one PostgreSQL transaction. Marketplace outbox ownership remains separate from Locks invoice and drain linkage.
+- Activation applies the existing configured proposal-acceptance window, bounded below the selected payment deadline for short caller-bound payment windows. Stable outbox UUID remains the SDK Payment Request ID on every worker retry.
+
+## Deferred lifecycle contract
+
 - Resolve: closed `{creator, invoice_id, outcome}` request where outcome is `paid_manually`, `refunded`, or `abandoned`; DB owns `resolved_at`; same outcome replays and a different outcome conflicts; annotation never rewrites protocol or Bitcoin facts.
 - Resolution of a prepared invoice blocks later activation but does not block void.
 
@@ -72,3 +78,12 @@ Accepted behavior:
 - DB-clock 15-minute default expiry evidence.
 - No outbox or SDK publication before activation.
 - Existing Locks invoice behavior remains green.
+
+## Verification required for activation and void slice
+
+- Signed production routes and closed request/response/error fixtures.
+- Exact activation and void replay with stored DB timestamps.
+- Authoritative-total, preparation-expiry, prepared-resolution, and late competing transition conflicts.
+- Independent PostgreSQL stores race activate against void on one row; exactly one transition commits.
+- No claimable work while prepared or voided; activation admits exactly one proposal intent.
+- Existing stable-ID outbox handoff consumes the Marketplace proposal without a second lifecycle state machine.

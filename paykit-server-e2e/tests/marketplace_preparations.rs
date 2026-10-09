@@ -5,9 +5,9 @@ use paykit_server::{
     crypto::Crypto,
     domain::locks::{CreatorPubky, ReaderPubky, parse_creator, parse_reader},
     persistence::{
-        CreatorCredentials, CreatorStore, MarketplacePreparationInput,
+        CreatorCredentials, CreatorStore, MarketplaceActivationInput, MarketplacePreparationInput,
         MarketplacePreparationPayloadFactory, MarketplacePreparationPayloads,
-        MarketplacePreparationStore, PersistenceError, run_migrations,
+        MarketplacePreparationStore, OutboxStore, PersistenceError, run_migrations,
     },
 };
 use paykit_server_e2e::postgres::TestDatabase;
@@ -143,6 +143,14 @@ async fn preparation_is_durable_unpublished_and_replay_first() {
             .unwrap(),
         0
     );
+    assert!(
+        OutboxStore::new(database.pool(), crypto())
+            .claim(uuid::Uuid::new_v4(), 10, std::time::Duration::from_secs(30),)
+            .await
+            .unwrap()
+            .is_empty(),
+        "prepared work must not be claimable"
+    );
 
     tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
     let replay = store
@@ -270,5 +278,240 @@ async fn non_unique_insert_failure_is_not_an_idempotency_conflict() {
         "a PostgreSQL check/invariant failure must fail closed, not become Conflict/HTTP 409"
     );
 
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn activate_starts_db_window_once_and_void_competes_on_the_preparation_row() {
+    let database = TestDatabase::create().await;
+    let first_store = store(&database).await;
+    let second_store = MarketplacePreparationStore::new(database.pool(), crypto());
+    let creator = creator();
+    let reader = reader();
+    let prepared = first_store
+        .prepare(input(
+            &creator,
+            &reader,
+            "marketplace-payment:race:attempt-1",
+            b"race-request",
+        ))
+        .await
+        .unwrap();
+
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
+    let activate = tokio::spawn({
+        let barrier = barrier.clone();
+        let store = first_store.clone();
+        let creator = creator.clone();
+        let invoice_id = prepared.invoice_id();
+        async move {
+            barrier.wait().await;
+            store
+                .activate(MarketplaceActivationInput {
+                    creator: &creator,
+                    invoice_id,
+                    total_sats: 100,
+                    proposal_acceptance_seconds: 30 * 60,
+                })
+                .await
+        }
+    });
+    let void = tokio::spawn({
+        let barrier = barrier.clone();
+        let store = second_store.clone();
+        let creator = creator.clone();
+        let invoice_id = prepared.invoice_id();
+        async move {
+            barrier.wait().await;
+            store.void(&creator, invoice_id).await
+        }
+    });
+    barrier.wait().await;
+    let (activated, voided) = tokio::join!(activate, void);
+    let activated = activated.unwrap();
+    let voided = voided.unwrap();
+
+    assert!(
+        matches!(
+            (&activated, &voided),
+            (Ok(Some(_)), Err(PersistenceError::Conflict))
+        ) || matches!(
+            (&activated, &voided),
+            (Err(PersistenceError::Conflict), Ok(Some(_)))
+        ),
+        "exactly one lifecycle transition must commit: activate={activated:?}, void={voided:?}"
+    );
+    let state: String =
+        sqlx::query_scalar("SELECT state FROM marketplace_payment_preparations WHERE id = $1")
+            .bind(prepared.invoice_id())
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    let outbox_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM outbox WHERE marketplace_preparation_id = $1")
+            .bind(prepared.invoice_id())
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(outbox_count, i64::from(state == "active"));
+
+    if let Ok(Some(activated)) = activated {
+        assert_eq!(
+            activated.payment_deadline() - activated.activated_at(),
+            time::Duration::days(1)
+        );
+        assert_eq!(activated.total_sats(), 100);
+        assert!(!activated.replayed());
+        let replay = first_store
+            .activate(MarketplaceActivationInput {
+                creator: &creator,
+                invoice_id: prepared.invoice_id(),
+                total_sats: 100,
+                proposal_acceptance_seconds: 30 * 60,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(replay.replayed());
+        assert_eq!(replay.activated_at(), activated.activated_at());
+        assert_eq!(replay.payment_deadline(), activated.payment_deadline());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM outbox WHERE marketplace_preparation_id = $1",
+            )
+            .bind(prepared.invoice_id())
+            .fetch_one(database.pool())
+            .await
+            .unwrap(),
+            1,
+            "activation replay inserted another proposal intent"
+        );
+        let outbox = OutboxStore::new(database.pool(), crypto());
+        let claims = outbox
+            .claim(uuid::Uuid::new_v4(), 10, std::time::Duration::from_secs(30))
+            .await
+            .unwrap();
+        assert_eq!(claims.len(), 1, "active proposal intent must be claimable");
+        let intent = outbox.delivery_intent(&claims[0]).unwrap();
+        let terms = intent.terms().unwrap();
+        assert!(terms.proposal_expires_at.is_some());
+        assert_eq!(
+            terms.payment_deadline.as_deref(),
+            Some(
+                activated
+                    .payment_deadline()
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap()
+                    .as_str()
+            )
+        );
+    } else {
+        let replay = second_store
+            .void(&creator, prepared.invoice_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(replay.replayed());
+        assert_eq!(replay.invoice_id(), prepared.invoice_id());
+    }
+
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn activation_rejects_wrong_total_expiry_and_prepared_resolution_without_publication() {
+    let database = TestDatabase::create().await;
+    let store = store(&database).await;
+    let creator = creator();
+    let reader = reader();
+
+    let wrong_total = store
+        .prepare(input(
+            &creator,
+            &reader,
+            "marketplace-payment:wrong-total:attempt-1",
+            b"wrong-total",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .activate(MarketplaceActivationInput {
+                creator: &creator,
+                invoice_id: wrong_total.invoice_id(),
+                total_sats: 101,
+                proposal_acceptance_seconds: 30 * 60,
+            })
+            .await,
+        Err(PersistenceError::Conflict)
+    );
+
+    let expired = store
+        .prepare(input_with_ttl(
+            &creator,
+            &reader,
+            "marketplace-payment:expired:attempt-1",
+            b"expired",
+            1,
+        ))
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+    assert_eq!(
+        store
+            .activate(MarketplaceActivationInput {
+                creator: &creator,
+                invoice_id: expired.invoice_id(),
+                total_sats: 100,
+                proposal_acceptance_seconds: 30 * 60,
+            })
+            .await,
+        Err(PersistenceError::Conflict)
+    );
+
+    let resolved = store
+        .prepare(input(
+            &creator,
+            &reader,
+            "marketplace-payment:resolved:attempt-1",
+            b"resolved",
+        ))
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE marketplace_payment_preparations
+         SET business_outcome = 'abandoned', resolved_at = clock_timestamp()
+         WHERE id = $1",
+    )
+    .bind(resolved.invoice_id())
+    .execute(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        store
+            .activate(MarketplaceActivationInput {
+                creator: &creator,
+                invoice_id: resolved.invoice_id(),
+                total_sats: 100,
+                proposal_acceptance_seconds: 30 * 60,
+            })
+            .await,
+        Err(PersistenceError::Conflict)
+    );
+    assert!(
+        store
+            .void(&creator, resolved.invoice_id())
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM outbox")
+            .fetch_one(database.pool())
+            .await
+            .unwrap(),
+        0
+    );
     database.cleanup().await;
 }

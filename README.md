@@ -93,7 +93,11 @@ does not create an active invoice or enqueue publication. Its Creator-scoped
 `operation_id` exactly replays the stored preparation when the closed request is
 unchanged, conflicts on changed binding, and remains replayable after the
 preparation TTL. Activation, void, and business resolution are separate lifecycle
-operations and are not exposed by this preparation-only slice.
+operations. Signed activation starts the bound payment window from the database
+clock and atomically enqueues one proposal; exact replay returns its stored result.
+Signed void wins only while prepared, never publishes, and never invokes SDK
+cancellation. Activate and void serialize on the preparation row. Business
+resolution remains deferred.
 
 `POST /setup/status` is the readiness check for an authenticated Creator. Its closed body is `{"creator":"pubky..."}` with optional `asset: "BTC"`, `"USD"`, or `"USDT"` to check whether approved receiving details can accept that denomination. Every signed route verifies Ed25519 over `b"paykit-http-signature-v1\0" + uppercase_method + b"\0" + exact_query_free_path + b"\0" + exact_raw_body`; there is no body-only fallback. It returns exactly one coarse state: `ready` when the persisted session, delegated key, App Registry entry, and hosted state are usable; `setup_required` when authority is absent or confirmed invalid; and `unavailable` for validation timeouts and storage, rate-limit, server, DNS, or transport failures. Untyped Pubky 401 responses are also `unavailable`: they cannot distinguish revoked grants from recoverable PoP failures. A revoked grant reported this way requires explicit reconnect. Callers must not convert `unavailable` into a new authorization flow.
 
