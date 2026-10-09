@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use async_trait::async_trait;
 use paykit_lib::{
@@ -74,6 +74,7 @@ impl Adapter for FakeAdapter {
     async fn propose_payment_request(
         &self,
         _reader: &str,
+        payment_request_id: paykit_lib::PaymentRequestId,
         _terms: &PaymentTermsV1,
     ) -> Result<HandoffResult, HandoffError> {
         self.calls.lock().unwrap().push("propose_payment_request");
@@ -81,7 +82,7 @@ impl Adapter for FakeAdapter {
         Ok(HandoffResult::PaymentRequestProposal {
             outbound_message_id: 42,
             event_id: "event-42".into(),
-            payment_request_id: "request-42".into(),
+            payment_request_id: payment_request_id.to_string(),
         })
     }
 
@@ -133,7 +134,7 @@ async fn incapable_registry_is_retryable_without_handoff() {
     };
 
     assert_eq!(
-        handoff(&adapter, &payment_intent()).await,
+        handoff(&adapter, uuid::Uuid::new_v4(), &payment_intent()).await,
         Err(HandoffFailure::Retryable(
             RetryableHandoffStage::RegistryIncapable
         ))
@@ -142,28 +143,26 @@ async fn incapable_registry_is_retryable_without_handoff() {
 }
 
 #[tokio::test]
-async fn retry_after_an_ambiguous_handoff_can_propose_twice() {
+async fn retry_after_an_ambiguous_handoff_reuses_outbox_id() {
     let selected = registry(true);
-    let adapter = Arc::new(FakeAdapter {
+    let adapter = FakeAdapter {
         registry: selected.clone(),
         authorization: Ok(ReaderAuthorization::Verified),
         link_error: None,
         payment_request_calls: Mutex::new(0),
         calls: Mutex::new(Vec::new()),
-    });
+    };
     let intent = payment_intent();
+    let outbox_id = uuid::Uuid::new_v4();
 
-    // A database worker may be reclaimed after the public SDK queued the first
-    // proposal but before its fenced state transition; repeating the public API
-    // is deliberate at-least-once behavior.
-    let first = handoff(adapter.as_ref(), &intent).await.unwrap();
-    let second = handoff(adapter.as_ref(), &intent).await.unwrap();
+    let first = handoff(&adapter, outbox_id, &intent).await.unwrap();
+    let second = handoff(&adapter, outbox_id, &intent).await.unwrap();
     assert!(matches!(
         (&first, &second),
         (
             HandoffResult::PaymentRequestProposal { outbound_message_id: 42, event_id, payment_request_id },
             HandoffResult::PaymentRequestProposal { outbound_message_id: 42, event_id: second_event, payment_request_id: second_request }
-        ) if event_id == "event-42" && payment_request_id == "request-42" && second_event == event_id && second_request == payment_request_id
+        ) if event_id == "event-42" && payment_request_id == &outbox_id.to_string() && second_event == event_id && second_request == payment_request_id
     ));
     assert_eq!(*adapter.payment_request_calls.lock().unwrap(), 2);
 }
@@ -179,7 +178,9 @@ async fn handoff_validates_authorization_and_link_before_enqueue() {
         calls: Mutex::new(Vec::new()),
     };
 
-    handoff(&adapter, &payment_intent()).await.unwrap();
+    handoff(&adapter, uuid::Uuid::new_v4(), &payment_intent())
+        .await
+        .unwrap();
 
     assert_eq!(
         *adapter.calls.lock().unwrap(),
@@ -206,7 +207,7 @@ async fn link_observation_failure_never_enqueues() {
     };
 
     assert_eq!(
-        handoff(&adapter, &payment_intent()).await,
+        handoff(&adapter, uuid::Uuid::new_v4(), &payment_intent()).await,
         Err(HandoffFailure::Retryable(
             RetryableHandoffStage::LinkEstablishment
         ))
@@ -235,6 +236,17 @@ fn adapter_with_authorization(
 }
 
 #[tokio::test]
+async fn invalid_outbox_id_is_rejected_before_adapter_effects() {
+    let adapter = adapter_with_authorization(Ok(ReaderAuthorization::Verified));
+
+    assert_eq!(
+        handoff(&adapter, uuid::Uuid::nil(), &payment_intent()).await,
+        Err(HandoffFailure::Permanent)
+    );
+    assert!(adapter.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn missing_or_invalid_reader_authorization_is_retryable_without_link_or_handoff() {
     for (authorization, stage) in [
         (
@@ -249,7 +261,7 @@ async fn missing_or_invalid_reader_authorization_is_retryable_without_link_or_ha
         let adapter = adapter_with_authorization(Ok(authorization));
 
         assert_eq!(
-            handoff(&adapter, &payment_intent()).await,
+            handoff(&adapter, uuid::Uuid::new_v4(), &payment_intent()).await,
             Err(HandoffFailure::Retryable(stage))
         );
         assert_eq!(
@@ -267,7 +279,7 @@ async fn reader_authorization_fetch_failure_keeps_its_own_stage() {
     )));
 
     assert_eq!(
-        handoff(&adapter, &payment_intent()).await,
+        handoff(&adapter, uuid::Uuid::new_v4(), &payment_intent()).await,
         Err(HandoffFailure::Retryable(
             RetryableHandoffStage::ReaderAuthorizationFetch
         ))
@@ -294,7 +306,7 @@ async fn pending_links_are_distinct_from_failed_link_operations() {
         let mut adapter = adapter_with_authorization(Ok(ReaderAuthorization::Verified));
         adapter.link_error = Some(HandoffError::Retryable(cause));
         assert_eq!(
-            handoff(&adapter, &payment_intent()).await,
+            handoff(&adapter, uuid::Uuid::new_v4(), &payment_intent()).await,
             Err(HandoffFailure::Retryable(expected))
         );
         assert_eq!(*adapter.payment_request_calls.lock().unwrap(), 0);

@@ -1042,10 +1042,11 @@ impl Adapter for PaykitAdapter {
 
     async fn execute_handoff(
         &self,
+        outbox_id: uuid::Uuid,
         intent: &DeliveryIntentV1,
     ) -> Result<HandoffResult, HandoffFailure> {
         let _guard = self.mutation_lock.lock().await;
-        handoff_steps(self, intent).await
+        handoff_steps(self, outbox_id, intent).await
     }
 
     async fn fetch_registry(
@@ -1085,12 +1086,17 @@ impl Adapter for PaykitAdapter {
     async fn propose_payment_request(
         &self,
         reader: &str,
+        payment_request_id: PaymentRequestId,
         terms: &PaymentTermsV1,
     ) -> Result<HandoffResult, HandoffError> {
         let reader = parse_peer(reader)?;
         let record = self
             .sdk
-            .propose_payment_request(reader, terms.to_sdk().map_err(|_| HandoffError::Permanent)?)
+            .propose_payment_request_with_id(
+                reader,
+                payment_request_id,
+                terms.to_sdk().map_err(|_| HandoffError::Permanent)?,
+            )
             .await
             .map_err(classify)?;
         Ok(HandoffResult::PaymentRequestProposal {
