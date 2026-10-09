@@ -12,7 +12,7 @@ use crate::{
     application::semantic_intent::DeliveryIntentV1,
     crypto::{Crypto, EncryptedEnvelope, EnvelopeContext, LookupHash},
     domain::locks::{CreatorPubky, ReaderPubky, parse_reader},
-    persistence::PersistenceError,
+    persistence::{PersistenceError, invoices::InvoicePaymentRecordV1},
 };
 
 const OPERATION_BINDING_UNIQUE_CONSTRAINT: &str = "marketplace_preparation_operation_binding_key";
@@ -483,6 +483,8 @@ impl MarketplacePreparationStore {
                 if outbox_count != 1 {
                     return Err(PersistenceError::CorruptOrMissing.into());
                 }
+                self.validate_settlement(&mut tx, creator_hash, &row, &envelope)
+                    .await?;
                 tx.commit()
                     .await
                     .map_err(|_| PersistenceError::Unavailable)?;
@@ -577,6 +579,41 @@ impl MarketplacePreparationStore {
         .execute(&mut *tx)
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
+        let payment_record = InvoicePaymentRecordV1::from_intent(
+            envelope.child_index,
+            &envelope.payment_request_intent,
+        )?;
+        let bitcoin_address_hash = self
+            .crypto
+            .bitcoin_address_lookup_hash(payment_record.bitcoin_address()?.as_bytes());
+        let derivation_index_hash = self
+            .crypto
+            .bitcoin_derivation_index_lookup_hash(creator_hash, payment_record.derivation_index());
+        let payment_record_plaintext = postcard::to_allocvec(&payment_record)
+            .map_err(|_| PersistenceError::CorruptOrMissing)?;
+        let payment_record_envelope = self
+            .crypto
+            .encrypt(
+                &EnvelopeContext::marketplace_settlement_payment_record(creator_hash, row.id),
+                &payment_record_plaintext,
+            )
+            .map_err(|_| PersistenceError::CorruptOrMissing)?;
+        sqlx::query(
+            "INSERT INTO marketplace_settlements (
+                 preparation_id, creator_id, payment_record_envelope,
+                 bitcoin_address_lookup_hash, derivation_index_lookup_hash,
+                 payment_status, confirmation_count, amount_matched
+             )
+             SELECT id, creator_id, $2, $3, $4, 'undetected', 0, FALSE
+             FROM marketplace_payment_preparations WHERE id = $1",
+        )
+        .bind(row.id)
+        .bind(payment_record_envelope.as_bytes())
+        .bind(bitcoin_address_hash.as_bytes().as_slice())
+        .bind(derivation_index_hash.as_bytes().as_slice())
+        .execute(&mut *tx)
+        .await
+        .map_err(classify_settlement_insert_error)?;
         let inserted = sqlx::query(
             "INSERT INTO outbox
              (id, creator_id, marketplace_preparation_id, intent_envelope, intent_kind,
@@ -826,6 +863,59 @@ impl MarketplacePreparationStore {
         Ok(envelope)
     }
 
+    async fn validate_settlement(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        creator_hash: LookupHash,
+        row: &LifecycleRow,
+        preparation: &PreparationEnvelopeV1,
+    ) -> Result<(), PersistenceError> {
+        let stored: Option<(Vec<u8>, Vec<u8>, Vec<u8>)> = sqlx::query_as(
+            "SELECT payment_record_envelope, bitcoin_address_lookup_hash,
+                    derivation_index_lookup_hash
+             FROM marketplace_settlements
+             WHERE preparation_id = $1 AND creator_id = (
+                 SELECT creator_id FROM marketplace_payment_preparations WHERE id = $1
+             )",
+        )
+        .bind(row.id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        let Some((encrypted, address_hash, derivation_hash)) = stored else {
+            return Err(PersistenceError::CorruptOrMissing);
+        };
+        let plaintext = self
+            .crypto
+            .decrypt(
+                &EnvelopeContext::marketplace_settlement_payment_record(creator_hash, row.id),
+                &EncryptedEnvelope::from_bytes(encrypted),
+            )
+            .map_err(|_| PersistenceError::CorruptOrMissing)?;
+        let actual: InvoicePaymentRecordV1 =
+            postcard::from_bytes(&plaintext).map_err(|_| PersistenceError::CorruptOrMissing)?;
+        let expected = InvoicePaymentRecordV1::from_intent(
+            preparation.child_index,
+            &preparation.payment_request_intent,
+        )
+        .map_err(|_| PersistenceError::CorruptOrMissing)?;
+        if actual != expected
+            || address_hash.as_slice()
+                != self
+                    .crypto
+                    .bitcoin_address_lookup_hash(expected.bitcoin_address()?.as_bytes())
+                    .as_bytes()
+            || derivation_hash.as_slice()
+                != self
+                    .crypto
+                    .bitcoin_derivation_index_lookup_hash(creator_hash, expected.derivation_index())
+                    .as_bytes()
+        {
+            return Err(PersistenceError::CorruptOrMissing);
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn validate_replay(
         &self,
@@ -926,6 +1016,13 @@ fn classify_preparation_insert_error(error: sqlx::Error) -> PersistenceError {
         {
             PersistenceError::Conflict
         }
+        sqlx::Error::Database(_) => PersistenceError::CorruptOrMissing,
+        _ => PersistenceError::Unavailable,
+    }
+}
+
+fn classify_settlement_insert_error(error: sqlx::Error) -> PersistenceError {
+    match error {
         sqlx::Error::Database(_) => PersistenceError::CorruptOrMissing,
         _ => PersistenceError::Unavailable,
     }

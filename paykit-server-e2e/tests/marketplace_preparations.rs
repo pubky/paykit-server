@@ -203,6 +203,14 @@ async fn preparation_is_durable_unpublished_and_replay_first() {
             .unwrap(),
         0
     );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM marketplace_settlements")
+            .fetch_one(database.pool())
+            .await
+            .unwrap(),
+        0,
+        "prepared work must not have settlement ownership"
+    );
 
     tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
     let replay = store
@@ -550,6 +558,14 @@ async fn activate_starts_db_window_once_and_void_competes_on_the_preparation_row
             .await
             .unwrap();
     assert_eq!(outbox_count, i64::from(state == "active"));
+    let settlement_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM marketplace_settlements WHERE preparation_id = $1",
+    )
+    .bind(prepared.invoice_id())
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(settlement_count, i64::from(state == "active"));
 
     if let Ok(Some(activated)) = activated {
         assert_eq!(
@@ -582,6 +598,26 @@ async fn activate_starts_db_window_once_and_void_competes_on_the_preparation_row
             1,
             "activation replay inserted another proposal intent"
         );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM marketplace_settlements WHERE preparation_id = $1",
+            )
+            .bind(prepared.invoice_id())
+            .fetch_one(database.pool())
+            .await
+            .unwrap(),
+            1,
+            "activation replay inserted another settlement"
+        );
+        let settlement: (String, i32, bool) = sqlx::query_as(
+            "SELECT payment_status, confirmation_count, amount_matched
+             FROM marketplace_settlements WHERE preparation_id = $1",
+        )
+        .bind(prepared.invoice_id())
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+        assert_eq!(settlement, ("undetected".into(), 0, false));
         let outbox = OutboxStore::new(database.pool(), crypto());
         let claims = outbox
             .claim(uuid::Uuid::new_v4(), 10, std::time::Duration::from_secs(30))
@@ -708,6 +744,14 @@ async fn activation_rejects_wrong_total_expiry_and_prepared_resolution_without_p
             .await
             .unwrap(),
         0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM marketplace_settlements")
+            .fetch_one(database.pool())
+            .await
+            .unwrap(),
+        0,
+        "failed, prepared, and voided activations must not create settlements"
     );
     database.cleanup().await;
 }
