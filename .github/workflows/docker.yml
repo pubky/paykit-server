@@ -38,3 +38,5 @@ jobs:
           image: paykit-server
           cache_from: type=gha
           cache_to: type=gha,mode=max
+          build_args: |
+            GIT_COMMIT=${{ github.sha }}

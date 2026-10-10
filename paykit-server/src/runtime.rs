@@ -10,7 +10,7 @@ use std::{
 
 use async_trait::async_trait;
 use axum::{
-    Router,
+    Json, Router,
     body::Body,
     http::{Request, StatusCode, header},
     middleware::{self, Next},
@@ -290,8 +290,19 @@ pub fn operational_router(public_routes: Router, runtime: Arc<Runtime>) -> Route
     public_routes
         .merge(health::router(runtime.clone()))
         .route("/metrics", get(move || metrics(metrics_runtime.clone())))
+        .route("/version", get(version))
         .layer(middleware::from_fn_with_state(runtime, capacity_middleware))
         .layer(middleware::from_fn(request_diagnostics::middleware))
+}
+
+/// Build identity baked in at compile time by `build.rs`.
+async fn version() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "name": "Paykit Server",
+        "version": env!("CARGO_PKG_VERSION"),
+        "commit": env!("PAYKIT_BUILD_COMMIT"),
+        "built_at": env!("PAYKIT_BUILT_AT"),
+    }))
 }
 
 async fn metrics(runtime: Arc<Runtime>) -> Response {

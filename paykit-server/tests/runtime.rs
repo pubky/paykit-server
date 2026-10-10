@@ -220,6 +220,26 @@ async fn health_schemas_and_status_codes_are_secret_free() {
 }
 
 #[tokio::test]
+async fn version_reports_build_identity_without_authentication() {
+    let app = operational_router(Router::new(), runtime(true, 1));
+    let response = app
+        .oneshot(Request::get("/version").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 1024).await.unwrap()).unwrap();
+    assert_eq!(body["name"], "Paykit Server");
+    assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+    for field in ["commit", "built_at"] {
+        assert!(
+            body[field].as_str().is_some_and(|value| !value.is_empty()),
+            "{field} must be a non-empty string"
+        );
+    }
+}
+
+#[tokio::test]
 async fn postgres_failure_is_not_ready_and_workers_are_only_degraded() {
     let unavailable = runtime(false, 1);
     assert_eq!(

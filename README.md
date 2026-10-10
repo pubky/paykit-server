@@ -47,6 +47,7 @@ Public operational routes:
 - `GET /health/live`
 - `GET /health/ready`
 - `GET /metrics`
+- `GET /version`: name, crate version, build commit and build time as JSON
 
 Business routes:
 

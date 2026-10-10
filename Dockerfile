@@ -13,12 +13,18 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 
 COPY . /build/paykit-server
 
+# .git is not a build input, so the commit and build time reach /version as
+# build arguments: --build-arg GIT_COMMIT=$(git rev-parse HEAD).
+ARG GIT_COMMIT
+ARG BUILD_TIME
+
 # locks-core, paykit-lib and paykit-sdk resolve from their pinned public git
 # sources in Cargo.toml. Dockerfile.local rewrites them to path dependencies for
 # local worktree builds; a published image must build the pinned revisions.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/build/paykit-server/target \
+    GIT_COMMIT="${GIT_COMMIT}" BUILD_TIME="${BUILD_TIME}" \
     cargo build --locked --release -p paykit-server --bin paykit-server && \
     install -Dm755 target/release/paykit-server /out/paykit-server
 

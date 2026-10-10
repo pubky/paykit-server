@@ -3,7 +3,12 @@
 use std::{env, process::Command};
 
 fn main() {
-    for name in ["GIT_COMMIT", "GITHUB_SHA", "BUILD_TIME", "SOURCE_DATE_EPOCH"] {
+    for name in [
+        "GIT_COMMIT",
+        "GITHUB_SHA",
+        "BUILD_TIME",
+        "SOURCE_DATE_EPOCH",
+    ] {
         println!("cargo:rerun-if-env-changed={name}");
     }
     println!("cargo:rustc-env=PAYKIT_BUILD_COMMIT={}", commit());

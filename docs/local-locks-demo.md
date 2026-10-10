@@ -44,6 +44,11 @@ Crate-level `paykit-lib` and `paykit-sdk` contexts avoid transferring the Paykit
 Rust workspace target directory and require no Docker-owned files in that
 repository. The Locks context applies its existing source-tree exclusions.
 
+The build context excludes `.git`, so `GET /version` reports the commit as
+`unknown` unless you pass it: add `--build-arg GIT_COMMIT=$(git rev-parse HEAD)`
+(and optionally `--build-arg BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)`) to
+either build command.
+
 Builder runs [`scripts/prepare-local-docker-sources.sh`](../scripts/prepare-local-docker-sources.sh) against copied manifests to resolve `paykit-lib`, `paykit-sdk`, and `locks-core` from named contexts. Committed Git dependency declarations and lockfile remain unchanged. No SSH agent or Cargo credentials are mounted. Exact dependency-pin matches make source drift fail closed.
 
 ## Runtime image
