@@ -64,7 +64,7 @@ Accepted behavior:
 
 - Activate: closed `{creator, invoice_id, total_sats}` request; DB-clock activation starts the bound payment window; atomically wins against void; inserts publication work once; replay returns stored success. Activation derives proposal acceptance duration as `min(configured proposal_acceptance_window, bound payment_window / 2)`. Duration arithmetic retains subsecond precision: a bound one-second payment window yields a 500-millisecond acceptance duration, not zero.
 - Void: closed `{creator, invoice_id}` request; only prepared invoices transition; no publication or SDK cancellation; replay returns stored success.
-- Activation at or after `prepare_expires_at` returns `409 prepare_expired`, signaling a new attempt. Activation after void or prepared-state resolution, and void after activation, return `409 lifecycle_terminal`, signaling terminal stop. An authoritative stored-total mismatch returns `409 total_mismatch`, signaling operator alert. Exact activation and void replay still return stored `200` responses. Void remains permitted for a resolved preparation.
+- Activation at or after `prepare_expires_at` returns `409 prepare_expired`, signaling a new attempt. Activation after void or prepared-state resolution returns `409 lifecycle_terminal`, signaling terminal stop. Void after activation returns `409 invoice_active`, signaling that payment remains live and observation must continue. An authoritative stored-total mismatch returns `409 total_mismatch`, signaling operator alert. Exact activation and void replay still return stored `200` responses. Void remains permitted for a resolved preparation. Persisted-state and database-integrity faults return `500 internal_error`, not a retryable `503`.
 - Prepared rows have no outbox work. Activation updates lifecycle state and inserts one encrypted proposal outbox intent in one PostgreSQL transaction. Marketplace outbox ownership remains separate from Locks invoice and drain linkage.
 - Activation applies `min(configured proposal_acceptance_window, bound payment_window / 2)` exactly, including subsecond results. Stable outbox UUID remains the SDK Payment Request ID on every worker retry.
 
@@ -79,7 +79,7 @@ Accepted behavior:
 - Marketplace settlement data remains separate from Locks `invoices`: it owns its encrypted payment record, Creator, Bitcoin address lookup, derivation-index lookup, and lifecycle projection. It does not fabricate a Locks bundle, lock resource, generation, drain membership, or buyer contact.
 - Payment Request lifecycle attribution is owner-aware. A delivered Marketplace proposal with `outbox.invoice_id IS NULL` projects against its active Marketplace settlement without making same-Creator Locks status or drain refresh unavailable. Locks lifecycle queries and drain semantics remain invoice-only.
 - Bitcoin addresses are globally unique across Locks invoices and Marketplace settlements at the PostgreSQL transaction boundary. Existing per-table invoice uniqueness and immutable activation replay remain intact.
-- This branch uses migration `0014_marketplace_settlements.sql`; stacked PR #68 already uses `0014` and must be renumbered when restacked onto this head.
+- This branch uses migration `0014_marketplace_settlements.sql`; stacked PR #68 uses `0015`.
 
 ## Marketplace Bitcoin observation — current implementation slice
 
@@ -112,7 +112,7 @@ Accepted behavior:
 - Signed production routes and closed request/response/error fixtures.
 - Exact activation and void replay with stored DB timestamps.
 - Authoritative-total, preparation-expiry, prepared-resolution, and late competing transition conflicts.
-- Independent PostgreSQL stores race activate against void on one row; exactly one transition commits.
+- Independent PostgreSQL stores race activate against void on one row; exactly one transition commits. Activation losing to void returns `lifecycle_terminal`; void losing to activation returns `invoice_active`.
 - No claimable work while prepared or voided; activation admits exactly one proposal intent.
 - Existing stable-ID outbox handoff consumes the Marketplace proposal without a second lifecycle state machine.
 

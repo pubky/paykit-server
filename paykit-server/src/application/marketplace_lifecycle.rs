@@ -30,9 +30,11 @@ pub enum MarketplaceLifecycleError {
     InvalidRequest,
     PrepareExpired,
     LifecycleTerminal,
+    InvoiceActive,
     TotalMismatch,
     NotFound,
     Unavailable,
+    Internal,
 }
 
 #[async_trait]
@@ -122,18 +124,23 @@ fn map_store(error: MarketplaceLifecyclePersistenceError) -> MarketplaceLifecycl
         MarketplaceLifecyclePersistenceError::LifecycleTerminal => {
             MarketplaceLifecycleError::LifecycleTerminal
         }
+        MarketplaceLifecyclePersistenceError::InvoiceActive => {
+            MarketplaceLifecycleError::InvoiceActive
+        }
         MarketplaceLifecyclePersistenceError::TotalMismatch => {
             MarketplaceLifecycleError::TotalMismatch
         }
         MarketplaceLifecyclePersistenceError::Persistence(PersistenceError::InvalidInput) => {
             MarketplaceLifecycleError::InvalidRequest
         }
+        MarketplaceLifecyclePersistenceError::Persistence(PersistenceError::Unavailable) => {
+            MarketplaceLifecycleError::Unavailable
+        }
         MarketplaceLifecyclePersistenceError::Persistence(
             PersistenceError::DeploymentMismatch
             | PersistenceError::CorruptOrMissing
             | PersistenceError::ReauthenticationMismatch
-            | PersistenceError::Unavailable
             | PersistenceError::Conflict,
-        ) => MarketplaceLifecycleError::Unavailable,
+        ) => MarketplaceLifecycleError::Internal,
     }
 }

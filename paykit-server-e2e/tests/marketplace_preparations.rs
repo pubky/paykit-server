@@ -534,7 +534,7 @@ async fn activate_starts_db_window_once_and_void_competes_on_the_preparation_row
             (&activated, &voided),
             (
                 Ok(Some(_)),
-                Err(MarketplaceLifecyclePersistenceError::LifecycleTerminal)
+                Err(MarketplaceLifecyclePersistenceError::InvoiceActive)
             )
         ) || matches!(
             (&activated, &voided),
@@ -646,6 +646,92 @@ async fn activate_starts_db_window_once_and_void_competes_on_the_preparation_row
         assert!(replay.replayed());
         assert_eq!(replay.invoice_id(), prepared.invoice_id());
     }
+
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn settlement_address_collision_is_integrity_failure_and_rolls_back_activation() {
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let first_creator = creator();
+    let second_creator = other_creator();
+    create_creator(&database, first_creator.clone(), "first-session", 9).await;
+    create_creator(&database, second_creator.clone(), "second-session", 10).await;
+    let store = MarketplacePreparationStore::new(database.pool(), crypto());
+    let reader = reader();
+
+    let first = store
+        .prepare(input(
+            &first_creator,
+            &reader,
+            "first-operation",
+            b"first-binding",
+        ))
+        .await
+        .unwrap();
+    let second = store
+        .prepare(input(
+            &second_creator,
+            &reader,
+            "second-operation",
+            b"second-binding",
+        ))
+        .await
+        .unwrap();
+
+    store
+        .activate(MarketplaceActivationInput {
+            creator: &first_creator,
+            invoice_id: first.invoice_id(),
+            total_sats: 100,
+            proposal_acceptance_window: std::time::Duration::from_secs(30 * 60),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .activate(MarketplaceActivationInput {
+                creator: &second_creator,
+                invoice_id: second.invoice_id(),
+                total_sats: 100,
+                proposal_acceptance_window: std::time::Duration::from_secs(30 * 60),
+            })
+            .await,
+        Err(MarketplaceLifecyclePersistenceError::Persistence(
+            PersistenceError::CorruptOrMissing
+        ))
+    );
+
+    let second_state: (String, Option<OffsetDateTime>, Option<OffsetDateTime>) = sqlx::query_as(
+        "SELECT state, activated_at, payment_deadline
+             FROM marketplace_payment_preparations WHERE id = $1",
+    )
+    .bind(second.invoice_id())
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(second_state, ("prepared".into(), None, None));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM marketplace_settlements WHERE preparation_id = $1",
+        )
+        .bind(second.invoice_id())
+        .fetch_one(database.pool())
+        .await
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM outbox WHERE marketplace_preparation_id = $1",
+        )
+        .bind(second.invoice_id())
+        .fetch_one(database.pool())
+        .await
+        .unwrap(),
+        0
+    );
 
     database.cleanup().await;
 }

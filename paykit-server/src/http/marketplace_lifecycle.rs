@@ -149,8 +149,10 @@ fn map_error(error: MarketplaceLifecycleError) -> ApiError {
         MarketplaceLifecycleError::InvalidRequest => ApiError::InvalidRequest,
         MarketplaceLifecycleError::PrepareExpired => ApiError::PrepareExpired,
         MarketplaceLifecycleError::LifecycleTerminal => ApiError::LifecycleTerminal,
+        MarketplaceLifecycleError::InvoiceActive => ApiError::InvoiceActive,
         MarketplaceLifecycleError::TotalMismatch => ApiError::TotalMismatch,
         MarketplaceLifecycleError::NotFound => ApiError::InvoiceNotFound,
         MarketplaceLifecycleError::Unavailable => ApiError::DependencyUnavailable,
+        MarketplaceLifecycleError::Internal => ApiError::InternalError,
     }
 }
