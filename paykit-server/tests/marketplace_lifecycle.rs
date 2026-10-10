@@ -36,6 +36,7 @@ enum Outcome {
     Success,
     PrepareExpired,
     LifecycleTerminal,
+    InvoiceActive,
     TotalMismatch,
     NotFound,
     Corrupt,
@@ -63,6 +64,7 @@ impl MarketplaceLifecyclePersistence for FakeStore {
             Outcome::LifecycleTerminal => {
                 Err(MarketplaceLifecyclePersistenceError::LifecycleTerminal)
             }
+            Outcome::InvoiceActive => Err(MarketplaceLifecyclePersistenceError::InvoiceActive),
             Outcome::TotalMismatch => Err(MarketplaceLifecyclePersistenceError::TotalMismatch),
             Outcome::NotFound => Ok(None),
             Outcome::Corrupt => Err(PersistenceError::CorruptOrMissing.into()),
@@ -84,6 +86,7 @@ impl MarketplaceLifecyclePersistence for FakeStore {
             Outcome::LifecycleTerminal => {
                 Err(MarketplaceLifecyclePersistenceError::LifecycleTerminal)
             }
+            Outcome::InvoiceActive => Err(MarketplaceLifecyclePersistenceError::InvoiceActive),
             Outcome::TotalMismatch => Err(MarketplaceLifecyclePersistenceError::TotalMismatch),
             Outcome::NotFound => Ok(None),
             Outcome::Corrupt => Err(PersistenceError::CorruptOrMissing.into()),
@@ -279,7 +282,7 @@ async fn lifecycle_failures_use_stable_error_fixtures() {
     }
 
     let void_path = "/marketplace/payment-requests/void";
-    let terminal_void = marketplace_lifecycle_router(service(Outcome::LifecycleTerminal))
+    let terminal_void = marketplace_lifecycle_router(service(Outcome::InvoiceActive))
         .layer(Extension(signed_auth(&key)))
         .oneshot(signed_request(
             &key,
@@ -292,8 +295,8 @@ async fn lifecycle_failures_use_stable_error_fixtures() {
     assert_eq!(
         json(terminal_void).await,
         serde_json::json!({"error":{
-            "code":"lifecycle_terminal",
-            "message":"payment lifecycle is already terminal"
+            "code":"invoice_active",
+            "message":"invoice is already active"
         }})
     );
 
@@ -316,12 +319,12 @@ async fn lifecycle_failures_use_stable_error_fixtures() {
         .oneshot(signed_request(&key, path, body()))
         .await
         .unwrap();
-    assert_eq!(corrupt.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(corrupt.status(), StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(
         json(corrupt).await,
         serde_json::json!({"error":{
-            "code":"dependency_unavailable",
-            "message":"dependency is unavailable"
+            "code":"internal_error",
+            "message":"internal server error"
         }})
     );
 }

@@ -19,6 +19,7 @@ pub enum ApiError {
     OperationConflict,
     PrepareExpired,
     LifecycleTerminal,
+    InvoiceActive,
     TotalMismatch,
     Unavailable,
     InvoiceConflict,
@@ -110,6 +111,11 @@ impl ApiError {
                 StatusCode::CONFLICT,
                 "lifecycle_terminal",
                 "payment lifecycle is already terminal",
+            ),
+            Self::InvoiceActive => (
+                StatusCode::CONFLICT,
+                "invoice_active",
+                "invoice is already active",
             ),
             Self::TotalMismatch => (
                 StatusCode::CONFLICT,
