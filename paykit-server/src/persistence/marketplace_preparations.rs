@@ -3,16 +3,17 @@
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 use thiserror::Error;
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
 use crate::{
     application::semantic_intent::DeliveryIntentV1,
+    bitcoin::{DirectBinding, ObservationAction, ObservationTarget, TrackedOutput},
     crypto::{Crypto, EncryptedEnvelope, EnvelopeContext, LookupHash},
     domain::locks::{CreatorPubky, ReaderPubky, parse_reader},
-    persistence::{PersistenceError, invoices::InvoicePaymentRecordV1},
+    persistence::{BitcoinObservationInput, PersistenceError, invoices::InvoicePaymentRecordV1},
 };
 
 const OPERATION_BINDING_UNIQUE_CONSTRAINT: &str = "marketplace_preparation_operation_binding_key";
@@ -251,12 +252,444 @@ struct LifecycleRow {
     resolved_at: Option<OffsetDateTime>,
 }
 
+#[derive(sqlx::FromRow)]
+struct MarketplaceObservationTargetRow {
+    preparation_id: Uuid,
+    creator_lookup_hash: Vec<u8>,
+    payment_record_envelope: Vec<u8>,
+    bitcoin_address_lookup_hash: Vec<u8>,
+    derivation_index_lookup_hash: Vec<u8>,
+    activated_at: OffsetDateTime,
+    observation_id: Option<Uuid>,
+    observation_envelope: Option<Vec<u8>>,
+    outpoint_lookup_hash: Option<Vec<u8>>,
+    confirmations: Option<i32>,
+    present: Option<bool>,
+    first_observed_at: Option<OffsetDateTime>,
+}
+
+#[derive(sqlx::FromRow)]
+struct MarketplaceSettlementRow {
+    preparation_id: Uuid,
+    creator_lookup_hash: Vec<u8>,
+    payment_record_envelope: Vec<u8>,
+    bitcoin_address_lookup_hash: Vec<u8>,
+    derivation_index_lookup_hash: Vec<u8>,
+    activated_at: OffsetDateTime,
+    payment_deadline: OffsetDateTime,
+}
+
+#[derive(sqlx::FromRow)]
+struct MarketplaceObservationRow {
+    id: Uuid,
+    invoice_id: Option<Uuid>,
+    marketplace_preparation_id: Option<Uuid>,
+    observation_envelope: Vec<u8>,
+    outpoint_lookup_hash: Vec<u8>,
+    confirmations: i32,
+    present: bool,
+    first_observed_at: OffsetDateTime,
+}
+
+#[derive(Serialize, Deserialize)]
+struct MarketplaceBitcoinObservationV1 {
+    version: u8,
+    outpoint: String,
+    observed_sats: u64,
+}
+
 impl MarketplacePreparationStore {
     pub fn new(pool: &PgPool, crypto: Arc<Crypto>) -> Self {
         Self {
             pool: pool.clone(),
             crypto,
         }
+    }
+
+    /// Loads every non-final activated Marketplace settlement as an authenticated target.
+    pub async fn observation_targets(&self) -> Result<Vec<ObservationTarget>, PersistenceError> {
+        self.observation_targets_with_time(None).await
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn observation_targets_at(
+        &self,
+        observed_at: OffsetDateTime,
+    ) -> Result<Vec<ObservationTarget>, PersistenceError> {
+        self.observation_targets_with_time(Some(observed_at)).await
+    }
+
+    async fn observation_targets_with_time(
+        &self,
+        observed_at: Option<OffsetDateTime>,
+    ) -> Result<Vec<ObservationTarget>, PersistenceError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        sqlx::query(
+            "SELECT settlement.preparation_id
+             FROM marketplace_settlements settlement
+             JOIN marketplace_payment_preparations preparation
+               ON preparation.id = settlement.preparation_id
+              AND preparation.creator_id = settlement.creator_id
+             WHERE preparation.state = 'active'
+               AND settlement.payment_expired_at IS NULL
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM marketplace_timely_amount_matched_outpoints timely
+                   JOIN bitcoin_observations observation
+                     ON observation.marketplace_preparation_id = timely.preparation_id
+                    AND observation.outpoint_lookup_hash = timely.outpoint_lookup_hash
+                    AND observation.active
+                    AND observation.present
+                   WHERE timely.preparation_id = settlement.preparation_id
+               )
+             ORDER BY settlement.preparation_id
+             FOR UPDATE OF settlement",
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        let observed_at = match observed_at {
+            Some(observed_at) => observed_at,
+            None => sqlx::query_scalar("SELECT clock_timestamp()")
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|_| PersistenceError::Unavailable)?,
+        };
+        sqlx::query(
+            "UPDATE marketplace_settlements settlement
+             SET payment_expired_at = $1, updated_at = clock_timestamp()
+             FROM marketplace_payment_preparations preparation
+             WHERE preparation.id = settlement.preparation_id
+               AND preparation.creator_id = settlement.creator_id
+               AND preparation.state = 'active'
+               AND preparation.payment_deadline < $1
+               AND settlement.payment_expired_at IS NULL
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM marketplace_timely_amount_matched_outpoints timely
+                   JOIN bitcoin_observations observation
+                     ON observation.marketplace_preparation_id = timely.preparation_id
+                    AND observation.outpoint_lookup_hash = timely.outpoint_lookup_hash
+                    AND observation.active
+                    AND observation.present
+                   WHERE timely.preparation_id = settlement.preparation_id
+               )",
+        )
+        .bind(observed_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        let rows = sqlx::query_as::<_, MarketplaceObservationTargetRow>(
+            "SELECT settlement.preparation_id, creators.creator_lookup_hash,
+                    settlement.payment_record_envelope,
+                    settlement.bitcoin_address_lookup_hash,
+                    settlement.derivation_index_lookup_hash,
+                    preparation.activated_at,
+                    observation.id AS observation_id,
+                    observation.observation_envelope,
+                    observation.outpoint_lookup_hash,
+                    observation.confirmations, observation.present,
+                    observation.first_observed_at
+             FROM marketplace_settlements settlement
+             JOIN marketplace_payment_preparations preparation
+               ON preparation.id = settlement.preparation_id
+              AND preparation.creator_id = settlement.creator_id
+             JOIN creators ON creators.id = settlement.creator_id
+             LEFT JOIN bitcoin_observations observation
+               ON observation.marketplace_preparation_id = settlement.preparation_id
+              AND observation.active
+             WHERE preparation.state = 'active'
+             ORDER BY settlement.preparation_id",
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        tx.commit()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+
+        rows.into_iter()
+            .map(|row| {
+                let creator_hash = stored_hash(&row.creator_lookup_hash)?;
+                let payment = self.decrypt_settlement_payment_record(
+                    creator_hash,
+                    row.preparation_id,
+                    row.payment_record_envelope,
+                )?;
+                let required = payment.bitcoin_required_amount()?;
+                let address = payment.bitcoin_address()?.to_owned();
+                if row.bitcoin_address_lookup_hash
+                    != self
+                        .crypto
+                        .bitcoin_address_lookup_hash(address.as_bytes())
+                        .as_bytes()
+                    || row.derivation_index_lookup_hash
+                        != self
+                            .crypto
+                            .bitcoin_derivation_index_lookup_hash(
+                                creator_hash,
+                                payment.derivation_index(),
+                            )
+                            .as_bytes()
+                {
+                    return Err(PersistenceError::CorruptOrMissing);
+                }
+                let current = match (
+                    row.observation_id,
+                    row.observation_envelope,
+                    row.outpoint_lookup_hash,
+                    row.confirmations,
+                    row.present,
+                    row.first_observed_at,
+                ) {
+                    (None, None, None, None, None, None) => None,
+                    (
+                        Some(id),
+                        Some(envelope),
+                        Some(outpoint_hash),
+                        Some(confirmations),
+                        Some(present),
+                        Some(first_observed_at),
+                    ) => {
+                        let observation = self.decrypt_marketplace_observation(
+                            creator_hash,
+                            row.preparation_id,
+                            id,
+                            envelope,
+                        )?;
+                        if outpoint_hash
+                            != self
+                                .crypto
+                                .bitcoin_outpoint_lookup_hash(observation.outpoint.as_bytes())
+                                .as_bytes()
+                            || confirmations < 0
+                            || (!present && confirmations != 0)
+                            || first_observed_at < row.activated_at
+                        {
+                            return Err(PersistenceError::CorruptOrMissing);
+                        }
+                        if present && confirmations >= 6 && observation.observed_sats >= required {
+                            return Ok(None);
+                        }
+                        let outpoint = observation
+                            .outpoint
+                            .parse::<bitcoin::OutPoint>()
+                            .map_err(|_| PersistenceError::CorruptOrMissing)?;
+                        if outpoint.to_string() != observation.outpoint {
+                            return Err(PersistenceError::CorruptOrMissing);
+                        }
+                        Some(TrackedOutput::new(outpoint, observation.observed_sats))
+                    }
+                    _ => return Err(PersistenceError::CorruptOrMissing),
+                };
+                Ok(Some(ObservationTarget::new(address, current)))
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(|targets| targets.into_iter().flatten().collect())
+    }
+
+    /// Authenticates every Marketplace settlement and historical Bitcoin evidence row.
+    pub async fn scan_observation_integrity(&self) -> Result<(), PersistenceError> {
+        let settlements = sqlx::query_as::<_, MarketplaceSettlementRow>(
+            "SELECT settlement.preparation_id, creators.creator_lookup_hash,
+                    settlement.payment_record_envelope,
+                    settlement.bitcoin_address_lookup_hash,
+                    settlement.derivation_index_lookup_hash,
+                    preparation.activated_at, preparation.payment_deadline
+             FROM marketplace_settlements settlement
+             JOIN marketplace_payment_preparations preparation
+               ON preparation.id = settlement.preparation_id
+              AND preparation.creator_id = settlement.creator_id
+             JOIN creators ON creators.id = settlement.creator_id
+             WHERE preparation.state = 'active'
+             ORDER BY settlement.preparation_id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        for settlement in settlements {
+            let creator_hash = stored_hash(&settlement.creator_lookup_hash)?;
+            let payment = self.decrypt_settlement_payment_record(
+                creator_hash,
+                settlement.preparation_id,
+                settlement.payment_record_envelope,
+            )?;
+            payment.bitcoin_required_amount()?;
+            if settlement.bitcoin_address_lookup_hash
+                != self
+                    .crypto
+                    .bitcoin_address_lookup_hash(payment.bitcoin_address()?.as_bytes())
+                    .as_bytes()
+                || settlement.derivation_index_lookup_hash
+                    != self
+                        .crypto
+                        .bitcoin_derivation_index_lookup_hash(
+                            creator_hash,
+                            payment.derivation_index(),
+                        )
+                        .as_bytes()
+                || settlement.activated_at >= settlement.payment_deadline
+            {
+                return Err(PersistenceError::CorruptOrMissing);
+            }
+        }
+        let observations = sqlx::query_as::<
+            _,
+            (
+                Uuid,
+                Option<Uuid>,
+                Option<Uuid>,
+                Vec<u8>,
+                Vec<u8>,
+                i32,
+                bool,
+                OffsetDateTime,
+                OffsetDateTime,
+                Vec<u8>,
+            ),
+        >(
+            "SELECT observation.id, observation.invoice_id,
+                    observation.marketplace_preparation_id,
+                    observation.observation_envelope,
+                    observation.outpoint_lookup_hash,
+                    observation.confirmations, observation.present,
+                    observation.first_observed_at, preparation.activated_at,
+                    creators.creator_lookup_hash
+             FROM bitcoin_observations observation
+             JOIN marketplace_settlements settlement
+               ON settlement.preparation_id = observation.marketplace_preparation_id
+             JOIN marketplace_payment_preparations preparation
+               ON preparation.id = settlement.preparation_id
+              AND preparation.creator_id = settlement.creator_id
+             JOIN creators ON creators.id = settlement.creator_id
+             WHERE observation.marketplace_preparation_id IS NOT NULL
+             ORDER BY observation.id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        for (
+            id,
+            invoice_id,
+            marketplace_preparation_id,
+            envelope,
+            outpoint_hash,
+            confirmations,
+            present,
+            first_observed_at,
+            activated_at,
+            creator_hash,
+        ) in observations
+        {
+            let Some(preparation_id) = marketplace_preparation_id else {
+                return Err(PersistenceError::CorruptOrMissing);
+            };
+            let creator_hash = stored_hash(&creator_hash)?;
+            let observation =
+                self.decrypt_marketplace_observation(creator_hash, preparation_id, id, envelope)?;
+            if invoice_id.is_some()
+                || outpoint_hash
+                    != self
+                        .crypto
+                        .bitcoin_outpoint_lookup_hash(observation.outpoint.as_bytes())
+                        .as_bytes()
+                || confirmations < 0
+                || (!present && confirmations != 0)
+                || first_observed_at < activated_at
+            {
+                return Err(PersistenceError::CorruptOrMissing);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn apply_bitcoin_observation_batch(
+        &self,
+        observations: &[BitcoinObservationInput],
+    ) -> Result<usize, PersistenceError> {
+        self.apply_bitcoin_observation_batch_with_time(observations, None)
+            .await
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) async fn apply_bitcoin_observation_batch_at(
+        &self,
+        observations: &[BitcoinObservationInput],
+        observed_at: OffsetDateTime,
+    ) -> Result<usize, PersistenceError> {
+        self.apply_bitcoin_observation_batch_with_time(observations, Some(observed_at))
+            .await
+    }
+
+    async fn apply_bitcoin_observation_batch_with_time(
+        &self,
+        observations: &[BitcoinObservationInput],
+        observed_at: Option<OffsetDateTime>,
+    ) -> Result<usize, PersistenceError> {
+        if observations.is_empty() {
+            return Ok(0);
+        }
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        let address_lookup_hashes = observations
+            .iter()
+            .map(|observation| {
+                self.crypto
+                    .bitcoin_address_lookup_hash(observation.address.as_bytes())
+                    .as_bytes()
+                    .to_vec()
+            })
+            .collect::<Vec<_>>();
+        sqlx::query(
+            "SELECT settlement.preparation_id
+             FROM marketplace_settlements settlement
+             JOIN marketplace_payment_preparations preparation
+               ON preparation.id = settlement.preparation_id
+              AND preparation.creator_id = settlement.creator_id
+             WHERE settlement.bitcoin_address_lookup_hash = ANY($1::bytea[])
+               AND preparation.state = 'active'
+             ORDER BY settlement.preparation_id
+             FOR UPDATE OF settlement",
+        )
+        .bind(&address_lookup_hashes)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        let observed_at = match observed_at {
+            Some(observed_at) => observed_at,
+            None => sqlx::query_scalar("SELECT clock_timestamp()")
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|_| PersistenceError::Unavailable)?,
+        };
+        let mut ordered: Vec<_> = observations.iter().collect();
+        ordered.sort_by(|left, right| {
+            left.address.cmp(&right.address).then_with(|| {
+                left.outpoint
+                    .canonical_text()
+                    .cmp(&right.outpoint.canonical_text())
+            })
+        });
+        let mut applied = 0;
+        for observation in ordered {
+            if self
+                .apply_marketplace_observation(&mut tx, observation, observed_at)
+                .await?
+            {
+                applied += 1;
+            }
+        }
+        tx.commit()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        Ok(applied)
     }
 
     /// Resolves replay or changed binding before mutable external work.
@@ -914,6 +1347,327 @@ impl MarketplacePreparationStore {
             return Err(PersistenceError::CorruptOrMissing);
         }
         Ok(())
+    }
+
+    async fn apply_marketplace_observation(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        input: &BitcoinObservationInput,
+        observed_at: OffsetDateTime,
+    ) -> Result<bool, PersistenceError> {
+        let address_hash = self
+            .crypto
+            .bitcoin_address_lookup_hash(input.address.as_bytes());
+        let settlement = sqlx::query_as::<_, MarketplaceSettlementRow>(
+            "SELECT settlement.preparation_id, creators.creator_lookup_hash,
+                    settlement.payment_record_envelope,
+                    settlement.bitcoin_address_lookup_hash,
+                    settlement.derivation_index_lookup_hash,
+                    preparation.activated_at, preparation.payment_deadline
+             FROM marketplace_settlements settlement
+             JOIN marketplace_payment_preparations preparation
+               ON preparation.id = settlement.preparation_id
+              AND preparation.creator_id = settlement.creator_id
+             JOIN creators ON creators.id = settlement.creator_id
+             WHERE settlement.bitcoin_address_lookup_hash = $1
+               AND preparation.state = 'active'
+             FOR UPDATE OF settlement",
+        )
+        .bind(address_hash.as_bytes().as_slice())
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        let Some(settlement) = settlement else {
+            return Ok(false);
+        };
+        let creator_hash = stored_hash(&settlement.creator_lookup_hash)?;
+        let payment = self.decrypt_settlement_payment_record(
+            creator_hash,
+            settlement.preparation_id,
+            settlement.payment_record_envelope,
+        )?;
+        let required = payment.bitcoin_required_amount()?;
+        if payment.bitcoin_address()? != input.address
+            || settlement.bitcoin_address_lookup_hash != address_hash.as_bytes()
+            || settlement.derivation_index_lookup_hash
+                != self
+                    .crypto
+                    .bitcoin_derivation_index_lookup_hash(creator_hash, payment.derivation_index())
+                    .as_bytes()
+            || observed_at < settlement.activated_at
+        {
+            return Err(PersistenceError::CorruptOrMissing);
+        }
+
+        let outpoint = input.outpoint.canonical_text();
+        let outpoint_hash = self
+            .crypto
+            .bitcoin_outpoint_lookup_hash(outpoint.as_bytes());
+        let existing = sqlx::query_as::<_, MarketplaceObservationRow>(
+            "SELECT id, invoice_id, marketplace_preparation_id, observation_envelope,
+                    outpoint_lookup_hash, confirmations, present, first_observed_at
+             FROM bitcoin_observations WHERE outpoint_lookup_hash = $1 FOR UPDATE",
+        )
+        .bind(outpoint_hash.as_bytes().as_slice())
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        if existing.as_ref().is_some_and(|row| {
+            row.invoice_id.is_some()
+                || row.marketplace_preparation_id != Some(settlement.preparation_id)
+        }) {
+            return Err(PersistenceError::Conflict);
+        }
+        if let Some(row) = existing.as_ref() {
+            let stored = self.decrypt_marketplace_observation(
+                creator_hash,
+                settlement.preparation_id,
+                row.id,
+                row.observation_envelope.clone(),
+            )?;
+            if stored.outpoint != outpoint
+                || stored.observed_sats != input.observed_sats
+                || row.outpoint_lookup_hash != outpoint_hash.as_bytes()
+            {
+                return Err(PersistenceError::Conflict);
+            }
+        }
+        let active = sqlx::query_as::<_, MarketplaceObservationRow>(
+            "SELECT id, invoice_id, marketplace_preparation_id, observation_envelope,
+                    outpoint_lookup_hash, confirmations, present, first_observed_at
+             FROM bitcoin_observations
+             WHERE marketplace_preparation_id = $1 AND active FOR UPDATE",
+        )
+        .bind(settlement.preparation_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        let active_record = active
+            .as_ref()
+            .map(|row| {
+                self.decrypt_marketplace_observation(
+                    creator_hash,
+                    settlement.preparation_id,
+                    row.id,
+                    row.observation_envelope.clone(),
+                )
+            })
+            .transpose()?;
+        if active
+            .as_ref()
+            .zip(active_record.as_ref())
+            .is_some_and(|(row, record)| {
+                row.present && row.confirmations >= 6 && record.observed_sats >= required
+            })
+        {
+            return Ok(true);
+        }
+        if !input.present
+            && active_record
+                .as_ref()
+                .is_some_and(|record| record.outpoint != outpoint)
+        {
+            return Ok(true);
+        }
+        let action = active
+            .as_ref()
+            .zip(active_record.as_ref())
+            .map(|(row, record)| {
+                DirectBinding::new(
+                    &record.outpoint,
+                    record.observed_sats,
+                    u32::try_from(row.confirmations).unwrap_or_default(),
+                    row.present,
+                )
+                .action_for_values(
+                    &outpoint,
+                    input.observed_sats,
+                    input.confirmations,
+                    input.present,
+                    required,
+                )
+            });
+        if action == Some(ObservationAction::Ignore) {
+            return Ok(true);
+        }
+        if active.is_none() && !input.present {
+            return Ok(true);
+        }
+        if action == Some(ObservationAction::Replace) {
+            sqlx::query(
+                "UPDATE bitcoin_observations SET active = FALSE, updated_at = clock_timestamp()
+                 WHERE marketplace_preparation_id = $1 AND active",
+            )
+            .bind(settlement.preparation_id)
+            .execute(&mut **tx)
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        }
+
+        let confirmations =
+            i32::try_from(input.confirmations).map_err(|_| PersistenceError::CorruptOrMissing)?;
+        let observation_id = existing.as_ref().map_or_else(Uuid::new_v4, |row| row.id);
+        let first_observed_at = existing
+            .as_ref()
+            .map_or(observed_at, |row| row.first_observed_at);
+        let encrypted = self
+            .crypto
+            .encrypt(
+                &EnvelopeContext::bitcoin_observation_for_marketplace(
+                    creator_hash,
+                    observation_id,
+                    settlement.preparation_id,
+                ),
+                &postcard::to_allocvec(&MarketplaceBitcoinObservationV1 {
+                    version: 1,
+                    outpoint,
+                    observed_sats: input.observed_sats,
+                })
+                .map_err(|_| PersistenceError::CorruptOrMissing)?,
+            )
+            .map_err(|_| PersistenceError::CorruptOrMissing)?;
+        let written = sqlx::query(
+            "INSERT INTO bitcoin_observations
+             (id, marketplace_preparation_id, observation_envelope, outpoint_lookup_hash,
+              confirmations, present, active, first_observed_at)
+             VALUES ($1, $2, $3, $4, $5, $6, TRUE, $7)
+             ON CONFLICT (outpoint_lookup_hash) DO UPDATE SET
+                 confirmations = EXCLUDED.confirmations,
+                 present = EXCLUDED.present,
+                 active = TRUE,
+                 updated_at = clock_timestamp()
+             WHERE bitcoin_observations.marketplace_preparation_id =
+                   EXCLUDED.marketplace_preparation_id",
+        )
+        .bind(observation_id)
+        .bind(settlement.preparation_id)
+        .bind(encrypted.as_bytes())
+        .bind(outpoint_hash.as_bytes().as_slice())
+        .bind(confirmations)
+        .bind(input.present)
+        .bind(first_observed_at)
+        .execute(&mut **tx)
+        .await
+        .map_err(|_| PersistenceError::Conflict)?;
+        if written.rows_affected() != 1 {
+            return Err(PersistenceError::Conflict);
+        }
+
+        let amount_matched = input.present && input.observed_sats >= required;
+        let timely = amount_matched && first_observed_at <= settlement.payment_deadline;
+        if timely {
+            sqlx::query(
+                "INSERT INTO marketplace_timely_amount_matched_outpoints
+                 (preparation_id, outpoint_lookup_hash) VALUES ($1, $2)
+                 ON CONFLICT DO NOTHING",
+            )
+            .bind(settlement.preparation_id)
+            .bind(outpoint_hash.as_bytes().as_slice())
+            .execute(&mut **tx)
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        }
+        if amount_matched {
+            sqlx::query(
+                "UPDATE marketplace_settlements
+                 SET first_amount_matched_observed_at =
+                         COALESCE(first_amount_matched_observed_at, $2),
+                     first_amount_matched_outpoint_lookup_hash =
+                         COALESCE(first_amount_matched_outpoint_lookup_hash, $3)
+                 WHERE preparation_id = $1",
+            )
+            .bind(settlement.preparation_id)
+            .bind(first_observed_at)
+            .bind(outpoint_hash.as_bytes().as_slice())
+            .execute(&mut **tx)
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        }
+        let projected_confirmations = if !input.present {
+            0
+        } else if amount_matched {
+            confirmations.min(6)
+        } else {
+            confirmations
+        };
+        let payment_status = if !input.present {
+            "undetected"
+        } else if projected_confirmations == 0 {
+            "detected"
+        } else {
+            "confirmed"
+        };
+        sqlx::query(
+            "UPDATE marketplace_settlements
+             SET payment_status = $2, confirmation_count = $3, amount_matched = $4,
+                 payment_expired_at = CASE
+                     WHEN $5 THEN NULL
+                     WHEN $6 > $7 THEN COALESCE(payment_expired_at, $6)
+                     ELSE payment_expired_at
+                 END,
+                 updated_at = clock_timestamp()
+             WHERE preparation_id = $1",
+        )
+        .bind(settlement.preparation_id)
+        .bind(payment_status)
+        .bind(projected_confirmations)
+        .bind(amount_matched)
+        .bind(timely)
+        .bind(observed_at)
+        .bind(settlement.payment_deadline)
+        .execute(&mut **tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        Ok(true)
+    }
+
+    fn decrypt_settlement_payment_record(
+        &self,
+        creator_hash: LookupHash,
+        preparation_id: Uuid,
+        envelope: Vec<u8>,
+    ) -> Result<InvoicePaymentRecordV1, PersistenceError> {
+        let plaintext = self
+            .crypto
+            .decrypt(
+                &EnvelopeContext::marketplace_settlement_payment_record(
+                    creator_hash,
+                    preparation_id,
+                ),
+                &EncryptedEnvelope::from_bytes(envelope),
+            )
+            .map_err(|_| PersistenceError::CorruptOrMissing)?;
+        postcard::from_bytes(&plaintext).map_err(|_| PersistenceError::CorruptOrMissing)
+    }
+
+    fn decrypt_marketplace_observation(
+        &self,
+        creator_hash: LookupHash,
+        preparation_id: Uuid,
+        observation_id: Uuid,
+        envelope: Vec<u8>,
+    ) -> Result<MarketplaceBitcoinObservationV1, PersistenceError> {
+        let plaintext = self
+            .crypto
+            .decrypt(
+                &EnvelopeContext::bitcoin_observation_for_marketplace(
+                    creator_hash,
+                    observation_id,
+                    preparation_id,
+                ),
+                &EncryptedEnvelope::from_bytes(envelope),
+            )
+            .map_err(|_| PersistenceError::CorruptOrMissing)?;
+        let observation: MarketplaceBitcoinObservationV1 =
+            postcard::from_bytes(&plaintext).map_err(|_| PersistenceError::CorruptOrMissing)?;
+        let outpoint = observation
+            .outpoint
+            .parse::<bitcoin::OutPoint>()
+            .map_err(|_| PersistenceError::CorruptOrMissing)?;
+        if observation.version != 1 || outpoint.to_string() != observation.outpoint {
+            return Err(PersistenceError::CorruptOrMissing);
+        }
+        Ok(observation)
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -21,7 +21,9 @@ use crate::{
     bitcoin::{ObservationTarget, ObservedOutput},
     config::{BitcoinNetwork, validate_electrum_endpoint},
     domain::payment::BitcoinOutpoint,
-    persistence::{BitcoinObservationInput, InvoiceStore, PersistenceError},
+    persistence::{
+        BitcoinObservationInput, InvoiceStore, MarketplacePreparationStore, PersistenceError,
+    },
 };
 
 /// Production Electrum adapters are injected here. This boundary deliberately
@@ -243,6 +245,37 @@ pub async fn observe_once(
     let observations = validate_batch(observations, network, targets)?;
     invoices
         .apply_bitcoin_observation_batch(&observations)
+        .await
+        .map_err(map_persistence)
+}
+
+/// Applies one fetched batch to Marketplace-owned settlements.
+pub async fn observe_marketplace_once(
+    port: &dyn ElectrumPort,
+    marketplace: &MarketplacePreparationStore,
+    network: &BitcoinNetwork,
+    targets: &[ObservationTarget],
+) -> Result<usize, ObserverError> {
+    let observations = port.observations(targets).await?;
+    let observations = validate_batch(observations, network, targets)?;
+    marketplace
+        .apply_bitcoin_observation_batch(&observations)
+        .await
+        .map_err(map_persistence)
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+pub async fn observe_marketplace_once_at(
+    port: &dyn ElectrumPort,
+    marketplace: &MarketplacePreparationStore,
+    network: &BitcoinNetwork,
+    targets: &[ObservationTarget],
+    observed_at: OffsetDateTime,
+) -> Result<usize, ObserverError> {
+    let observations = port.observations(targets).await?;
+    let observations = validate_batch(observations, network, targets)?;
+    marketplace
+        .apply_bitcoin_observation_batch_at(&observations, observed_at)
         .await
         .map_err(map_persistence)
 }

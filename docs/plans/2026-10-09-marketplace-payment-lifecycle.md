@@ -1,6 +1,6 @@
 # Marketplace Payment Lifecycle Decision Ledger
 
-Status: preparation, activation, void, and activated-settlement ownership slices authorized; resolution deferred.
+Status: preparation, activation, void, activated-settlement ownership, and Bitcoin observation slices authorized; resolution and signed Marketplace status deferred.
 
 ## Authority and baseline
 
@@ -81,10 +81,19 @@ Accepted behavior:
 - Bitcoin addresses are globally unique across Locks invoices and Marketplace settlements at the PostgreSQL transaction boundary. Existing per-table invoice uniqueness and immutable activation replay remain intact.
 - This branch uses migration `0014_marketplace_settlements.sql`; stacked PR #68 already uses `0014` and must be renumbered when restacked onto this head.
 
+## Marketplace Bitcoin observation — current implementation slice
+
+- Activated Marketplace settlements are Electrum observation targets. Prepared and voided preparations cannot own observation rows by schema construction.
+- Shared Bitcoin evidence has exactly one Locks or Marketplace owner. Outpoint identity, encrypted first-observed amount, and first-observed time are immutable; chain presence, confirmations, and active replacement state remain mutable.
+- A zero-confirmation, disappeared, or underpaid output may be replaced. Each replacement keeps its own first observation and timeliness; an earlier timely output never lends timeliness to a later outpoint.
+- A present amount-matched output is final at six confirmations. Underpayment remains replaceable regardless of confirmation count. Reorg and stale-absence handling match Locks observation semantics.
+- Marketplace settlement projection records current Bitcoin status, capped matching confirmations, amount match, historical first match, and expiry without creating Locks invoices, drains, generations, or buyer contacts.
+- Existing Locks observation and `{creator, bundle_id}` behavior remains owner-isolated and unchanged apart from enforcing immutable evidence for all Bitcoin outpoints.
+
 ## Explicitly deferred follow-up and release hold
 
 - `usdt_observations` remains unchanged; Marketplace USDT settlement ownership is a later slice.
-- Marketplace Bitcoin observation, outpoint evidence, and signed `{creator, invoice_id}` status are separate follow-up work. This slice does not complete Marketplace payment observation or payment status.
+- Signed `{creator, invoice_id}` status remains separate follow-up work. Bitcoin observation alone does not complete Marketplace payment status.
 - Marketplace must reject activation after its Marketplace-owned inventory hold expires; that cross-service timing guard belongs to the Marketplace consumer follow-up.
 - PR #67 may remain a reviewed draft, but must not merge to `master` until Bitcoin observation/status, Marketplace hold-boundary work, and the accepted base-stack-stability gate are complete. No deployment is authorized.
 
@@ -114,3 +123,11 @@ Accepted behavior:
 - Cross-owner Bitcoin address collisions fail closed in PostgreSQL; existing Locks invoice address uniqueness remains unchanged.
 - Actual SDK-delivered Marketplace proposals project lifecycle state to the Marketplace owner while same-Creator Locks status and drain refresh remain available.
 - Existing Locks lifecycle, status, drain, and `buyer_contacts` coverage remains unchanged and green.
+
+## Verification required for Marketplace Bitcoin observation slice
+
+- Fresh and upgrade PostgreSQL migrations preserve Locks evidence while adding exactly-one-owner and immutable-evidence constraints.
+- Prepared and voided preparations remain excluded; activated settlements are discovered through authenticated payment records.
+- Tests cover active zero-confirmation replacement, immutable first time and amount, no timeliness transfer, reorg, late match, underpayment replacement, six-confirmation finality, and stale absence.
+- Cross-owner outpoints conflict; Creator and AEAD parent binding remain isolated.
+- Existing Locks observation, status, drain, lifecycle, and buyer-contact suites remain green.
