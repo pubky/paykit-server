@@ -93,16 +93,22 @@ async fn verified_timely_payment_queues_one_contact_attempt_per_buyer() {
     let store = store(&database).await;
     let (id, address) = invoice(&store).await;
     assert!(store.claim_buyer_contact().await.unwrap().is_none());
-    let outpoint = persisted_outpoint("buyer-contact");
-    for (amount, present) in [(99, true), (100, false)] {
+    let underpayment = persisted_outpoint("buyer-contact-underpayment");
+    for present in [true, false] {
         store
-            .apply_bitcoin_observation(&address, &outpoint, amount, 1, present)
+            .apply_bitcoin_observation(&address, &underpayment, 99, 1, present)
             .await
             .unwrap();
         assert!(store.claim_buyer_contact().await.unwrap().is_none());
     }
     store
-        .apply_bitcoin_observation(&address, &outpoint, 100, 0, true)
+        .apply_bitcoin_observation(
+            &address,
+            &persisted_outpoint("buyer-contact-payment"),
+            100,
+            0,
+            true,
+        )
         .await
         .unwrap();
     let pending = store.claim_buyer_contact().await.unwrap().unwrap();
@@ -1480,10 +1486,12 @@ async fn underpayment_is_nonfinal_replaceable_and_outpoints_stay_globally_unique
         facts(&database, invoice_id).await,
         ("confirmed".into(), 20, false)
     );
-    store
-        .apply_bitcoin_observation(&address, &persisted_outpoint("underpaid"), 100, 0, true)
-        .await
-        .unwrap();
+    assert_eq!(
+        store
+            .apply_bitcoin_observation(&address, &persisted_outpoint("underpaid"), 100, 0, true)
+            .await,
+        Err(PersistenceError::Conflict)
+    );
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM bitcoin_observations WHERE invoice_id = $1",
@@ -1743,22 +1751,13 @@ async fn payment_record_integrity_rejects_row_and_type_envelope_swaps() {
     .fetch_one(database.pool())
     .await
     .unwrap();
-    sqlx::query("UPDATE bitcoin_observations SET invoice_id = $1 WHERE id = $2")
-        .bind(other_invoice_id)
-        .bind(first_observation.0)
-        .execute(database.pool())
-        .await
-        .unwrap();
-    assert_eq!(
-        store.scan_payment_record_integrity().await,
-        Err(PersistenceError::CorruptOrMissing)
-    );
-    sqlx::query("UPDATE bitcoin_observations SET invoice_id = $1 WHERE id = $2")
-        .bind(first_id)
-        .bind(first_observation.0)
-        .execute(database.pool())
-        .await
-        .unwrap();
+    let cross_creator_rewrite =
+        sqlx::query("UPDATE bitcoin_observations SET invoice_id = $1 WHERE id = $2")
+            .bind(other_invoice_id)
+            .bind(first_observation.0)
+            .execute(database.pool())
+            .await;
+    assert!(cross_creator_rewrite.is_err());
     store.scan_payment_record_integrity().await.unwrap();
 
     let (same_creator_parent_id, _) = invoice_for(
@@ -1768,40 +1767,22 @@ async fn payment_record_integrity_rejects_row_and_type_envelope_swaps() {
         "bitcoin-address-2",
     )
     .await;
-    sqlx::query("UPDATE bitcoin_observations SET invoice_id = $1 WHERE id = $2")
-        .bind(same_creator_parent_id)
-        .bind(first_observation.0)
-        .execute(database.pool())
-        .await
-        .unwrap();
-    assert_eq!(
-        store.scan_payment_record_integrity().await,
-        Err(PersistenceError::CorruptOrMissing)
-    );
-    sqlx::query("UPDATE bitcoin_observations SET invoice_id = $1 WHERE id = $2")
-        .bind(first_id)
-        .bind(first_observation.0)
-        .execute(database.pool())
-        .await
-        .unwrap();
+    let same_creator_rewrite =
+        sqlx::query("UPDATE bitcoin_observations SET invoice_id = $1 WHERE id = $2")
+            .bind(same_creator_parent_id)
+            .bind(first_observation.0)
+            .execute(database.pool())
+            .await;
+    assert!(same_creator_rewrite.is_err());
     store.scan_payment_record_integrity().await.unwrap();
 
-    sqlx::query("UPDATE bitcoin_observations SET observation_envelope = $1 WHERE id = $2")
-        .bind(&second_observation.1)
-        .bind(first_observation.0)
-        .execute(database.pool())
-        .await
-        .unwrap();
-    assert_eq!(
-        store.scan_payment_record_integrity().await,
-        Err(PersistenceError::CorruptOrMissing)
-    );
-    sqlx::query("UPDATE bitcoin_observations SET observation_envelope = $1 WHERE id = $2")
-        .bind(&first_observation.1)
-        .bind(first_observation.0)
-        .execute(database.pool())
-        .await
-        .unwrap();
+    let envelope_rewrite =
+        sqlx::query("UPDATE bitcoin_observations SET observation_envelope = $1 WHERE id = $2")
+            .bind(&second_observation.1)
+            .bind(first_observation.0)
+            .execute(database.pool())
+            .await;
+    assert!(envelope_rewrite.is_err());
 
     sqlx::query("UPDATE invoices SET payment_record_envelope = $1 WHERE id = $2")
         .bind(&first_observation.1)
