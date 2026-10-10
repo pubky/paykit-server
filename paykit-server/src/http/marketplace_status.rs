@@ -79,6 +79,8 @@ async fn status(
         Ok(None) => ApiError::InvoiceNotFound.into_response(),
         Err(MarketplaceStatusError::Conflict) => ApiError::Conflict.into_response(),
         Err(MarketplaceStatusError::Unavailable) => ApiError::Unavailable.into_response(),
+        Err(MarketplaceStatusError::RecoveryRequired) => ApiError::RecoveryRequired.into_response(),
+        Err(MarketplaceStatusError::InvalidConflict) => ApiError::InvalidConflict.into_response(),
     }
 }
 

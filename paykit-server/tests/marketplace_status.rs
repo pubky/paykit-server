@@ -328,6 +328,28 @@ async fn marketplace_consumer_fixtures_are_emitted_by_the_signed_route() {
             StatusCode::SERVICE_UNAVAILABLE,
             include_str!("../../docs/fixtures/marketplace-payment-request-status/unavailable.json"),
         ),
+        (
+            Ok(Some(active_status_with(
+                Some("recovery_required"),
+                "undetected",
+                None,
+            ))),
+            StatusCode::SERVICE_UNAVAILABLE,
+            include_str!(
+                "../../docs/fixtures/marketplace-payment-request-status/recovery-required.json"
+            ),
+        ),
+        (
+            Ok(Some(active_status_with(
+                Some("invalid_conflict"),
+                "undetected",
+                None,
+            ))),
+            StatusCode::CONFLICT,
+            include_str!(
+                "../../docs/fixtures/marketplace-payment-request-status/invalid-conflict.json"
+            ),
+        ),
     ] {
         let response = marketplace_status_router(Arc::new(MarketplaceStatusService::new(
             Arc::new(FakeStore { result }),
@@ -454,6 +476,16 @@ async fn status_rejects_unknown_fields_and_maps_closed_errors() {
             Err(MarketplaceStatusError::Unavailable),
             StatusCode::SERVICE_UNAVAILABLE,
             "unavailable",
+        ),
+        (
+            Err(MarketplaceStatusError::RecoveryRequired),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "recovery_required",
+        ),
+        (
+            Err(MarketplaceStatusError::InvalidConflict),
+            StatusCode::CONFLICT,
+            "invalid_conflict",
         ),
     ] {
         let response = marketplace_status_router(Arc::new(MarketplaceStatusService::new(

@@ -111,6 +111,8 @@ impl MarketplaceInvoiceStatus {
 pub enum MarketplaceStatusError {
     Conflict,
     Unavailable,
+    RecoveryRequired,
+    InvalidConflict,
 }
 
 #[async_trait]
@@ -138,8 +140,8 @@ impl MarketplaceStatusService {
     ) -> Result<Option<MarketplaceInvoiceStatus>, MarketplaceStatusError> {
         let status = self.store.status(creator, invoice_id).await?;
         match status.as_ref().and_then(|status| status.request_state) {
-            Some("recovery_required") => Err(MarketplaceStatusError::Unavailable),
-            Some("invalid_conflict") => Err(MarketplaceStatusError::Conflict),
+            Some("recovery_required") => Err(MarketplaceStatusError::RecoveryRequired),
+            Some("invalid_conflict") => Err(MarketplaceStatusError::InvalidConflict),
             _ => Ok(status),
         }
     }

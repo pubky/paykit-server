@@ -22,6 +22,8 @@ pub enum ApiError {
     InvoiceActive,
     TotalMismatch,
     ResolutionConflict,
+    RecoveryRequired,
+    InvalidConflict,
     Unavailable,
     InvoiceConflict,
     InvoiceNotFound,
@@ -127,6 +129,16 @@ impl ApiError {
                 StatusCode::CONFLICT,
                 "resolution_conflict",
                 "business resolution conflicts with persisted outcome",
+            ),
+            Self::RecoveryRequired => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "recovery_required",
+                "payment request requires recovery",
+            ),
+            Self::InvalidConflict => (
+                StatusCode::CONFLICT,
+                "invalid_conflict",
+                "payment request lifecycle is inconsistent",
             ),
             Self::Unavailable => (
                 StatusCode::SERVICE_UNAVAILABLE,
