@@ -2165,7 +2165,7 @@ impl MarketplacePreparationStore {
             .map_err(|_| PersistenceError::CorruptOrMissing)?;
         let confirmations =
             u32::try_from(values.3).map_err(|_| PersistenceError::CorruptOrMissing)?;
-        let amount_matched = observation.observed_sats >= required_sats;
+        let amount_matched = values.4 && observation.observed_sats >= required_sats;
         let paid_on_time = values.4 && amount_matched && row.active_outpoint_timely;
         Ok(Some(MarketplaceBitcoinStatus::new(
             outpoint.txid.to_string(),

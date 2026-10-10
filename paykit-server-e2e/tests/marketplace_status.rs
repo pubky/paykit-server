@@ -428,7 +428,7 @@ async fn bitcoin_evidence_keeps_identity_amount_and_first_observation_immutable(
                 first_at,
                 0,
                 false,
-                true,
+                false,
                 false,
             )),
             None,

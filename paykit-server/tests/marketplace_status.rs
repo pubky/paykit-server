@@ -70,6 +70,43 @@ fn active_status() -> MarketplaceInvoiceStatus {
     )
 }
 
+fn active_status_with(
+    request_state: Option<&'static str>,
+    payment_state: &'static str,
+    bitcoin: Option<MarketplaceBitcoinStatus>,
+) -> MarketplaceInvoiceStatus {
+    MarketplaceInvoiceStatus::active(
+        INVOICE_ID,
+        "delivered",
+        request_state,
+        payment_state,
+        OffsetDateTime::UNIX_EPOCH,
+        OffsetDateTime::UNIX_EPOCH + time::Duration::days(1),
+        bitcoin,
+        None,
+        None,
+    )
+}
+
+fn bitcoin_status(
+    observed_sats: u64,
+    confirmations: u32,
+    present: bool,
+    amount_matched: bool,
+    paid_on_time: bool,
+) -> MarketplaceBitcoinStatus {
+    MarketplaceBitcoinStatus::new(
+        "0000000000000000000000000000000000000000000000000000000000000001".into(),
+        2,
+        observed_sats,
+        OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
+        confirmations,
+        present,
+        amount_matched,
+        paid_on_time,
+    )
+}
+
 fn signed_auth(key: &SigningKey) -> Arc<SignedServiceAuth> {
     let key = pubky::PublicKey::from(
         pubky::pkarr::PublicKey::try_from(key.verifying_key().as_bytes()).unwrap(),
@@ -120,13 +157,18 @@ fn request(key: &SigningKey, value: serde_json::Value) -> Request<Body> {
         .unwrap()
 }
 
-async fn body(response: axum::response::Response) -> serde_json::Value {
-    serde_json::from_slice(
-        &axum::body::to_bytes(response.into_body(), 8192)
+async fn response_body(response: axum::response::Response) -> String {
+    String::from_utf8(
+        axum::body::to_bytes(response.into_body(), 8192)
             .await
-            .unwrap(),
+            .unwrap()
+            .to_vec(),
     )
     .unwrap()
+}
+
+async fn body(response: axum::response::Response) -> serde_json::Value {
+    serde_json::from_str(&response_body(response).await).unwrap()
 }
 
 #[tokio::test]
@@ -184,6 +226,122 @@ async fn signed_status_has_exact_closed_active_fixture() {
             "state":"active"
         })
     );
+}
+
+#[tokio::test]
+async fn marketplace_consumer_fixtures_are_emitted_by_the_signed_route() {
+    let key = SigningKey::from_bytes(&[7; 32]);
+    let success_cases = [
+        (
+            MarketplaceInvoiceStatus::inactive(INVOICE_ID, "prepared", None, None),
+            include_str!("../../docs/fixtures/marketplace-payment-request-status/prepared.json"),
+        ),
+        (
+            active_status_with(None, "undetected", None),
+            include_str!(
+                "../../docs/fixtures/marketplace-payment-request-status/active-unprojected.json"
+            ),
+        ),
+        (
+            active_status_with(Some("proposed"), "undetected", None),
+            include_str!(
+                "../../docs/fixtures/marketplace-payment-request-status/proposed-undetected.json"
+            ),
+        ),
+        (
+            active_status_with(
+                Some("accepted"),
+                "detected",
+                Some(bitcoin_status(50_000, 0, true, true, true)),
+            ),
+            include_str!("../../docs/fixtures/marketplace-payment-request-status/detected.json"),
+        ),
+        (
+            active_status_with(
+                Some("accepted"),
+                "confirmed",
+                Some(bitcoin_status(50_000, 3, true, true, true)),
+            ),
+            include_str!(
+                "../../docs/fixtures/marketplace-payment-request-status/confirmed-matched.json"
+            ),
+        ),
+        (
+            active_status_with(
+                Some("accepted"),
+                "confirmed",
+                Some(bitcoin_status(49_999, 3, true, false, false)),
+            ),
+            include_str!(
+                "../../docs/fixtures/marketplace-payment-request-status/confirmed-unmatched.json"
+            ),
+        ),
+        (
+            active_status_with(
+                Some("accepted"),
+                "expired",
+                Some(bitcoin_status(50_000, 3, true, true, false)),
+            ),
+            include_str!(
+                "../../docs/fixtures/marketplace-payment-request-status/expired-late-match.json"
+            ),
+        ),
+        (
+            active_status_with(
+                Some("accepted"),
+                "undetected",
+                Some(bitcoin_status(50_000, 0, false, false, false)),
+            ),
+            include_str!("../../docs/fixtures/marketplace-payment-request-status/reorged.json"),
+        ),
+    ];
+    for (status, fixture) in success_cases {
+        let response = marketplace_status_router(Arc::new(MarketplaceStatusService::new(
+            Arc::new(FakeStore {
+                result: Ok(Some(status)),
+            }),
+        )))
+        .layer(Extension(signed_auth(&key)))
+        .oneshot(request(
+            &key,
+            serde_json::json!({"creator":CREATOR,"invoice_id":INVOICE_ID}),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response_body(response).await, fixture.trim_end());
+    }
+
+    for (result, expected_status, fixture) in [
+        (
+            Ok(None),
+            StatusCode::NOT_FOUND,
+            include_str!("../../docs/fixtures/marketplace-payment-request-status/not-found.json"),
+        ),
+        (
+            Err(MarketplaceStatusError::Conflict),
+            StatusCode::CONFLICT,
+            include_str!("../../docs/fixtures/marketplace-payment-request-status/conflict.json"),
+        ),
+        (
+            Err(MarketplaceStatusError::Unavailable),
+            StatusCode::SERVICE_UNAVAILABLE,
+            include_str!("../../docs/fixtures/marketplace-payment-request-status/unavailable.json"),
+        ),
+    ] {
+        let response = marketplace_status_router(Arc::new(MarketplaceStatusService::new(
+            Arc::new(FakeStore { result }),
+        )))
+        .layer(Extension(signed_auth(&key)))
+        .oneshot(request(
+            &key,
+            serde_json::json!({"creator":CREATOR,"invoice_id":INVOICE_ID}),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(response.status(), expected_status);
+        assert_eq!(response_body(response).await, fixture.trim_end());
+    }
 }
 
 #[tokio::test]
