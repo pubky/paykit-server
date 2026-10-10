@@ -48,6 +48,9 @@ pub enum MarketplaceLifecyclePersistenceError {
     /// A terminal lifecycle transition already won.
     #[error("marketplace payment lifecycle is terminal")]
     LifecycleTerminal,
+    /// Void lost to activation; payment remains live and must still be observed.
+    #[error("marketplace invoice is already active")]
+    InvoiceActive,
     /// Caller total differs from the authoritative prepared total.
     #[error("marketplace payment total does not match")]
     TotalMismatch,
@@ -1183,7 +1186,7 @@ impl MarketplacePreparationStore {
                 }));
             }
             "prepared" => {}
-            "active" => return Err(MarketplaceLifecyclePersistenceError::LifecycleTerminal),
+            "active" => return Err(MarketplaceLifecyclePersistenceError::InvoiceActive),
             _ => return Err(PersistenceError::CorruptOrMissing.into()),
         }
         if row.activated_at.is_some() || row.payment_deadline.is_some() || row.voided_at.is_some() {
