@@ -1,6 +1,6 @@
 //! Bakes the build commit and time into the binary for `GET /version`.
 
-use std::{env, process::Command};
+use std::{env, path::Path, process::Command};
 
 fn main() {
     for name in [
@@ -39,9 +39,21 @@ fn commit() -> String {
         return "unknown".to_owned();
     };
     // Rebuild when HEAD moves, so a local build never reports a stale commit.
-    if let Some(git_dir) = git(&["rev-parse", "--absolute-git-dir"]) {
-        for path in ["HEAD", "refs", "packed-refs"] {
-            println!("cargo:rerun-if-changed={git_dir}/{path}");
+    // `--git-path` resolves shared refs to the common directory in linked
+    // worktrees; a missing path would make Cargo rerun this script every build.
+    let paths = git(&[
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-path",
+        "HEAD",
+        "--git-path",
+        "refs",
+        "--git-path",
+        "packed-refs",
+    ]);
+    for path in paths.iter().flat_map(|paths| paths.lines()) {
+        if Path::new(path).exists() {
+            println!("cargo:rerun-if-changed={path}");
         }
     }
     commit
