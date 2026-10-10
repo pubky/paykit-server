@@ -9,7 +9,8 @@ use crate::{
     domain::locks::CreatorPubky,
     persistence::{
         MarketplaceActivationInput, MarketplaceActivationResult,
-        MarketplaceLifecyclePersistenceError, MarketplacePreparationStore, MarketplaceVoidResult,
+        MarketplaceLifecyclePersistenceError, MarketplacePreparationStore,
+        MarketplaceResolutionOutcome, MarketplaceResolutionResult, MarketplaceVoidResult,
         PersistenceError,
     },
 };
@@ -25,6 +26,12 @@ pub struct VoidMarketplaceRequest {
     pub invoice_id: Uuid,
 }
 
+pub struct ResolveMarketplaceRequest {
+    pub creator: CreatorPubky,
+    pub invoice_id: Uuid,
+    pub outcome: MarketplaceResolutionOutcome,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MarketplaceLifecycleError {
     InvalidRequest,
@@ -32,6 +39,7 @@ pub enum MarketplaceLifecycleError {
     LifecycleTerminal,
     InvoiceActive,
     TotalMismatch,
+    ResolutionConflict,
     NotFound,
     Unavailable,
     Internal,
@@ -49,6 +57,13 @@ pub trait MarketplaceLifecyclePersistence: Send + Sync {
         creator: &CreatorPubky,
         invoice_id: Uuid,
     ) -> Result<Option<MarketplaceVoidResult>, MarketplaceLifecyclePersistenceError>;
+
+    async fn resolve(
+        &self,
+        creator: &CreatorPubky,
+        invoice_id: Uuid,
+        outcome: MarketplaceResolutionOutcome,
+    ) -> Result<Option<MarketplaceResolutionResult>, MarketplaceLifecyclePersistenceError>;
 }
 
 #[async_trait]
@@ -66,6 +81,15 @@ impl MarketplaceLifecyclePersistence for MarketplacePreparationStore {
         invoice_id: Uuid,
     ) -> Result<Option<MarketplaceVoidResult>, MarketplaceLifecyclePersistenceError> {
         MarketplacePreparationStore::void(self, creator, invoice_id).await
+    }
+
+    async fn resolve(
+        &self,
+        creator: &CreatorPubky,
+        invoice_id: Uuid,
+        outcome: MarketplaceResolutionOutcome,
+    ) -> Result<Option<MarketplaceResolutionResult>, MarketplaceLifecyclePersistenceError> {
+        MarketplacePreparationStore::resolve(self, creator, invoice_id, outcome).await
     }
 }
 
@@ -114,6 +138,17 @@ impl MarketplaceLifecycleService {
             .map_err(map_store)?
             .ok_or(MarketplaceLifecycleError::NotFound)
     }
+
+    pub async fn resolve(
+        &self,
+        request: ResolveMarketplaceRequest,
+    ) -> Result<MarketplaceResolutionResult, MarketplaceLifecycleError> {
+        self.store
+            .resolve(&request.creator, request.invoice_id, request.outcome)
+            .await
+            .map_err(map_store)?
+            .ok_or(MarketplaceLifecycleError::NotFound)
+    }
 }
 
 fn map_store(error: MarketplaceLifecyclePersistenceError) -> MarketplaceLifecycleError {
@@ -129,6 +164,9 @@ fn map_store(error: MarketplaceLifecyclePersistenceError) -> MarketplaceLifecycl
         }
         MarketplaceLifecyclePersistenceError::TotalMismatch => {
             MarketplaceLifecycleError::TotalMismatch
+        }
+        MarketplaceLifecyclePersistenceError::ResolutionConflict => {
+            MarketplaceLifecycleError::ResolutionConflict
         }
         MarketplaceLifecyclePersistenceError::Persistence(PersistenceError::InvalidInput) => {
             MarketplaceLifecycleError::InvalidRequest

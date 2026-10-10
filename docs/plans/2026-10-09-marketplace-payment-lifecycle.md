@@ -1,6 +1,6 @@
 # Marketplace Payment Lifecycle Decision Ledger
 
-Status: preparation, activation, void, activated-settlement ownership, and Bitcoin observation slices authorized; resolution and signed Marketplace status deferred.
+Status: preparation, activation, void, activated-settlement ownership, Bitcoin observation, resolution, and signed Marketplace status slices authorized.
 
 ## Authority and baseline
 
@@ -68,10 +68,18 @@ Accepted behavior:
 - Prepared rows have no outbox work. Activation updates lifecycle state and inserts one encrypted proposal outbox intent in one PostgreSQL transaction. Marketplace outbox ownership remains separate from Locks invoice and drain linkage.
 - Activation applies `min(configured proposal_acceptance_window, bound payment_window / 2)` exactly, including subsecond results. Stable outbox UUID remains the SDK Payment Request ID on every worker retry.
 
-## Deferred lifecycle contract
+## Resolution contract — current implementation slice
 
 - Resolve: closed `{creator, invoice_id, outcome}` request where outcome is `paid_manually`, `refunded`, or `abandoned`; DB owns `resolved_at`; same outcome replays and a different outcome conflicts; annotation never rewrites protocol or Bitcoin facts.
 - Resolution of a prepared invoice blocks later activation but does not block void.
+
+## Verification required for resolution slice
+
+- Signed production route and closed request/response/error fixtures.
+- PostgreSQL-backed same-outcome replay and different-outcome conflict races across independent stores.
+- DB-authoritative stored timestamp and schema-level outcome immutability.
+- Prepared resolution versus activation serialization; no publication when resolution wins first.
+- Resolution on prepared, active, and voided rows without Payment Request, Bitcoin observation, or SDK cancellation mutation.
 
 ## Activated settlement ownership — current implementation slice
 
@@ -79,7 +87,7 @@ Accepted behavior:
 - Marketplace settlement data remains separate from Locks `invoices`: it owns its encrypted payment record, Creator, Bitcoin address lookup, derivation-index lookup, and lifecycle projection. It does not fabricate a Locks bundle, lock resource, generation, drain membership, or buyer contact.
 - Payment Request lifecycle attribution is owner-aware. A delivered Marketplace proposal with `outbox.invoice_id IS NULL` projects against its active Marketplace settlement without making same-Creator Locks status or drain refresh unavailable. Locks lifecycle queries and drain semantics remain invoice-only.
 - Bitcoin addresses are globally unique across Locks invoices and Marketplace settlements at the PostgreSQL transaction boundary. Existing per-table invoice uniqueness and immutable activation replay remain intact.
-- This branch uses migration `0014_marketplace_settlements.sql`; stacked PR #68 uses `0015`.
+- Settlement ownership uses migration `0014_marketplace_settlements.sql`; Bitcoin observation follows as `0015_marketplace_bitcoin_observations.sql`; resolution immutability follows as `0016_marketplace_resolution_immutability.sql`.
 
 ## Marketplace Bitcoin observation — current implementation slice
 
@@ -93,7 +101,7 @@ Accepted behavior:
 ## Explicitly deferred follow-up and release hold
 
 - `usdt_observations` remains unchanged; Marketplace USDT settlement ownership is a later slice.
-- Signed `{creator, invoice_id}` status remains separate follow-up work. Bitcoin observation alone does not complete Marketplace payment status.
+- Marketplace consumer adaptation and exact-revision cross-service status fixtures remain separate follow-up work.
 - Marketplace must reject activation after its Marketplace-owned inventory hold expires; that cross-service timing guard belongs to the Marketplace consumer follow-up.
 - PR #67 may remain a reviewed draft, but must not merge to `master` until Bitcoin observation/status, Marketplace hold-boundary work, and the accepted base-stack-stability gate are complete. No deployment is authorized.
 

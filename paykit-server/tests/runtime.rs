@@ -398,6 +398,12 @@ async fn production_constructor_mounts_all_routes() {
             StatusCode::UNAUTHORIZED,
         ),
         (
+            Request::post("/marketplace/payment-requests/resolve")
+                .body(Body::empty())
+                .unwrap(),
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
             Request::post("/connections/status")
                 .body(Body::empty())
                 .unwrap(),

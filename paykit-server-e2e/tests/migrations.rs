@@ -38,6 +38,8 @@ const SETTLEMENT_MIGRATION: &str =
     include_str!("../../paykit-server/migrations/0014_marketplace_settlements.sql");
 const MARKETPLACE_OBSERVATION_MIGRATION: &str =
     include_str!("../../paykit-server/migrations/0015_marketplace_bitcoin_observations.sql");
+const RESOLUTION_MIGRATION: &str =
+    include_str!("../../paykit-server/migrations/0016_marketplace_resolution_immutability.sql");
 
 /// PostgreSQL advisory locks are server-wide, not database-scoped. These
 /// migration tests deliberately use the production migration lock key, so
@@ -79,7 +81,7 @@ async fn migrations_create_the_required_schema_and_are_restart_safe() {
             .fetch_all(pool)
             .await
             .unwrap();
-    assert_eq!(applied_versions, (1..=15).collect::<Vec<_>>());
+    assert_eq!(applied_versions, (1..=16).collect::<Vec<_>>());
 
     let plaintext_creator_pubky_columns: Vec<String> = sqlx::query_scalar(
         "SELECT table_name \
@@ -207,6 +209,87 @@ async fn settlement_migration_backfills_invoice_owners_and_rejects_unbackfillabl
         Some("P0001")
     );
     migration.rollback().await.unwrap();
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn resolution_migration_upgrades_settlement_schema_and_enforces_immutability() {
+    let _migration_test_guard = migration_test_lock().lock().await;
+    let database = TestDatabase::create().await;
+    let pool = database.pool();
+    apply_pre_settlement_migrations(pool).await;
+    let creator_id = insert_creator(pool).await;
+
+    let mut settlement = pool.begin().await.unwrap();
+    sqlx::raw_sql(SETTLEMENT_MIGRATION)
+        .execute(&mut *settlement)
+        .await
+        .unwrap();
+    settlement.commit().await.unwrap();
+
+    sqlx::raw_sql(MARKETPLACE_OBSERVATION_MIGRATION)
+        .execute(pool)
+        .await
+        .unwrap();
+
+    let preparation_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO marketplace_payment_preparations (
+             id, creator_id, operation_lookup_hash, request_lookup_hash,
+             reader_lookup_hash, preparation_envelope, state, prepared_at,
+             prepare_expires_at
+         ) VALUES ($1, $2, $3, $4, $5, $6, 'prepared', NOW(), NOW() + INTERVAL '1 hour')",
+    )
+    .bind(preparation_id)
+    .bind(creator_id)
+    .bind(vec![1_u8; 32])
+    .bind(vec![2_u8; 32])
+    .bind(vec![3_u8; 32])
+    .bind(b"encrypted-preparation".as_slice())
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let mut resolution = pool.begin().await.unwrap();
+    sqlx::raw_sql(RESOLUTION_MIGRATION)
+        .execute(&mut *resolution)
+        .await
+        .unwrap();
+    resolution.commit().await.unwrap();
+
+    sqlx::query(
+        "UPDATE marketplace_payment_preparations
+         SET business_outcome = 'refunded', resolved_at = clock_timestamp()
+         WHERE id = $1",
+    )
+    .bind(preparation_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    assert_check_violation(
+        sqlx::query(
+            "UPDATE marketplace_payment_preparations
+             SET business_outcome = 'abandoned', resolved_at = clock_timestamp()
+             WHERE id = $1",
+        )
+        .bind(preparation_id)
+        .execute(pool)
+        .await,
+    );
+
+    let settlement_indexes: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_indexes
+         WHERE schemaname = 'public'
+           AND indexname IN (
+               'marketplace_settlements_pkey',
+               'marketplace_settlements_bitcoin_address_lookup_hash_key',
+               'payment_request_lifecycles_marketplace_index'
+           )",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(settlement_indexes, 3);
     database.cleanup().await;
 }
 

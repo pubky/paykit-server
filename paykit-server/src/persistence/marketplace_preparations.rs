@@ -9,7 +9,13 @@ use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
 use crate::{
-    application::semantic_intent::DeliveryIntentV1,
+    application::{
+        marketplace_status::{
+            MarketplaceBitcoinStatus, MarketplaceInvoiceStatus, MarketplaceStatusError,
+            MarketplaceStatusPersistence,
+        },
+        semantic_intent::DeliveryIntentV1,
+    },
     bitcoin::{DirectBinding, ObservationAction, ObservationTarget, TrackedOutput},
     crypto::{Crypto, EncryptedEnvelope, EnvelopeContext, LookupHash},
     domain::locks::{CreatorPubky, ReaderPubky, parse_reader},
@@ -54,6 +60,9 @@ pub enum MarketplaceLifecyclePersistenceError {
     /// Caller total differs from the authoritative prepared total.
     #[error("marketplace payment total does not match")]
     TotalMismatch,
+    /// A different immutable business outcome was already recorded.
+    #[error("marketplace business resolution conflicts with persisted outcome")]
+    ResolutionConflict,
     /// Generic persistence or validation failure.
     #[error(transparent)]
     Persistence(#[from] PersistenceError),
@@ -203,6 +212,72 @@ impl MarketplaceVoidResult {
     }
 }
 
+/// Closed Marketplace business outcome vocabulary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MarketplaceResolutionOutcome {
+    PaidManually,
+    Refunded,
+    Abandoned,
+}
+
+impl MarketplaceResolutionOutcome {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "paid_manually" => Some(Self::PaidManually),
+            "refunded" => Some(Self::Refunded),
+            "abandoned" => Some(Self::Abandoned),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PaidManually => "paid_manually",
+            Self::Refunded => "refunded",
+            Self::Abandoned => "abandoned",
+        }
+    }
+}
+
+/// Secret-free stored Marketplace resolution response.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MarketplaceResolutionResult {
+    invoice_id: Uuid,
+    outcome: MarketplaceResolutionOutcome,
+    resolved_at: OffsetDateTime,
+    replayed: bool,
+}
+
+impl MarketplaceResolutionResult {
+    /// Builds a result returned by an injected persistence adapter.
+    pub fn new(
+        invoice_id: Uuid,
+        outcome: MarketplaceResolutionOutcome,
+        resolved_at: OffsetDateTime,
+        replayed: bool,
+    ) -> Self {
+        Self {
+            invoice_id,
+            outcome,
+            resolved_at,
+            replayed,
+        }
+    }
+
+    pub fn invoice_id(&self) -> Uuid {
+        self.invoice_id
+    }
+    pub fn outcome(&self) -> MarketplaceResolutionOutcome {
+        self.outcome
+    }
+    pub fn resolved_at(&self) -> OffsetDateTime {
+        self.resolved_at
+    }
+    pub fn replayed(&self) -> bool {
+        self.replayed
+    }
+}
+
 /// PostgreSQL-backed Marketplace preparation store.
 #[derive(Clone, Debug)]
 pub struct MarketplacePreparationStore {
@@ -252,6 +327,7 @@ struct LifecycleRow {
     activated_at: Option<OffsetDateTime>,
     payment_deadline: Option<OffsetDateTime>,
     voided_at: Option<OffsetDateTime>,
+    business_outcome: Option<String>,
     resolved_at: Option<OffsetDateTime>,
 }
 
@@ -280,6 +356,40 @@ struct MarketplaceSettlementRow {
     derivation_index_lookup_hash: Vec<u8>,
     activated_at: OffsetDateTime,
     payment_deadline: OffsetDateTime,
+}
+
+#[derive(sqlx::FromRow)]
+struct MarketplaceStatusRow {
+    id: Uuid,
+    creator_lookup_hash: Vec<u8>,
+    preparation_envelope: Vec<u8>,
+    state: String,
+    prepared_at: OffsetDateTime,
+    prepare_expires_at: OffsetDateTime,
+    activated_at: Option<OffsetDateTime>,
+    payment_deadline: Option<OffsetDateTime>,
+    voided_at: Option<OffsetDateTime>,
+    business_outcome: Option<String>,
+    resolved_at: Option<OffsetDateTime>,
+    settlement_count: i64,
+    payment_record_envelope: Option<Vec<u8>>,
+    bitcoin_address_lookup_hash: Option<Vec<u8>>,
+    derivation_index_lookup_hash: Option<Vec<u8>>,
+    payment_status: Option<String>,
+    confirmation_count: Option<i32>,
+    amount_matched: Option<bool>,
+    outbox_count: i64,
+    outbox_status: Option<String>,
+    lifecycle_count: i64,
+    request_state: Option<String>,
+    observation_id: Option<Uuid>,
+    observation_envelope: Option<Vec<u8>>,
+    outpoint_lookup_hash: Option<Vec<u8>>,
+    confirmations: Option<i32>,
+    present: Option<bool>,
+    first_observed_at: Option<OffsetDateTime>,
+    active_outpoint_timely: bool,
+    observed_at: OffsetDateTime,
 }
 
 #[derive(sqlx::FromRow)]
@@ -1146,6 +1256,81 @@ impl MarketplacePreparationStore {
         }))
     }
 
+    /// Records one immutable business outcome without changing protocol or payment facts.
+    pub async fn resolve(
+        &self,
+        creator: &CreatorPubky,
+        invoice_id: Uuid,
+        outcome: MarketplaceResolutionOutcome,
+    ) -> Result<Option<MarketplaceResolutionResult>, MarketplaceLifecyclePersistenceError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        let Some(row) = self
+            .load_lifecycle_locked(&mut tx, creator, invoice_id)
+            .await?
+        else {
+            tx.commit()
+                .await
+                .map_err(|_| PersistenceError::Unavailable)?;
+            return Ok(None);
+        };
+        let creator_hash = stored_hash(&row.creator_lookup_hash)?;
+        self.decode_lifecycle_envelope(creator_hash, &row)?;
+        if !matches!(row.state.as_str(), "prepared" | "active" | "voided") {
+            return Err(PersistenceError::CorruptOrMissing.into());
+        }
+        match (&row.business_outcome, row.resolved_at) {
+            (Some(existing), Some(resolved_at)) => {
+                let existing = MarketplaceResolutionOutcome::parse(existing)
+                    .ok_or(PersistenceError::CorruptOrMissing)?;
+                if existing != outcome {
+                    return Err(MarketplaceLifecyclePersistenceError::ResolutionConflict);
+                }
+                tx.commit()
+                    .await
+                    .map_err(|_| PersistenceError::Unavailable)?;
+                return Ok(Some(MarketplaceResolutionResult::new(
+                    row.id,
+                    existing,
+                    resolved_at,
+                    true,
+                )));
+            }
+            (None, None) => {}
+            _ => return Err(PersistenceError::CorruptOrMissing.into()),
+        }
+        let resolved_at: OffsetDateTime = sqlx::query_scalar("SELECT clock_timestamp()")
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        let updated = sqlx::query(
+            "UPDATE marketplace_payment_preparations
+             SET business_outcome = $2, resolved_at = $3, updated_at = clock_timestamp()
+             WHERE id = $1 AND business_outcome IS NULL AND resolved_at IS NULL",
+        )
+        .bind(row.id)
+        .bind(outcome.as_str())
+        .bind(resolved_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        if updated.rows_affected() != 1 {
+            return Err(PersistenceError::CorruptOrMissing.into());
+        }
+        tx.commit()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        Ok(Some(MarketplaceResolutionResult::new(
+            row.id,
+            outcome,
+            resolved_at,
+            false,
+        )))
+    }
+
     async fn load_locked(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -1216,6 +1401,7 @@ impl MarketplacePreparationStore {
                 Option<OffsetDateTime>,
                 Option<OffsetDateTime>,
                 Option<OffsetDateTime>,
+                Option<String>,
                 Option<OffsetDateTime>,
             ),
         >(
@@ -1223,7 +1409,8 @@ impl MarketplacePreparationStore {
                     preparation.preparation_envelope, preparation.state,
                     preparation.prepared_at, preparation.prepare_expires_at,
                     preparation.activated_at, preparation.payment_deadline,
-                    preparation.voided_at, preparation.resolved_at
+                    preparation.voided_at, preparation.business_outcome,
+                    preparation.resolved_at
              FROM marketplace_payment_preparations AS preparation
              JOIN creators ON creators.id = preparation.creator_id
              WHERE preparation.id = $1 AND creators.creator_lookup_hash = $2
@@ -1245,6 +1432,7 @@ impl MarketplacePreparationStore {
                     activated_at,
                     payment_deadline,
                     voided_at,
+                    business_outcome,
                     resolved_at,
                 )| LifecycleRow {
                     id,
@@ -1256,6 +1444,7 @@ impl MarketplacePreparationStore {
                     activated_at,
                     payment_deadline,
                     voided_at,
+                    business_outcome,
                     resolved_at,
                 },
             )
@@ -1673,6 +1862,323 @@ impl MarketplacePreparationStore {
         Ok(observation)
     }
 
+    async fn status_snapshot(
+        &self,
+        creator: &CreatorPubky,
+        invoice_id: Uuid,
+    ) -> Result<Option<MarketplaceInvoiceStatus>, PersistenceError> {
+        let creator_hash = self.crypto.lookup_hash(creator.to_string().as_bytes());
+        let row = sqlx::query_as::<_, MarketplaceStatusRow>(
+            "SELECT preparation.id, creators.creator_lookup_hash,
+                    preparation.preparation_envelope, preparation.state,
+                    preparation.prepared_at, preparation.prepare_expires_at,
+                    preparation.activated_at, preparation.payment_deadline,
+                    preparation.voided_at, preparation.business_outcome,
+                    preparation.resolved_at,
+                    (SELECT count(*) FROM marketplace_settlements
+                     WHERE preparation_id = preparation.id) AS settlement_count,
+                    settlement.payment_record_envelope,
+                    settlement.bitcoin_address_lookup_hash,
+                    settlement.derivation_index_lookup_hash,
+                    settlement.payment_status, settlement.confirmation_count,
+                    settlement.amount_matched,
+                    (SELECT count(*) FROM outbox WHERE marketplace_preparation_id = preparation.id
+                        AND intent_kind = 'payment_request_proposal') AS outbox_count,
+                    (SELECT status FROM outbox WHERE marketplace_preparation_id = preparation.id
+                        AND intent_kind = 'payment_request_proposal' LIMIT 1) AS outbox_status,
+                    (SELECT count(*) FROM payment_request_lifecycles
+                     WHERE marketplace_preparation_id = preparation.id) AS lifecycle_count,
+                    (SELECT request_state FROM payment_request_lifecycles
+                     WHERE marketplace_preparation_id = preparation.id
+                     ORDER BY CASE request_state
+                         WHEN 'invalid_conflict' THEN 9 WHEN 'recovery_required' THEN 8
+                         WHEN 'proof_submitted' THEN 7 WHEN 'active_recurring' THEN 6
+                         WHEN 'accepted' THEN 5 WHEN 'proposed' THEN 4 ELSE 0 END DESC,
+                         last_event_at DESC, request_state DESC LIMIT 1) AS request_state,
+                    observation.id AS observation_id,
+                    observation.observation_envelope,
+                    observation.outpoint_lookup_hash,
+                    observation.confirmations, observation.present,
+                    observation.first_observed_at,
+                    EXISTS (
+                        SELECT 1 FROM marketplace_timely_amount_matched_outpoints timely
+                        WHERE timely.preparation_id = preparation.id
+                          AND timely.outpoint_lookup_hash = observation.outpoint_lookup_hash
+                    ) AS active_outpoint_timely,
+                    clock_timestamp() AS observed_at
+             FROM marketplace_payment_preparations preparation
+             JOIN creators ON creators.id = preparation.creator_id
+             LEFT JOIN marketplace_settlements settlement
+               ON settlement.preparation_id = preparation.id
+              AND settlement.creator_id = preparation.creator_id
+             LEFT JOIN bitcoin_observations observation
+               ON observation.marketplace_preparation_id = preparation.id AND observation.active
+             WHERE preparation.id = $1 AND creators.creator_lookup_hash = $2",
+        )
+        .bind(invoice_id)
+        .bind(creator_hash.as_bytes().as_slice())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        if stored_hash(&row.creator_lookup_hash)? != creator_hash {
+            return Err(PersistenceError::CorruptOrMissing);
+        }
+        let lifecycle = LifecycleRow {
+            id: row.id,
+            creator_lookup_hash: row.creator_lookup_hash.clone(),
+            preparation_envelope: row.preparation_envelope.clone(),
+            state: row.state.clone(),
+            prepared_at: row.prepared_at,
+            prepare_expires_at: row.prepare_expires_at,
+            activated_at: row.activated_at,
+            payment_deadline: row.payment_deadline,
+            voided_at: row.voided_at,
+            business_outcome: row.business_outcome.clone(),
+            resolved_at: row.resolved_at,
+        };
+        let preparation = self.decode_lifecycle_envelope(creator_hash, &lifecycle)?;
+        let outcome = row
+            .business_outcome
+            .as_deref()
+            .map(parse_business_outcome)
+            .transpose()?;
+        if outcome.is_some() != row.resolved_at.is_some()
+            || row.prepared_at >= row.prepare_expires_at
+        {
+            return Err(PersistenceError::CorruptOrMissing);
+        }
+        match row.state.as_str() {
+            "prepared" | "voided" => {
+                if row.settlement_count != 0
+                    || row.payment_record_envelope.is_some()
+                    || row.bitcoin_address_lookup_hash.is_some()
+                    || row.derivation_index_lookup_hash.is_some()
+                    || row.payment_status.is_some()
+                    || row.confirmation_count.is_some()
+                    || row.amount_matched.is_some()
+                    || row.outbox_count != 0
+                    || row.outbox_status.is_some()
+                    || row.lifecycle_count != 0
+                    || row.request_state.is_some()
+                    || row.observation_id.is_some()
+                    || row.activated_at.is_some()
+                    || row.payment_deadline.is_some()
+                    || (row.state == "prepared" && row.voided_at.is_some())
+                    || (row.state == "voided" && row.voided_at.is_none())
+                    || row
+                        .resolved_at
+                        .is_some_and(|resolved_at| resolved_at < row.prepared_at)
+                {
+                    return Err(PersistenceError::CorruptOrMissing);
+                }
+                Ok(Some(MarketplaceInvoiceStatus::inactive(
+                    row.id,
+                    if row.state == "prepared" {
+                        "prepared"
+                    } else {
+                        "voided"
+                    },
+                    outcome,
+                    row.resolved_at,
+                )))
+            }
+            "active" => {
+                let (
+                    Some(activated_at),
+                    Some(payment_deadline),
+                    Some(payment_record_envelope),
+                    Some(address_hash),
+                    Some(derivation_hash),
+                    Some(stored_payment_status),
+                    Some(stored_confirmations),
+                    Some(stored_amount_matched),
+                ) = (
+                    row.activated_at,
+                    row.payment_deadline,
+                    row.payment_record_envelope.as_ref(),
+                    row.bitcoin_address_lookup_hash.as_deref(),
+                    row.derivation_index_lookup_hash.as_deref(),
+                    row.payment_status.as_deref(),
+                    row.confirmation_count,
+                    row.amount_matched,
+                )
+                else {
+                    return Err(PersistenceError::CorruptOrMissing);
+                };
+                if row.settlement_count != 1
+                    || row.outbox_count != 1
+                    || row.lifecycle_count > 1
+                    || activated_at >= payment_deadline
+                    || row.voided_at.is_some()
+                    || activated_at < row.prepared_at
+                    || row
+                        .resolved_at
+                        .is_some_and(|resolved_at| resolved_at < activated_at)
+                {
+                    return Err(PersistenceError::CorruptOrMissing);
+                }
+                let payment = self.decrypt_settlement_payment_record(
+                    creator_hash,
+                    row.id,
+                    payment_record_envelope.clone(),
+                )?;
+                let expected_payment = InvoicePaymentRecordV1::from_intent(
+                    preparation.child_index,
+                    &preparation.payment_request_intent,
+                )
+                .map_err(|_| PersistenceError::CorruptOrMissing)?;
+                if payment != expected_payment
+                    || address_hash
+                        != self
+                            .crypto
+                            .bitcoin_address_lookup_hash(payment.bitcoin_address()?.as_bytes())
+                            .as_bytes()
+                    || derivation_hash
+                        != self
+                            .crypto
+                            .bitcoin_derivation_index_lookup_hash(
+                                creator_hash,
+                                payment.derivation_index(),
+                            )
+                            .as_bytes()
+                {
+                    return Err(PersistenceError::CorruptOrMissing);
+                }
+                let publication = publication_state(
+                    row.outbox_status
+                        .as_deref()
+                        .ok_or(PersistenceError::CorruptOrMissing)?,
+                )?;
+                let request_state = row
+                    .request_state
+                    .as_deref()
+                    .map(parse_request_state)
+                    .transpose()?;
+                let bitcoin = self.status_bitcoin(
+                    creator_hash,
+                    &row,
+                    payment.bitcoin_required_amount()?,
+                    activated_at,
+                )?;
+                let projected_payment_status = match bitcoin.as_ref() {
+                    None => "undetected",
+                    Some(bitcoin) if !bitcoin.present => "undetected",
+                    Some(bitcoin) if bitcoin.confirmations == 0 => "detected",
+                    Some(_) => "confirmed",
+                };
+                let projected_confirmations = bitcoin.as_ref().map_or(0, |bitcoin| {
+                    if bitcoin.amount_matched {
+                        bitcoin.confirmations.min(6)
+                    } else {
+                        bitcoin.confirmations
+                    }
+                });
+                let projected_amount_matched = bitcoin
+                    .as_ref()
+                    .is_some_and(|bitcoin| bitcoin.present && bitcoin.amount_matched);
+                if stored_payment_status != projected_payment_status
+                    || stored_confirmations
+                        != i32::try_from(projected_confirmations)
+                            .map_err(|_| PersistenceError::CorruptOrMissing)?
+                    || stored_amount_matched != projected_amount_matched
+                {
+                    return Err(PersistenceError::CorruptOrMissing);
+                }
+                let paid_on_time = bitcoin.as_ref().is_some_and(|bitcoin| bitcoin.paid_on_time);
+                let deadline_passed = row.observed_at > payment_deadline
+                    || bitcoin
+                        .as_ref()
+                        .is_some_and(|bitcoin| bitcoin.first_observed_at > payment_deadline);
+                let payment_state = if deadline_passed && !paid_on_time {
+                    "expired"
+                } else {
+                    projected_payment_status
+                };
+                Ok(Some(MarketplaceInvoiceStatus::active(
+                    row.id,
+                    publication,
+                    request_state,
+                    payment_state,
+                    activated_at,
+                    payment_deadline,
+                    bitcoin,
+                    outcome,
+                    row.resolved_at,
+                )))
+            }
+            _ => Err(PersistenceError::CorruptOrMissing),
+        }
+    }
+
+    fn status_bitcoin(
+        &self,
+        creator_hash: LookupHash,
+        row: &MarketplaceStatusRow,
+        required_sats: u64,
+        activated_at: OffsetDateTime,
+    ) -> Result<Option<MarketplaceBitcoinStatus>, PersistenceError> {
+        let values = match (
+            row.observation_id,
+            row.observation_envelope.as_ref(),
+            row.outpoint_lookup_hash.as_ref(),
+            row.confirmations,
+            row.present,
+            row.first_observed_at,
+        ) {
+            (None, None, None, None, None, None) => return Ok(None),
+            (
+                Some(id),
+                Some(envelope),
+                Some(hash),
+                Some(confirmations),
+                Some(present),
+                Some(first_observed_at),
+            ) => (
+                id,
+                envelope.clone(),
+                hash,
+                confirmations,
+                present,
+                first_observed_at,
+            ),
+            _ => return Err(PersistenceError::CorruptOrMissing),
+        };
+        let observation =
+            self.decrypt_marketplace_observation(creator_hash, row.id, values.0, values.1)?;
+        if values.2
+            != self
+                .crypto
+                .bitcoin_outpoint_lookup_hash(observation.outpoint.as_bytes())
+                .as_bytes()
+            || values.3 < 0
+            || (!values.4 && values.3 != 0)
+            || values.5 < activated_at
+        {
+            return Err(PersistenceError::CorruptOrMissing);
+        }
+        let outpoint = observation
+            .outpoint
+            .parse::<bitcoin::OutPoint>()
+            .map_err(|_| PersistenceError::CorruptOrMissing)?;
+        let confirmations =
+            u32::try_from(values.3).map_err(|_| PersistenceError::CorruptOrMissing)?;
+        let amount_matched = values.4 && observation.observed_sats >= required_sats;
+        let paid_on_time = values.4 && amount_matched && row.active_outpoint_timely;
+        Ok(Some(MarketplaceBitcoinStatus::new(
+            outpoint.txid.to_string(),
+            outpoint.vout,
+            observation.observed_sats,
+            values.5,
+            if values.4 { confirmations } else { 0 },
+            values.4,
+            amount_matched,
+            paid_on_time,
+        )))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn validate_replay(
         &self,
@@ -1731,6 +2237,55 @@ impl MarketplacePreparationStore {
             prepare_expires_at: row.prepare_expires_at,
             replayed: true,
         })
+    }
+}
+
+#[async_trait::async_trait]
+impl MarketplaceStatusPersistence for MarketplacePreparationStore {
+    async fn status(
+        &self,
+        creator: &CreatorPubky,
+        invoice_id: Uuid,
+    ) -> Result<Option<MarketplaceInvoiceStatus>, MarketplaceStatusError> {
+        self.status_snapshot(creator, invoice_id)
+            .await
+            .map_err(|error| match error {
+                PersistenceError::Conflict => MarketplaceStatusError::Conflict,
+                _ => MarketplaceStatusError::Unavailable,
+            })
+    }
+}
+
+fn publication_state(value: &str) -> Result<&'static str, PersistenceError> {
+    match value {
+        "queued" | "leased" | "retryable" | "handed_off" => Ok("pending"),
+        "delivered" => Ok("delivered"),
+        "permanently_failed" => Ok("failed"),
+        _ => Err(PersistenceError::CorruptOrMissing),
+    }
+}
+
+fn parse_request_state(value: &str) -> Result<&'static str, PersistenceError> {
+    match value {
+        "proposed" => Ok("proposed"),
+        "proposal_expired" => Ok("proposal_expired"),
+        "accepted" => Ok("accepted"),
+        "rejected" => Ok("rejected"),
+        "canceled" => Ok("canceled"),
+        "proof_submitted" => Ok("proof_submitted"),
+        "active_recurring" => Ok("active_recurring"),
+        "recovery_required" => Ok("recovery_required"),
+        "invalid_conflict" => Ok("invalid_conflict"),
+        _ => Err(PersistenceError::CorruptOrMissing),
+    }
+}
+
+fn parse_business_outcome(value: &str) -> Result<&'static str, PersistenceError> {
+    match value {
+        "paid_manually" => Ok("paid_manually"),
+        "refunded" => Ok("refunded"),
+        "abandoned" => Ok("abandoned"),
+        _ => Err(PersistenceError::CorruptOrMissing),
     }
 }
 

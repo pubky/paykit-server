@@ -21,7 +21,8 @@ use paykit_server::{
     },
     persistence::{
         MarketplaceActivationInput, MarketplaceActivationResult,
-        MarketplaceLifecyclePersistenceError, MarketplaceVoidResult, PersistenceError,
+        MarketplaceLifecyclePersistenceError, MarketplaceResolutionOutcome,
+        MarketplaceResolutionResult, MarketplaceVoidResult, PersistenceError,
     },
 };
 use time::OffsetDateTime;
@@ -38,6 +39,7 @@ enum Outcome {
     LifecycleTerminal,
     InvoiceActive,
     TotalMismatch,
+    Conflict,
     NotFound,
     Corrupt,
 }
@@ -66,6 +68,7 @@ impl MarketplaceLifecyclePersistence for FakeStore {
             }
             Outcome::InvoiceActive => Err(MarketplaceLifecyclePersistenceError::InvoiceActive),
             Outcome::TotalMismatch => Err(MarketplaceLifecyclePersistenceError::TotalMismatch),
+            Outcome::Conflict => Err(PersistenceError::Conflict.into()),
             Outcome::NotFound => Ok(None),
             Outcome::Corrupt => Err(PersistenceError::CorruptOrMissing.into()),
         }
@@ -88,8 +91,34 @@ impl MarketplaceLifecyclePersistence for FakeStore {
             }
             Outcome::InvoiceActive => Err(MarketplaceLifecyclePersistenceError::InvoiceActive),
             Outcome::TotalMismatch => Err(MarketplaceLifecyclePersistenceError::TotalMismatch),
+            Outcome::Conflict => Err(PersistenceError::Conflict.into()),
             Outcome::NotFound => Ok(None),
             Outcome::Corrupt => Err(PersistenceError::CorruptOrMissing.into()),
+        }
+    }
+
+    async fn resolve(
+        &self,
+        _creator: &CreatorPubky,
+        invoice_id: Uuid,
+        outcome: MarketplaceResolutionOutcome,
+    ) -> Result<Option<MarketplaceResolutionResult>, MarketplaceLifecyclePersistenceError> {
+        match self.outcome {
+            Outcome::Success => Ok(Some(MarketplaceResolutionResult::new(
+                invoice_id,
+                outcome,
+                OffsetDateTime::UNIX_EPOCH,
+                true,
+            ))),
+            Outcome::Conflict => Err(MarketplaceLifecyclePersistenceError::ResolutionConflict),
+            Outcome::NotFound => Ok(None),
+            Outcome::Corrupt => Err(PersistenceError::CorruptOrMissing.into()),
+            Outcome::PrepareExpired => Err(MarketplaceLifecyclePersistenceError::PrepareExpired),
+            Outcome::LifecycleTerminal => {
+                Err(MarketplaceLifecyclePersistenceError::LifecycleTerminal)
+            }
+            Outcome::InvoiceActive => Err(MarketplaceLifecyclePersistenceError::InvoiceActive),
+            Outcome::TotalMismatch => Err(MarketplaceLifecyclePersistenceError::TotalMismatch),
         }
     }
 }
@@ -239,6 +268,68 @@ async fn signed_activate_and_void_have_closed_success_fixtures() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn signed_resolve_has_closed_success_and_error_fixtures() {
+    let key = SigningKey::from_bytes(&[11; 32]);
+    let path = "/marketplace/payment-requests/resolve";
+    let body = || {
+        serde_json::json!({
+            "creator": CREATOR,
+            "invoice_id": INVOICE_ID,
+            "outcome": "abandoned",
+        })
+    };
+    let response = marketplace_lifecycle_router(service(Outcome::Success))
+        .layer(Extension(signed_auth(&key)))
+        .oneshot(signed_request(&key, path, body()))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        json(response).await,
+        serde_json::json!({
+            "invoice_id": INVOICE_ID,
+            "outcome": "abandoned",
+            "resolved_at": "1970-01-01T00:00:00Z",
+        })
+    );
+
+    for invalid in [
+        serde_json::json!({
+            "creator": CREATOR,
+            "invoice_id": INVOICE_ID,
+            "outcome": "cancelled",
+        }),
+        serde_json::json!({
+            "creator": CREATOR,
+            "invoice_id": INVOICE_ID,
+            "outcome": "abandoned",
+            "resolved_at": "1970-01-01T00:00:00Z",
+        }),
+    ] {
+        let response = marketplace_lifecycle_router(service(Outcome::Success))
+            .layer(Extension(signed_auth(&key)))
+            .oneshot(signed_request(&key, path, invalid))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    let conflict = marketplace_lifecycle_router(service(Outcome::Conflict))
+        .layer(Extension(signed_auth(&key)))
+        .oneshot(signed_request(&key, path, body()))
+        .await
+        .unwrap();
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json(conflict).await,
+        serde_json::json!({"error":{
+            "code":"resolution_conflict",
+            "message":"business resolution conflicts with persisted outcome"
+        }})
+    );
 }
 
 #[tokio::test]
