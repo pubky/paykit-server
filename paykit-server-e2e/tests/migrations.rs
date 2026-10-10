@@ -36,6 +36,8 @@ const PRE_SETTLEMENT_MIGRATIONS: [&str; 13] = [
 ];
 const SETTLEMENT_MIGRATION: &str =
     include_str!("../../paykit-server/migrations/0014_marketplace_settlements.sql");
+const MARKETPLACE_OBSERVATION_MIGRATION: &str =
+    include_str!("../../paykit-server/migrations/0015_marketplace_bitcoin_observations.sql");
 
 /// PostgreSQL advisory locks are server-wide, not database-scoped. These
 /// migration tests deliberately use the production migration lock key, so
@@ -77,7 +79,7 @@ async fn migrations_create_the_required_schema_and_are_restart_safe() {
             .fetch_all(pool)
             .await
             .unwrap();
-    assert_eq!(applied_versions, (1..=14).collect::<Vec<_>>());
+    assert_eq!(applied_versions, (1..=15).collect::<Vec<_>>());
 
     let plaintext_creator_pubky_columns: Vec<String> = sqlx::query_scalar(
         "SELECT table_name \
@@ -454,8 +456,8 @@ async fn schema_uniqueness_constraints_reject_duplicate_lookup_keys() {
     sqlx::query(
         "INSERT INTO bitcoin_observations
          (invoice_id, observation_envelope, outpoint_lookup_hash, active,
-          confirmations, present)
-         VALUES ($1, $2, $3, TRUE, 0, TRUE)",
+          confirmations, present, first_observed_at)
+         VALUES ($1, $2, $3, TRUE, 0, TRUE, clock_timestamp())",
     )
     .bind(first_invoice)
     .bind(b"encrypted-observation-a".as_slice())
@@ -467,8 +469,8 @@ async fn schema_uniqueness_constraints_reject_duplicate_lookup_keys() {
         sqlx::query(
             "INSERT INTO bitcoin_observations
              (invoice_id, observation_envelope, outpoint_lookup_hash, active,
-              confirmations, present)
-             VALUES ($1, $2, $3, TRUE, 0, TRUE)",
+              confirmations, present, first_observed_at)
+             VALUES ($1, $2, $3, TRUE, 0, TRUE, clock_timestamp())",
         )
         .bind(second_invoice)
         .bind(b"encrypted-observation-b".as_slice())
@@ -610,6 +612,88 @@ async fn enum_like_status_columns_allow_unexpected_text_for_read_time_validation
         .get("payment_status");
     assert_eq!(status, "unexpected_corrupt_status");
 
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn observation_migration_upgrades_existing_locks_evidence_without_rewriting_it() {
+    let _migration_test_guard = migration_test_lock().lock().await;
+    let database = TestDatabase::create().await;
+    let pool = database.pool();
+    apply_pre_settlement_migrations(pool).await;
+    sqlx::raw_sql(SETTLEMENT_MIGRATION)
+        .execute(pool)
+        .await
+        .unwrap();
+    let creator_id = insert_creator(pool).await;
+    insert_invoice(pool, creator_id, b"upgrade-bundle", b"upgrade-request").await;
+    let invoice_id: Uuid =
+        sqlx::query_scalar("SELECT id FROM invoices WHERE payment_request_lookup_hash = $1")
+            .bind(b"upgrade-request".as_slice())
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    let outpoint_hash = vec![71_u8; 32];
+    let created_at: time::OffsetDateTime = sqlx::query_scalar(
+        "INSERT INTO bitcoin_observations
+         (invoice_id, observation_envelope, outpoint_lookup_hash, active,
+          confirmations, present)
+         VALUES ($1, $2, $3, TRUE, 0, TRUE)
+         RETURNING created_at",
+    )
+    .bind(invoice_id)
+    .bind(b"encrypted-upgrade-observation".as_slice())
+    .bind(&outpoint_hash)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+
+    sqlx::raw_sql(MARKETPLACE_OBSERVATION_MIGRATION)
+        .execute(pool)
+        .await
+        .unwrap();
+    let upgraded: (Option<Uuid>, Option<Uuid>, time::OffsetDateTime, Vec<u8>) = sqlx::query_as(
+        "SELECT invoice_id, marketplace_preparation_id, first_observed_at,
+                observation_envelope
+         FROM bitcoin_observations WHERE outpoint_lookup_hash = $1",
+    )
+    .bind(&outpoint_hash)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        upgraded,
+        (
+            Some(invoice_id),
+            None,
+            created_at,
+            b"encrypted-upgrade-observation".to_vec(),
+        )
+    );
+    assert_check_violation(
+        sqlx::query(
+            "UPDATE bitcoin_observations SET invoice_id = NULL
+             WHERE outpoint_lookup_hash = $1",
+        )
+        .bind(&outpoint_hash)
+        .execute(pool)
+        .await,
+    );
+    assert_check_violation(
+        sqlx::query(
+            "UPDATE bitcoin_observations SET first_observed_at = first_observed_at + INTERVAL '1 second'
+             WHERE outpoint_lookup_hash = $1",
+        )
+        .bind(&outpoint_hash)
+        .execute(pool)
+        .await,
+    );
+    assert_check_violation(
+        sqlx::query("DELETE FROM bitcoin_observations WHERE outpoint_lookup_hash = $1")
+            .bind(&outpoint_hash)
+            .execute(pool)
+            .await,
+    );
     database.cleanup().await;
 }
 

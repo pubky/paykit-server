@@ -191,6 +191,8 @@ pub enum EnvelopeType {
     InvoicePaymentRecord,
     /// An encrypted Bitcoin outpoint and observed amount.
     BitcoinObservation,
+    /// Marketplace-owned encrypted Bitcoin outpoint and observed amount.
+    MarketplaceBitcoinObservation,
     UsdtObservation,
     /// Versioned server-owned semantic inputs for an outbound SDK handoff.
     OutboxSemanticIntent,
@@ -210,6 +212,7 @@ impl EnvelopeType {
             Self::Invoice => b"invoice",
             Self::InvoicePaymentRecord => b"invoice-payment-record",
             Self::BitcoinObservation => b"bitcoin-observation",
+            Self::MarketplaceBitcoinObservation => b"marketplace-bitcoin-observation",
             Self::UsdtObservation => b"usdt-observation",
             Self::OutboxSemanticIntent => b"outbox-semantic-intent",
             Self::PaymentDrain => b"payment-drain",
@@ -280,6 +283,20 @@ impl EnvelopeContext {
     ) -> Self {
         let mut context = Self::bitcoin_observation(creator_lookup_hash, row_id);
         context.parent_row_id = Some(invoice_id);
+        context
+    }
+    /// Binds one Bitcoin observation row to its owning Marketplace settlement.
+    pub fn bitcoin_observation_for_marketplace(
+        creator_lookup_hash: LookupHash,
+        row_id: Uuid,
+        marketplace_preparation_id: Uuid,
+    ) -> Self {
+        let mut context = Self::new(
+            EnvelopeType::MarketplaceBitcoinObservation,
+            creator_lookup_hash,
+            row_id,
+        );
+        context.parent_row_id = Some(marketplace_preparation_id);
         context
     }
     pub fn usdt_observation(
