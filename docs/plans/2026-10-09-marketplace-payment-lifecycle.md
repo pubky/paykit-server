@@ -87,7 +87,7 @@ Accepted behavior:
 - Marketplace settlement data remains separate from Locks `invoices`: it owns its encrypted payment record, Creator, Bitcoin address lookup, derivation-index lookup, and lifecycle projection. It does not fabricate a Locks bundle, lock resource, generation, drain membership, or buyer contact.
 - Payment Request lifecycle attribution is owner-aware. A delivered Marketplace proposal with `outbox.invoice_id IS NULL` projects against its active Marketplace settlement without making same-Creator Locks status or drain refresh unavailable. Locks lifecycle queries and drain semantics remain invoice-only.
 - Bitcoin addresses are globally unique across Locks invoices and Marketplace settlements at the PostgreSQL transaction boundary. Existing per-table invoice uniqueness and immutable activation replay remain intact.
-- Settlement ownership uses migration `0014_marketplace_settlements.sql`; Bitcoin observation follows as `0015_marketplace_bitcoin_observations.sql`; resolution immutability follows as `0016_marketplace_resolution_immutability.sql`.
+- Settlement ownership uses migration `0014_marketplace_settlements.sql`; #74 Bitcoin observation uses `0015_marketplace_bitcoin_observations.sql`; #68 resolution immutability uses `0016_marketplace_resolution_immutability.sql`.
 
 ## Marketplace Bitcoin observation — current implementation slice
 
