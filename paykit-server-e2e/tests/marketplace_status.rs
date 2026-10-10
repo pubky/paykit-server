@@ -632,8 +632,11 @@ async fn lifecycle_states_project_and_exception_states_fail_closed() {
     }
 
     for (state, expected) in [
-        ("recovery_required", MarketplaceStatusError::Unavailable),
-        ("invalid_conflict", MarketplaceStatusError::Conflict),
+        (
+            "recovery_required",
+            MarketplaceStatusError::RecoveryRequired,
+        ),
+        ("invalid_conflict", MarketplaceStatusError::InvalidConflict),
     ] {
         let database = TestDatabase::create().await;
         let store = store(&database).await;
