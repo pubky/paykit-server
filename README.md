@@ -58,6 +58,7 @@ Business routes:
 - signed `POST /marketplace/payment-requests/activate`
 - signed `POST /marketplace/payment-requests/void`
 - signed `POST /marketplace/payment-requests/resolve`
+- signed `POST /marketplace/payment-requests/status`
 - signed `POST /connections/status`
 - signed `POST /transactions/status`
 - signed `POST /setup/status`
@@ -105,6 +106,22 @@ using database time. Exact outcome replay returns its stored timestamp; a differ
 outcome conflicts. Resolution never changes payment-request or Bitcoin facts and
 never invokes SDK cancellation. Resolving a prepared invoice blocks activation but
 still permits void.
+
+Marketplace status uses closed `{"creator","invoice_id"}` input. Prepared and voided
+responses keep proposal and payment facts null; active responses project proposal
+delivery, canonical SDK request state, producer-owned payment state, business outcome,
+and active Bitcoin txid/amount/confirmations. A 0-confirmation replacement may change
+the active outpoint, while immutable per-outpoint amount and first-observation evidence
+continues to determine `amount_matched` and `paid_on_time`. When an active output is
+missing after a reorg, its Bitcoin object remains as evidence, but confirmations are
+zero and `amount_matched` and `paid_on_time` are false. `request_state: null` means no
+SDK lifecycle has been projected yet; `proposed` means proposal is projected but
+acceptance is not. Neither lag state means rejection or expiry. `payment_state` becomes
+`expired` after the inclusive payment deadline passes without the current active
+outpoint carrying durable timely amount-match evidence; a late match remains visible
+but does not restore eligibility. Exact route-emitted consumer and error fixtures live
+under `docs/fixtures/marketplace-payment-request-status/`. Unknown invoices and wrong
+Creators return the same `404`.
 
 Marketplace lifecycle conflicts use recovery-specific `409` codes. `prepare_expired`
 requires a new preparation attempt; `lifecycle_terminal` means activation lost to
