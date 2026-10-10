@@ -1,6 +1,6 @@
 # Marketplace Payment Lifecycle Decision Ledger
 
-Status: preparation, activation, void, activated-settlement ownership, Bitcoin observation, and resolution slices authorized; signed Marketplace status deferred.
+Status: preparation, activation, void, activated-settlement ownership, Bitcoin observation, resolution, and signed Marketplace status slices authorized.
 
 ## Authority and baseline
 
@@ -101,7 +101,7 @@ Accepted behavior:
 ## Explicitly deferred follow-up and release hold
 
 - `usdt_observations` remains unchanged; Marketplace USDT settlement ownership is a later slice.
-- Signed `{creator, invoice_id}` status remains separate follow-up work. Bitcoin observation alone does not complete Marketplace payment status.
+- Marketplace consumer adaptation and exact-revision cross-service status fixtures remain separate follow-up work.
 - Marketplace must reject activation after its Marketplace-owned inventory hold expires; that cross-service timing guard belongs to the Marketplace consumer follow-up.
 - PR #67 may remain a reviewed draft, but must not merge to `master` until Bitcoin observation/status, Marketplace hold-boundary work, and the accepted base-stack-stability gate are complete. No deployment is authorized.
 
