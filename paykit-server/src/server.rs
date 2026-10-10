@@ -12,6 +12,7 @@ use crate::{
         },
         marketplace_lifecycle::MarketplaceLifecycleService,
         marketplace_preparation::PrepareMarketplaceService,
+        marketplace_status::MarketplaceStatusService,
         payment_drain::{
             PaymentDrainCleanupToken, PaymentDrainError, PaymentDrainOperations,
             PaymentDrainSummary,
@@ -275,6 +276,9 @@ impl Server {
             marketplace_preparations.clone(),
             config.paykit.proposal_acceptance_window,
         ));
+        let marketplace_status_service = Arc::new(MarketplaceStatusService::new(
+            marketplace_preparations.clone(),
+        ));
         let connection_status_service = Arc::new(ConnectionStatusService::new(
             Arc::new(invoices.clone()),
             Arc::new(sessions.clone()),
@@ -321,6 +325,9 @@ impl Server {
                 )
                 .merge(http::marketplace_lifecycle::marketplace_lifecycle_router(
                     marketplace_lifecycle_service,
+                ))
+                .merge(http::marketplace_status::marketplace_status_router(
+                    marketplace_status_service,
                 ))
                 .merge(http::status::status_router(status_service))
                 .merge(http::payment_drains::payment_drains_router(

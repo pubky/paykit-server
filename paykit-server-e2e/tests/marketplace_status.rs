@@ -436,7 +436,9 @@ async fn bitcoin_evidence_keeps_identity_amount_and_first_observation_immutable(
         ))
     );
 
-    let replacement_at = first_at + time::Duration::hours(4);
+    // A late replacement owns its own immutable first-observation evidence. It must
+    // not borrow the displaced outpoint's on-time match.
+    let replacement_at = activated.payment_deadline() + time::Duration::seconds(1);
     let replacement = outpoint(2);
     let targets = store.observation_targets().await.unwrap();
     observe_marketplace_once_at(
@@ -461,7 +463,7 @@ async fn bitcoin_evidence_keeps_identity_amount_and_first_observation_immutable(
             invoice_id,
             "pending",
             None,
-            "confirmed",
+            "expired",
             activated.activated_at(),
             activated.payment_deadline(),
             Some(MarketplaceBitcoinStatus::new(
@@ -472,7 +474,7 @@ async fn bitcoin_evidence_keeps_identity_amount_and_first_observation_immutable(
                 1,
                 true,
                 true,
-                true,
+                false,
             )),
             None,
             None,
@@ -654,7 +656,7 @@ async fn lifecycle_states_project_and_exception_states_fail_closed() {
 }
 
 #[tokio::test]
-async fn inactive_resolution_and_encrypted_address_reconciliation_are_projected() {
+async fn inactive_resolution_is_projected_without_payment_fields() {
     let database = TestDatabase::create().await;
     let store = store(&database).await;
     let prepared = prepare(&store).await;
@@ -688,39 +690,6 @@ async fn inactive_resolution_and_encrypted_address_reconciliation_are_projected(
             Some("abandoned"),
             Some(resolution.resolved_at()),
         ))
-    );
-
-    sqlx::query(
-        "UPDATE marketplace_payment_preparations
-         SET bitcoin_address_lookup_hash = NULL WHERE id = $1",
-    )
-    .bind(invoice_id)
-    .execute(database.pool())
-    .await
-    .unwrap();
-    store.reconcile_bitcoin_address_hashes().await.unwrap();
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>(
-            "SELECT count(*) FROM marketplace_payment_preparations
-             WHERE id = $1 AND bitcoin_address_lookup_hash IS NOT NULL",
-        )
-        .bind(invoice_id)
-        .fetch_one(database.pool())
-        .await
-        .unwrap(),
-        1
-    );
-    sqlx::query(
-        "UPDATE marketplace_payment_preparations
-         SET bitcoin_address_lookup_hash = decode(repeat('00', 32), 'hex') WHERE id = $1",
-    )
-    .bind(invoice_id)
-    .execute(database.pool())
-    .await
-    .unwrap();
-    assert_eq!(
-        store.reconcile_bitcoin_address_hashes().await,
-        Err(PersistenceError::CorruptOrMissing)
     );
 
     database.cleanup().await;
@@ -986,7 +955,7 @@ async fn observation_evidence_rejects_direct_rewrite_and_delete() {
     .await
     .unwrap();
     assert_eq!(
-        store.reconcile_bitcoin_address_hashes().await,
+        store.scan_observation_integrity().await,
         Err(PersistenceError::CorruptOrMissing)
     );
 

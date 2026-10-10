@@ -24,8 +24,13 @@ use time::OffsetDateTime;
 use tower::ServiceExt;
 use uuid::Uuid;
 
-const CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
+// Exact consumer fixture from Marketplace fe76694bb4eebdf2ee48ed928f25cec2296be1f9,
+// retained by composed acceptance 20fa6e66474c1f1edc8ab40e51ebb455859b4802.
+const CREATOR: &str = "pubkygy1wnkhfwezwdnawnur1bc3kw1x3jf5ggjj3cm37e31i5ntq3pco";
 const INVOICE_ID: Uuid = Uuid::from_u128(0x4c6e66c7_8a8b_4d54_b97b_340cedb3e1d0);
+const CONSUMER_STATUS_BODY: &str = r#"{"creator":"pubkygy1wnkhfwezwdnawnur1bc3kw1x3jf5ggjj3cm37e31i5ntq3pco","invoice_id":"4c6e66c7-8a8b-4d54-b97b-340cedb3e1d0"}"#;
+const CONSUMER_STATUS_SIGNATURE: &str =
+    "wis1mgbBnXe1u13cnM9-CUbS4EoT2q39_SlAnyQUgErHnQflpbEwyoM6AkP6wlD5sN-rQx14BVw7CUGSaznUAQ";
 
 struct FakeStore {
     result: Result<Option<MarketplaceInvoiceStatus>, MarketplaceStatusError>,
@@ -126,7 +131,24 @@ async fn body(response: axum::response::Response) -> serde_json::Value {
 
 #[tokio::test]
 async fn signed_status_has_exact_closed_active_fixture() {
-    let key = SigningKey::from_bytes(&[11; 32]);
+    let key = SigningKey::from_bytes(&[7; 32]);
+    let canonical_body = serde_json_canonicalizer::to_string(&serde_json::json!({
+        "creator": CREATOR,
+        "invoice_id": INVOICE_ID,
+    }))
+    .unwrap();
+    assert_eq!(canonical_body, CONSUMER_STATUS_BODY);
+    assert_eq!(
+        URL_SAFE_NO_PAD.encode(
+            key.sign(&signature_preimage(
+                "POST",
+                "/marketplace/payment-requests/status",
+                canonical_body.as_bytes(),
+            ))
+            .to_bytes()
+        ),
+        CONSUMER_STATUS_SIGNATURE
+    );
     let router = marketplace_status_router(Arc::new(MarketplaceStatusService::new(Arc::new(
         FakeStore {
             result: Ok(Some(active_status())),
@@ -161,6 +183,39 @@ async fn signed_status_has_exact_closed_active_fixture() {
             "resolved_at":"1970-01-01T02:00:00Z",
             "state":"active"
         })
+    );
+}
+
+#[tokio::test]
+async fn status_rejects_missing_and_untrusted_signatures() {
+    let trusted = SigningKey::from_bytes(&[7; 32]);
+    let untrusted = SigningKey::from_bytes(&[8; 32]);
+    let router = marketplace_status_router(Arc::new(MarketplaceStatusService::new(Arc::new(
+        FakeStore {
+            result: Ok(Some(active_status())),
+        },
+    ))))
+    .layer(Extension(signed_auth(&trusted)));
+
+    let unsigned = Request::builder()
+        .method(Method::POST)
+        .uri("/marketplace/payment-requests/status")
+        .body(Body::from(CONSUMER_STATUS_BODY))
+        .unwrap();
+    assert_eq!(
+        router.clone().oneshot(unsigned).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        router
+            .oneshot(request(
+                &untrusted,
+                serde_json::json!({"creator":CREATOR,"invoice_id":INVOICE_ID}),
+            ))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
     );
 }
 

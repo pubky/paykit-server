@@ -58,6 +58,7 @@ Business routes:
 - signed `POST /marketplace/payment-requests/activate`
 - signed `POST /marketplace/payment-requests/void`
 - signed `POST /marketplace/payment-requests/resolve`
+- signed `POST /marketplace/payment-requests/status`
 - signed `POST /connections/status`
 - signed `POST /transactions/status`
 - signed `POST /setup/status`
@@ -105,6 +106,14 @@ using database time. Exact outcome replay returns its stored timestamp; a differ
 outcome conflicts. Resolution never changes payment-request or Bitcoin facts and
 never invokes SDK cancellation. Resolving a prepared invoice blocks activation but
 still permits void.
+
+Marketplace status uses closed `{"creator","invoice_id"}` input. Prepared and voided
+responses keep proposal and payment facts null; active responses project proposal
+delivery, canonical SDK request state, producer-owned payment state, business outcome,
+and active Bitcoin txid/amount/confirmations. A 0-confirmation replacement may change
+the active outpoint, while immutable per-outpoint amount and first-observation evidence
+continues to determine `amount_matched` and `paid_on_time`. Unknown invoices and wrong
+Creators return the same `404`.
 
 Marketplace lifecycle conflicts use recovery-specific `409` codes. `prepare_expired`
 requires a new preparation attempt; `lifecycle_terminal` means activation or void

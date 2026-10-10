@@ -62,7 +62,6 @@ fn crypto() -> Arc<Crypto> {
 }
 
 struct Payloads;
-struct SecondCreatorPayloads;
 
 #[derive(Serialize, Deserialize)]
 struct StoredPreparationEnvelopeV1 {
@@ -89,21 +88,6 @@ impl MarketplacePreparationPayloadFactory for Payloads {
             payment_request_intent: common::payment_intent_with_reference(
                 &reader(),
                 format!("marketplace-address-{child_index}"),
-                "7cceb26d-9042-4ea6-bfcb-01bbd778d76e".into(),
-            ),
-        })
-    }
-}
-
-impl MarketplacePreparationPayloadFactory for SecondCreatorPayloads {
-    fn for_child_index(
-        &self,
-        child_index: i64,
-    ) -> Result<MarketplacePreparationPayloads, PersistenceError> {
-        Ok(MarketplacePreparationPayloads {
-            payment_request_intent: common::payment_intent_with_reference(
-                &reader(),
-                format!("marketplace-second-address-{child_index}"),
                 "7cceb26d-9042-4ea6-bfcb-01bbd778d76e".into(),
             ),
         })
@@ -474,15 +458,12 @@ async fn same_operation_id_is_independent_across_creators() {
             "shared-operation",
             b"same-binding"
         )),
-        second_store.prepare(MarketplacePreparationInput {
-            payloads: &SecondCreatorPayloads,
-            ..input(
-                &second_creator,
-                &reader,
-                "shared-operation",
-                b"same-binding"
-            )
-        }),
+        second_store.prepare(input(
+            &second_creator,
+            &reader,
+            "shared-operation",
+            b"same-binding"
+        )),
     );
     let first = first.unwrap();
     let second = second.unwrap();
