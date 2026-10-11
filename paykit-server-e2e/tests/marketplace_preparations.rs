@@ -61,6 +61,18 @@ fn crypto() -> Arc<Crypto> {
     Arc::new(Crypto::from_master_key(&[7; 32]).unwrap())
 }
 
+fn parse_rfc3339(value: &str) -> OffsetDateTime {
+    OffsetDateTime::parse(value, &Rfc3339).unwrap()
+}
+
+#[test]
+fn rfc3339_timestamp_equality_preserves_fractional_instants() {
+    let expected = parse_rfc3339("2026-10-11T12:00:00.86877Z");
+
+    assert_eq!(parse_rfc3339("2026-10-11T12:00:00.868770Z"), expected);
+    assert_ne!(parse_rfc3339("2026-10-11T12:00:00.868771Z"), expected);
+}
+
 struct Payloads;
 
 #[derive(Serialize, Deserialize)]
@@ -741,14 +753,8 @@ async fn activate_starts_db_window_once_and_void_competes_on_the_preparation_row
         let terms = intent.terms().unwrap();
         assert!(terms.proposal_expires_at.is_some());
         assert_eq!(
-            terms.payment_deadline.as_deref(),
-            Some(
-                activated
-                    .payment_deadline()
-                    .format(&time::format_description::well_known::Rfc3339)
-                    .unwrap()
-                    .as_str()
-            )
+            parse_rfc3339(terms.payment_deadline.as_deref().unwrap()),
+            activated.payment_deadline()
         );
     } else {
         let replay = second_store
