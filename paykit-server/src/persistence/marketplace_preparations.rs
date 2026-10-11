@@ -783,13 +783,7 @@ impl MarketplacePreparationStore {
                 .map_err(|_| PersistenceError::Unavailable)?,
         };
         let mut ordered: Vec<_> = observations.iter().collect();
-        ordered.sort_by(|left, right| {
-            left.address.cmp(&right.address).then_with(|| {
-                left.outpoint
-                    .canonical_text()
-                    .cmp(&right.outpoint.canonical_text())
-            })
-        });
+        ordered.sort_by(|left, right| left.cmp_for_batch(right));
         let mut applied = 0;
         for observation in ordered {
             if self

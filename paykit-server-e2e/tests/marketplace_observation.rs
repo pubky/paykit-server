@@ -163,6 +163,71 @@ async fn observe(
     .await
 }
 
+async fn assert_reorg_batch_preserves_replacement(original: OutPoint, replacement: OutPoint) {
+    let database = TestDatabase::create().await;
+    let store = store(&database).await;
+    let prepared = prepare(&store, "marketplace-payment:reorg-batch", 60).await;
+    let activated = activate(&store, prepared.invoice_id()).await;
+    let original_at = activated.activated_at() + time::Duration::seconds(1);
+    let batch_at = original_at + time::Duration::seconds(1);
+
+    let target = store.observation_targets().await.unwrap().remove(0);
+    assert_eq!(
+        observe(&store, target, output(original, 100, 1, true), original_at).await,
+        Ok(1)
+    );
+    let target = store.observation_targets().await.unwrap().remove(0);
+    assert_eq!(
+        observe_marketplace_once_at(
+            &FixedBatch(vec![
+                output(replacement, 100, 0, true),
+                output(original, 100, 0, false),
+            ]),
+            &store,
+            &BitcoinNetwork::Regtest,
+            &[target],
+            batch_at,
+        )
+        .await,
+        Ok(2)
+    );
+
+    let active: (i32, bool, OffsetDateTime) = sqlx::query_as(
+        "SELECT confirmations, present, first_observed_at
+         FROM bitcoin_observations
+         WHERE marketplace_preparation_id = $1 AND active",
+    )
+    .bind(prepared.invoice_id())
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(active, (0, true, batch_at));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM bitcoin_observations
+             WHERE marketplace_preparation_id = $1",
+        )
+        .bind(prepared.invoice_id())
+        .fetch_one(database.pool())
+        .await
+        .unwrap(),
+        2
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM marketplace_timely_amount_matched_outpoints
+             WHERE preparation_id = $1",
+        )
+        .bind(prepared.invoice_id())
+        .fetch_one(database.pool())
+        .await
+        .unwrap(),
+        2
+    );
+
+    database.cleanup().await;
+}
+
 #[tokio::test]
 async fn prepared_and_voided_preparations_are_not_observation_targets() {
     let database = TestDatabase::create().await;
@@ -287,6 +352,12 @@ async fn replacement_keeps_per_outpoint_evidence_and_does_not_transfer_timelines
     .unwrap();
     assert_eq!(projection, ("confirmed".into(), 1, true, true));
     database.cleanup().await;
+}
+
+#[tokio::test]
+async fn reorg_batch_preserves_replacement_first_seen_for_both_outpoint_orders() {
+    assert_reorg_batch_preserves_replacement(outpoint(2), outpoint(1)).await;
+    assert_reorg_batch_preserves_replacement(outpoint(1), outpoint(2)).await;
 }
 
 #[tokio::test]

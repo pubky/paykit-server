@@ -180,6 +180,20 @@ pub(crate) struct BitcoinObservationInput {
     pub present: bool,
 }
 
+impl BitcoinObservationInput {
+    /// Groups address work, clears tracked absences before replacements, and
+    /// gives all remaining fields a provider-order-independent tie break.
+    pub(crate) fn cmp_for_batch(&self, other: &Self) -> std::cmp::Ordering {
+        self.address
+            .cmp(&other.address)
+            .then_with(|| self.present.cmp(&other.present))
+            .then_with(|| self.outpoint.txid().cmp(other.outpoint.txid()))
+            .then_with(|| self.outpoint.vout().cmp(&other.outpoint.vout()))
+            .then_with(|| self.observed_sats.cmp(&other.observed_sats))
+            .then_with(|| self.confirmations.cmp(&other.confirmations))
+    }
+}
+
 /// Produces payloads after the creator-row lock determines the child index.
 pub trait InvoicePayloadFactory: Send + Sync {
     fn for_child_index(&self, child_index: i64) -> Result<InvoicePayloads, PersistenceError>;

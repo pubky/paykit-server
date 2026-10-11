@@ -352,6 +352,96 @@ async fn set_invoice_deadline(
     .unwrap();
 }
 
+async fn assert_reorg_batch_preserves_replacement_for_invoice(
+    original: OutPoint,
+    replacement: OutPoint,
+) {
+    let database = TestDatabase::create().await;
+    let (store, invoice_id) = batch_invoice(&database).await;
+    let deadline = timestamp("2030-01-02T00:00:00Z");
+    set_invoice_deadline(&database, invoice_id, deadline).await;
+    let original_at = deadline - time::Duration::seconds(1);
+
+    assert_eq!(
+        observe_once_at(
+            &FixedBatch(vec![ObservedOutput {
+                network: BitcoinNetwork::Regtest,
+                address: REGTEST_ADDRESS.into(),
+                outpoint: original,
+                sats: 100,
+                confirmations: 1,
+                present: true,
+            }]),
+            &store,
+            &BitcoinNetwork::Regtest,
+            &[invoice_target()],
+            original_at,
+        )
+        .await,
+        Ok(1)
+    );
+    assert_eq!(
+        observe_once_at(
+            &FixedBatch(vec![
+                ObservedOutput {
+                    network: BitcoinNetwork::Regtest,
+                    address: REGTEST_ADDRESS.into(),
+                    outpoint: replacement,
+                    sats: 100,
+                    confirmations: 0,
+                    present: true,
+                },
+                ObservedOutput {
+                    network: BitcoinNetwork::Regtest,
+                    address: REGTEST_ADDRESS.into(),
+                    outpoint: original,
+                    sats: 100,
+                    confirmations: 0,
+                    present: false,
+                },
+            ]),
+            &store,
+            &BitcoinNetwork::Regtest,
+            &[tracked_invoice_target(original, 100)],
+            deadline,
+        )
+        .await,
+        Ok(2)
+    );
+
+    let active: (i32, bool, OffsetDateTime) = sqlx::query_as(
+        "SELECT confirmations, present, first_observed_at
+         FROM bitcoin_observations WHERE invoice_id = $1 AND active",
+    )
+    .bind(invoice_id)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(active, (0, true, deadline));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM bitcoin_observations WHERE invoice_id = $1",
+        )
+        .bind(invoice_id)
+        .fetch_one(database.pool())
+        .await
+        .unwrap(),
+        2
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM invoice_timely_amount_matched_outpoints WHERE invoice_id = $1",
+        )
+        .bind(invoice_id)
+        .fetch_one(database.pool())
+        .await
+        .unwrap(),
+        2
+    );
+
+    database.cleanup().await;
+}
+
 async fn install_decision_clock_audit(database: &TestDatabase) {
     sqlx::query(
         "CREATE TABLE decision_clock_audit (
@@ -874,6 +964,20 @@ async fn matching_output_later_in_exact_deadline_batch_wins_before_expiry() {
     );
 
     database.cleanup().await;
+}
+
+#[tokio::test]
+async fn reorg_batch_preserves_invoice_replacement_for_both_outpoint_orders() {
+    assert_reorg_batch_preserves_replacement_for_invoice(
+        provider_outpoint(2),
+        provider_outpoint(1),
+    )
+    .await;
+    assert_reorg_batch_preserves_replacement_for_invoice(
+        provider_outpoint(1),
+        provider_outpoint(2),
+    )
+    .await;
 }
 
 #[tokio::test]

@@ -363,12 +363,7 @@ fn validate_batch(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    validated.sort_by(|left, right| {
-        left.address
-            .cmp(&right.address)
-            .then_with(|| left.outpoint.txid().cmp(right.outpoint.txid()))
-            .then_with(|| left.outpoint.vout().cmp(&right.outpoint.vout()))
-    });
+    validated.sort_by(|left, right| left.cmp_for_batch(right));
     Ok(validated)
 }
 
