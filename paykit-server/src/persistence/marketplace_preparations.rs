@@ -993,6 +993,21 @@ impl MarketplacePreparationStore {
             .begin()
             .await
             .map_err(|_| PersistenceError::Unavailable)?;
+        let creator_hash = self
+            .crypto
+            .lookup_hash(input.creator.to_string().as_bytes());
+        let creator_id: Option<Uuid> =
+            sqlx::query_scalar("SELECT id FROM creators WHERE creator_lookup_hash = $1 FOR UPDATE")
+                .bind(creator_hash.as_bytes().as_slice())
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|_| PersistenceError::Unavailable)?;
+        if creator_id.is_none() {
+            tx.commit()
+                .await
+                .map_err(|_| PersistenceError::Unavailable)?;
+            return Ok(None);
+        }
         let Some(row) = self
             .load_lifecycle_locked(&mut tx, input.creator, input.invoice_id)
             .await?

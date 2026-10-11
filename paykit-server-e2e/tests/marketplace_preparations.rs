@@ -121,6 +121,26 @@ async fn create_creator(
         .unwrap();
 }
 
+async fn wait_for_lock_waiters(database: &TestDatabase, minimum: i64) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity
+                 WHERE datname = current_database() AND wait_event_type = 'Lock'",
+            )
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+            if waiting >= minimum {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("expected at least {minimum} PostgreSQL lock waiters"));
+}
+
 fn input<'a>(
     creator: &'a CreatorPubky,
     reader: &'a ReaderPubky,
@@ -391,6 +411,90 @@ async fn independent_stores_serialize_same_operation_and_binding() {
         1,
         "concurrent exact retry allocated a duplicate address"
     );
+
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn activation_and_prepare_replay_share_creator_before_preparation_lock_order() {
+    let database = TestDatabase::create().await;
+    let activation_store = store(&database).await;
+    let replay_store = MarketplacePreparationStore::new(database.pool(), crypto());
+    let creator = creator();
+    let reader = reader();
+    let operation_id = "marketplace-payment:activation-replay-lock-order:attempt-1";
+    let request_binding = b"activation-replay-lock-order";
+    let prepared = activation_store
+        .prepare(input(&creator, &reader, operation_id, request_binding))
+        .await
+        .unwrap();
+
+    let lock_key = i64::from_be_bytes(uuid::Uuid::new_v4().as_bytes()[..8].try_into().unwrap());
+    let mut activation_gate = database.pool().begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(lock_key)
+        .execute(&mut *activation_gate)
+        .await
+        .unwrap();
+    sqlx::query(&format!(
+        "CREATE FUNCTION hold_marketplace_activation() RETURNS TRIGGER AS $$
+         BEGIN
+             PERFORM pg_advisory_xact_lock({lock_key});
+             RETURN NEW;
+         END;
+         $$ LANGUAGE plpgsql"
+    ))
+    .execute(database.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER hold_marketplace_activation
+         BEFORE UPDATE OF state ON marketplace_payment_preparations
+         FOR EACH ROW WHEN (NEW.state = 'active' AND OLD.state = 'prepared')
+         EXECUTE FUNCTION hold_marketplace_activation()",
+    )
+    .execute(database.pool())
+    .await
+    .unwrap();
+
+    let activate = tokio::spawn({
+        let creator = creator.clone();
+        async move {
+            activation_store
+                .activate(MarketplaceActivationInput {
+                    creator: &creator,
+                    invoice_id: prepared.invoice_id(),
+                    total_sats: 100,
+                    proposal_acceptance_window: std::time::Duration::from_secs(30 * 60),
+                })
+                .await
+        }
+    });
+    wait_for_lock_waiters(&database, 1).await;
+
+    let replay = tokio::spawn({
+        let creator = creator.clone();
+        let reader = reader.clone();
+        async move {
+            replay_store
+                .prepare(input(&creator, &reader, operation_id, request_binding))
+                .await
+        }
+    });
+    wait_for_lock_waiters(&database, 2).await;
+    activation_gate.rollback().await.unwrap();
+
+    let (activated, replayed) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::join!(activate, replay)
+    })
+    .await
+    .expect("activation and exact prepare replay must not deadlock");
+    let activated = activated.unwrap().unwrap().unwrap();
+    let replayed = replayed.unwrap().unwrap();
+    assert!(!activated.replayed());
+    assert!(replayed.replayed());
+    assert_eq!(activated.invoice_id(), prepared.invoice_id());
+    assert_eq!(replayed.invoice_id(), prepared.invoice_id());
 
     database.cleanup().await;
 }
