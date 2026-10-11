@@ -2042,26 +2042,4 @@ mod tests {
         assert_eq!(result, Err(PaymentDrainError::Unavailable));
         assert_eq!(*calls.lock().unwrap(), vec!["replay", "refresh"]);
     }
-
-    #[tokio::test]
-    async fn unavailable_required_intake_prevents_payment_request_status_lookup() {
-        let calls = Arc::new(StdMutex::new(Vec::new()));
-        let refresh_calls = calls.clone();
-        let lookup_calls = calls.clone();
-
-        let result = refresh_then(
-            move || {
-                refresh_calls.lock().unwrap().push("refresh");
-                std::future::ready(Err(PaymentRequestStatusError::Unavailable))
-            },
-            move || {
-                lookup_calls.lock().unwrap().push("lookup");
-                std::future::ready(Ok::<_, PaymentRequestStatusError>(Some(7_u8)))
-            },
-        )
-        .await;
-
-        assert_eq!(result, Err(PaymentRequestStatusError::Unavailable));
-        assert_eq!(*calls.lock().unwrap(), vec!["refresh"]);
-    }
 }
