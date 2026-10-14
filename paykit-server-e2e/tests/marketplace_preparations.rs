@@ -75,6 +75,10 @@ fn rfc3339_timestamp_equality_preserves_fractional_instants() {
 
 struct Payloads;
 
+struct DescribedPayloads {
+    note: Option<&'static str>,
+}
+
 #[derive(Serialize, Deserialize)]
 struct StoredPreparationEnvelopeV1 {
     version: u8,
@@ -101,6 +105,22 @@ impl MarketplacePreparationPayloadFactory for Payloads {
                 &reader(),
                 format!("marketplace-address-{child_index}"),
                 "7cceb26d-9042-4ea6-bfcb-01bbd778d76e".into(),
+            ),
+        })
+    }
+}
+
+impl MarketplacePreparationPayloadFactory for DescribedPayloads {
+    fn for_child_index(
+        &self,
+        child_index: i64,
+    ) -> Result<MarketplacePreparationPayloads, PersistenceError> {
+        Ok(MarketplacePreparationPayloads {
+            payment_request_intent: common::payment_intent_with_reference_and_note(
+                &reader(),
+                format!("marketplace-address-{child_index}"),
+                "7cceb26d-9042-4ea6-bfcb-01bbd778d76e".into(),
+                self.note,
             ),
         })
     }
@@ -198,6 +218,120 @@ fn input_with_ttl_and_window<'a>(
         prepare_ttl_seconds,
         payloads: &Payloads,
     }
+}
+
+fn input_with_payloads<'a>(
+    creator: &'a CreatorPubky,
+    reader: &'a ReaderPubky,
+    operation_id: &'a str,
+    request_binding: &'a [u8],
+    payloads: &'a dyn MarketplacePreparationPayloadFactory,
+) -> MarketplacePreparationInput<'a> {
+    MarketplacePreparationInput {
+        payloads,
+        ..input(creator, reader, operation_id, request_binding)
+    }
+}
+
+async fn stored_preparation_envelope(
+    database: &TestDatabase,
+    creator: &CreatorPubky,
+    invoice_id: uuid::Uuid,
+) -> StoredPreparationEnvelopeV1 {
+    let encrypted: Vec<u8> = sqlx::query_scalar(
+        "SELECT preparation_envelope FROM marketplace_payment_preparations WHERE id = $1",
+    )
+    .bind(invoice_id)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    let crypto = crypto();
+    let context = EnvelopeContext::marketplace_preparation(
+        crypto.lookup_hash(creator.to_string().as_bytes()),
+        invoice_id,
+    );
+    let plaintext = crypto
+        .decrypt(&context, &EncryptedEnvelope::from_bytes(encrypted))
+        .unwrap();
+    postcard::from_bytes(&plaintext).unwrap()
+}
+
+#[tokio::test]
+async fn description_note_is_persisted_exactly_and_replay_keeps_original_intent() {
+    let database = TestDatabase::create().await;
+    let store = store(&database).await;
+    let creator = creator();
+    let reader = reader();
+    let described = DescribedPayloads {
+        note: Some("Café order 🛒"),
+    };
+    let omitted = DescribedPayloads { note: None };
+
+    let first = store
+        .prepare(input_with_payloads(
+            &creator,
+            &reader,
+            "marketplace-payment:description:attempt-1",
+            b"described-request",
+            &described,
+        ))
+        .await
+        .unwrap();
+    let stored = stored_preparation_envelope(&database, &creator, first.invoice_id()).await;
+    assert_eq!(
+        stored.payment_request_intent.terms().unwrap().metadata,
+        serde_json::Map::from_iter([(
+            "note".into(),
+            serde_json::Value::String("Café order 🛒".into()),
+        )])
+    );
+
+    let replay = store
+        .prepare(input_with_payloads(
+            &creator,
+            &reader,
+            "marketplace-payment:description:attempt-1",
+            b"described-request",
+            &omitted,
+        ))
+        .await
+        .unwrap();
+    assert!(replay.replayed());
+    assert_eq!(replay.invoice_id(), first.invoice_id());
+    let replayed = stored_preparation_envelope(&database, &creator, replay.invoice_id()).await;
+    assert_eq!(
+        replayed.payment_request_intent,
+        stored.payment_request_intent
+    );
+
+    let legacy = store
+        .prepare(input_with_payloads(
+            &creator,
+            &reader,
+            "marketplace-payment:description:attempt-2",
+            b"legacy-request",
+            &omitted,
+        ))
+        .await
+        .unwrap();
+    let legacy = stored_preparation_envelope(&database, &creator, legacy.invoice_id()).await;
+    assert!(
+        legacy
+            .payment_request_intent
+            .terms()
+            .unwrap()
+            .metadata
+            .is_empty()
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM marketplace_payment_preparations")
+            .fetch_one(database.pool())
+            .await
+            .unwrap(),
+        2
+    );
+
+    database.cleanup().await;
 }
 
 #[tokio::test]
