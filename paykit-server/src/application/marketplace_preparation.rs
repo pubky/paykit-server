@@ -352,6 +352,9 @@ impl PrepareMarketplaceService {
 
 type MarketplaceOperationLock = tokio::sync::Mutex<()>;
 
+const MAX_RFC3339_PROPOSAL_EXPIRES_AT: &str = "9999-12-31T23:59:59.999999998Z";
+const MAX_RFC3339_PAYMENT_DEADLINE: &str = "9999-12-31T23:59:59.999999999Z";
+
 fn marketplace_operation_lock(
     creator: &CreatorPubky,
     operation_id: &str,
@@ -435,6 +438,16 @@ impl MarketplacePreparationPayloadFactory for MarketplacePayloads<'_> {
         let intent =
             DeliveryIntentV1::payment_request(self.reader.to_string(), self.app_id.clone(), &terms)
                 .map_err(|_| PersistenceError::InvalidInput)?;
+        // Activation owns real deadline selection. Check its largest possible RFC 3339
+        // shape now so no prepared invoice can later fail only because deadlines grow
+        // the outbound Payment Request past the Noise frame.
+        let mut final_shape = intent.clone();
+        final_shape
+            .set_deadlines(
+                MAX_RFC3339_PROPOSAL_EXPIRES_AT.into(),
+                MAX_RFC3339_PAYMENT_DEADLINE.into(),
+            )
+            .map_err(|_| PersistenceError::InvalidInput)?;
         Ok(MarketplacePreparationPayloads {
             payment_request_intent: intent,
         })
