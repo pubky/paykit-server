@@ -147,6 +147,24 @@ impl InvoicePaymentRecordV1 {
         self.derivation_index
     }
 
+    pub(crate) fn has_bitcoin(&self) -> bool {
+        self.bitcoin.is_some()
+    }
+
+    pub(crate) fn has_usdt(&self) -> bool {
+        self.usdt.is_some()
+    }
+
+    pub(crate) fn usdt_required_amount(&self) -> Result<u64, PersistenceError> {
+        if self.version != 1 {
+            return Err(PersistenceError::CorruptOrMissing);
+        }
+        self.usdt
+            .as_ref()
+            .map(|destination| destination.required_amount)
+            .ok_or(PersistenceError::InvalidInput)
+    }
+
     pub(crate) fn bitcoin_address(&self) -> Result<&str, PersistenceError> {
         self.bitcoin
             .as_ref()

@@ -81,7 +81,28 @@ async fn migrations_create_the_required_schema_and_are_restart_safe() {
             .fetch_all(pool)
             .await
             .unwrap();
-    assert_eq!(applied_versions, (1..=16).collect::<Vec<_>>());
+    assert_eq!(applied_versions, (1..=17).collect::<Vec<_>>());
+
+    let settlement_address_nullable: String = sqlx::query_scalar(
+        "SELECT is_nullable FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = 'marketplace_settlements'
+           AND column_name = 'bitcoin_address_lookup_hash'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(settlement_address_nullable, "YES");
+    let claim_trigger: String = sqlx::query_scalar(
+        "SELECT pg_get_triggerdef(oid) FROM pg_trigger
+         WHERE tgname = 'marketplace_settlements_claim_global_bitcoin_address'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert!(
+        claim_trigger.contains("WHEN ((new.bitcoin_address_lookup_hash IS NOT NULL))"),
+        "{claim_trigger}"
+    );
 
     let plaintext_creator_pubky_columns: Vec<String> = sqlx::query_scalar(
         "SELECT table_name \

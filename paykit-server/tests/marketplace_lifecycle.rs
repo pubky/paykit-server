@@ -10,8 +10,10 @@ use axum::{
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use ed25519_dalek::{Signer, SigningKey};
 use paykit_server::{
-    application::marketplace_lifecycle::{
-        MarketplaceLifecyclePersistence, MarketplaceLifecycleService,
+    application::{
+        marketplace_lifecycle::{MarketplaceLifecyclePersistence, MarketplaceLifecycleService},
+        marketplace_terms::{MarketplaceQuote, MarketplaceTerms},
+        setup_status::AcceptedAsset,
     },
     config::{Config, ConfigEnvironment},
     domain::locks::CreatorPubky,
@@ -59,7 +61,19 @@ impl MarketplaceLifecyclePersistence for FakeStore {
                 input.invoice_id,
                 OffsetDateTime::UNIX_EPOCH,
                 OffsetDateTime::UNIX_EPOCH + time::Duration::days(1),
-                input.total_sats,
+                MarketplaceTerms::new(
+                    input.amount,
+                    input.asset,
+                    [AcceptedAsset::Btc, AcceptedAsset::Usdt],
+                )
+                .unwrap(),
+                MarketplaceQuote::new(
+                    vec![
+                        (AcceptedAsset::Btc, 6_173),
+                        (AcceptedAsset::Usdt, 5_000_000),
+                    ],
+                    Vec::new(),
+                ),
                 true,
             ))),
             Outcome::PrepareExpired => Err(MarketplaceLifecyclePersistenceError::PrepareExpired),
@@ -202,7 +216,8 @@ async fn signed_activate_and_void_have_closed_success_fixtures() {
             serde_json::json!({
                 "creator": CREATOR,
                 "invoice_id": INVOICE_ID,
-                "total_sats": 50_000,
+                "amount": "500",
+                "asset": "USD",
             }),
         ))
         .await
@@ -215,7 +230,10 @@ async fn signed_activate_and_void_have_closed_success_fixtures() {
             "invoice_id": INVOICE_ID,
             "payment_deadline": "1970-01-02T00:00:00Z",
             "state": "active",
-            "total_sats": 50_000,
+            "amount": "500",
+            "asset": "USD",
+            "accepted_assets": ["BTC", "USDT"],
+            "payment_amounts": {"BTC": "6173", "USDT": "5000000"},
         })
     );
 
@@ -247,7 +265,8 @@ async fn signed_activate_and_void_have_closed_success_fixtures() {
             serde_json::json!({
                 "creator": CREATOR,
                 "invoice_id": INVOICE_ID,
-                "total_sats": 50_000,
+                "amount": "500",
+                "asset": "USD",
                 "stack_id": "forbidden",
             }),
         ))
@@ -340,7 +359,8 @@ async fn lifecycle_failures_use_stable_error_fixtures() {
         serde_json::json!({
             "creator": CREATOR,
             "invoice_id": INVOICE_ID,
-            "total_sats": 50_000,
+            "amount": "500",
+            "asset": "USD",
         })
     };
     for (outcome, code, message) in [

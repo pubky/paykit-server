@@ -14,12 +14,17 @@ use crate::{
             MarketplaceBitcoinStatus, MarketplaceInvoiceStatus, MarketplaceStatusError,
             MarketplaceStatusPersistence,
         },
+        marketplace_terms::{MarketplaceQuote, MarketplaceTerms},
         semantic_intent::DeliveryIntentV1,
+        setup_status::AcceptedAsset,
     },
     bitcoin::{DirectBinding, ObservationAction, ObservationTarget, TrackedOutput},
     crypto::{Crypto, EncryptedEnvelope, EnvelopeContext, LookupHash},
-    domain::locks::{CreatorPubky, ReaderPubky, parse_reader},
-    persistence::{BitcoinObservationInput, PersistenceError, invoices::InvoicePaymentRecordV1},
+    domain::{
+        invoice::CriterionAsset,
+        locks::{CreatorPubky, ReaderPubky, parse_reader},
+    },
+    persistence::{BitcoinObservationInput, InvoicePaymentRecordV1, PersistenceError},
 };
 
 const OPERATION_BINDING_UNIQUE_CONSTRAINT: &str = "marketplace_preparation_operation_binding_key";
@@ -31,7 +36,7 @@ pub struct MarketplacePreparationInput<'a> {
     pub reference: &'a str,
     pub operation_id: &'a str,
     pub request_binding: &'a [u8],
-    pub total_sats: u64,
+    pub terms: &'a MarketplaceTerms,
     pub payment_window_seconds: u64,
     pub prepare_ttl_seconds: u64,
     pub payloads: &'a dyn MarketplacePreparationPayloadFactory,
@@ -41,7 +46,8 @@ pub struct MarketplacePreparationInput<'a> {
 pub struct MarketplaceActivationInput<'a> {
     pub creator: &'a CreatorPubky,
     pub invoice_id: Uuid,
-    pub total_sats: u64,
+    pub amount: u64,
+    pub asset: CriterionAsset,
     pub proposal_acceptance_window: std::time::Duration,
 }
 
@@ -57,7 +63,7 @@ pub enum MarketplaceLifecyclePersistenceError {
     /// Void lost to activation; payment remains live and must still be observed.
     #[error("marketplace invoice is already active")]
     InvoiceActive,
-    /// Caller total differs from the authoritative prepared total.
+    /// Caller amount or asset differs from the authoritative prepared terms.
     #[error("marketplace payment total does not match")]
     TotalMismatch,
     /// A different immutable business outcome was already recorded.
@@ -90,10 +96,11 @@ pub enum MarketplacePreparationPreflight {
 }
 
 /// Secret-free result of preparing an unpublished Marketplace invoice.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MarketplacePreparationResult {
     invoice_id: Uuid,
-    total_sats: u64,
+    terms: MarketplaceTerms,
+    quote: MarketplaceQuote,
     prepared_at: OffsetDateTime,
     prepare_expires_at: OffsetDateTime,
     replayed: bool,
@@ -103,14 +110,16 @@ impl MarketplacePreparationResult {
     /// Builds a result returned by an injected persistence adapter.
     pub fn new(
         invoice_id: Uuid,
-        total_sats: u64,
+        terms: MarketplaceTerms,
+        quote: MarketplaceQuote,
         prepared_at: OffsetDateTime,
         prepare_expires_at: OffsetDateTime,
         replayed: bool,
     ) -> Self {
         Self {
             invoice_id,
-            total_sats,
+            terms,
+            quote,
             prepared_at,
             prepare_expires_at,
             replayed,
@@ -121,8 +130,12 @@ impl MarketplacePreparationResult {
         self.invoice_id
     }
 
-    pub fn total_sats(&self) -> u64 {
-        self.total_sats
+    pub fn terms(&self) -> &MarketplaceTerms {
+        &self.terms
+    }
+
+    pub fn quote(&self) -> &MarketplaceQuote {
+        &self.quote
     }
 
     pub fn prepared_at(&self) -> OffsetDateTime {
@@ -139,12 +152,13 @@ impl MarketplacePreparationResult {
 }
 
 /// Secret-free stored activation response.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MarketplaceActivationResult {
     invoice_id: Uuid,
     activated_at: OffsetDateTime,
     payment_deadline: OffsetDateTime,
-    total_sats: u64,
+    terms: MarketplaceTerms,
+    quote: MarketplaceQuote,
     replayed: bool,
 }
 
@@ -154,14 +168,16 @@ impl MarketplaceActivationResult {
         invoice_id: Uuid,
         activated_at: OffsetDateTime,
         payment_deadline: OffsetDateTime,
-        total_sats: u64,
+        terms: MarketplaceTerms,
+        quote: MarketplaceQuote,
         replayed: bool,
     ) -> Self {
         Self {
             invoice_id,
             activated_at,
             payment_deadline,
-            total_sats,
+            terms,
+            quote,
             replayed,
         }
     }
@@ -175,8 +191,11 @@ impl MarketplaceActivationResult {
     pub fn payment_deadline(&self) -> OffsetDateTime {
         self.payment_deadline
     }
-    pub fn total_sats(&self) -> u64 {
-        self.total_sats
+    pub fn terms(&self) -> &MarketplaceTerms {
+        &self.terms
+    }
+    pub fn quote(&self) -> &MarketplaceQuote {
+        &self.quote
     }
     pub fn replayed(&self) -> bool {
         self.replayed
@@ -285,6 +304,7 @@ pub struct MarketplacePreparationStore {
     crypto: Arc<Crypto>,
 }
 
+/// Preparation envelope as written by rc11 through rc16: Bitcoin only, sats total.
 #[derive(Serialize, Deserialize)]
 struct PreparationEnvelopeV1 {
     version: u8,
@@ -299,6 +319,67 @@ struct PreparationEnvelopeV1 {
     prepare_expires_at: OffsetDateTime,
     child_index: i64,
     payment_request_intent: DeliveryIntentV1,
+}
+
+/// Current preparation envelope. `version` is the stored version: 2 is written, 1
+/// is only read, as `{BTC, total_sats, [BTC]}`.
+#[derive(Serialize, Deserialize)]
+struct PreparationEnvelope {
+    version: u8,
+    operation_id: String,
+    request_binding: Vec<u8>,
+    reader: String,
+    reference: String,
+    terms: MarketplaceTerms,
+    payment_window_seconds: u64,
+    prepare_ttl_seconds: u64,
+    prepared_at: OffsetDateTime,
+    prepare_expires_at: OffsetDateTime,
+    child_index: i64,
+    payment_request_intent: DeliveryIntentV1,
+}
+
+impl PreparationEnvelope {
+    fn terms_match(&self, amount: u64, asset: CriterionAsset) -> bool {
+        self.terms.amount() == amount && self.terms.asset() == asset
+    }
+
+    fn quote(&self) -> Result<MarketplaceQuote, PersistenceError> {
+        MarketplaceQuote::from_intent(&self.payment_request_intent, &self.terms)
+            .map_err(|_| PersistenceError::CorruptOrMissing)
+    }
+
+    fn decode(plaintext: &[u8]) -> Result<Self, PersistenceError> {
+        match plaintext.first() {
+            Some(1) => {
+                let legacy: PreparationEnvelopeV1 = postcard::from_bytes(plaintext)
+                    .map_err(|_| PersistenceError::CorruptOrMissing)?;
+                Ok(Self {
+                    version: 1,
+                    operation_id: legacy.operation_id,
+                    request_binding: legacy.request_binding,
+                    reader: legacy.reader,
+                    reference: legacy.reference,
+                    terms: MarketplaceTerms::new(
+                        legacy.total_sats,
+                        CriterionAsset::Btc,
+                        [AcceptedAsset::Btc],
+                    )
+                    .map_err(|_| PersistenceError::CorruptOrMissing)?,
+                    payment_window_seconds: legacy.payment_window_seconds,
+                    prepare_ttl_seconds: legacy.prepare_ttl_seconds,
+                    prepared_at: legacy.prepared_at,
+                    prepare_expires_at: legacy.prepare_expires_at,
+                    child_index: legacy.child_index,
+                    payment_request_intent: legacy.payment_request_intent,
+                })
+            }
+            Some(2) => {
+                postcard::from_bytes(plaintext).map_err(|_| PersistenceError::CorruptOrMissing)
+            }
+            _ => Err(PersistenceError::CorruptOrMissing),
+        }
+    }
 }
 
 struct CreatorRow {
@@ -352,7 +433,7 @@ struct MarketplaceSettlementRow {
     preparation_id: Uuid,
     creator_lookup_hash: Vec<u8>,
     payment_record_envelope: Vec<u8>,
-    bitcoin_address_lookup_hash: Vec<u8>,
+    bitcoin_address_lookup_hash: Option<Vec<u8>>,
     derivation_index_lookup_hash: Vec<u8>,
     activated_at: OffsetDateTime,
     payment_deadline: OffsetDateTime,
@@ -448,6 +529,7 @@ impl MarketplacePreparationStore {
                ON preparation.id = settlement.preparation_id
               AND preparation.creator_id = settlement.creator_id
              WHERE preparation.state = 'active'
+               AND settlement.bitcoin_address_lookup_hash IS NOT NULL
                AND settlement.payment_expired_at IS NULL
                AND NOT EXISTS (
                    SELECT 1
@@ -479,6 +561,7 @@ impl MarketplacePreparationStore {
              WHERE preparation.id = settlement.preparation_id
                AND preparation.creator_id = settlement.creator_id
                AND preparation.state = 'active'
+               AND settlement.bitcoin_address_lookup_hash IS NOT NULL
                AND preparation.payment_deadline < $1
                AND settlement.payment_expired_at IS NULL
                AND NOT EXISTS (
@@ -516,6 +599,7 @@ impl MarketplacePreparationStore {
                ON observation.marketplace_preparation_id = settlement.preparation_id
               AND observation.active
              WHERE preparation.state = 'active'
+               AND settlement.bitcoin_address_lookup_hash IS NOT NULL
              ORDER BY settlement.preparation_id",
         )
         .fetch_all(&mut *tx)
@@ -631,12 +715,10 @@ impl MarketplacePreparationStore {
                 settlement.preparation_id,
                 settlement.payment_record_envelope,
             )?;
-            payment.bitcoin_required_amount()?;
-            if settlement.bitcoin_address_lookup_hash
-                != self
-                    .crypto
-                    .bitcoin_address_lookup_hash(payment.bitcoin_address()?.as_bytes())
-                    .as_bytes()
+            if payment.has_bitcoin() {
+                payment.bitcoin_required_amount()?;
+            }
+            if settlement.bitcoin_address_lookup_hash != self.settlement_address_hash(&payment)?
                 || settlement.derivation_index_lookup_hash
                     != self
                         .crypto
@@ -840,7 +922,6 @@ impl MarketplacePreparationStore {
     ) -> Result<MarketplacePreparationResult, PersistenceError> {
         if input.operation_id.is_empty()
             || input.request_binding.is_empty()
-            || input.total_sats == 0
             || input.payment_window_seconds == 0
             || input.prepare_ttl_seconds == 0
         {
@@ -907,20 +988,20 @@ impl MarketplacePreparationStore {
             .checked_add(ttl)
             .ok_or(PersistenceError::InvalidInput)?;
         let payloads = input.payloads.for_child_index(creator.next_child_index)?;
-        validate_intent(
+        let quote = validate_intent(
             &payloads.payment_request_intent,
             input.reader,
             input.reference,
-            input.total_sats,
+            input.terms,
         )?;
         let invoice_id = Uuid::new_v4();
-        let envelope = PreparationEnvelopeV1 {
-            version: 1,
+        let envelope = PreparationEnvelope {
+            version: 2,
             operation_id: input.operation_id.to_owned(),
             request_binding: input.request_binding.to_vec(),
             reader: input.reader.to_string(),
             reference: input.reference.to_owned(),
-            total_sats: input.total_sats,
+            terms: input.terms.clone(),
             payment_window_seconds: input.payment_window_seconds,
             prepare_ttl_seconds: input.prepare_ttl_seconds,
             prepared_at,
@@ -967,7 +1048,8 @@ impl MarketplacePreparationStore {
             .map_err(|_| PersistenceError::Unavailable)?;
         Ok(MarketplacePreparationResult {
             invoice_id,
-            total_sats: input.total_sats,
+            terms: input.terms.clone(),
+            quote,
             prepared_at,
             prepare_expires_at,
             replayed: false,
@@ -979,7 +1061,7 @@ impl MarketplacePreparationStore {
         &self,
         input: MarketplaceActivationInput<'_>,
     ) -> Result<Option<MarketplaceActivationResult>, MarketplaceLifecyclePersistenceError> {
-        if input.total_sats == 0 || input.proposal_acceptance_window.is_zero() {
+        if input.amount == 0 || input.proposal_acceptance_window.is_zero() {
             return Err(PersistenceError::InvalidInput.into());
         }
         let mut tx = self
@@ -1015,7 +1097,7 @@ impl MarketplacePreparationStore {
         let mut envelope = self.decode_lifecycle_envelope(creator_hash, &row)?;
         match row.state.as_str() {
             "active" => {
-                if envelope.total_sats != input.total_sats {
+                if !envelope.terms_match(input.amount, input.asset) {
                     return Err(MarketplaceLifecyclePersistenceError::TotalMismatch);
                 }
                 let (Some(activated_at), Some(payment_deadline)) =
@@ -1043,11 +1125,13 @@ impl MarketplacePreparationStore {
                 tx.commit()
                     .await
                     .map_err(|_| PersistenceError::Unavailable)?;
+                let quote = envelope.quote()?;
                 return Ok(Some(MarketplaceActivationResult {
                     invoice_id: row.id,
                     activated_at,
                     payment_deadline,
-                    total_sats: envelope.total_sats,
+                    terms: envelope.terms,
+                    quote,
                     replayed: true,
                 }));
             }
@@ -1073,7 +1157,7 @@ impl MarketplacePreparationStore {
         if now >= row.prepare_expires_at {
             return Err(MarketplaceLifecyclePersistenceError::PrepareExpired);
         }
-        if envelope.total_sats != input.total_sats {
+        if !envelope.terms_match(input.amount, input.asset) {
             return Err(MarketplaceLifecyclePersistenceError::TotalMismatch);
         }
         let window_seconds = i64::try_from(envelope.payment_window_seconds)
@@ -1099,11 +1183,11 @@ impl MarketplacePreparationStore {
                     .map_err(|_| PersistenceError::InvalidInput)?,
             )
             .map_err(|_| PersistenceError::CorruptOrMissing)?;
-        validate_intent(
+        let quote = validate_intent(
             &envelope.payment_request_intent,
             &parse_reader(&envelope.reader).map_err(|_| PersistenceError::CorruptOrMissing)?,
             &envelope.reference,
-            envelope.total_sats,
+            &envelope.terms,
         )?;
         let outbox_id = Uuid::new_v4();
         let intent_plaintext = postcard::to_allocvec(&envelope.payment_request_intent)
@@ -1138,9 +1222,7 @@ impl MarketplacePreparationStore {
             envelope.child_index,
             &envelope.payment_request_intent,
         )?;
-        let bitcoin_address_hash = self
-            .crypto
-            .bitcoin_address_lookup_hash(payment_record.bitcoin_address()?.as_bytes());
+        let bitcoin_address_hash = self.settlement_address_hash(&payment_record)?;
         let derivation_index_hash = self
             .crypto
             .bitcoin_derivation_index_lookup_hash(creator_hash, payment_record.derivation_index());
@@ -1164,7 +1246,7 @@ impl MarketplacePreparationStore {
         )
         .bind(row.id)
         .bind(payment_record_envelope.as_bytes())
-        .bind(bitcoin_address_hash.as_bytes().as_slice())
+        .bind(bitcoin_address_hash)
         .bind(derivation_index_hash.as_bytes().as_slice())
         .execute(&mut *tx)
         .await
@@ -1193,7 +1275,8 @@ impl MarketplacePreparationStore {
             invoice_id: row.id,
             activated_at: now,
             payment_deadline,
-            total_sats: envelope.total_sats,
+            terms: envelope.terms,
+            quote,
             replayed: false,
         }))
     }
@@ -1465,7 +1548,7 @@ impl MarketplacePreparationStore {
         &self,
         creator_hash: LookupHash,
         row: &LifecycleRow,
-    ) -> Result<PreparationEnvelopeV1, PersistenceError> {
+    ) -> Result<PreparationEnvelope, PersistenceError> {
         let plaintext = self
             .crypto
             .decrypt(
@@ -1473,17 +1556,14 @@ impl MarketplacePreparationStore {
                 &EncryptedEnvelope::from_bytes(row.preparation_envelope.clone()),
             )
             .map_err(|_| PersistenceError::CorruptOrMissing)?;
-        let envelope: PreparationEnvelopeV1 =
-            postcard::from_bytes(&plaintext).map_err(|_| PersistenceError::CorruptOrMissing)?;
+        let envelope = PreparationEnvelope::decode(&plaintext)?;
         let ttl = i64::try_from(envelope.prepare_ttl_seconds)
             .map(Duration::seconds)
             .map_err(|_| PersistenceError::CorruptOrMissing)?;
-        if envelope.version != 1
-            || envelope.prepared_at != row.prepared_at
+        if envelope.prepared_at != row.prepared_at
             || envelope.prepare_expires_at != row.prepare_expires_at
             || envelope.prepared_at.checked_add(ttl) != Some(envelope.prepare_expires_at)
             || envelope.payment_window_seconds == 0
-            || envelope.total_sats == 0
         {
             return Err(PersistenceError::CorruptOrMissing);
         }
@@ -1491,7 +1571,7 @@ impl MarketplacePreparationStore {
             &envelope.payment_request_intent,
             &parse_reader(&envelope.reader).map_err(|_| PersistenceError::CorruptOrMissing)?,
             &envelope.reference,
-            envelope.total_sats,
+            &envelope.terms,
         )
         .map_err(|_| PersistenceError::CorruptOrMissing)?;
         Ok(envelope)
@@ -1502,9 +1582,9 @@ impl MarketplacePreparationStore {
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         creator_hash: LookupHash,
         row: &LifecycleRow,
-        preparation: &PreparationEnvelopeV1,
+        preparation: &PreparationEnvelope,
     ) -> Result<(), PersistenceError> {
-        let stored: Option<(Vec<u8>, Vec<u8>, Vec<u8>)> = sqlx::query_as(
+        let stored: Option<(Vec<u8>, Option<Vec<u8>>, Vec<u8>)> = sqlx::query_as(
             "SELECT payment_record_envelope, bitcoin_address_lookup_hash,
                     derivation_index_lookup_hash
              FROM marketplace_settlements
@@ -1534,11 +1614,7 @@ impl MarketplacePreparationStore {
         )
         .map_err(|_| PersistenceError::CorruptOrMissing)?;
         if actual != expected
-            || address_hash.as_slice()
-                != self
-                    .crypto
-                    .bitcoin_address_lookup_hash(expected.bitcoin_address()?.as_bytes())
-                    .as_bytes()
+            || address_hash != self.settlement_address_hash(&expected)?
             || derivation_hash.as_slice()
                 != self
                     .crypto
@@ -1589,7 +1665,8 @@ impl MarketplacePreparationStore {
         )?;
         let required = payment.bitcoin_required_amount()?;
         if payment.bitcoin_address()? != input.address
-            || settlement.bitcoin_address_lookup_hash != address_hash.as_bytes()
+            || settlement.bitcoin_address_lookup_hash.as_deref()
+                != Some(address_hash.as_bytes().as_slice())
             || settlement.derivation_index_lookup_hash
                 != self
                     .crypto
@@ -1822,6 +1899,25 @@ impl MarketplacePreparationStore {
         Ok(true)
     }
 
+    /// The keyed Bitcoin address hash a settlement must hold: present exactly when
+    /// the request accepts Bitcoin, because a USDT-only request has no address to watch.
+    fn settlement_address_hash(
+        &self,
+        payment: &InvoicePaymentRecordV1,
+    ) -> Result<Option<Vec<u8>>, PersistenceError> {
+        payment
+            .has_bitcoin()
+            .then(|| {
+                payment.bitcoin_address().map(|address| {
+                    self.crypto
+                        .bitcoin_address_lookup_hash(address.as_bytes())
+                        .as_bytes()
+                        .to_vec()
+                })
+            })
+            .transpose()
+    }
+
     fn decrypt_settlement_payment_record(
         &self,
         creator_hash: LookupHash,
@@ -1999,7 +2095,6 @@ impl MarketplacePreparationStore {
                     Some(activated_at),
                     Some(payment_deadline),
                     Some(payment_record_envelope),
-                    Some(address_hash),
                     Some(derivation_hash),
                     Some(stored_payment_status),
                     Some(stored_confirmations),
@@ -2008,7 +2103,6 @@ impl MarketplacePreparationStore {
                     row.activated_at,
                     row.payment_deadline,
                     row.payment_record_envelope.as_ref(),
-                    row.bitcoin_address_lookup_hash.as_deref(),
                     row.derivation_index_lookup_hash.as_deref(),
                     row.payment_status.as_deref(),
                     row.confirmation_count,
@@ -2040,11 +2134,7 @@ impl MarketplacePreparationStore {
                 )
                 .map_err(|_| PersistenceError::CorruptOrMissing)?;
                 if payment != expected_payment
-                    || address_hash
-                        != self
-                            .crypto
-                            .bitcoin_address_lookup_hash(payment.bitcoin_address()?.as_bytes())
-                            .as_bytes()
+                    || row.bitcoin_address_lookup_hash != self.settlement_address_hash(&payment)?
                     || derivation_hash
                         != self
                             .crypto
@@ -2066,12 +2156,18 @@ impl MarketplacePreparationStore {
                     .as_deref()
                     .map(parse_request_state)
                     .transpose()?;
-                let bitcoin = self.status_bitcoin(
-                    creator_hash,
-                    &row,
-                    payment.bitcoin_required_amount()?,
-                    activated_at,
-                )?;
+                let bitcoin = if payment.has_bitcoin() {
+                    self.status_bitcoin(
+                        creator_hash,
+                        &row,
+                        payment.bitcoin_required_amount()?,
+                        activated_at,
+                    )?
+                } else if row.observation_id.is_some() {
+                    return Err(PersistenceError::CorruptOrMissing);
+                } else {
+                    None
+                };
                 let projected_payment_status = match bitcoin.as_ref() {
                     None => "undetected",
                     Some(bitcoin) if !bitcoin.present => "undetected",
@@ -2214,17 +2310,16 @@ impl MarketplacePreparationStore {
                 &EncryptedEnvelope::from_bytes(row.preparation_envelope),
             )
             .map_err(|_| PersistenceError::CorruptOrMissing)?;
-        let envelope: PreparationEnvelopeV1 =
-            postcard::from_bytes(&plaintext).map_err(|_| PersistenceError::CorruptOrMissing)?;
+        let envelope = PreparationEnvelope::decode(&plaintext)?;
         let stored_ttl = i64::try_from(envelope.prepare_ttl_seconds)
             .map(Duration::seconds)
             .map_err(|_| PersistenceError::CorruptOrMissing)?;
-        if envelope.version != 1
+        if envelope.version != 2
             || envelope.operation_id != input.operation_id
             || envelope.request_binding != input.request_binding
             || envelope.reader != input.reader.to_string()
             || envelope.reference != input.reference
-            || envelope.total_sats != input.total_sats
+            || envelope.terms != *input.terms
             || envelope.payment_window_seconds != input.payment_window_seconds
             || envelope.prepared_at != row.prepared_at
             || envelope.prepare_expires_at != row.prepare_expires_at
@@ -2233,15 +2328,16 @@ impl MarketplacePreparationStore {
         {
             return Err(PersistenceError::CorruptOrMissing);
         }
-        validate_intent(
+        let quote = validate_intent(
             &envelope.payment_request_intent,
             input.reader,
             input.reference,
-            input.total_sats,
+            &envelope.terms,
         )?;
         Ok(MarketplacePreparationResult {
             invoice_id: row.id,
-            total_sats: envelope.total_sats,
+            terms: envelope.terms,
+            quote,
             prepared_at: row.prepared_at,
             prepare_expires_at: row.prepare_expires_at,
             replayed: true,
@@ -2302,24 +2398,23 @@ fn validate_intent(
     intent: &DeliveryIntentV1,
     reader: &ReaderPubky,
     reference: &str,
-    total_sats: u64,
-) -> Result<(), PersistenceError> {
+    terms: &MarketplaceTerms,
+) -> Result<MarketplaceQuote, PersistenceError> {
     intent
         .validate()
         .map_err(|_| PersistenceError::InvalidInput)?;
     if parse_reader(intent.reader_pubky()).ok().as_ref() != Some(reader) {
         return Err(PersistenceError::InvalidInput);
     }
-    let terms = intent.terms().map_err(|_| PersistenceError::InvalidInput)?;
-    let expected = format!(
-        "{}.{:08}",
-        total_sats / 100_000_000,
-        total_sats % 100_000_000
-    );
-    if terms.asset != "btc" || terms.amount != expected || terms.payment_reference != reference {
+    if intent
+        .terms()
+        .map_err(|_| PersistenceError::InvalidInput)?
+        .payment_reference
+        != reference
+    {
         return Err(PersistenceError::InvalidInput);
     }
-    Ok(())
+    MarketplaceQuote::from_intent(intent, terms)
 }
 
 fn stored_hash(bytes: &[u8]) -> Result<LookupHash, PersistenceError> {

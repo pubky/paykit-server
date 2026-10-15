@@ -19,12 +19,17 @@ use paykit_server::{
             RegistryDiscoveryError, RegistryRetryDelay, SessionValidationError, SessionValidator,
         },
         marketplace_preparation::{
-            MarketplacePreparationPersistence, PrepareMarketplaceError, PrepareMarketplaceRequest,
-            PrepareMarketplaceService,
+            MarketplacePreparationPersistence, MissingSellerRails, PrepareMarketplaceError,
+            PrepareMarketplaceRequest, PrepareMarketplaceService,
         },
+        marketplace_terms::MarketplaceQuote,
+        setup_status::AcceptedAsset,
     },
     config::{BitcoinNetwork, Config, ConfigEnvironment},
-    domain::locks::{CreatorPubky, parse_creator, parse_reader},
+    domain::{
+        invoice::CriterionAsset,
+        locks::{CreatorPubky, parse_creator, parse_reader},
+    },
     http::{
         auth::{SignedServiceAuth, signature_preimage},
         marketplace_preparation::marketplace_preparation_router,
@@ -99,7 +104,9 @@ fn request(window: u64) -> PrepareMarketplaceRequest {
         creator: parse_creator(CREATOR).unwrap(),
         reader: parse_reader(&reader()).unwrap(),
         reference: REFERENCE.into(),
-        amount_sats: 50_000,
+        amount: 50_000,
+        asset: CriterionAsset::Btc,
+        accepted_assets: vec![AcceptedAsset::Btc],
         operation_id: "marketplace-payment:order-1:attempt-1".into(),
         payment_window_seconds: window,
         description: None,
@@ -340,7 +347,8 @@ impl MarketplacePreparationPersistence for FakeStore {
         }
         Ok(MarketplacePreparationResult::new(
             uuid::Uuid::from_u128(1),
-            input.total_sats,
+            input.terms.clone(),
+            MarketplaceQuote::new(vec![(AcceptedAsset::Btc, input.terms.amount())], Vec::new()),
             time::OffsetDateTime::UNIX_EPOCH,
             time::OffsetDateTime::UNIX_EPOCH + time::Duration::minutes(15),
             self.preflight == MarketplacePreparationPreflight::ExactReplay,
@@ -383,7 +391,8 @@ impl MarketplacePreparationPersistence for ConcurrentStore {
         }
         Ok(MarketplacePreparationResult::new(
             uuid::Uuid::from_u128(1),
-            input.total_sats,
+            input.terms.clone(),
+            MarketplaceQuote::new(vec![(AcceptedAsset::Btc, input.terms.amount())], Vec::new()),
             time::OffsetDateTime::UNIX_EPOCH,
             time::OffsetDateTime::UNIX_EPOCH + time::Duration::minutes(15),
             replayed,
@@ -508,7 +517,9 @@ async fn omitted_description_keeps_exact_legacy_binding() {
     deps.service.prepare(request(86_400)).await.unwrap();
 
     let expected = serde_json_canonicalizer::to_vec(&serde_json::json!({
-        "amount_sats": 50_000,
+        "accepted_assets": ["BTC"],
+        "amount": "50000",
+        "asset": "BTC",
         "creator": CREATOR,
         "operation_id": "marketplace-payment:order-1:attempt-1",
         "payment_window_seconds": 86_400,
@@ -780,18 +791,20 @@ async fn missing_seller_bitcoin_details_is_typed_setup_pending() {
 
     assert_eq!(
         service.prepare(request(86_400)).await,
-        Err(PrepareMarketplaceError::SellerSetupPending)
+        Err(PrepareMarketplaceError::SellerSetupPending(
+            MissingSellerRails::Bitcoin
+        ))
     );
 }
 
 #[tokio::test]
 async fn invalid_or_over_cap_window_fails_before_preflight() {
-    for window in [0, 86_401] {
+    for (window, expected) in [
+        (0, PrepareMarketplaceError::InvalidRequest),
+        (86_401, PrepareMarketplaceError::PaymentWindowExceedsCap),
+    ] {
         let deps = service(MarketplacePreparationPreflight::New);
-        assert_eq!(
-            deps.service.prepare(request(window)).await,
-            Err(PrepareMarketplaceError::InvalidRequest)
-        );
+        assert_eq!(deps.service.prepare(request(window)).await, Err(expected));
         assert_eq!(deps.store.prepare_calls.load(Ordering::SeqCst), 0);
         assert_eq!(deps.session.calls.load(Ordering::SeqCst), 0);
     }
@@ -900,7 +913,9 @@ poll_interval = "5s"
 
 fn body(extra: bool) -> Vec<u8> {
     let mut value = serde_json::json!({
-        "amount_sats": 50_000,
+        "accepted_assets": ["BTC"],
+        "amount": "50000",
+        "asset": "BTC",
         "creator": CREATOR,
         "operation_id": "marketplace-payment:order-1:attempt-1",
         "payment_window_seconds": 86_400,
@@ -958,7 +973,11 @@ async fn signed_prepare_route_has_closed_request_and_response() {
             "invoice_id": "00000000-0000-0000-0000-000000000001",
             "prepare_expires_at": "1970-01-01T00:15:00Z",
             "state": "prepared",
-            "total_sats": 50_000,
+            "amount": "50000",
+            "asset": "BTC",
+            "accepted_assets": ["BTC"],
+            "payment_amounts": {"BTC": "50000"},
+            "rates": {},
         })
     );
 

@@ -11,7 +11,10 @@ use paykit_server::{
     bitcoin::{ObservationTarget, ObservedOutput},
     config::BitcoinNetwork,
     crypto::Crypto,
-    domain::locks::{CreatorPubky, ReaderPubky, parse_creator, parse_reader},
+    domain::{
+        invoice::CriterionAsset,
+        locks::{CreatorPubky, ReaderPubky, parse_creator, parse_reader},
+    },
     persistence::{
         CreatorCredentials, CreatorStore, MarketplaceActivationInput, MarketplacePreparationInput,
         MarketplacePreparationPayloadFactory, MarketplacePreparationPayloads,
@@ -112,7 +115,7 @@ async fn prepare_with_window(
             reference: REFERENCE,
             operation_id: "marketplace-payment:order-1:attempt-1",
             request_binding: b"request-one",
-            total_sats: 100,
+            terms: common::btc_terms(100),
             payment_window_seconds,
             prepare_ttl_seconds: 15 * 60,
             payloads: &Payloads,
@@ -185,7 +188,8 @@ async fn status_scopes_owner_and_projects_publication_and_resolution() {
         .activate(MarketplaceActivationInput {
             creator: &creator(),
             invoice_id,
-            total_sats: 100,
+            amount: 100,
+            asset: CriterionAsset::Btc,
             proposal_acceptance_window: Duration::from_secs(30 * 60),
         })
         .await
@@ -284,7 +288,8 @@ async fn bitcoin_evidence_keeps_identity_amount_and_first_observation_immutable(
         .activate(MarketplaceActivationInput {
             creator: &creator(),
             invoice_id,
-            total_sats: 100,
+            amount: 100,
+            asset: CriterionAsset::Btc,
             proposal_acceptance_window: Duration::from_secs(30 * 60),
         })
         .await
@@ -569,7 +574,8 @@ async fn malformed_active_relations_fail_closed() {
         .activate(MarketplaceActivationInput {
             creator: &creator(),
             invoice_id,
-            total_sats: 100,
+            amount: 100,
+            asset: CriterionAsset::Btc,
             proposal_acceptance_window: Duration::from_secs(30 * 60),
         })
         .await
@@ -606,7 +612,8 @@ async fn lifecycle_states_project_and_exception_states_fail_closed() {
             .activate(MarketplaceActivationInput {
                 creator: &creator(),
                 invoice_id,
-                total_sats: 100,
+                amount: 100,
+                asset: CriterionAsset::Btc,
                 proposal_acceptance_window: Duration::from_secs(30 * 60),
             })
             .await
@@ -645,7 +652,8 @@ async fn lifecycle_states_project_and_exception_states_fail_closed() {
             .activate(MarketplaceActivationInput {
                 creator: &creator(),
                 invoice_id,
-                total_sats: 100,
+                amount: 100,
+                asset: CriterionAsset::Btc,
                 proposal_acceptance_window: Duration::from_secs(30 * 60),
             })
             .await
@@ -707,7 +715,8 @@ async fn deadline_expiry_underpayment_and_late_match_are_projected() {
         .activate(MarketplaceActivationInput {
             creator: &creator(),
             invoice_id,
-            total_sats: 100,
+            amount: 100,
+            asset: CriterionAsset::Btc,
             proposal_acceptance_window: Duration::from_secs(30 * 60),
         })
         .await
@@ -836,7 +845,8 @@ async fn observation_waits_for_creator_before_locking_preparation() {
         .activate(MarketplaceActivationInput {
             creator: &creator(),
             invoice_id,
-            total_sats: 100,
+            amount: 100,
+            asset: CriterionAsset::Btc,
             proposal_acceptance_window: Duration::from_secs(30 * 60),
         })
         .await
@@ -896,7 +906,8 @@ async fn observation_evidence_rejects_direct_rewrite_and_delete() {
         .activate(MarketplaceActivationInput {
             creator: &creator(),
             invoice_id,
-            total_sats: 100,
+            amount: 100,
+            asset: CriterionAsset::Btc,
             proposal_acceptance_window: Duration::from_secs(30 * 60),
         })
         .await
