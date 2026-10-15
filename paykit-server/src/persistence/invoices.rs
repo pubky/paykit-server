@@ -147,6 +147,17 @@ impl InvoicePaymentRecordV1 {
         self.derivation_index
     }
 
+    /// The shared USDT receiving address this record offered, if any.
+    pub(crate) fn usdt_address(&self) -> Result<Option<UsdtAddress>, PersistenceError> {
+        self.usdt
+            .as_ref()
+            .map(|destination| {
+                UsdtAddress::try_from(destination.address.clone())
+                    .map_err(|_| PersistenceError::CorruptOrMissing)
+            })
+            .transpose()
+    }
+
     pub(crate) fn has_bitcoin(&self) -> bool {
         self.bitcoin.is_some()
     }

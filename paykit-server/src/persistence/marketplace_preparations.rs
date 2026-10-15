@@ -8,6 +8,8 @@ use thiserror::Error;
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
+mod usdt;
+
 use crate::{
     application::{
         marketplace_status::{
@@ -809,7 +811,7 @@ impl MarketplacePreparationStore {
                 return Err(PersistenceError::CorruptOrMissing);
             }
         }
-        Ok(())
+        self.scan_usdt_observation_integrity().await
     }
 
     pub(crate) async fn apply_bitcoin_observation_batch(
@@ -1993,6 +1995,17 @@ impl MarketplacePreparationStore {
         invoice_id: Uuid,
     ) -> Result<Option<MarketplaceInvoiceStatus>, PersistenceError> {
         let creator_hash = self.crypto.lookup_hash(creator.to_string().as_bytes());
+        // One snapshot for the settlement row and every receipt, so a status read never
+        // shows a proof that a concurrent commit has only half applied.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
         let row = sqlx::query_as::<_, MarketplaceStatusRow>(
             "SELECT preparation.id, creators.creator_lookup_hash,
                     preparation.preparation_envelope, preparation.state,
@@ -2042,7 +2055,7 @@ impl MarketplacePreparationStore {
         )
         .bind(invoice_id)
         .bind(creator_hash.as_bytes().as_slice())
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
         let Some(row) = row else {
@@ -2065,6 +2078,8 @@ impl MarketplacePreparationStore {
             resolved_at: row.resolved_at,
         };
         let preparation = self.decode_lifecycle_envelope(creator_hash, &lifecycle)?;
+        let accepted_assets = preparation.terms.accepted_assets().to_vec();
+        let payment_amounts = preparation.quote()?.payment_amounts().to_vec();
         let outcome = row
             .business_outcome
             .as_deref()
@@ -2099,16 +2114,19 @@ impl MarketplacePreparationStore {
                 {
                     return Err(PersistenceError::CorruptOrMissing);
                 }
-                Ok(Some(MarketplaceInvoiceStatus::inactive(
-                    row.id,
-                    if row.state == "prepared" {
-                        "prepared"
-                    } else {
-                        "voided"
-                    },
-                    outcome,
-                    row.resolved_at,
-                )))
+                Ok(Some(
+                    MarketplaceInvoiceStatus::inactive(
+                        row.id,
+                        if row.state == "prepared" {
+                            "prepared"
+                        } else {
+                            "voided"
+                        },
+                        outcome,
+                        row.resolved_at,
+                    )
+                    .with_offer(accepted_assets, payment_amounts),
+                ))
             }
             "active" => {
                 let (
@@ -2212,27 +2230,65 @@ impl MarketplacePreparationStore {
                 {
                     return Err(PersistenceError::CorruptOrMissing);
                 }
-                let paid_on_time = bitcoin.as_ref().is_some_and(|bitcoin| bitcoin.paid_on_time);
+                let usdt = self
+                    .status_usdt(
+                        &mut tx,
+                        creator_hash,
+                        row.id,
+                        &payment,
+                        activated_at,
+                        payment_deadline,
+                    )
+                    .await?;
+                // Each rail is judged alone: partial payments are never combined, and
+                // the rail whose receipt qualified first is the paid asset.
+                let bitcoin_paid = bitcoin
+                    .as_ref()
+                    .filter(|bitcoin| bitcoin.paid_on_time)
+                    .map(|bitcoin| (bitcoin.first_observed_at, AcceptedAsset::Btc));
+                let usdt_paid = usdt
+                    .as_ref()
+                    .filter(|usdt| usdt.paid_on_time)
+                    .map(|usdt| (usdt.observed_at, AcceptedAsset::Usdt));
+                let paid_asset = [bitcoin_paid, usdt_paid]
+                    .into_iter()
+                    .flatten()
+                    .min()
+                    .map(|(_, asset)| asset);
+                let paid_on_time = paid_asset.is_some();
                 let deadline_passed = row.observed_at > payment_deadline
                     || bitcoin
                         .as_ref()
-                        .is_some_and(|bitcoin| bitcoin.first_observed_at > payment_deadline);
+                        .is_some_and(|bitcoin| bitcoin.first_observed_at > payment_deadline)
+                    || usdt
+                        .as_ref()
+                        .is_some_and(|usdt| usdt.observed_at > payment_deadline);
                 let payment_state = if deadline_passed && !paid_on_time {
                     "expired"
+                } else if projected_payment_status == "confirmed"
+                    || usdt.as_ref().is_some_and(|usdt| usdt.confirmations > 0)
+                {
+                    "confirmed"
+                } else if projected_payment_status == "detected" || usdt.is_some() {
+                    "detected"
                 } else {
-                    projected_payment_status
+                    "undetected"
                 };
-                Ok(Some(MarketplaceInvoiceStatus::active(
-                    row.id,
-                    publication,
-                    request_state,
-                    payment_state,
-                    activated_at,
-                    payment_deadline,
-                    bitcoin,
-                    outcome,
-                    row.resolved_at,
-                )))
+                Ok(Some(
+                    MarketplaceInvoiceStatus::active(
+                        row.id,
+                        publication,
+                        request_state,
+                        payment_state,
+                        activated_at,
+                        payment_deadline,
+                        bitcoin,
+                        outcome,
+                        row.resolved_at,
+                    )
+                    .with_offer(accepted_assets, payment_amounts)
+                    .with_usdt(usdt, paid_asset),
+                ))
             }
             _ => Err(PersistenceError::CorruptOrMissing),
         }

@@ -748,7 +748,11 @@ async fn creator_adapter(
     let creator = credentials.creator().clone();
     let sessions = workers.sessions.provider(&creator);
     PaykitAdapter::new(creator_id, sessions, &workers.paykit)
-        .map(|adapter| adapter.with_usdt(workers.invoices.clone(), workers.usdt.clone()))
+        .map(|adapter| {
+            adapter
+                .with_usdt(workers.invoices.clone(), workers.usdt.clone())
+                .with_marketplace_usdt(workers.marketplace_preparations.clone())
+        })
         .map_err(|_| AdapterBuildError::Permanent)
 }
 
