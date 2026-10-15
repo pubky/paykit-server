@@ -121,9 +121,16 @@ Decision PK1 (John, 15 Oct 2026): one Paykit request carries every asset the sel
 - Preparation envelope version 2 stores the offered terms. Version 1 envelopes written by rc11 to rc16 still decode as `{BTC, total_sats, [BTC]}` so rows prepared or activated before the upgrade keep activating, observing and reporting status. A version 1 `operation_id` cannot replay under the new binding and is an `operation_conflict`.
 - Migration `0017_marketplace_optional_bitcoin_rail.sql` makes the settlement's Bitcoin address optional: a request that offers only USDT activates with no address to claim or watch, and its settlement is never an Electrum target.
 
+## Marketplace USDT settlement and status (PK1, second slice)
+
+- Migration `0018_marketplace_usdt_observations.sql` gives `usdt_observations` the Marketplace owner column (`marketplace_preparation_id`, exactly one of invoice or preparation), as `0015` did for Bitcoin, and makes owner and transfer identity immutable. Receipt facts are AEAD-bound to the settlement (`marketplace-usdt-observation`).
+- Verified `erc20-transfer-eip712` proofs reach active Marketplace requests that offer USDT through the unchanged #47 attestation and canonical Arbitrum receipt checks. Attribution is the request's SDK lifecycle record; the background reconciliation pass observes it (Marketplace has no per-request status-read refresh, as for Bitcoin). A transfer already owned by another request or a Locks invoice is ignored, and the Locks path now treats a Marketplace-owned transfer the same way.
+- Status adds `accepted_assets`, `payment_amounts` (every state), `usdt_arbitrum` and `paid_asset`. `usdt_arbitrum` carries `tx_hash`, `observed_amount`, `confirmations`, `amount_matched`, `paid_on_time`, `finalized`, and is `null` when no receipt is present, including after a reorg. The window is block time within `[activation second, deadline]`.
+- `paid_asset` is the rail whose receipt is `amount_matched` and `paid_on_time` (earliest first), else `null`. Both rail objects stay populated on a cross-rail double payment; partial payments across rails are never combined. `payment_state` follows Locks: `confirmed` with any included payment, `detected` with a present unconfirmed receipt, `expired` after the deadline with no qualifying payment.
+- The settlement row and every receipt are read in one repeatable-read snapshot, so a status read overlapping a proof commit sees the request entirely before or entirely after it.
+
 ## Explicitly deferred follow-up and release hold
 
-- `usdt_observations` remains unchanged in this slice; Marketplace USDT settlement ownership is the next slice.
 - Marketplace consumer adaptation and exact-revision cross-service status fixtures remain separate follow-up work.
 - Marketplace must reject activation after its Marketplace-owned inventory hold expires; that cross-service timing guard belongs to the Marketplace consumer follow-up.
 - PR #67 may remain a reviewed draft, but must not merge to `master` until Bitcoin observation/status, Marketplace hold-boundary work, and the accepted base-stack-stability gate are complete. No deployment is authorized.
@@ -170,3 +177,11 @@ Decision PK1 (John, 15 Oct 2026): one Paykit request carries every asset the sel
 - The feed failing at activation does not affect activation; the stored rates are the ones proposed.
 - A 1,800 second window gives a 15 minute accept-by and a 30 minute payment deadline.
 - A BTC payment on a dual-asset request is matched against the converted sats; rc16 envelopes still activate and report status; a USDT-only request activates and is never an observation target.
+
+## Verification required for Marketplace USDT settlement and status
+
+- A verified proof on a dual-asset request reaches the status route (included, then finalized); a reorg returns `usdt_arbitrum: null` and the receipt returns with the block; a finalized receipt is never un-presented.
+- Underpaid, early, late and exact-deadline receipts; BTC payment on a dual request; a cross-rail double payment keeping both observations with the earlier rail as `paid_asset` in both orders; partial payments across rails never combined.
+- One transfer, one request: a second request and a Locks invoice cannot take an owned receipt; a request that did not offer USDT ignores a USDT proof; a USDT-only request settles by its proof alone.
+- A status read racing a proof submission sees only the state before or after it.
+- The integrity scan authenticates Marketplace receipts and a tampered receipt fails the status read closed; `0018` upgrades existing Locks receipts untouched.
