@@ -20,6 +20,7 @@ pub enum OutboxRetryClass {
     ReaderAuthorizationMissing,
     ReaderAuthorizationInvalid,
     LinkEstablishment,
+    LinkDependency,
     LinkPending,
     PaymentRequestProposal,
     PaymentRequestCancellation,
@@ -38,6 +39,7 @@ impl OutboxRetryClass {
             Self::ReaderAuthorizationMissing => "reader_authorization_missing",
             Self::ReaderAuthorizationInvalid => "reader_authorization_invalid",
             Self::LinkEstablishment => "link_establishment",
+            Self::LinkDependency => "link_dependency",
             Self::LinkPending => "link_pending",
             Self::PaymentRequestProposal => "payment_request_proposal",
             Self::PaymentRequestCancellation => "payment_request_cancellation",
@@ -243,13 +245,18 @@ impl OutboxStore {
         self.reconciliation.wait().await
     }
 
-    /// Reports aggregate delivery availability without exposing row or Creator identifiers.
+    /// Reports durable systemic delivery failures without treating individual
+    /// Reader progress or retained terminal history as a global outage.
     pub async fn delivery_available(&self) -> Result<bool, PersistenceError> {
         sqlx::query_scalar(
             "SELECT NOT EXISTS ( \
                  SELECT 1 FROM outbox \
-                 WHERE status IN ('retryable', 'handed_off', 'permanently_failed') \
-                    OR (status = 'leased' AND error_class IS NOT NULL) \
+                 WHERE error_class IN ( \
+                     'adapter_unavailable', 'registry_fetch', \
+                     'reader_authorization_fetch', 'link_dependency', \
+                     'payment_request_proposal', \
+                     'payment_request_cancellation', 'reconciliation' \
+                 ) \
              )",
         )
         .fetch_one(&self.pool)
@@ -516,6 +523,18 @@ impl OutboxStore {
         DeliveryIntentV1::decode(&plaintext).map_err(|_| PersistenceError::CorruptOrMissing)
     }
 
+    /// Compares a proposal deadline with authoritative database time.
+    pub async fn proposal_expired(
+        &self,
+        deadline: OffsetDateTime,
+    ) -> Result<bool, PersistenceError> {
+        sqlx::query_scalar("SELECT $1 <= clock_timestamp()")
+            .bind(deadline)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|_| PersistenceError::Unavailable)
+    }
+
     /// Records the exact SDK enqueue result while the enqueue fence is live.
     pub async fn mark_handed_off(
         &self,
@@ -624,6 +643,14 @@ impl OutboxStore {
         claim: &ClaimedOutbox,
     ) -> Result<bool, PersistenceError> {
         self.transition(claim, "permanently_failed", Some("permanent"), None)
+            .await
+    }
+
+    pub async fn mark_proposal_expired(
+        &self,
+        claim: &ClaimedOutbox,
+    ) -> Result<bool, PersistenceError> {
+        self.transition(claim, "permanently_failed", Some("proposal_expired"), None)
             .await
     }
 
@@ -799,6 +826,7 @@ mod tests {
                 OutboxRetryClass::ReaderAuthorizationMissing,
                 OutboxRetryClass::ReaderAuthorizationInvalid,
                 OutboxRetryClass::LinkEstablishment,
+                OutboxRetryClass::LinkDependency,
                 OutboxRetryClass::LinkPending,
                 OutboxRetryClass::PaymentRequestProposal,
                 OutboxRetryClass::PaymentRequestCancellation,
@@ -815,6 +843,7 @@ mod tests {
                 "reader_authorization_missing",
                 "reader_authorization_invalid",
                 "link_establishment",
+                "link_dependency",
                 "link_pending",
                 "payment_request_proposal",
                 "payment_request_cancellation",

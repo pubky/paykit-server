@@ -69,6 +69,7 @@ impl RetryableHandoffCause {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HandoffFailure {
     Retryable(RetryableHandoffStage),
+    ProposalExpired,
     Permanent,
 }
 
@@ -78,6 +79,25 @@ fn at_stage(error: HandoffError, stage: RetryableHandoffStage) -> HandoffFailure
             HandoffFailure::Retryable(RetryableHandoffStage::LinkPending)
         }
         HandoffError::Retryable(_) => HandoffFailure::Retryable(stage),
+        HandoffError::Permanent => HandoffFailure::Permanent,
+    }
+}
+
+fn at_link_stage(error: HandoffError) -> HandoffFailure {
+    match error {
+        HandoffError::Retryable(RetryableHandoffCause::LinkPending) => {
+            HandoffFailure::Retryable(RetryableHandoffStage::LinkPending)
+        }
+        HandoffError::Retryable(
+            RetryableHandoffCause::Storage
+            | RetryableHandoffCause::Identity
+            | RetryableHandoffCause::Transport
+            | RetryableHandoffCause::PaymentAdapter
+            | RetryableHandoffCause::Other,
+        ) => HandoffFailure::Retryable(RetryableHandoffStage::LinkDependency),
+        HandoffError::Retryable(_) => {
+            HandoffFailure::Retryable(RetryableHandoffStage::LinkEstablishment)
+        }
         HandoffError::Permanent => HandoffFailure::Permanent,
     }
 }
@@ -128,8 +148,7 @@ pub trait Adapter: Send + Sync {
         claim: &ClaimedOutbox,
         intent: &DeliveryIntentV1,
     ) -> Result<HandoffResult, HandoffFailure> {
-        check_claim(Some((store, claim))).await?;
-        self.execute_handoff(claim.id(), intent).await
+        claimed_handoff_steps(self, intent, store, claim).await
     }
 
     /// Executes one complete semantic handoff. Concrete adapters may override
@@ -195,8 +214,22 @@ pub(crate) async fn claimed_handoff_steps<A: Adapter + ?Sized>(
     handoff_steps_with_claim(adapter, claim.id(), intent, Some((store, claim))).await
 }
 
-async fn check_claim(claim: Option<(&OutboxStore, &ClaimedOutbox)>) -> Result<(), HandoffFailure> {
+async fn check_claim(
+    claim: Option<(&OutboxStore, &ClaimedOutbox)>,
+    proposal_expires_at: Option<time::OffsetDateTime>,
+) -> Result<(), HandoffFailure> {
     if let Some((store, claim)) = claim {
+        if let Some(deadline) = proposal_expires_at {
+            match store.proposal_expired(deadline).await {
+                Ok(true) => return Err(HandoffFailure::ProposalExpired),
+                Ok(false) => {}
+                Err(_) => {
+                    return Err(HandoffFailure::Retryable(
+                        RetryableHandoffStage::AdapterUnavailable,
+                    ));
+                }
+            }
+        }
         match store.claim_handoff_eligible(claim).await {
             Ok(true) => {}
             Ok(false) => return Err(HandoffFailure::Permanent),
@@ -217,9 +250,12 @@ async fn handoff_steps_with_claim<A: Adapter + ?Sized>(
     claim: Option<(&OutboxStore, &ClaimedOutbox)>,
 ) -> Result<HandoffResult, HandoffFailure> {
     intent.validate().map_err(|_| HandoffFailure::Permanent)?;
+    let proposal_expires_at = intent
+        .proposal_expires_at()
+        .map_err(|_| HandoffFailure::Permanent)?;
     let payment_request_id = paykit_lib::PaymentRequestId::new(outbox_id.to_string())
         .map_err(|_| HandoffFailure::Permanent)?;
-    check_claim(claim).await?;
+    check_claim(claim, proposal_expires_at).await?;
     let registry = adapter
         .fetch_registry(intent.reader_pubky())
         .await
@@ -232,6 +268,7 @@ async fn handoff_steps_with_claim<A: Adapter + ?Sized>(
             RetryableHandoffStage::RegistryIncapable,
         ));
     }
+    check_claim(claim, proposal_expires_at).await?;
     // Retryable like an incapable registry: the Reader can still publish or fix it.
     match adapter
         .fetch_authorization(intent.reader_pubky())
@@ -250,12 +287,12 @@ async fn handoff_steps_with_claim<A: Adapter + ?Sized>(
             ));
         }
     }
-    check_claim(claim).await?;
+    check_claim(claim, proposal_expires_at).await?;
     adapter
         .ensure_link_with_peer(intent.reader_pubky())
         .await
-        .map_err(|error| at_stage(error, RetryableHandoffStage::LinkEstablishment))?;
-    check_claim(claim).await?;
+        .map_err(at_link_stage)?;
+    check_claim(claim, proposal_expires_at).await?;
     match intent.operation() {
         DeliveryOperationV1::PaymentRequestProposal { terms } => adapter
             .propose_payment_request(intent.reader_pubky(), payment_request_id, terms)
@@ -345,6 +382,16 @@ where
                 .map(|transitioned| (transitioned, ProcessingHealth::PermanentFailure));
         }
     };
+    if let Some(deadline) = intent
+        .proposal_expires_at()
+        .map_err(|_| PersistenceError::CorruptOrMissing)?
+        && store.proposal_expired(deadline).await?
+    {
+        return store
+            .mark_proposal_expired(claim)
+            .await
+            .map(|transitioned| (transitioned, ProcessingHealth::Available));
+    }
     match execute(intent).await {
         Ok(result) => store
             .mark_handed_off(claim, &result)
@@ -357,6 +404,10 @@ where
                 .await
                 .map(|transitioned| (transitioned, ProcessingHealth::Retryable(delay)))
         }
+        Err(HandoffFailure::ProposalExpired) => store
+            .mark_proposal_expired(claim)
+            .await
+            .map(|transitioned| (transitioned, ProcessingHealth::Available)),
         Err(HandoffFailure::Permanent) => store
             .mark_permanently_failed(claim)
             .await

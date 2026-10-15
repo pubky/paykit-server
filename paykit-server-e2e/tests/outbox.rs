@@ -1,11 +1,14 @@
 use std::{
     collections::VecDeque,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
 use async_trait::async_trait;
-use paykit_lib::PaykitAppRegistry;
+use paykit_lib::{PaykitApp, PaykitAppCapabilities, PaykitAppId, PaykitAppRegistry};
 use paykit_sdk::{
     LinkedPeerState, OutboundPrivateMessageStatus, PaykitIdentitySecretKey, PubkyLocalSecretKey,
     PubkyPublicKey, PubkySessionBootstrap, StorageAdapter,
@@ -27,6 +30,7 @@ use paykit_server::{
 };
 use paykit_server_e2e::postgres::TestDatabase;
 use pubky_testnet::{EphemeralTestnet, pubky::Keypair};
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 mod common;
@@ -36,6 +40,13 @@ mod sdk_fixtures;
 const CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
 
 async fn queued_invoice(database: &TestDatabase) -> OutboxStore {
+    queued_invoice_with_proposal_window(database, 3600).await
+}
+
+async fn queued_invoice_with_proposal_window(
+    database: &TestDatabase,
+    proposal_acceptance_seconds: u64,
+) -> OutboxStore {
     run_migrations(database.pool()).await.unwrap();
     let crypto = Arc::new(Crypto::from_master_key(&[7; 32]).unwrap());
     let creator = creator();
@@ -63,7 +74,7 @@ async fn queued_invoice(database: &TestDatabase) -> OutboxStore {
             invoice_payloads: &Payloads {
                 reader: reader.clone(),
             },
-            proposal_acceptance_seconds: 3600,
+            proposal_acceptance_seconds,
             payment_window_seconds: 86400,
         })
         .await
@@ -213,6 +224,376 @@ async fn pending_links_reset_failure_backoff_without_resetting_attempts() {
             .await
             .unwrap()
     );
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn expired_proposal_becomes_retained_terminal_work_without_adapter_retry() {
+    let database = TestDatabase::create().await;
+    let outbox = queued_invoice_with_proposal_window(&database, 1).await;
+    let deadline: OffsetDateTime =
+        sqlx::query_scalar("SELECT proposal_expires_at FROM invoices LIMIT 1")
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    let wait_seconds: f64 = sqlx::query_scalar(
+        "SELECT GREATEST(EXTRACT(EPOCH FROM ($1 - clock_timestamp())), 0)::DOUBLE PRECISION",
+    )
+    .bind(deadline)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_secs_f64(wait_seconds + 0.05)).await;
+
+    drop(outbox);
+    let outbox = OutboxStore::new(
+        database.pool(),
+        Arc::new(Crypto::from_master_key(&[7; 32]).unwrap()),
+    );
+    let claim = outbox
+        .claim(Uuid::new_v4(), 1, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .remove(0);
+    let adapter = ReconciliationAdapter {
+        statuses: Mutex::new(VecDeque::new()),
+    };
+    assert!(
+        process_claim(&outbox, &adapter, &claim, Duration::ZERO)
+            .await
+            .unwrap()
+    );
+
+    let state: (String, Option<String>) =
+        sqlx::query_as("SELECT status, error_class FROM outbox WHERE id = $1")
+            .bind(claim.id())
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        state,
+        ("permanently_failed".into(), Some("proposal_expired".into()))
+    );
+    assert!(
+        outbox
+            .claim(Uuid::new_v4(), 1, Duration::from_secs(30))
+            .await
+            .unwrap()
+            .is_empty(),
+        "an expired proposal was retried"
+    );
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn proposal_expiry_boundary_is_inclusive_in_database_time() {
+    let database = TestDatabase::create().await;
+    let outbox = queued_invoice(&database).await;
+    let boundary: OffsetDateTime = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+    assert!(outbox.proposal_expired(boundary).await.unwrap());
+
+    let future: OffsetDateTime =
+        sqlx::query_scalar("SELECT clock_timestamp() + INTERVAL '1 minute'")
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert!(!outbox.proposal_expired(future).await.unwrap());
+    database.cleanup().await;
+}
+
+struct LinkPendingAdapter {
+    calls: AtomicUsize,
+}
+
+fn capable_registry() -> PaykitAppRegistry {
+    let mut registry =
+        PaykitAppRegistry::new(Some(paykit_lib::derive_paykit_noise_public_key(&[8; 32])));
+    registry
+        .register_app(
+            PaykitAppId::new("bitkit").unwrap(),
+            PaykitApp::new(
+                "Bitkit",
+                PaykitAppCapabilities {
+                    private_payments: true,
+                    payment_requests: true,
+                    receipts: false,
+                    outgoing_payments: true,
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    registry
+}
+
+struct DeadlineCrossingAdapter {
+    link_calls: AtomicUsize,
+    proposal_calls: AtomicUsize,
+}
+
+#[async_trait]
+impl Adapter for DeadlineCrossingAdapter {
+    async fn fetch_registry(
+        &self,
+        _reader: &str,
+    ) -> Result<Option<PaykitAppRegistry>, HandoffError> {
+        Ok(Some(capable_registry()))
+    }
+
+    async fn fetch_authorization(
+        &self,
+        _reader: &str,
+    ) -> Result<paykit_server::application::create_invoice::ReaderAuthorization, HandoffError> {
+        Ok(paykit_server::application::create_invoice::ReaderAuthorization::Verified)
+    }
+
+    async fn ensure_link_with_peer(&self, _reader: &str) -> Result<(), HandoffError> {
+        self.link_calls.fetch_add(1, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        Ok(())
+    }
+
+    async fn propose_payment_request(
+        &self,
+        _reader: &str,
+        _payment_request_id: paykit_lib::PaymentRequestId,
+        _terms: &paykit_server::application::semantic_intent::PaymentTermsV1,
+    ) -> Result<HandoffResult, HandoffError> {
+        self.proposal_calls.fetch_add(1, Ordering::SeqCst);
+        unreachable!("expired proposal reached SDK proposal effect")
+    }
+
+    async fn cancel_payment_request(
+        &self,
+        _reader: &str,
+        _payment_request_id: &str,
+    ) -> Result<HandoffResult, HandoffError> {
+        unreachable!()
+    }
+
+    async fn outbound_status(
+        &self,
+        _outbound_message_id: u64,
+    ) -> Result<Option<OutboundPrivateMessageStatus>, HandoffError> {
+        unreachable!()
+    }
+}
+
+#[tokio::test]
+async fn expiry_during_link_work_prevents_the_proposal_effect() {
+    let database = TestDatabase::create().await;
+    let outbox = queued_invoice_with_proposal_window(&database, 1).await;
+    let claim = outbox
+        .claim(Uuid::new_v4(), 1, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .remove(0);
+    let adapter = DeadlineCrossingAdapter {
+        link_calls: AtomicUsize::new(0),
+        proposal_calls: AtomicUsize::new(0),
+    };
+
+    assert!(
+        process_claim(&outbox, &adapter, &claim, Duration::ZERO)
+            .await
+            .unwrap()
+    );
+    assert_eq!(adapter.link_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(adapter.proposal_calls.load(Ordering::SeqCst), 0);
+    let state: (String, Option<String>) =
+        sqlx::query_as("SELECT status, error_class FROM outbox WHERE id = $1")
+            .bind(claim.id())
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        state,
+        ("permanently_failed".into(), Some("proposal_expired".into()))
+    );
+    database.cleanup().await;
+}
+
+#[async_trait]
+impl Adapter for LinkPendingAdapter {
+    async fn execute_claimed_handoff(
+        &self,
+        _store: &OutboxStore,
+        _claim: &paykit_server::persistence::ClaimedOutbox,
+        _intent: &paykit_server::application::semantic_intent::DeliveryIntentV1,
+    ) -> Result<HandoffResult, paykit_server::workers::outbox::HandoffFailure> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Err(paykit_server::workers::outbox::HandoffFailure::Retryable(
+            OutboxRetryClass::LinkPending,
+        ))
+    }
+
+    async fn fetch_registry(
+        &self,
+        _reader: &str,
+    ) -> Result<Option<PaykitAppRegistry>, HandoffError> {
+        unreachable!()
+    }
+
+    async fn fetch_authorization(
+        &self,
+        _reader: &str,
+    ) -> Result<paykit_server::application::create_invoice::ReaderAuthorization, HandoffError> {
+        unreachable!()
+    }
+
+    async fn ensure_link_with_peer(&self, _reader: &str) -> Result<(), HandoffError> {
+        unreachable!()
+    }
+
+    async fn propose_payment_request(
+        &self,
+        _reader: &str,
+        _payment_request_id: paykit_lib::PaymentRequestId,
+        _terms: &paykit_server::application::semantic_intent::PaymentTermsV1,
+    ) -> Result<HandoffResult, HandoffError> {
+        unreachable!()
+    }
+
+    async fn cancel_payment_request(
+        &self,
+        _reader: &str,
+        _payment_request_id: &str,
+    ) -> Result<HandoffResult, HandoffError> {
+        unreachable!()
+    }
+
+    async fn outbound_status(
+        &self,
+        _outbound_message_id: u64,
+    ) -> Result<Option<OutboundPrivateMessageStatus>, HandoffError> {
+        unreachable!()
+    }
+}
+
+#[tokio::test]
+async fn repeated_link_pending_stops_at_authoritative_proposal_expiry() {
+    let database = TestDatabase::create().await;
+    let outbox = queued_invoice_with_proposal_window(&database, 2).await;
+    let adapter = LinkPendingAdapter {
+        calls: AtomicUsize::new(0),
+    };
+    for expected_calls in 1..=2 {
+        let claim = outbox
+            .claim(Uuid::new_v4(), 1, Duration::from_secs(30))
+            .await
+            .unwrap()
+            .remove(0);
+        assert!(
+            process_claim(&outbox, &adapter, &claim, Duration::ZERO)
+                .await
+                .unwrap()
+        );
+        assert_eq!(adapter.calls.load(Ordering::SeqCst), expected_calls);
+    }
+
+    let deadline: OffsetDateTime =
+        sqlx::query_scalar("SELECT proposal_expires_at FROM invoices LIMIT 1")
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    let wait_seconds: f64 = sqlx::query_scalar(
+        "SELECT GREATEST(EXTRACT(EPOCH FROM ($1 - clock_timestamp())), 0)::DOUBLE PRECISION",
+    )
+    .bind(deadline)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_secs_f64(wait_seconds + 0.05)).await;
+    let claim = outbox
+        .claim(Uuid::new_v4(), 1, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .remove(0);
+    assert!(
+        process_claim(&outbox, &adapter, &claim, Duration::ZERO)
+            .await
+            .unwrap()
+    );
+    assert_eq!(adapter.calls.load(Ordering::SeqCst), 2);
+    let state: (String, Option<String>) =
+        sqlx::query_as("SELECT status, error_class FROM outbox WHERE id = $1")
+            .bind(claim.id())
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        state,
+        ("permanently_failed".into(), Some("proposal_expired".into()))
+    );
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn individual_delivery_states_do_not_hide_systemic_delivery_failures() {
+    let database = TestDatabase::create().await;
+    let outbox = queued_invoice(&database).await;
+    let row_id: Uuid = sqlx::query_scalar("SELECT id FROM outbox LIMIT 1")
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+
+    for (status, error_class) in [
+        ("retryable", Some("registry_missing")),
+        ("retryable", Some("registry_incapable")),
+        ("retryable", Some("reader_authorization_missing")),
+        ("retryable", Some("reader_authorization_invalid")),
+        ("retryable", Some("link_establishment")),
+        ("retryable", Some("link_pending")),
+        ("handed_off", None),
+        ("handed_off", Some("reconciliation_pending")),
+        ("permanently_failed", Some("permanent")),
+        ("permanently_failed", Some("proposal_expired")),
+    ] {
+        sqlx::query(
+            "UPDATE outbox SET status = $2, error_class = $3,
+                    sdk_outbound_message_id = CASE WHEN $2 = 'handed_off' THEN '1' ELSE NULL END,
+                    sdk_event_id = CASE WHEN $2 = 'handed_off' THEN 'event-1' ELSE NULL END,
+                    sdk_payment_request_id = CASE WHEN $2 = 'handed_off' THEN 'request-1' ELSE NULL END
+             WHERE id = $1",
+        )
+        .bind(row_id)
+        .bind(status)
+        .bind(error_class)
+        .execute(database.pool())
+        .await
+        .unwrap();
+        assert!(
+            outbox.delivery_available().await.unwrap(),
+            "individual state {status}/{error_class:?} degraded global delivery"
+        );
+    }
+
+    for error_class in [
+        "adapter_unavailable",
+        "registry_fetch",
+        "reader_authorization_fetch",
+        "link_dependency",
+        "payment_request_proposal",
+        "payment_request_cancellation",
+        "reconciliation",
+    ] {
+        sqlx::query(
+            "UPDATE outbox SET status = 'retryable', error_class = $2
+             WHERE id = $1",
+        )
+        .bind(row_id)
+        .bind(error_class)
+        .execute(database.pool())
+        .await
+        .unwrap();
+        assert!(
+            !outbox.delivery_available().await.unwrap(),
+            "systemic failure {error_class} reported globally healthy"
+        );
+    }
     database.cleanup().await;
 }
 
@@ -573,8 +954,8 @@ async fn invoice_request_is_claimable_directly_and_preserves_delivery_fences() {
         .unwrap();
     assert_eq!(request_claims.len(), 1);
     assert!(
-        !outbox.delivery_available().await.unwrap(),
-        "leasing a retry must not report recovery"
+        outbox.delivery_available().await.unwrap(),
+        "one Reader's missing registry degraded global delivery"
     );
     sqlx::query("UPDATE outbox SET lease_expires_at = NOW() - INTERVAL '1 second' WHERE id = $1")
         .bind(request_claims[0].id())
