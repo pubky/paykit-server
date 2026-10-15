@@ -178,7 +178,8 @@ second of activation and closes at the deadline) and `finalized`. One receipt is
 never a sum of partial transfers, and a finalized receipt is never rewritten. A transfer
 belongs to one request for good. `paid_asset` is `"BTC"` or `"USDT"` for the rail whose
 receipt is `amount_matched` and `paid_on_time`, the earlier one if both qualify (Bitcoin by
-first observation, USDT by block time), else `null`. The two times come from different
+first observation, USDT by the block time of its earliest qualifying receipt, not of the
+receipt shown in `usdt_arbitrum`, which ranks by finality and confirmations), else `null`. The two times come from different
 clocks, this server's first sighting of the output and the chain's whole-second block
 time, so they order two qualifying payments only approximately: a close race can name
 either rail, and Bitcoin wins an exact tie. Consumers that must not depend on the order

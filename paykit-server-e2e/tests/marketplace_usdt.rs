@@ -489,33 +489,49 @@ async fn proof_before_activation_attribution_is_ignored_and_prepared_requests_ne
 }
 
 /// A status read overlapping the commit that applies a proof sees the request either
-/// entirely before it or entirely after it, never a half-applied mixture.
+/// entirely before it or entirely after it, never a half-applied mixture. The reads are
+/// bounded and synchronised, not timed: every reader has read before the proof is
+/// submitted and reads a fixed number of times after it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn status_reads_racing_a_proof_submission_never_see_a_half_applied_state() {
+    const READERS: usize = 3;
+    const READS_BEFORE_SUBMIT: usize = 3;
+    const READS_AFTER_SUBMIT: usize = 6;
     let rig = std::sync::Arc::new(rig(BOTH_RAILS, true).await);
     let rpc = Rpc::start().await;
     let request = offered(&rig, 0, &[]).await;
     chain(&rpc, |chain| chain.timestamp = request.at(10));
 
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let submitted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let early_reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut readers = Vec::new();
-    for _ in 0..3 {
+    for _ in 0..READERS {
         let rig = rig.clone();
-        let stop = stop.clone();
+        let submitted = submitted.clone();
+        let early_reads = early_reads.clone();
         let invoice = request.invoice.clone();
         readers.push(tokio::spawn(async move {
             let mut seen = Vec::new();
-            while !stop.load(Ordering::SeqCst) {
+            let mut counted = 0;
+            while !submitted.load(Ordering::SeqCst) {
+                seen.push(rig.status(&invoice).await);
+                if counted < READS_BEFORE_SUBMIT {
+                    counted += 1;
+                    early_reads.fetch_add(1, Ordering::SeqCst);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            for _ in 0..READS_AFTER_SUBMIT {
                 seen.push(rig.status(&invoice).await);
             }
-            seen.push(rig.status(&invoice).await);
             seen
         }));
     }
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    while early_reads.load(Ordering::SeqCst) < READERS * READS_BEFORE_SUBMIT {
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
     submit(&rig, &rpc, 0).await;
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-    stop.store(true, Ordering::SeqCst);
+    submitted.store(true, Ordering::SeqCst);
 
     let mut before = 0;
     let mut after = 0;
@@ -538,9 +554,171 @@ async fn status_reads_racing_a_proof_submission_never_see_a_half_applied_state()
                 assert_eq!(status["payment_state"], "undetected", "{status}");
             }
         }
+        assert!(
+            applied,
+            "every reader's reads after the submit see the proof"
+        );
     }
-    assert!(before > 0 && after > 0, "before={before} after={after}");
+    assert!(before >= READERS * READS_BEFORE_SUBMIT, "before={before}");
+    assert!(after >= READERS * READS_AFTER_SUBMIT, "after={after}");
     std::sync::Arc::into_inner(rig).unwrap().cleanup().await;
+}
+
+/// Facts of one receipt as the store keeps them encrypted, for receipts the fixtures
+/// cannot sign (the proof fixtures cover one transfer per request).
+#[derive(serde::Serialize)]
+struct ReceiptFacts {
+    identity: String,
+    amount: u64,
+    timestamp: OffsetDateTime,
+}
+
+fn extra_tx_hash(byte: u8) -> String {
+    format!("0x{}", format!("{byte:02x}").repeat(32))
+}
+
+/// Records a second, verified-looking receipt for the request straight through the
+/// storage layer, so two distinct USDT transfers can settle one request.
+async fn insert_receipt(
+    rig: &Rig,
+    request: &Offered,
+    byte: u8,
+    amount: u64,
+    block_offset: i64,
+    confirmations: i32,
+    finalized: bool,
+) -> String {
+    use paykit_server::crypto::EnvelopeContext;
+    let crypto = Crypto::from_master_key(&[7; 32]).unwrap();
+    let preparation = Uuid::parse_str(&request.invoice).unwrap();
+    let identity = format!("42161:{}:1", extra_tx_hash(byte));
+    let id = Uuid::new_v4();
+    let envelope = crypto
+        .encrypt(
+            &EnvelopeContext::usdt_observation_for_marketplace(
+                crypto.lookup_hash(creator().to_string().as_bytes()),
+                id,
+                preparation,
+            ),
+            &postcard::to_allocvec(&ReceiptFacts {
+                identity: identity.clone(),
+                amount,
+                timestamp: OffsetDateTime::from_unix_timestamp(request.at(block_offset)).unwrap(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO usdt_observations
+         (id, marketplace_preparation_id, transfer_lookup_hash, observation_envelope,
+          confirmations, present, finalized)
+         VALUES ($1, $2, $3, $4, $5, TRUE, $6)",
+    )
+    .bind(id)
+    .bind(preparation)
+    .bind(
+        crypto
+            .usdt_transfer_lookup_hash(identity.as_bytes())
+            .as_bytes()
+            .as_slice(),
+    )
+    .bind(envelope.as_bytes())
+    .bind(confirmations)
+    .bind(finalized)
+    .execute(rig.database.pool())
+    .await
+    .unwrap();
+    extra_tx_hash(byte)
+}
+
+/// Which rail was paid first is decided by the earliest qualifying receipt of each rail.
+/// A later receipt that ranks higher for display (final, more confirmations) must not
+/// move USDT behind Bitcoin.
+#[tokio::test]
+async fn earliest_qualifying_usdt_receipt_decides_the_paid_asset_not_the_displayed_one() {
+    // USDT receipt A, then Bitcoin, then a final, higher-ranked USDT receipt B.
+    let rig = rig(BOTH_RAILS, true).await;
+    let rpc = Rpc::start().await;
+    let request = offered(&rig, 0, &[]).await;
+    chain(&rpc, |chain| chain.timestamp = request.at(10));
+    submit(&rig, &rpc, 0).await;
+    observe_bitcoin(
+        &rig,
+        REQUIRED_SATS,
+        1,
+        1,
+        request.activated_at + time::Duration::seconds(20),
+    )
+    .await;
+    let b = insert_receipt(&rig, &request, 0xb1, REQUIRED_USDT, 30, 9, true).await;
+    let status = rig.status(&request.invoice).await;
+    assert_eq!(status["usdt_arbitrum"]["tx_hash"], b, "B is displayed");
+    assert_eq!(status["usdt_arbitrum"]["finalized"], true);
+    assert_eq!(status["bitcoin"]["paid_on_time"], true);
+    assert_eq!(
+        status["paid_asset"], "USDT",
+        "A, the earliest qualifying receipt, preceded Bitcoin"
+    );
+
+    // A is reorged out: the earliest qualifying USDT receipt is now B, after Bitcoin.
+    chain(&rpc, |chain| chain.reorg = true);
+    age_receipts(&rig).await;
+    submit(&rig, &rpc, 0).await;
+    let status = rig.status(&request.invoice).await;
+    assert_eq!(status["usdt_arbitrum"]["tx_hash"], b);
+    assert_eq!(status["paid_asset"], "BTC");
+
+    // A returns with its block.
+    chain(&rpc, |chain| chain.reorg = false);
+    age_receipts(&rig).await;
+    submit(&rig, &rpc, 0).await;
+    assert_eq!(rig.status(&request.invoice).await["paid_asset"], "USDT");
+    rig.cleanup().await;
+
+    // Bitcoin first: both USDT receipts come after it.
+    let rig = fresh_dual_rig().await;
+    let rpc = Rpc::start().await;
+    let request = offered(&rig, 0, &[]).await;
+    observe_bitcoin(
+        &rig,
+        REQUIRED_SATS,
+        1,
+        1,
+        request.activated_at + time::Duration::seconds(5),
+    )
+    .await;
+    chain(&rpc, |chain| chain.timestamp = request.at(10));
+    submit(&rig, &rpc, 0).await;
+    insert_receipt(&rig, &request, 0xb1, REQUIRED_USDT, 30, 9, true).await;
+    let status = rig.status(&request.invoice).await;
+    assert_eq!(status["paid_asset"], "BTC");
+    assert_eq!(status["usdt_arbitrum"]["paid_on_time"], true);
+    rig.cleanup().await;
+
+    // An earlier receipt that does not qualify never counts as the first payment.
+    let rig = fresh_dual_rig().await;
+    let rpc = Rpc::start().await;
+    let request = offered(&rig, 0, &[]).await;
+    chain(&rpc, |chain| {
+        transfer(chain, REQUIRED_USDT - 1);
+        chain.timestamp = request.at(10);
+    });
+    submit(&rig, &rpc, 0).await;
+    observe_bitcoin(
+        &rig,
+        REQUIRED_SATS,
+        1,
+        1,
+        request.activated_at + time::Duration::seconds(20),
+    )
+    .await;
+    insert_receipt(&rig, &request, 0xb1, REQUIRED_USDT, 30, 9, true).await;
+    assert_eq!(rig.status(&request.invoice).await["paid_asset"], "BTC");
+    rig.cleanup().await;
+}
+
+async fn fresh_dual_rig() -> Rig {
+    rig(BOTH_RAILS, true).await
 }
 
 #[tokio::test]

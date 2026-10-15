@@ -193,6 +193,10 @@ network = "mainnet"
 endpoint = "ssl://electrum.example:50002"
 [outbox]
 poll_interval = "5s"
+# An explicit request budget, so no test result depends on how fast the machine is.
+[rate_limits]
+signed_requests_per_second = 1000
+signed_burst = 5000
 "#
         ),
         ConfigEnvironment {
