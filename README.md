@@ -166,6 +166,30 @@ but does not restore eligibility. Exact route-emitted consumer and error fixture
 under `docs/fixtures/marketplace-payment-request-status/`. Unknown invoices and wrong
 Creators return the same `404`.
 
+Marketplace status also echoes `accepted_assets` and `payment_amounts` for every state,
+and reports USDT0 on Arbitrum One next to Bitcoin. Verified `erc20-transfer-eip712`
+proofs reach an active Marketplace request that offers USDT through the same attestation
+and Arbitrum receipt checks as Locks invoices, on the background reconciliation pass, keyed
+by the request's attributed SDK lifecycle record. `usdt_arbitrum` is `null` until a receipt
+is present, and again after a reorg removes it (the row is kept as evidence); otherwise it
+carries `tx_hash`, `observed_amount` (base-unit string), `confirmations`, `amount_matched`,
+`paid_on_time` (the receipt's block time is inside the window, which opens at the whole
+second of activation and closes at the deadline) and `finalized`. One receipt is chosen,
+never a sum of partial transfers, and a finalized receipt is never rewritten. A transfer
+belongs to one request for good. `paid_asset` is `"BTC"` or `"USDT"` for the rail whose
+receipt is `amount_matched` and `paid_on_time`, the earlier one if both qualify (Bitcoin by
+first observation, USDT by the block time of its earliest qualifying receipt, not of the
+receipt shown in `usdt_arbitrum`, which ranks by finality and confirmations), else `null`. The two times come from different
+clocks, this server's first sighting of the output and the chain's whole-second block
+time, so they order two qualifying payments only approximately: a close race can name
+either rail, and Bitcoin wins an exact tie. Consumers that must not depend on the order
+should read both rail objects, which stay populated. A second payment on the other rail
+leaves both rail objects populated for the consumer to flag; partial payments across rails
+are never combined. `payment_state` is `confirmed` when either rail has an included
+payment, `detected` when a receipt is present with no confirmations, and `expired` once the
+deadline has passed with no qualifying payment on either rail. Fixtures captured from the
+real services are under `docs/fixtures/marketplace-payment-request-status/`.
+
 Marketplace lifecycle conflicts use recovery-specific `409` codes. `prepare_expired`
 requires a new preparation attempt; `lifecycle_terminal` means activation lost to
 void or prepared-state resolution and must stop; `invoice_active` means void lost to
