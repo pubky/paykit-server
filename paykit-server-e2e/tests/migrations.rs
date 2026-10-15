@@ -1001,13 +1001,8 @@ async fn insert_usdt_receipt(
     .await
 }
 
-/// The index build waits for older transactions but must never stall Locks, and the
-/// validation must not wait for them at all.
-#[tokio::test]
-async fn usdt_validation_and_index_migrations_do_not_block_locks_writers() {
-    let _migration_test_guard = migration_test_lock().lock().await;
-    let database = TestDatabase::create().await;
-    let pool = database.pool();
+/// A live Locks table: everything through `0018` applied, one receipt present.
+async fn live_usdt_table_through_0018(pool: &PgPool) -> Uuid {
     apply_pre_settlement_migrations(pool).await;
     for migration in [
         SETTLEMENT_MIGRATION,
@@ -1027,6 +1022,17 @@ async fn usdt_validation_and_index_migrations_do_not_block_locks_writers() {
             .await
             .unwrap();
     insert_usdt_receipt(pool, invoice_id, 1).await.unwrap();
+    invoice_id
+}
+
+/// The index build waits for older transactions but must never stall Locks, and the
+/// validation must not wait for them at all.
+#[tokio::test]
+async fn usdt_validation_and_index_migrations_do_not_block_locks_writers() {
+    let _migration_test_guard = migration_test_lock().lock().await;
+    let database = TestDatabase::create().await;
+    let pool = database.pool();
+    let invoice_id = live_usdt_table_through_0018(pool).await;
 
     // A Locks writer is mid-transaction while the migrations run.
     let mut open_writer = pool.begin().await.unwrap();
@@ -1217,4 +1223,70 @@ async fn acquire_and_release_advisory_lock(connection: &mut PgConnection) {
     })
     .await
     .expect("cancelled migration left the advisory lock held");
+}
+
+/// An interrupted concurrent build leaves the named index invalid. The rerun must fail
+/// visibly rather than accept the unusable relation and record the migration.
+#[tokio::test]
+async fn interrupted_index_build_makes_the_rerun_fail_visibly() {
+    let _migration_test_guard = migration_test_lock().lock().await;
+    let database = TestDatabase::create().await;
+    let pool = database.pool();
+    let invoice_id = live_usdt_table_through_0018(pool).await;
+    sqlx::raw_sql(USDT_VALIDATION_MIGRATION)
+        .execute(pool)
+        .await
+        .unwrap();
+
+    // The build waits for the open writer, and is cancelled while it waits.
+    let mut open_writer = pool.begin().await.unwrap();
+    insert_usdt_receipt(&mut *open_writer, invoice_id, 2)
+        .await
+        .unwrap();
+    let mut interrupted = database.acquire_connection().await;
+    sqlx::query("SET statement_timeout = '500ms'")
+        .execute(&mut *interrupted)
+        .await
+        .unwrap();
+    sqlx::raw_sql(USDT_INDEX_MIGRATION)
+        .execute(&mut *interrupted)
+        .await
+        .expect_err("the build is cancelled while it waits for the older writer");
+    sqlx::query("RESET statement_timeout")
+        .execute(&mut *interrupted)
+        .await
+        .unwrap();
+    drop(interrupted);
+    open_writer.commit().await.unwrap();
+
+    let index_valid = || async {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT indisvalid FROM pg_index
+             WHERE indexrelid = 'usdt_observations_marketplace_settlement_index'::regclass",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    };
+    assert!(!index_valid().await, "the cancelled build left it invalid");
+
+    let rerun = sqlx::raw_sql(USDT_INDEX_MIGRATION).execute(pool).await;
+    let error = rerun.expect_err("the rerun must not accept the invalid index");
+    assert!(
+        error.to_string().contains("already exists"),
+        "unexpected error: {error}"
+    );
+    assert!(!index_valid().await);
+
+    // The documented recovery: drop it concurrently, then rerun.
+    sqlx::raw_sql("DROP INDEX CONCURRENTLY usdt_observations_marketplace_settlement_index")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql(USDT_INDEX_MIGRATION)
+        .execute(pool)
+        .await
+        .unwrap();
+    assert!(index_valid().await);
+    database.cleanup().await;
 }
