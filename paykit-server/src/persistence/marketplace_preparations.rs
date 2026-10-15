@@ -429,6 +429,13 @@ struct MarketplaceObservationTargetRow {
 }
 
 #[derive(sqlx::FromRow)]
+struct StoredSettlement {
+    payment_record_envelope: Vec<u8>,
+    bitcoin_address_lookup_hash: Option<Vec<u8>>,
+    derivation_index_lookup_hash: Vec<u8>,
+}
+
+#[derive(sqlx::FromRow)]
 struct MarketplaceSettlementRow {
     preparation_id: Uuid,
     creator_lookup_hash: Vec<u8>,
@@ -1584,7 +1591,7 @@ impl MarketplacePreparationStore {
         row: &LifecycleRow,
         preparation: &PreparationEnvelope,
     ) -> Result<(), PersistenceError> {
-        let stored: Option<(Vec<u8>, Option<Vec<u8>>, Vec<u8>)> = sqlx::query_as(
+        let stored: Option<StoredSettlement> = sqlx::query_as(
             "SELECT payment_record_envelope, bitcoin_address_lookup_hash,
                     derivation_index_lookup_hash
              FROM marketplace_settlements
@@ -1596,7 +1603,12 @@ impl MarketplacePreparationStore {
         .fetch_optional(&mut **tx)
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
-        let Some((encrypted, address_hash, derivation_hash)) = stored else {
+        let Some(StoredSettlement {
+            payment_record_envelope: encrypted,
+            bitcoin_address_lookup_hash: address_hash,
+            derivation_index_lookup_hash: derivation_hash,
+        }) = stored
+        else {
             return Err(PersistenceError::CorruptOrMissing);
         };
         let plaintext = self
