@@ -119,6 +119,8 @@ Decision PK1 (John, 15 Oct 2026): one Paykit request carries every asset the sel
 - Decision D4: a window over the applicable cap, `min(payment_window, conversion_payment_window)` when what is offered crosses BTC, is `400 payment_window_exceeds_cap`; it is never clamped.
 - The request binding covers amount, asset, the sorted filter when present, window and description, so any change under the same `operation_id` is `409 operation_conflict`.
 - Preparation envelope version 2 stores the offered terms. Version 1 envelopes written by rc11 to rc16 still decode as `{BTC, total_sats, [BTC]}` so rows prepared or activated before the upgrade keep activating, observing and reporting status. A version 1 `operation_id` cannot replay under the new binding and is an `operation_conflict`.
+- `seller_setup_pending` names only rails the deployment can offer: on a deployment without `[usdt]` a `["BTC","USDT"]` filter on a seller with no Bitcoin names Bitcoin alone.
+- A settlement's `payment_expired_at` only stops Electrum discovery of its Bitcoin address after the deadline; the status route derives `expired` from the deadline at read time. A request that offers only USDT has no address to stop watching, so it never needs a stored expiry.
 - Migration `0017_marketplace_optional_bitcoin_rail.sql` makes the settlement's Bitcoin address optional: a request that offers only USDT activates with no address to claim or watch, and its settlement is never an Electrum target.
 
 ## Marketplace USDT settlement and status (PK1, second slice)
