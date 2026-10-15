@@ -2257,7 +2257,7 @@ impl MarketplacePreparationStore {
                 {
                     return Err(PersistenceError::CorruptOrMissing);
                 }
-                let usdt = self
+                let (usdt, first_usdt_qualifying_at) = match self
                     .status_usdt(
                         &mut tx,
                         creator_hash,
@@ -2266,22 +2266,25 @@ impl MarketplacePreparationStore {
                         activated_at,
                         payment_deadline,
                     )
-                    .await?;
+                    .await?
+                {
+                    Some((usdt, first)) => (Some(usdt), first),
+                    None => (None, None),
+                };
                 // Each rail is judged alone: partial payments are never combined, and
                 // the rail whose receipt qualified first is the paid asset. The two
                 // times come from different clocks: Bitcoin's is this server's first
                 // sighting of the output (poll-interval granularity, after the
                 // broadcast), USDT's is the chain's whole-second block time. They only
                 // order two payments that both qualified, so a close race can name
-                // either rail; Bitcoin wins an exact tie.
+                // either rail; Bitcoin wins an exact tie. USDT's time is the earliest
+                // qualifying receipt's, not the displayed receipt's, so a later,
+                // higher-ranked receipt cannot move the payment behind Bitcoin.
                 let bitcoin_paid = bitcoin
                     .as_ref()
                     .filter(|bitcoin| bitcoin.paid_on_time)
                     .map(|bitcoin| (bitcoin.first_observed_at, AcceptedAsset::Btc));
-                let usdt_paid = usdt
-                    .as_ref()
-                    .filter(|usdt| usdt.paid_on_time)
-                    .map(|usdt| (usdt.observed_at, AcceptedAsset::Usdt));
+                let usdt_paid = first_usdt_qualifying_at.map(|first| (first, AcceptedAsset::Usdt));
                 let paid_asset = [bitcoin_paid, usdt_paid]
                     .into_iter()
                     .flatten()

@@ -347,8 +347,10 @@ impl MarketplacePreparationStore {
         Ok(())
     }
 
-    /// The one present receipt that best settles the request, never a sum of partial
-    /// transfers. A final qualifying receipt is not hidden by a newer unfinalized one.
+    /// The one present receipt to display, never a sum of partial transfers (a final
+    /// qualifying receipt is not hidden by a newer unfinalized one), and separately the
+    /// block time of the earliest present receipt that qualifies. Which rail was paid
+    /// first must not depend on which receipt ranks highest for display.
     pub(super) async fn status_usdt(
         &self,
         tx: &mut Transaction<'_, Postgres>,
@@ -357,7 +359,7 @@ impl MarketplacePreparationStore {
         payment: &InvoicePaymentRecordV1,
         activated_at: OffsetDateTime,
         payment_deadline: OffsetDateTime,
-    ) -> Result<Option<MarketplaceUsdtStatus>, PersistenceError> {
+    ) -> Result<Option<(MarketplaceUsdtStatus, Option<OffsetDateTime>)>, PersistenceError> {
         let rows: Vec<UsdtObservationRow> = sqlx::query_as(
             "SELECT id, observation_envelope, transfer_lookup_hash, confirmations, finalized
              FROM usdt_observations
@@ -382,6 +384,7 @@ impl MarketplacePreparationStore {
             .replace_nanosecond(0)
             .map_err(|_| PersistenceError::CorruptOrMissing)?;
         let mut selected: Option<((bool, bool, bool, u32), MarketplaceUsdtStatus)> = None;
+        let mut first_qualifying_at: Option<OffsetDateTime> = None;
         for row in rows {
             let facts = self.usdt_facts(creator_hash, preparation_id, &row)?;
             let confirmations =
@@ -390,6 +393,11 @@ impl MarketplacePreparationStore {
             let paid_on_time = amount_matched
                 && facts.timestamp >= window_start
                 && facts.timestamp <= payment_deadline;
+            if paid_on_time {
+                first_qualifying_at = Some(
+                    first_qualifying_at.map_or(facts.timestamp, |first| first.min(facts.timestamp)),
+                );
+            }
             let tx_hash = transaction_hash(&facts.identity)?;
             let rank = (paid_on_time, row.finalized, amount_matched, confirmations);
             let candidate = MarketplaceUsdtStatus::new(
@@ -405,7 +413,7 @@ impl MarketplacePreparationStore {
                 selected = Some((rank, candidate));
             }
         }
-        Ok(selected.map(|(_, status)| status))
+        Ok(selected.map(|(_, status)| (status, first_qualifying_at)))
     }
 }
 
