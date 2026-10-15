@@ -640,7 +640,8 @@ fn normalized_filter(
 }
 
 /// Why nothing could be offered: the deployment cannot do the only asset asked for,
-/// or the seller has not set up any asset the request allows.
+/// or the seller has not set up any asset the request allows. The refusal names only
+/// rails this deployment could offer.
 fn refusal_without_rails(
     filter: Option<&[AcceptedAsset]>,
     usdt_enabled: bool,
@@ -650,7 +651,7 @@ fn refusal_without_rails(
         None => PrepareMarketplaceError::SellerSetupPending(MissingSellerRails::Bitcoin),
         Some([Usdt]) if !usdt_enabled => PrepareMarketplaceError::AssetUnsupported,
         Some(set) => PrepareMarketplaceError::SellerSetupPending(
-            match (set.contains(&Btc), set.contains(&Usdt)) {
+            match (set.contains(&Btc), set.contains(&Usdt) && usdt_enabled) {
                 (true, true) => MissingSellerRails::BitcoinAndUsdt,
                 (false, true) => MissingSellerRails::Usdt,
                 _ => MissingSellerRails::Bitcoin,

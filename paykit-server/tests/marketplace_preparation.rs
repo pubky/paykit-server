@@ -1596,6 +1596,37 @@ async fn nothing_to_offer_is_a_typed_setup_refusal_that_names_the_rail() {
 }
 
 #[tokio::test]
+async fn refusal_never_names_a_rail_the_deployment_cannot_offer() {
+    use CriterionAsset::Usd;
+    for (bitcoin, usdt, filter) in [
+        (false, false, Some(vec![BTC, USDT])),
+        (false, true, Some(vec![BTC, USDT])),
+        (false, true, Some(vec![BTC])),
+    ] {
+        let rig = rig(bitcoin, usdt, false, Some(FEED));
+        assert_eq!(
+            rig.service
+                .prepare(multi_request(500, Usd, filter.as_deref(), 3_600))
+                .await,
+            Err(PrepareMarketplaceError::SellerSetupPending(
+                MissingSellerRails::Bitcoin
+            )),
+            "{filter:?} bitcoin={bitcoin} usdt={usdt}"
+        );
+    }
+    // With USDT available on the deployment the same filter still names both.
+    let rig = rig(false, false, true, Some(FEED));
+    assert_eq!(
+        rig.service
+            .prepare(multi_request(500, Usd, Some(&[BTC, USDT]), 3_600))
+            .await,
+        Err(PrepareMarketplaceError::SellerSetupPending(
+            MissingSellerRails::BitcoinAndUsdt
+        ))
+    );
+}
+
+#[tokio::test]
 async fn usdt_asked_alone_on_a_deployment_without_usdt_is_asset_unsupported() {
     use CriterionAsset::Usd;
     let rig = rig(true, true, false, Some(FEED));
