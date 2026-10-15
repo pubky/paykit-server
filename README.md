@@ -111,8 +111,8 @@ unit. The `200` response echoes `amount`, `asset`, the offered `accepted_assets`
 `payment_amounts` (per offered asset, in that asset's base units), the fixed `rates`
 (payment-asset units per one requested-asset unit; `{}` when none) and
 `prepare_expires_at`. Typed refusals: `503 seller_setup_pending` when nothing can be
-offered (the message names the rail: Bitcoin, USDT, or both; an omitted filter on a seller
-with no rail names Bitcoin), `409 asset_unsupported` (the filter asks only for USDT and this
+offered (the message names the rail: Bitcoin, USDT, or both, never a rail this deployment
+cannot offer; an omitted filter on a seller with no rail names Bitcoin), `409 asset_unsupported` (the filter asks only for USDT and this
 deployment has no `[usdt]` configuration), `400 payment_window_exceeds_cap` (the window is
 over `min(payment_window, conversion_payment_window)` when what is offered crosses BTC,
 else over `payment_window`; never clamped) and, when the feed is unavailable or stale,

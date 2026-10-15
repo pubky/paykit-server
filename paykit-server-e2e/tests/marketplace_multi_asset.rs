@@ -1106,3 +1106,34 @@ async fn rc16_preparation_rows_still_activate_and_report_status_as_bitcoin() {
     assert_eq!(json(&body)["error"]["code"], "operation_conflict");
     rig.cleanup().await;
 }
+
+#[tokio::test]
+async fn usdt_only_request_expires_at_read_time_without_a_bitcoin_watcher() {
+    let rig = rig(
+        Seller {
+            bitcoin: false,
+            usdt: true,
+        },
+        true,
+    )
+    .await;
+    // `payment_expired_at` only stops Electrum discovery of a Bitcoin address; the
+    // status route derives `expired` from the deadline itself, so a request with no
+    // Bitcoin rail needs no stored expiry.
+    let (_, prepared) = rig.prepare("one-second", "500", "USD", &["USDT"], 1).await;
+    let invoice = invoice_id(&prepared);
+    rig.activate(&invoice, "500", "USD").await;
+    assert_eq!(rig.status(&invoice).await["payment_state"], "undetected");
+    tokio::time::sleep(Duration::from_millis(1_300)).await;
+    assert!(rig.store.observation_targets().await.unwrap().is_empty());
+    let status = rig.status(&invoice).await;
+    assert_eq!(status["payment_state"], "expired");
+    assert!(status["paid_asset"].is_null());
+    let stored: Option<time::OffsetDateTime> =
+        sqlx::query_scalar("SELECT payment_expired_at FROM marketplace_settlements")
+            .fetch_one(rig.database.pool())
+            .await
+            .unwrap();
+    assert_eq!(stored, None);
+    rig.cleanup().await;
+}
