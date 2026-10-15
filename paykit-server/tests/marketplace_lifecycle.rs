@@ -439,3 +439,70 @@ async fn lifecycle_failures_use_stable_error_fixtures() {
         }})
     );
 }
+
+#[tokio::test]
+async fn activate_body_is_closed_to_the_retired_total_and_malformed_terms() {
+    let key = SigningKey::from_bytes(&[11; 32]);
+    let path = "/marketplace/payment-requests/activate";
+    let valid = || {
+        serde_json::json!({
+            "creator": CREATOR,
+            "invoice_id": INVOICE_ID,
+            "amount": "500",
+            "asset": "USD",
+        })
+    };
+    let router =
+        marketplace_lifecycle_router(service(Outcome::Success)).layer(Extension(signed_auth(&key)));
+    let response = router
+        .clone()
+        .oneshot(signed_request(&key, path, valid()))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let with_total_sats = || {
+        let mut value = valid();
+        value["total_sats"] = serde_json::json!(500);
+        value
+    };
+    let without = |field: &'static str| {
+        move || {
+            let mut value = valid();
+            value.as_object_mut().unwrap().remove(field);
+            value
+        }
+    };
+    let amount = |amount: serde_json::Value| {
+        move || {
+            let mut value = valid();
+            value["amount"] = amount.clone();
+            value
+        }
+    };
+    let asset = |asset: &'static str| {
+        move || {
+            let mut value = valid();
+            value["asset"] = serde_json::json!(asset);
+            value
+        }
+    };
+    let bodies: Vec<(&str, serde_json::Value)> = vec![
+        ("total_sats is the retired field", with_total_sats()),
+        ("amount missing", without("amount")()),
+        ("asset missing", without("asset")()),
+        ("amount not a string", amount(serde_json::json!(500))()),
+        ("amount zero", amount(serde_json::json!("0"))()),
+        ("amount fractional", amount(serde_json::json!("5.00"))()),
+        ("asset lowercase", asset("usd")()),
+        ("asset unknown", asset("EUR")()),
+    ];
+    for (label, body) in bodies {
+        let response = router
+            .clone()
+            .oneshot(signed_request(&key, path, body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{label}");
+    }
+}

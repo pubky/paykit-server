@@ -15,9 +15,11 @@ use ed25519_dalek::{Signer, SigningKey};
 use paykit_server::{
     application::{
         create_invoice::{
-            AppRegistryDiscovery, CreatorReceivingProvider, ReaderAuthorization, ReceivingDetails,
-            RegistryDiscoveryError, RegistryRetryDelay, SessionValidationError, SessionValidator,
+            AppRegistryDiscovery, CreateInvoiceError, CreatorReceivingProvider,
+            ReaderAuthorization, ReceivingDetails, RegistryDiscoveryError, RegistryRetryDelay,
+            SessionValidationError, SessionValidator,
         },
+        invoice_pricing::ExchangeRates,
         marketplace_preparation::{
             MarketplacePreparationPersistence, MissingSellerRails, PrepareMarketplaceError,
             PrepareMarketplaceRequest, PrepareMarketplaceService,
@@ -1153,4 +1155,743 @@ async fn setup_pending_emits_exact_redacted_failure_stage() {
             "message" | "event" | "operation" | "stage" | "category" | "request_id"
         )
     }));
+}
+
+const USDT_ADDRESS: &str = "0x1111111111111111111111111111111111111111";
+
+struct RailCredentials {
+    bitcoin: bool,
+    usdt: bool,
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl CreatorReceivingProvider for RailCredentials {
+    async fn receiving(
+        &self,
+        _creator: &CreatorPubky,
+    ) -> Result<ReceivingDetails, PersistenceError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(ReceivingDetails {
+            bitcoin: self
+                .bitcoin
+                .then(|| paykit_server::domain::receiving::BitcoinAccount {
+                    xpub: account_xpub().into(),
+                    account_index: 0,
+                }),
+            usdt: self
+                .usdt
+                .then(|| USDT_ADDRESS.to_owned().try_into().unwrap()),
+        })
+    }
+}
+
+struct FixedRates {
+    price: Option<&'static str>,
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl ExchangeRates for FixedRates {
+    async fn usd_per_btc(&self) -> Result<String, CreateInvoiceError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.price
+            .map(str::to_owned)
+            .ok_or(CreateInvoiceError::Unavailable)
+    }
+}
+
+#[derive(Default)]
+struct CapturingStore {
+    bindings: Mutex<Vec<Vec<u8>>>,
+    terms: Mutex<Option<paykit_server::application::semantic_intent::PaymentTermsV1>>,
+    result: Mutex<Option<MarketplacePreparationResult>>,
+    prepare_calls: AtomicUsize,
+}
+
+#[async_trait]
+impl MarketplacePreparationPersistence for CapturingStore {
+    async fn preflight(
+        &self,
+        _creator: &CreatorPubky,
+        _operation_id: &str,
+        request_binding: &[u8],
+    ) -> Result<MarketplacePreparationPreflight, PersistenceError> {
+        self.bindings.lock().unwrap().push(request_binding.to_vec());
+        Ok(MarketplacePreparationPreflight::New)
+    }
+
+    async fn prepare(
+        &self,
+        input: MarketplacePreparationInput<'_>,
+    ) -> Result<MarketplacePreparationResult, PersistenceError> {
+        self.prepare_calls.fetch_add(1, Ordering::SeqCst);
+        let payloads = input.payloads.for_child_index(0)?;
+        let quote = MarketplaceQuote::from_intent(&payloads.payment_request_intent, input.terms)?;
+        *self.terms.lock().unwrap() =
+            Some(payloads.payment_request_intent.terms().unwrap().clone());
+        let result = MarketplacePreparationResult::new(
+            uuid::Uuid::from_u128(1),
+            input.terms.clone(),
+            quote,
+            time::OffsetDateTime::UNIX_EPOCH,
+            time::OffsetDateTime::UNIX_EPOCH + time::Duration::minutes(15),
+            false,
+        );
+        *self.result.lock().unwrap() = Some(result.clone());
+        Ok(result)
+    }
+}
+
+struct Rig {
+    service: PrepareMarketplaceService,
+    session: Arc<FakeSession>,
+    credentials: Arc<RailCredentials>,
+    rates: Arc<FixedRates>,
+    store: Arc<CapturingStore>,
+}
+
+fn rig(bitcoin: bool, usdt: bool, usdt_enabled: bool, price: Option<&'static str>) -> Rig {
+    let session = Arc::new(FakeSession {
+        calls: AtomicUsize::default(),
+    });
+    let credentials = Arc::new(RailCredentials {
+        bitcoin,
+        usdt,
+        calls: AtomicUsize::default(),
+    });
+    let rates = Arc::new(FixedRates {
+        price,
+        calls: AtomicUsize::default(),
+    });
+    let store = Arc::new(CapturingStore::default());
+    let service = PrepareMarketplaceService::new(
+        session.clone(),
+        Arc::new(FakeRegistries {
+            calls: AtomicUsize::default(),
+        }),
+        credentials.clone(),
+        store.clone(),
+        paykit_lib::PaykitAppId::new("paykit-server").unwrap(),
+        BitcoinNetwork::Mainnet,
+        Duration::from_secs(24 * 60 * 60),
+        Duration::from_secs(15 * 60),
+    )
+    .with_usdt(usdt_enabled)
+    .with_conversion_payment_window(Duration::from_secs(60 * 60))
+    .with_exchange_rates(rates.clone());
+    Rig {
+        service,
+        session,
+        credentials,
+        rates,
+        store,
+    }
+}
+
+fn multi_request(
+    amount: u64,
+    asset: CriterionAsset,
+    accepted: &[AcceptedAsset],
+    window: u64,
+) -> PrepareMarketplaceRequest {
+    PrepareMarketplaceRequest {
+        amount,
+        asset,
+        accepted_assets: accepted.to_vec(),
+        ..request(window)
+    }
+}
+
+const BTC: AcceptedAsset = AcceptedAsset::Btc;
+const USDT: AcceptedAsset = AcceptedAsset::Usdt;
+const FEED: &str = "81000";
+
+#[tokio::test]
+async fn every_denomination_and_accepted_asset_combination_is_prepared_exactly() {
+    use CriterionAsset::{Btc as InBtc, Usd, Usdt as InUsdt};
+    let btc_rate = "0.000012345679012346";
+    // (denomination, amount, accepted, intent amount, payable per asset, rates, feed read)
+    #[allow(clippy::type_complexity)]
+    let cases: Vec<(
+        CriterionAsset,
+        u64,
+        Vec<AcceptedAsset>,
+        &str,
+        Vec<(AcceptedAsset, u64)>,
+        Vec<(AcceptedAsset, &str)>,
+        bool,
+    )> = vec![
+        (
+            Usd,
+            500,
+            vec![BTC],
+            "5.00",
+            vec![(BTC, 6_173)],
+            vec![(BTC, btc_rate)],
+            true,
+        ),
+        (
+            Usd,
+            500,
+            vec![USDT],
+            "5.00",
+            vec![(USDT, 5_000_000)],
+            vec![(USDT, "1")],
+            false,
+        ),
+        (
+            Usd,
+            500,
+            vec![BTC, USDT],
+            "5.00",
+            vec![(BTC, 6_173), (USDT, 5_000_000)],
+            vec![(BTC, btc_rate), (USDT, "1")],
+            true,
+        ),
+        (
+            InBtc,
+            50_000,
+            vec![BTC],
+            "0.00050000",
+            vec![(BTC, 50_000)],
+            vec![],
+            false,
+        ),
+        (
+            InBtc,
+            50_000,
+            vec![USDT],
+            "0.00050000",
+            vec![(USDT, 40_500_000)],
+            vec![(USDT, "81000")],
+            true,
+        ),
+        (
+            InBtc,
+            50_000,
+            vec![BTC, USDT],
+            "0.00050000",
+            vec![(BTC, 50_000), (USDT, 40_500_000)],
+            vec![(USDT, "81000")],
+            true,
+        ),
+        (
+            InUsdt,
+            5_000_000,
+            vec![BTC],
+            "5.000000",
+            vec![(BTC, 6_173)],
+            vec![(BTC, btc_rate)],
+            true,
+        ),
+        (
+            InUsdt,
+            5_000_000,
+            vec![USDT],
+            "5.000000",
+            vec![(USDT, 5_000_000)],
+            vec![],
+            false,
+        ),
+        (
+            InUsdt,
+            5_000_000,
+            vec![BTC, USDT],
+            "5.000000",
+            vec![(BTC, 6_173), (USDT, 5_000_000)],
+            vec![(BTC, btc_rate)],
+            true,
+        ),
+    ];
+    for (asset, amount, accepted, intent_amount, payable, rates, feed_read) in cases {
+        let rig = rig(true, true, true, Some(FEED));
+        let result = rig
+            .service
+            .prepare(multi_request(amount, asset, &accepted, 3_600))
+            .await
+            .unwrap_or_else(|error| panic!("{asset:?} {accepted:?}: {error:?}"));
+        let label = format!("{asset:?} {accepted:?}");
+        assert_eq!(result.quote().payment_amounts(), payable, "{label}");
+        assert_eq!(
+            result.quote().rates(),
+            rates
+                .iter()
+                .map(|(asset, value)| (*asset, (*value).to_owned()))
+                .collect::<Vec<_>>(),
+            "{label}"
+        );
+        assert_eq!(
+            result.terms().accepted_assets(),
+            accepted.as_slice(),
+            "{label}"
+        );
+        assert_eq!(
+            rig.rates.calls.load(Ordering::SeqCst),
+            usize::from(feed_read),
+            "{label}"
+        );
+        let terms = rig.store.terms.lock().unwrap().clone().unwrap();
+        assert_eq!(terms.asset, asset.as_str().to_ascii_lowercase(), "{label}");
+        assert_eq!(terms.amount, intent_amount, "{label}");
+        let mut endpoints: Vec<_> = terms.payment_endpoints.keys().cloned().collect();
+        endpoints.sort();
+        let mut expected: Vec<_> = accepted
+            .iter()
+            .map(|asset| match asset {
+                AcceptedAsset::Btc => "btc-bitcoin-p2wpkh",
+                AcceptedAsset::Usdt => "usdt-arbitrum-address",
+            })
+            .map(str::to_owned)
+            .collect();
+        expected.sort();
+        assert_eq!(
+            endpoints, expected,
+            "no rail the request did not ask for: {label}"
+        );
+        assert_eq!(
+            terms.accepted_endpoint_identifiers.len(),
+            accepted.len(),
+            "{label}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn payable_amounts_round_up_to_each_endpoint_unit() {
+    use CriterionAsset::{Btc as InBtc, Usd};
+    for (asset, amount, accepted, expected) in [
+        (Usd, 1, vec![BTC, USDT], vec![(BTC, 13), (USDT, 10_000)]),
+        (InBtc, 1, vec![BTC, USDT], vec![(BTC, 1), (USDT, 810)]),
+        (InBtc, 3, vec![BTC, USDT], vec![(BTC, 3), (USDT, 2_430)]),
+        (Usd, 8_100_000, vec![BTC], vec![(BTC, 100_000_001)]),
+    ] {
+        let rig = rig(true, true, true, Some(FEED));
+        let result = rig
+            .service
+            .prepare(multi_request(amount, asset, &accepted, 3_600))
+            .await
+            .unwrap();
+        assert_eq!(
+            result.quote().payment_amounts(),
+            expected,
+            "{asset:?} {amount}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn amount_that_overflows_a_payment_asset_is_an_invalid_request() {
+    let rig = rig(true, true, true, Some(FEED));
+    assert_eq!(
+        rig.service
+            .prepare(multi_request(u64::MAX, CriterionAsset::Btc, &[USDT], 3_600))
+            .await,
+        Err(PrepareMarketplaceError::InvalidRequest)
+    );
+    assert_eq!(rig.store.prepare_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn seller_missing_a_requested_rail_is_a_typed_setup_refusal_that_names_it() {
+    use CriterionAsset::Usd;
+    for (bitcoin, usdt, accepted, expected) in [
+        (false, true, vec![BTC], MissingSellerRails::Bitcoin),
+        (true, false, vec![USDT], MissingSellerRails::Usdt),
+        (
+            false,
+            false,
+            vec![BTC, USDT],
+            MissingSellerRails::BitcoinAndUsdt,
+        ),
+        (true, false, vec![BTC, USDT], MissingSellerRails::Usdt),
+        (false, true, vec![BTC, USDT], MissingSellerRails::Bitcoin),
+    ] {
+        let rig = rig(bitcoin, usdt, true, Some(FEED));
+        assert_eq!(
+            rig.service
+                .prepare(multi_request(500, Usd, &accepted, 3_600))
+                .await,
+            Err(PrepareMarketplaceError::SellerSetupPending(expected)),
+            "{accepted:?} bitcoin={bitcoin} usdt={usdt}"
+        );
+        assert_eq!(rig.store.prepare_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            rig.rates.calls.load(Ordering::SeqCst),
+            0,
+            "no feed read before the seller can receive"
+        );
+    }
+}
+
+#[tokio::test]
+async fn seller_rail_that_was_not_requested_is_never_added() {
+    let rig = rig(true, true, true, Some(FEED));
+    rig.service
+        .prepare(multi_request(50_000, CriterionAsset::Btc, &[BTC], 3_600))
+        .await
+        .unwrap();
+    let terms = rig.store.terms.lock().unwrap().clone().unwrap();
+    assert_eq!(
+        terms.payment_endpoints.keys().collect::<Vec<_>>(),
+        ["btc-bitcoin-p2wpkh"]
+    );
+    assert!(terms.rates.is_empty());
+}
+
+#[tokio::test]
+async fn usdt_without_server_configuration_is_asset_unsupported_before_any_read() {
+    use CriterionAsset::{Btc as InBtc, Usd, Usdt as InUsdt};
+    for (asset, accepted) in [
+        (Usd, vec![USDT]),
+        (Usd, vec![BTC, USDT]),
+        (InBtc, vec![USDT]),
+        (InUsdt, vec![BTC]),
+    ] {
+        let rig = rig(true, true, false, Some(FEED));
+        assert_eq!(
+            rig.service
+                .prepare(multi_request(500, asset, &accepted, 3_600))
+                .await,
+            Err(PrepareMarketplaceError::AssetUnsupported),
+            "{asset:?} {accepted:?}"
+        );
+        assert_eq!(rig.session.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(rig.credentials.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(rig.rates.calls.load(Ordering::SeqCst), 0);
+    }
+    let rig = rig(true, false, false, Some(FEED));
+    rig.service
+        .prepare(multi_request(500, CriterionAsset::Usd, &[BTC], 3_600))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn window_over_the_applicable_cap_is_refused_never_clamped() {
+    use CriterionAsset::{Btc as InBtc, Usd};
+    for (asset, accepted, window, allowed) in [
+        (Usd, vec![BTC, USDT], 3_600, true),
+        (Usd, vec![BTC, USDT], 3_601, false),
+        (Usd, vec![BTC], 3_601, false),
+        (InBtc, vec![USDT], 3_601, false),
+        (InBtc, vec![BTC, USDT], 3_601, false),
+        (Usd, vec![USDT], 86_400, true),
+        (Usd, vec![USDT], 86_401, false),
+        (InBtc, vec![BTC], 86_400, true),
+        (InBtc, vec![BTC], 86_401, false),
+        (Usd, vec![BTC, USDT], 1_800, true),
+    ] {
+        let rig = rig(true, true, true, Some(FEED));
+        let amount = if asset == InBtc { 50_000 } else { 500 };
+        let result = rig
+            .service
+            .prepare(multi_request(amount, asset, &accepted, window))
+            .await;
+        let label = format!("{asset:?} {accepted:?} {window}");
+        if allowed {
+            result.unwrap_or_else(|error| panic!("{label}: {error:?}"));
+        } else {
+            assert_eq!(
+                result,
+                Err(PrepareMarketplaceError::PaymentWindowExceedsCap),
+                "{label}"
+            );
+            assert_eq!(rig.rates.calls.load(Ordering::SeqCst), 0, "{label}");
+            assert_eq!(rig.session.calls.load(Ordering::SeqCst), 0, "{label}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn unavailable_rate_fails_only_the_combinations_that_cross_bitcoin() {
+    use CriterionAsset::{Btc as InBtc, Usd, Usdt as InUsdt};
+    for (asset, accepted) in [
+        (Usd, vec![BTC]),
+        (Usd, vec![BTC, USDT]),
+        (InBtc, vec![USDT]),
+        (InUsdt, vec![BTC, USDT]),
+    ] {
+        let rig = rig(true, true, true, None);
+        assert_eq!(
+            rig.service
+                .prepare(multi_request(500, asset, &accepted, 3_600))
+                .await,
+            Err(PrepareMarketplaceError::Unavailable),
+            "{asset:?} {accepted:?}"
+        );
+        assert_eq!(rig.rates.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(rig.store.prepare_calls.load(Ordering::SeqCst), 0);
+    }
+    for (asset, accepted) in [(Usd, vec![USDT]), (InBtc, vec![BTC]), (InUsdt, vec![USDT])] {
+        let rig = rig(true, true, true, None);
+        rig.service
+            .prepare(multi_request(500, asset, &accepted, 3_600))
+            .await
+            .unwrap();
+        assert_eq!(rig.rates.calls.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn rate_provider_is_not_configured_means_crossing_requests_are_unavailable() {
+    let session = Arc::new(FakeSession {
+        calls: AtomicUsize::default(),
+    });
+    let service = PrepareMarketplaceService::new(
+        session,
+        Arc::new(FakeRegistries {
+            calls: AtomicUsize::default(),
+        }),
+        Arc::new(RailCredentials {
+            bitcoin: true,
+            usdt: true,
+            calls: AtomicUsize::default(),
+        }),
+        Arc::new(CapturingStore::default()),
+        paykit_lib::PaykitAppId::new("paykit-server").unwrap(),
+        BitcoinNetwork::Mainnet,
+        Duration::from_secs(24 * 60 * 60),
+        Duration::from_secs(15 * 60),
+    )
+    .with_usdt(true);
+    assert_eq!(
+        service
+            .prepare(multi_request(500, CriterionAsset::Usd, &[BTC], 3_600))
+            .await,
+        Err(PrepareMarketplaceError::Unavailable)
+    );
+}
+
+#[tokio::test]
+async fn binding_covers_amount_asset_and_the_accepted_set_but_not_its_order() {
+    use CriterionAsset::{Btc as InBtc, Usd};
+    let mut bindings = Vec::new();
+    for (asset, amount, accepted) in [
+        (Usd, 500, vec![BTC, USDT]),
+        (Usd, 500, vec![USDT, BTC]),
+        (Usd, 500, vec![BTC]),
+        (Usd, 500, vec![USDT]),
+        (Usd, 501, vec![BTC, USDT]),
+        (InBtc, 500, vec![BTC, USDT]),
+    ] {
+        let rig = rig(true, true, true, Some(FEED));
+        let _ = rig
+            .service
+            .prepare(multi_request(amount, asset, &accepted, 3_600))
+            .await;
+        bindings.push(rig.store.bindings.lock().unwrap()[0].clone());
+    }
+    assert_eq!(bindings[0], bindings[1], "set order is not significant");
+    for changed in &bindings[2..] {
+        assert_ne!(&bindings[0], changed);
+    }
+    let unique: std::collections::BTreeSet<_> = bindings[2..].iter().collect();
+    assert_eq!(unique.len(), 4);
+}
+
+#[tokio::test]
+async fn empty_duplicate_or_zero_terms_are_invalid_before_any_read() {
+    for (amount, accepted) in [
+        (500, vec![]),
+        (500, vec![BTC, BTC]),
+        (500, vec![USDT, USDT, BTC]),
+        (0, vec![BTC]),
+    ] {
+        let rig = rig(true, true, true, Some(FEED));
+        assert_eq!(
+            rig.service
+                .prepare(multi_request(amount, CriterionAsset::Usd, &accepted, 3_600))
+                .await,
+            Err(PrepareMarketplaceError::InvalidRequest)
+        );
+        assert!(rig.store.bindings.lock().unwrap().is_empty());
+    }
+}
+
+fn dual_body(change: impl FnOnce(&mut serde_json::Value)) -> Vec<u8> {
+    let mut value = serde_json::json!({
+        "accepted_assets": ["BTC", "USDT"],
+        "amount": "500",
+        "asset": "USD",
+        "creator": CREATOR,
+        "operation_id": "marketplace-payment:order-1:attempt-1",
+        "payment_window_seconds": 1_800,
+        "reader": reader(),
+        "reference": REFERENCE,
+    });
+    change(&mut value);
+    serde_json_canonicalizer::to_vec(&value).unwrap()
+}
+
+#[tokio::test]
+async fn prepare_route_echoes_terms_payable_amounts_and_fixed_rates() {
+    let key = SigningKey::from_bytes(&[11; 32]);
+    let rig = rig(true, true, true, Some(FEED));
+    let router =
+        marketplace_preparation_router(Arc::new(rig.service)).layer(Extension(signed_auth(&key)));
+    let response = router
+        .oneshot(signed_request(&key, dual_body(|_| {})))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+        serde_json::json!({
+            "invoice_id": "00000000-0000-0000-0000-000000000001",
+            "state": "prepared",
+            "amount": "500",
+            "asset": "USD",
+            "accepted_assets": ["BTC", "USDT"],
+            "payment_amounts": {"BTC": "6173", "USDT": "5000000"},
+            "rates": {"BTC": "0.000012345679012346", "USDT": "1"},
+            "prepare_expires_at": "1970-01-01T00:15:00Z",
+        })
+    );
+}
+
+#[tokio::test]
+async fn prepare_route_body_is_closed_to_the_old_and_malformed_shapes() {
+    let key = SigningKey::from_bytes(&[11; 32]);
+    for (label, change) in [
+        (
+            "amount_sats is the retired field",
+            Box::new(|value: &mut serde_json::Value| {
+                value["amount_sats"] = serde_json::json!(500);
+            }) as Box<dyn FnOnce(&mut serde_json::Value)>,
+        ),
+        (
+            "amount must be a string",
+            Box::new(|value| value["amount"] = serde_json::json!(500)),
+        ),
+        (
+            "amount zero",
+            Box::new(|value| value["amount"] = serde_json::json!("0")),
+        ),
+        (
+            "amount fractional",
+            Box::new(|value| value["amount"] = serde_json::json!("5.00")),
+        ),
+        (
+            "amount overflow",
+            Box::new(|value| value["amount"] = serde_json::json!("18446744073709551616")),
+        ),
+        (
+            "asset lowercase",
+            Box::new(|value| value["asset"] = serde_json::json!("usd")),
+        ),
+        (
+            "asset unknown",
+            Box::new(|value| value["asset"] = serde_json::json!("EUR")),
+        ),
+        (
+            "accepted empty",
+            Box::new(|value| value["accepted_assets"] = serde_json::json!([])),
+        ),
+        (
+            "accepted duplicate",
+            Box::new(|value| value["accepted_assets"] = serde_json::json!(["BTC", "BTC"])),
+        ),
+        (
+            "accepted denomination is not a payment asset",
+            Box::new(|value| value["accepted_assets"] = serde_json::json!(["USD"])),
+        ),
+        (
+            "accepted lowercase",
+            Box::new(|value| value["accepted_assets"] = serde_json::json!(["btc"])),
+        ),
+        (
+            "accepted missing",
+            Box::new(|value| {
+                value.as_object_mut().unwrap().remove("accepted_assets");
+            }),
+        ),
+        (
+            "asset missing",
+            Box::new(|value| {
+                value.as_object_mut().unwrap().remove("asset");
+            }),
+        ),
+    ] {
+        let rig = rig(true, true, true, Some(FEED));
+        let router = marketplace_preparation_router(Arc::new(rig.service))
+            .layer(Extension(signed_auth(&key)));
+        let response = router
+            .oneshot(signed_request(&key, dual_body(change)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{label}");
+    }
+}
+
+#[tokio::test]
+async fn prepare_route_maps_typed_refusals_to_stable_bodies() {
+    let key = SigningKey::from_bytes(&[11; 32]);
+    let call = |bitcoin: bool, usdt: bool, usdt_enabled: bool, window: u64| {
+        let key = key.clone();
+        async move {
+            let rig = rig(bitcoin, usdt, usdt_enabled, Some(FEED));
+            let router = marketplace_preparation_router(Arc::new(rig.service))
+                .layer(Extension(signed_auth(&key)));
+            let response = router
+                .oneshot(signed_request(
+                    &key,
+                    dual_body(|value| value["payment_window_seconds"] = window.into()),
+                ))
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            (
+                status,
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            )
+        }
+    };
+    for (outcome, status, code, message) in [
+        (
+            call(true, false, true, 1_800).await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "seller_setup_pending",
+            "seller USDT receiving setup is needed",
+        ),
+        (
+            call(false, true, true, 1_800).await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "seller_setup_pending",
+            "seller Bitcoin receiving setup is needed",
+        ),
+        (
+            call(false, false, true, 1_800).await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "seller_setup_pending",
+            "seller Bitcoin and USDT receiving setup is needed",
+        ),
+        (
+            call(true, true, false, 1_800).await,
+            StatusCode::CONFLICT,
+            "asset_unsupported",
+            "requested payment asset is not supported by this deployment",
+        ),
+        (
+            call(true, true, true, 3_601).await,
+            StatusCode::BAD_REQUEST,
+            "payment_window_exceeds_cap",
+            "payment window exceeds the cap for this request",
+        ),
+    ]
+    .map(|((status, body), expected_status, code, message)| {
+        ((status, body), expected_status, code, message)
+    }) {
+        assert_eq!(outcome.0, status, "{code}");
+        assert_eq!(
+            outcome.1,
+            serde_json::json!({"error":{"code":code,"message":message}})
+        );
+    }
 }

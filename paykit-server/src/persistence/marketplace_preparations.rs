@@ -2455,4 +2455,110 @@ mod tests {
             PersistenceError::Unavailable
         );
     }
+
+    fn legacy_intent() -> DeliveryIntentV1 {
+        use std::collections::HashMap;
+
+        use paykit_lib::{
+            PaykitAppId, PaymentAmount, PaymentEndpointIdentifier, PaymentEndpointPayload,
+            PaymentReference, PaymentRequestTerms,
+        };
+        let app_id = PaykitAppId::new("paykit-server").unwrap();
+        let endpoint = PaymentEndpointIdentifier::new("btc-bitcoin-p2wpkh").unwrap();
+        let terms = PaymentRequestTerms::builder(
+            PaymentAmount::new("0.00050000", "btc").unwrap(),
+            PaymentReference::new("7cceb26d-9042-4ea6-bfcb-01bbd778d76e").unwrap(),
+            vec![endpoint.clone()],
+        )
+        .required_app_id(Some(app_id.clone()))
+        .payment_endpoints(Some(HashMap::from([(
+            endpoint,
+            PaymentEndpointPayload::new(
+                serde_json::json!({"value": "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq"})
+                    .to_string(),
+            ),
+        )])))
+        .build()
+        .unwrap();
+        DeliveryIntentV1::payment_request(
+            "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy".into(),
+            app_id,
+            &terms,
+        )
+        .unwrap()
+    }
+
+    fn legacy_envelope() -> PreparationEnvelopeV1 {
+        PreparationEnvelopeV1 {
+            version: 1,
+            operation_id: "marketplace-payment:order-1:attempt-1".into(),
+            request_binding: b"rc16 binding".to_vec(),
+            reader: "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy".into(),
+            reference: "7cceb26d-9042-4ea6-bfcb-01bbd778d76e".into(),
+            total_sats: 50_000,
+            payment_window_seconds: 86_400,
+            prepare_ttl_seconds: 900,
+            prepared_at: OffsetDateTime::UNIX_EPOCH,
+            prepare_expires_at: OffsetDateTime::UNIX_EPOCH + Duration::minutes(15),
+            child_index: 3,
+            payment_request_intent: legacy_intent(),
+        }
+    }
+
+    #[test]
+    fn rc16_envelope_reads_as_bitcoin_denominated_bitcoin_only() {
+        let bytes = postcard::to_allocvec(&legacy_envelope()).unwrap();
+        let envelope = PreparationEnvelope::decode(&bytes).unwrap();
+        assert_eq!(envelope.version, 1);
+        assert_eq!(envelope.child_index, 3);
+        assert_eq!(envelope.terms.amount(), 50_000);
+        assert_eq!(envelope.terms.asset(), CriterionAsset::Btc);
+        assert_eq!(envelope.terms.accepted_assets(), [AcceptedAsset::Btc]);
+        assert_eq!(
+            envelope.quote().unwrap().payment_amounts(),
+            [(AcceptedAsset::Btc, 50_000)]
+        );
+        assert!(envelope.terms_match(50_000, CriterionAsset::Btc));
+        assert!(!envelope.terms_match(50_000, CriterionAsset::Usd));
+    }
+
+    #[test]
+    fn current_envelope_round_trips_and_unknown_versions_are_corrupt() {
+        let legacy = legacy_envelope();
+        let current = PreparationEnvelope {
+            version: 2,
+            operation_id: legacy.operation_id,
+            request_binding: legacy.request_binding,
+            reader: legacy.reader,
+            reference: legacy.reference,
+            terms: MarketplaceTerms::new(
+                50_000,
+                CriterionAsset::Btc,
+                [AcceptedAsset::Usdt, AcceptedAsset::Btc],
+            )
+            .unwrap(),
+            payment_window_seconds: legacy.payment_window_seconds,
+            prepare_ttl_seconds: legacy.prepare_ttl_seconds,
+            prepared_at: legacy.prepared_at,
+            prepare_expires_at: legacy.prepare_expires_at,
+            child_index: legacy.child_index,
+            payment_request_intent: legacy.payment_request_intent,
+        };
+        let bytes = postcard::to_allocvec(&current).unwrap();
+        let decoded = PreparationEnvelope::decode(&bytes).unwrap();
+        assert_eq!(decoded.version, 2);
+        assert_eq!(decoded.terms, current.terms);
+        for version in [0_u8, 3, 255] {
+            let mut tampered = bytes.clone();
+            tampered[0] = version;
+            assert_eq!(
+                PreparationEnvelope::decode(&tampered).err(),
+                Some(PersistenceError::CorruptOrMissing)
+            );
+        }
+        assert_eq!(
+            PreparationEnvelope::decode(&[]).err(),
+            Some(PersistenceError::CorruptOrMissing)
+        );
+    }
 }

@@ -233,4 +233,152 @@ mod tests {
             );
         }
     }
+
+    use std::collections::HashMap;
+
+    use paykit_lib::{
+        ConversionRate, PaykitAppId, PaymentAmount, PaymentConversion, PaymentEndpointIdentifier,
+        PaymentEndpointPayload, PaymentReference, PaymentRequestTerms,
+    };
+
+    const BTC_ADDRESS: &str = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq";
+    const USDT_ADDRESS: &str = "0x1111111111111111111111111111111111111111";
+
+    fn intent(
+        amount: &str,
+        asset: &str,
+        endpoints: &[&str],
+        rates: &[(&str, &str)],
+    ) -> DeliveryIntentV1 {
+        let app_id = PaykitAppId::new("paykit-server").unwrap();
+        let payloads: HashMap<_, _> = endpoints
+            .iter()
+            .map(|name| {
+                let payload = if *name == "usdt-arbitrum-address" {
+                    crate::domain::receiving::UsdtAddress::try_from(USDT_ADDRESS.to_owned())
+                        .unwrap()
+                        .endpoint()
+                        .to_string()
+                } else {
+                    serde_json::json!({"value": BTC_ADDRESS}).to_string()
+                };
+                (
+                    PaymentEndpointIdentifier::new(*name).unwrap(),
+                    PaymentEndpointPayload::new(payload),
+                )
+            })
+            .collect();
+        let mut identifiers: Vec<_> = payloads.keys().cloned().collect();
+        identifiers.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        let terms = PaymentRequestTerms::builder(
+            PaymentAmount::new(amount, asset).unwrap(),
+            PaymentReference::new("7cceb26d-9042-4ea6-bfcb-01bbd778d76e").unwrap(),
+            identifiers,
+        )
+        .required_app_id(Some(app_id.clone()))
+        .payment_endpoints(Some(payloads))
+        .conversion((!rates.is_empty()).then(|| {
+            PaymentConversion::Fixed {
+                rates: rates
+                    .iter()
+                    .map(|(asset, value)| ConversionRate {
+                        asset: (*asset).into(),
+                        value: (*value).into(),
+                    })
+                    .collect(),
+            }
+        }))
+        .build()
+        .unwrap();
+        DeliveryIntentV1::payment_request(
+            "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy".into(),
+            app_id,
+            &terms,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn quote_reads_exact_payable_amounts_and_rates_from_the_intent() {
+        let terms = MarketplaceTerms::new(
+            500,
+            CriterionAsset::Usd,
+            [AcceptedAsset::Btc, AcceptedAsset::Usdt],
+        )
+        .unwrap();
+        let quote = MarketplaceQuote::from_intent(
+            &intent(
+                "5.00",
+                "usd",
+                &["btc-bitcoin-p2wpkh", "usdt-arbitrum-address"],
+                &[("btc", "0.000012345679012346"), ("usdt", "1")],
+            ),
+            &terms,
+        )
+        .unwrap();
+        assert_eq!(
+            quote.payment_amounts(),
+            [
+                (AcceptedAsset::Btc, 6_173),
+                (AcceptedAsset::Usdt, 5_000_000)
+            ]
+        );
+        assert_eq!(quote.payment_amount(AcceptedAsset::Usdt), Some(5_000_000));
+        assert_eq!(quote.rates().len(), 2);
+    }
+
+    #[test]
+    fn quote_refuses_anything_the_request_did_not_ask_for_or_cannot_price() {
+        let usd_btc =
+            MarketplaceTerms::new(500, CriterionAsset::Usd, [AcceptedAsset::Btc]).unwrap();
+        let btc_rate = ("btc", "0.000012345679012346");
+        for (label, intent) in [
+            (
+                "extra USDT endpoint",
+                intent(
+                    "5.00",
+                    "usd",
+                    &["btc-bitcoin-p2wpkh", "usdt-arbitrum-address"],
+                    &[btc_rate, ("usdt", "1")],
+                ),
+            ),
+            (
+                "missing rate",
+                intent("5.00", "usd", &["btc-bitcoin-p2wpkh"], &[]),
+            ),
+            (
+                "wrong amount",
+                intent("5.01", "usd", &["btc-bitcoin-p2wpkh"], &[btc_rate]),
+            ),
+            (
+                "wrong denomination",
+                intent("0.00000500", "btc", &["btc-bitcoin-p2wpkh"], &[btc_rate]),
+            ),
+            (
+                "missing endpoint",
+                intent("5.00", "usd", &["usdt-arbitrum-address"], &[("usdt", "1")]),
+            ),
+        ] {
+            assert_eq!(
+                MarketplaceQuote::from_intent(&intent, &usd_btc),
+                Err(PersistenceError::InvalidInput),
+                "{label}"
+            );
+        }
+        let btc_only =
+            MarketplaceTerms::new(50_000, CriterionAsset::Btc, [AcceptedAsset::Btc]).unwrap();
+        assert!(
+            MarketplaceQuote::from_intent(
+                &intent(
+                    "0.00050000",
+                    "btc",
+                    &["btc-bitcoin-p2wpkh"],
+                    &[("btc", "1")]
+                ),
+                &btc_only
+            )
+            .is_err(),
+            "a rate for the requested asset itself"
+        );
+    }
 }
