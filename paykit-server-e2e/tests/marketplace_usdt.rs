@@ -48,6 +48,10 @@ fn reference(index: usize) -> String {
 /// Prepares and activates a request whose reference and request id match proof fixture
 /// `index`, and records the SDK lifecycle attribution the background worker would.
 async fn offered(rig: &Rig, index: usize, accepted: &[&str]) -> Offered {
+    offered_with_window(rig, index, accepted, 1_800).await
+}
+
+async fn offered_with_window(rig: &Rig, index: usize, accepted: &[&str], window: u64) -> Offered {
     let (status, prepared) = rig
         .prepare_with_reference(
             &reference(index),
@@ -55,7 +59,7 @@ async fn offered(rig: &Rig, index: usize, accepted: &[&str]) -> Offered {
             AMOUNT,
             "USD",
             accepted,
-            1_800,
+            window,
         )
         .await;
     assert_eq!(
@@ -575,5 +579,66 @@ async fn usdt_receipts_are_authenticated_by_the_integrity_scan() {
         StatusCode::SERVICE_UNAVAILABLE,
         "a tampered receipt fails closed"
     );
+    rig.cleanup().await;
+}
+
+/// A pass that starts after the payment window has closed, and after Bitcoin target
+/// discovery has stamped the settlement expired, is an ordinary pass: the receipt is
+/// judged by its block time, not skipped and not an error.
+#[tokio::test]
+async fn proof_pass_after_the_settlement_expired_records_the_receipt_by_block_time() {
+    for (label, block_offset, on_time) in [("on time by block time", 0, true), ("late", 5, false)] {
+        let rig = rig(BOTH_RAILS, true).await;
+        let rpc = Rpc::start().await;
+        let request = offered_with_window(&rig, 0, &[], 1).await;
+        tokio::time::sleep(std::time::Duration::from_millis(1_300)).await;
+        rig.store.observation_targets().await.unwrap();
+        let expired: Option<OffsetDateTime> =
+            sqlx::query_scalar("SELECT payment_expired_at FROM marketplace_settlements")
+                .fetch_one(rig.database.pool())
+                .await
+                .unwrap();
+        assert!(expired.is_some(), "{label}: discovery stamped the expiry");
+
+        chain(&rpc, |chain| chain.timestamp = request.at(block_offset));
+        submit(&rig, &rpc, 0).await;
+        let status = rig.status(&request.invoice).await;
+        assert_eq!(status["usdt_arbitrum"]["paid_on_time"], on_time, "{label}");
+        assert_eq!(
+            status["paid_asset"],
+            if on_time { json!("USDT") } else { Value::Null },
+            "{label}"
+        );
+        assert_eq!(
+            status["payment_state"],
+            if on_time { "confirmed" } else { "expired" },
+            "{label}"
+        );
+        rig.cleanup().await;
+    }
+}
+
+/// The settlement a proof pass locks cannot disappear or leave `active` underneath it:
+/// the database refuses the state change, so a failed lock is a broken invariant.
+#[tokio::test]
+async fn an_active_settlement_cannot_leave_active_during_a_pass() {
+    let rig = rig(BOTH_RAILS, true).await;
+    let rpc = Rpc::start().await;
+    let request = offered_with_window(&rig, 0, &[], 1).await;
+    tokio::time::sleep(std::time::Duration::from_millis(1_300)).await;
+    rig.store.observation_targets().await.unwrap();
+    for statement in [
+        "UPDATE marketplace_payment_preparations SET state = 'voided', activated_at = NULL, payment_deadline = NULL, voided_at = NOW()",
+        "UPDATE marketplace_payment_preparations SET state = 'prepared', activated_at = NULL, payment_deadline = NULL",
+        "DELETE FROM marketplace_settlements",
+    ] {
+        sqlx::query(statement)
+            .execute(rig.database.pool())
+            .await
+            .expect_err(statement);
+    }
+    chain(&rpc, |chain| chain.timestamp = request.at(0));
+    submit(&rig, &rpc, 0).await;
+    assert_eq!(rig.status(&request.invoice).await["paid_asset"], "USDT");
     rig.cleanup().await;
 }

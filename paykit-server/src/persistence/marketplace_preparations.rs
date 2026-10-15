@@ -2241,7 +2241,12 @@ impl MarketplacePreparationStore {
                     )
                     .await?;
                 // Each rail is judged alone: partial payments are never combined, and
-                // the rail whose receipt qualified first is the paid asset.
+                // the rail whose receipt qualified first is the paid asset. The two
+                // times come from different clocks: Bitcoin's is this server's first
+                // sighting of the output (poll-interval granularity, after the
+                // broadcast), USDT's is the chain's whole-second block time. They only
+                // order two payments that both qualified, so a close race can name
+                // either rail; Bitcoin wins an exact tie.
                 let bitcoin_paid = bitcoin
                     .as_ref()
                     .filter(|bitcoin| bitcoin.paid_on_time)

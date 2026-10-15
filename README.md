@@ -170,7 +170,11 @@ second of activation and closes at the deadline) and `finalized`. One receipt is
 never a sum of partial transfers, and a finalized receipt is never rewritten. A transfer
 belongs to one request for good. `paid_asset` is `"BTC"` or `"USDT"` for the rail whose
 receipt is `amount_matched` and `paid_on_time`, the earlier one if both qualify (Bitcoin by
-first observation, USDT by block time), else `null`. A second payment on the other rail
+first observation, USDT by block time), else `null`. The two times come from different
+clocks, this server's first sighting of the output and the chain's whole-second block
+time, so they order two qualifying payments only approximately: a close race can name
+either rail, and Bitcoin wins an exact tie. Consumers that must not depend on the order
+should read both rail objects, which stay populated. A second payment on the other rail
 leaves both rail objects populated for the consumer to flag; partial payments across rails
 are never combined. `payment_state` is `confirmed` when either rail has an included
 payment, `detected` when a receipt is present with no confirmations, and `expired` once the
