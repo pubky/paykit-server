@@ -488,15 +488,113 @@ async fn proof_before_activation_attribution_is_ignored_and_prepared_requests_ne
     rig.cleanup().await;
 }
 
+type Reads = Vec<Value>;
+
+/// Waits until `ready` reports every reader's initial reads. A reader returns only after
+/// the proof is submitted, so a reader that finishes first has failed: its panic is
+/// reported at once, not discovered after a wait that can never end. `limit` is a
+/// backstop for a reader that neither progresses nor fails.
+async fn wait_for_readers_ready(
+    readers: &mut tokio::task::JoinSet<Reads>,
+    ready: impl Fn() -> bool,
+    limit: std::time::Duration,
+) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + limit;
+    while !ready() {
+        tokio::select! {
+            finished = readers.join_next() => {
+                return Err(match finished {
+                    Some(Err(error)) if error.is_panic() => {
+                        let payload = error.into_panic();
+                        let message = payload
+                            .downcast_ref::<String>()
+                            .cloned()
+                            .or_else(|| payload.downcast_ref::<&str>().map(|text| (*text).to_owned()))
+                            .unwrap_or_else(|| "non-string panic".to_owned());
+                        format!("a status reader failed before the proof was submitted: {message}")
+                    }
+                    Some(Err(error)) => format!("a status reader was cancelled: {error}"),
+                    Some(Ok(_)) => "a status reader stopped before the proof was submitted".to_owned(),
+                    None => "no status readers are running".to_owned(),
+                });
+            }
+            () = tokio::time::sleep(std::time::Duration::from_millis(1)) => {}
+            () = tokio::time::sleep_until(deadline) => {
+                return Err(format!("status readers were not ready within {limit:?}"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A reader failing, or going quiet, before readiness fails the wait promptly instead of
+/// hanging it.
+#[tokio::test]
+async fn reader_failure_before_readiness_fails_the_wait_promptly() {
+    use std::{sync::atomic::AtomicUsize, time::Duration};
+    let limit = Duration::from_secs(30);
+    let promptly = Duration::from_secs(5);
+
+    let mut failing = tokio::task::JoinSet::new();
+    failing.spawn(async { panic!("status 429") });
+    failing.spawn(async {
+        std::future::pending::<()>().await;
+        Vec::new()
+    });
+    let started = std::time::Instant::now();
+    let error = wait_for_readers_ready(&mut failing, || false, limit)
+        .await
+        .unwrap_err();
+    assert!(started.elapsed() < promptly, "took {:?}", started.elapsed());
+    assert!(error.contains("status 429"), "{error}");
+
+    let mut quiet_exit = tokio::task::JoinSet::new();
+    quiet_exit.spawn(async { Vec::new() });
+    let error = wait_for_readers_ready(&mut quiet_exit, || false, limit)
+        .await
+        .unwrap_err();
+    assert!(error.contains("stopped before the proof"), "{error}");
+
+    let mut stalled = tokio::task::JoinSet::new();
+    stalled.spawn(async {
+        std::future::pending::<()>().await;
+        Vec::new()
+    });
+    let started = std::time::Instant::now();
+    let error = wait_for_readers_ready(&mut stalled, || false, Duration::from_millis(200))
+        .await
+        .unwrap_err();
+    assert!(started.elapsed() < promptly);
+    assert!(error.contains("not ready within"), "{error}");
+
+    let progress = std::sync::Arc::new(AtomicUsize::new(0));
+    let mut healthy = tokio::task::JoinSet::new();
+    let ticking = progress.clone();
+    healthy.spawn(async move {
+        for _ in 0..3 {
+            ticking.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        std::future::pending::<()>().await;
+        Vec::new()
+    });
+    wait_for_readers_ready(&mut healthy, || progress.load(Ordering::SeqCst) >= 3, limit)
+        .await
+        .unwrap();
+}
+
 /// A status read overlapping the commit that applies a proof sees the request either
 /// entirely before it or entirely after it, never a half-applied mixture. The reads are
 /// bounded and synchronised, not timed: every reader has read before the proof is
-/// submitted and reads a fixed number of times after it.
+/// submitted and reads a fixed number of times after it. A reader that fails before
+/// that point fails the test at once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn status_reads_racing_a_proof_submission_never_see_a_half_applied_state() {
     const READERS: usize = 3;
     const READS_BEFORE_SUBMIT: usize = 3;
     const READS_AFTER_SUBMIT: usize = 6;
+    /// Backstop on the reads before the submit, so a stalled test cannot flood the rig.
+    const MAX_READS_BEFORE_SUBMIT: usize = 1_000;
     let rig = std::sync::Arc::new(rig(BOTH_RAILS, true).await);
     let rpc = Rpc::start().await;
     let request = offered(&rig, 0, &[]).await;
@@ -504,16 +602,19 @@ async fn status_reads_racing_a_proof_submission_never_see_a_half_applied_state()
 
     let submitted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let early_reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let mut readers = Vec::new();
+    let mut readers = tokio::task::JoinSet::new();
     for _ in 0..READERS {
         let rig = rig.clone();
         let submitted = submitted.clone();
         let early_reads = early_reads.clone();
         let invoice = request.invoice.clone();
-        readers.push(tokio::spawn(async move {
+        readers.spawn(async move {
             let mut seen = Vec::new();
             let mut counted = 0;
             while !submitted.load(Ordering::SeqCst) {
+                if seen.len() >= MAX_READS_BEFORE_SUBMIT {
+                    return seen;
+                }
                 seen.push(rig.status(&invoice).await);
                 if counted < READS_BEFORE_SUBMIT {
                     counted += 1;
@@ -525,18 +626,22 @@ async fn status_reads_racing_a_proof_submission_never_see_a_half_applied_state()
                 seen.push(rig.status(&invoice).await);
             }
             seen
-        }));
+        });
     }
-    while early_reads.load(Ordering::SeqCst) < READERS * READS_BEFORE_SUBMIT {
-        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-    }
+    wait_for_readers_ready(
+        &mut readers,
+        || early_reads.load(Ordering::SeqCst) >= READERS * READS_BEFORE_SUBMIT,
+        std::time::Duration::from_secs(30),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("{error}"));
     submit(&rig, &rpc, 0).await;
     submitted.store(true, Ordering::SeqCst);
 
     let mut before = 0;
     let mut after = 0;
-    for reader in readers {
-        let seen = reader.await.unwrap();
+    while let Some(reader) = readers.join_next().await {
+        let seen = reader.unwrap();
         let mut applied = false;
         for status in &seen {
             let has_usdt = !status["usdt_arbitrum"].is_null();
