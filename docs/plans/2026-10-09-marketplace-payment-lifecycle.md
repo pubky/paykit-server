@@ -1,6 +1,6 @@
 # Marketplace Payment Lifecycle Decision Ledger
 
-Status: preparation, activation, void, activated-settlement ownership, Bitcoin observation, resolution, and signed Marketplace status slices authorized.
+Status: preparation, activation, void, activated-settlement ownership, Bitcoin observation, resolution, and signed Marketplace status slices authorized. Prepare and activate carry amount, asset and accepted assets (decision PK1, 15 Oct 2026; see the multi-asset section below).
 
 ## Authority and baseline
 
@@ -26,14 +26,16 @@ Request:
   "creator": "<Pubky>",
   "reader": "<Pubky>",
   "reference": "<payment reference>",
-  "amount_sats": 1,
+  "amount": "500",
+  "asset": "USD",
+  "accepted_assets": ["BTC", "USDT"],
   "operation_id": "marketplace-payment:<payment_reference>:<bind_attempt>",
   "payment_window_seconds": 86400,
   "description": "Pubky Shop order 8F3A91"
 }
 ```
 
-`description` is optional. Omission preserves the original six-field request binding and Payment Request terms.
+`description` is optional. The request binding covers every field, `accepted_assets` as a sorted set.
 
 Success `200`:
 
@@ -41,7 +43,11 @@ Success `200`:
 {
   "invoice_id": "<server-issued id>",
   "state": "prepared",
-  "total_sats": 1,
+  "amount": "500",
+  "asset": "USD",
+  "accepted_assets": ["BTC", "USDT"],
+  "payment_amounts": {"BTC": "6173", "USDT": "5000000"},
+  "rates": {"BTC": "0.000012345679012346", "USDT": "1"},
   "prepare_expires_at": "<RFC3339 UTC>"
 }
 ```
@@ -60,16 +66,16 @@ Accepted behavior:
 10. Reject unknown fields and fork-only fields including `stack_id`, `allocation_mode`, `nonce_sats`, address fingerprint, and caller-provided `resolved_at`.
 11. Bound preparation by the same 15-second request deadline as `POST /invoices`, including the process-local operation-lock wait, session and Reader checks, receiving-detail lookup, and entry into durable storage. Deadline exhaustion returns `503 dependency_timeout`. Once a PostgreSQL mutation begins, await its factual commit or rollback result rather than canceling it into an ambiguous response.
 12. Retry only a cleanly missing Reader App Registry, with three total reads and the shared full-jitter delay policy. Exhausted absence remains `reader_setup_pending`; malformed and unavailable reads keep their distinct errors.
-13. A seller without Bitcoin receiving details returns `503 seller_setup_pending`, distinct from malformed buyer input and Reader setup.
+13. A seller missing a receiving rail the request asked for returns `503 seller_setup_pending`, distinct from malformed buyer input and Reader setup; the message names the missing rail (Bitcoin, USDT, or both).
 14. PostgreSQL Creator-row locking and the post-lock operation read serialize commits across processes. The process-local operation mutex only suppresses duplicate external reads within one server process; it is not a horizontal-replica persistence fence.
 15. An optional `description` is an immutable part of the request binding and is copied exactly to Payment Request `metadata.note`. It must contain 1–140 Unicode scalar values and cannot be blank, contain control or bidi direction-control characters, or contain Unicode line/paragraph separators. Explicit `null` and non-string values are invalid; accepted text is not trimmed, normalized, or truncated.
 16. A scalar-valid description must also fit in the actual complete serialized Payment Request under the pinned Pubky Noise frame. Oversized requests return `400 invalid_request` before persistence. There is no guessed fixed UTF-8 description limit or description-free retry.
 
 ## Activation and void contract — current implementation slice
 
-- Activate: closed `{creator, invoice_id, total_sats}` request; DB-clock activation starts the bound payment window; atomically wins against void; inserts publication work once; replay returns stored success. Activation derives proposal acceptance duration as `min(configured proposal_acceptance_window, bound payment_window / 2)`. Duration arithmetic retains subsecond precision: a bound one-second payment window yields a 500-millisecond acceptance duration, not zero.
+- Activate: closed `{creator, invoice_id, amount, asset}` request; DB-clock activation starts the bound payment window; atomically wins against void; inserts publication work once; replay returns stored success. Activation derives proposal acceptance duration as `min(configured proposal_acceptance_window, bound payment_window / 2)`. Duration arithmetic retains subsecond precision: a bound one-second payment window yields a 500-millisecond acceptance duration, not zero.
 - Void: closed `{creator, invoice_id}` request; only prepared invoices transition; no publication or SDK cancellation; replay returns stored success.
-- Activation at or after `prepare_expires_at` returns `409 prepare_expired`, signaling a new attempt. Activation after void or prepared-state resolution returns `409 lifecycle_terminal`, signaling terminal stop. Void after activation returns `409 invoice_active`, signaling that payment remains live and observation must continue. An authoritative stored-total mismatch returns `409 total_mismatch`, signaling operator alert. Exact activation and void replay still return stored `200` responses. Void remains permitted for a resolved preparation. Persisted-state and database-integrity faults return `500 internal_error`, not a retryable `503`.
+- Activation at or after `prepare_expires_at` returns `409 prepare_expired`, signaling a new attempt. Activation after void or prepared-state resolution returns `409 lifecycle_terminal`, signaling terminal stop. Void after activation returns `409 invoice_active`, signaling that payment remains live and observation must continue. An authoritative stored amount or asset mismatch returns `409 total_mismatch`, signaling operator alert. Exact activation and void replay still return stored `200` responses. Void remains permitted for a resolved preparation. Persisted-state and database-integrity faults return `500 internal_error`, not a retryable `503`.
 - Prepared rows have no outbox work. Activation updates lifecycle state and inserts one encrypted proposal outbox intent in one PostgreSQL transaction. Marketplace outbox ownership remains separate from Locks invoice and drain linkage.
 - Activation applies `min(configured proposal_acceptance_window, bound payment_window / 2)` exactly, including subsecond results. Stable outbox UUID remains the SDK Payment Request ID on every worker retry.
 
@@ -92,7 +98,7 @@ Accepted behavior:
 - Marketplace settlement data remains separate from Locks `invoices`: it owns its encrypted payment record, Creator, Bitcoin address lookup, derivation-index lookup, and lifecycle projection. It does not fabricate a Locks bundle, lock resource, generation, drain membership, or buyer contact.
 - Payment Request lifecycle attribution is owner-aware. A delivered Marketplace proposal with `outbox.invoice_id IS NULL` projects against its active Marketplace settlement without making same-Creator Locks status or drain refresh unavailable. Locks lifecycle queries and drain semantics remain invoice-only.
 - Bitcoin addresses are globally unique across Locks invoices and Marketplace settlements at the PostgreSQL transaction boundary. Existing per-table invoice uniqueness and immutable activation replay remain intact.
-- Settlement ownership uses migration `0014_marketplace_settlements.sql`; #74 Bitcoin observation uses `0015_marketplace_bitcoin_observations.sql`; #68 resolution immutability uses `0016_marketplace_resolution_immutability.sql`.
+- Settlement ownership uses migration `0014_marketplace_settlements.sql`; the optional Bitcoin rail uses `0017_marketplace_optional_bitcoin_rail.sql`; #74 Bitcoin observation uses `0015_marketplace_bitcoin_observations.sql`; #68 resolution immutability uses `0016_marketplace_resolution_immutability.sql`.
 
 ## Marketplace Bitcoin observation — current implementation slice
 
@@ -103,9 +109,22 @@ Accepted behavior:
 - Marketplace settlement projection records current Bitcoin status, capped matching confirmations, amount match, historical first match, and expiry without creating Locks invoices, drains, generations, or buyer contacts.
 - Existing Locks observation and `{creator, bundle_id}` behavior remains owner-isolated and unchanged apart from enforcing immutable evidence for all Bitcoin outpoints.
 
+## Multi-asset prepare and activate (PK1)
+
+Decision PK1 (John, 15 Oct 2026): one Paykit request carries every asset the seller accepts, so the Shop offers a single "Pay with Paykit" option and the buyer picks BTC or USDT0 in Bitkit.
+
+- Request terms: `amount` is a base-unit integer string in the Locks criterion format; `asset` is the denomination (`BTC`, `USD`, `USDT`); `accepted_assets` is a non-empty, unique subset of `BTC` and `USDT`. The retired `amount_sats` body and `total_sats` response and activation fields no longer exist; no compatibility path reads them.
+- Every combination is supported. USD and USDT are fixed parity (`"1"`). Anything crossing BTC uses one Blocktank rate fixed at prepare (ten-minute freshness) and stored as `PaymentConversion::Fixed` in the preparation. Activation never refetches the rate. Open question for Paykit maintainers: confirm prepare, not activation, as the fixing point.
+- Each payable amount is computed with `invoice_pricing::payment_units` from the stored rates and rounded up to the endpoint's own unit, the same arithmetic Locks invoices use.
+- Decision D2: an asset that was not requested never gets an endpoint, a rate or a payable amount. A seller without a requested rail is `503 seller_setup_pending`; USDT without server `[usdt]` configuration is `409 asset_unsupported`.
+- Decision D4: a window over the applicable cap, `min(payment_window, conversion_payment_window)` when the request crosses BTC, is `400 payment_window_exceeds_cap`; it is never clamped.
+- The request binding covers amount, asset, the sorted accepted set, window and description, so any change under the same `operation_id` is `409 operation_conflict`.
+- Preparation envelope version 2 stores the terms. Version 1 envelopes written by rc11 to rc16 still decode as `{BTC, total_sats, [BTC]}` so rows prepared or activated before the upgrade keep activating, observing and reporting status. A version 1 `operation_id` cannot replay under the new binding and is an `operation_conflict`.
+- Migration `0017_marketplace_optional_bitcoin_rail.sql` makes the settlement's Bitcoin address optional: a USDT-only request activates with no address to claim or watch, and its settlement is never an Electrum target.
+
 ## Explicitly deferred follow-up and release hold
 
-- `usdt_observations` remains unchanged; Marketplace USDT settlement ownership is a later slice.
+- `usdt_observations` remains unchanged in this slice; Marketplace USDT settlement ownership is the next slice.
 - Marketplace consumer adaptation and exact-revision cross-service status fixtures remain separate follow-up work.
 - Marketplace must reject activation after its Marketplace-owned inventory hold expires; that cross-service timing guard belongs to the Marketplace consumer follow-up.
 - PR #67 may remain a reviewed draft, but must not merge to `master` until Bitcoin observation/status, Marketplace hold-boundary work, and the accepted base-stack-stability gate are complete. No deployment is authorized.
@@ -144,3 +163,11 @@ Accepted behavior:
 - Tests cover active zero-confirmation replacement, immutable first time and amount, no timeliness transfer, reorg, late match, underpayment replacement, six-confirmation finality, and stale absence.
 - Cross-owner outpoints conflict; Creator and AEAD parent binding remain isolated.
 - Existing Locks observation, status, drain, lifecycle, and buyer-contact suites remain green.
+
+## Verification required for multi-asset prepare and activate
+
+- Every denomination and accepted-set combination prepares over the signed route with the expected endpoints, rates and payable amounts, and exact replay never reads the feed.
+- Refusals persist nothing and keep the address index: seller setup (each missing rail), unsupported USDT, window over cap (including 3,601 s on a BTC-crossing request while parity requests keep the ordinary cap), unavailable or stale feed.
+- The feed failing at activation does not affect activation; the stored rates are the ones proposed.
+- A 1,800 second window gives a 15 minute accept-by and a 30 minute payment deadline.
+- A BTC payment on a dual-asset request is matched against the converted sats; rc16 envelopes still activate and report status; a USDT-only request activates and is never an observation target.
