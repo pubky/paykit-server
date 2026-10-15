@@ -2,13 +2,7 @@ use paykit_lib::{
     PaykitAppId, PaymentAmount, PaymentEndpointIdentifier, PaymentEndpointPayload,
     PaymentReference, PaymentRequestTerms,
 };
-use paykit_server::{
-    application::{
-        marketplace_terms::MarketplaceTerms, semantic_intent::DeliveryIntentV1,
-        setup_status::AcceptedAsset,
-    },
-    domain::{invoice::CriterionAsset, locks::ReaderPubky},
-};
+use paykit_server::{application::semantic_intent::DeliveryIntentV1, domain::locks::ReaderPubky};
 use std::collections::HashMap;
 
 pub fn app_id() -> PaykitAppId {
@@ -53,14 +47,6 @@ pub fn payment_intent_with_reference_and_note(
     }
     let terms = terms.build().unwrap();
     DeliveryIntentV1::payment_request(reader.to_string(), app_id(), &terms).unwrap()
-}
-
-/// Bitcoin-denominated, Bitcoin-only terms for store-level tests.
-#[allow(dead_code)]
-pub fn btc_terms(sats: u64) -> &'static MarketplaceTerms {
-    Box::leak(Box::new(
-        MarketplaceTerms::new(sats, CriterionAsset::Btc, [AcceptedAsset::Btc]).unwrap(),
-    ))
 }
 
 /// Compares a response body with a checked-in fixture, or rewrites the fixture when

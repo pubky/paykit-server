@@ -32,11 +32,19 @@ struct PrepareBody {
     reference: String,
     amount: String,
     asset: String,
-    accepted_assets: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_present_assets")]
+    accepted_assets: Option<Vec<String>>,
     operation_id: String,
     payment_window_seconds: u64,
     #[serde(default, deserialize_with = "deserialize_present_description")]
     description: Option<String>,
+}
+
+fn deserialize_present_assets<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Vec::<String>::deserialize(deserializer).map(Some)
 }
 
 fn deserialize_present_description<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
@@ -113,7 +121,11 @@ fn parse(body: PrepareBody) -> Result<PrepareMarketplaceRequest, ApiError> {
         reference: body.reference,
         amount: parse_amount(&body.amount)?,
         asset: parse_asset(&body.asset)?,
-        accepted_assets: parse_accepted_assets(&body.accepted_assets)?,
+        accepted_assets: body
+            .accepted_assets
+            .as_deref()
+            .map(parse_accepted_assets)
+            .transpose()?,
         operation_id: body.operation_id,
         payment_window_seconds: body.payment_window_seconds,
         description: body.description,

@@ -28,14 +28,13 @@ Request:
   "reference": "<payment reference>",
   "amount": "500",
   "asset": "USD",
-  "accepted_assets": ["BTC", "USDT"],
   "operation_id": "marketplace-payment:<payment_reference>:<bind_attempt>",
   "payment_window_seconds": 86400,
   "description": "Pubky Shop order 8F3A91"
 }
 ```
 
-`description` is optional. The request binding covers every field, `accepted_assets` as a sorted set.
+`description` is optional. `accepted_assets` (`["BTC"]`, `["USDT"]` or both) is optional and only narrows what the seller's setup offers; omit it to offer every enabled rail. The request binding covers every field present, `accepted_assets` as a sorted set.
 
 Success `200`:
 
@@ -113,14 +112,14 @@ Accepted behavior:
 
 Decision PK1 (John, 15 Oct 2026): one Paykit request carries every asset the seller accepts, so the Shop offers a single "Pay with Paykit" option and the buyer picks BTC or USDT0 in Bitkit.
 
-- Request terms: `amount` is a base-unit integer string in the Locks criterion format; `asset` is the denomination (`BTC`, `USD`, `USDT`); `accepted_assets` is a non-empty, unique subset of `BTC` and `USDT`. The retired `amount_sats` body and `total_sats` response and activation fields no longer exist; no compatibility path reads them.
+- Request terms: `amount` is a base-unit integer string in the Locks criterion format; `asset` is the denomination (`BTC`, `USD`, `USDT`). Paykit Server derives the endpoints from the seller's setup, as for Locks invoices: a fresh Bitcoin address from the seller's xpub, and the seller's USDT address when the deployment has `[usdt]`. The optional `accepted_assets` (non-empty, unique subset of `BTC`, `USDT`) only narrows; it never adds a rail. It exists because a shared USDT address cannot be removed on reconnect, so the Shop's "Accept USDT" toggle can only be honoured by narrowing. The retired `amount_sats` body and `total_sats` response and activation fields no longer exist; no compatibility path reads them.
 - Every combination is supported. USD and USDT are fixed parity (`"1"`). Anything crossing BTC uses one Blocktank rate fixed at prepare (ten-minute freshness) and stored as `PaymentConversion::Fixed` in the preparation. Activation never refetches the rate. Open question for Paykit maintainers: confirm prepare, not activation, as the fixing point.
 - Each payable amount is computed with `invoice_pricing::payment_units` from the stored rates and rounded up to the endpoint's own unit, the same arithmetic Locks invoices use.
-- Decision D2: an asset that was not requested never gets an endpoint, a rate or a payable amount. A seller without a requested rail is `503 seller_setup_pending`; USDT without server `[usdt]` configuration is `409 asset_unsupported`.
-- Decision D4: a window over the applicable cap, `min(payment_window, conversion_payment_window)` when the request crosses BTC, is `400 payment_window_exceeds_cap`; it is never clamped.
-- The request binding covers amount, asset, the sorted accepted set, window and description, so any change under the same `operation_id` is `409 operation_conflict`.
-- Preparation envelope version 2 stores the terms. Version 1 envelopes written by rc11 to rc16 still decode as `{BTC, total_sats, [BTC]}` so rows prepared or activated before the upgrade keep activating, observing and reporting status. A version 1 `operation_id` cannot replay under the new binding and is an `operation_conflict`.
-- Migration `0017_marketplace_optional_bitcoin_rail.sql` makes the settlement's Bitcoin address optional: a USDT-only request activates with no address to claim or watch, and its settlement is never an Electrum target.
+- Decision D2: with a filter, an asset that was not asked for never gets an endpoint, a rate or a payable amount. A requested rail the seller has not set up is absent, not a refusal. Only when nothing can be offered is it `503 seller_setup_pending`, naming the rail; a filter asking only for USDT on a deployment without `[usdt]` is `409 asset_unsupported`.
+- Decision D4: a window over the applicable cap, `min(payment_window, conversion_payment_window)` when what is offered crosses BTC, is `400 payment_window_exceeds_cap`; it is never clamped.
+- The request binding covers amount, asset, the sorted filter when present, window and description, so any change under the same `operation_id` is `409 operation_conflict`.
+- Preparation envelope version 2 stores the offered terms. Version 1 envelopes written by rc11 to rc16 still decode as `{BTC, total_sats, [BTC]}` so rows prepared or activated before the upgrade keep activating, observing and reporting status. A version 1 `operation_id` cannot replay under the new binding and is an `operation_conflict`.
+- Migration `0017_marketplace_optional_bitcoin_rail.sql` makes the settlement's Bitcoin address optional: a request that offers only USDT activates with no address to claim or watch, and its settlement is never an Electrum target.
 
 ## Explicitly deferred follow-up and release hold
 
@@ -166,8 +165,8 @@ Decision PK1 (John, 15 Oct 2026): one Paykit request carries every asset the sel
 
 ## Verification required for multi-asset prepare and activate
 
-- Every denomination and accepted-set combination prepares over the signed route with the expected endpoints, rates and payable amounts, and exact replay never reads the feed.
-- Refusals persist nothing and keep the address index: seller setup (each missing rail), unsupported USDT, window over cap (including 3,601 s on a BTC-crossing request while parity requests keep the ordinary cap), unavailable or stale feed.
+- Every denomination and filter combination prepares over the signed route with the expected endpoints, rates and payable amounts; an omitted filter offers what the seller enabled; exact replay never reads the feed.
+- Refusals persist nothing and keep the address index: nothing to offer (each missing rail), USDT-only filter without `[usdt]`, window over cap (including 3,601 s on a BTC-crossing request while parity requests keep the ordinary cap), unavailable or stale feed.
 - The feed failing at activation does not affect activation; the stored rates are the ones proposed.
 - A 1,800 second window gives a 15 minute accept-by and a 30 minute payment deadline.
 - A BTC payment on a dual-asset request is matched against the converted sats; rc16 envelopes still activate and report status; a USDT-only request activates and is never an observation target.

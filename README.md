@@ -93,33 +93,39 @@ and errors are not cached. Payment authorization, handoff, and verification keep
 their own fresh checks.
 
 Marketplace prepare and activate carry one request for every asset the buyer may pay
-with. `POST /marketplace/payment-requests/prepare` takes a closed body of `creator`,
-`reader`, `reference`, `operation_id`, `payment_window_seconds`, optional `description`,
-`amount` (a base-unit integer string: sats, cents or millionths, the Locks criterion
-format), `asset` (the denomination: `BTC`, `USD` or `USDT`) and `accepted_assets` (a
-non-empty, unique subset of `BTC` and `USDT`; order is not significant). Every
-combination is supported, including both assets in one request. USD and USDT are fixed
-parity (rate `"1"`). Any pairing that crosses BTC reads the Blocktank BTC/USD feed once at
-prepare (ten-minute freshness, as Locks invoices do) and stores it as a fixed conversion
-in the preparation; activation never refetches it. Each payable amount is rounded up to
-its own endpoint unit. Only the accepted assets get payment endpoints: a rail the request
-did not ask for is never added. The `200` response echoes `amount`, `asset`,
-`accepted_assets`, `payment_amounts` (per accepted asset, in that asset's base units),
-the fixed `rates` (payment-asset units per one requested-asset unit; `{}` when none) and
-`prepare_expires_at`. Typed refusals: `503 seller_setup_pending` (the message names the
-missing rail: Bitcoin, USDT, or both), `409 asset_unsupported` (USDT requested but this
+with, derived from the seller's Paykit setup exactly as Locks invoices are.
+`POST /marketplace/payment-requests/prepare` takes a closed body of `creator`, `reader`,
+`reference`, `operation_id`, `payment_window_seconds`, optional `description`, `amount`
+(a base-unit integer string: sats, cents or millionths, the Locks criterion format) and
+`asset` (the denomination: `BTC`, `USD` or `USDT`). The optional `accepted_assets` (a
+non-empty, unique subset of `BTC` and `USDT`; order is not significant; `null` and `[]`
+are invalid) only narrows. When it is omitted the request offers every asset the seller
+has set up: a Bitcoin address from the seller's xpub, and the seller's shared USDT address
+when this deployment has `[usdt]`. When present it never adds a rail, and a requested rail
+the seller has not set up is absent rather than a refusal. Every combination is supported,
+including both assets in one request. USD and USDT are fixed parity (rate `"1"`). Any
+pairing that crosses BTC reads the Blocktank BTC/USD feed once at prepare (ten-minute
+freshness, as Locks invoices do) and stores it as a fixed conversion in the preparation;
+activation never refetches it. Each payable amount is rounded up to its own endpoint
+unit. The `200` response echoes `amount`, `asset`, the offered `accepted_assets`,
+`payment_amounts` (per offered asset, in that asset's base units), the fixed `rates`
+(payment-asset units per one requested-asset unit; `{}` when none) and
+`prepare_expires_at`. Typed refusals: `503 seller_setup_pending` when nothing can be
+offered (the message names the rail: Bitcoin, USDT, or both; an omitted filter on a seller
+with no rail names Bitcoin), `409 asset_unsupported` (the filter asks only for USDT and this
 deployment has no `[usdt]` configuration), `400 payment_window_exceeds_cap` (the window is
-over `min(payment_window, conversion_payment_window)` when the request crosses BTC, else
-over `payment_window`; never clamped) and, when the feed is unavailable or stale,
-`503 dependency_unavailable`. Changing the amount, asset or accepted set under the same
-`operation_id` is `409 operation_conflict`. `POST /marketplace/payment-requests/activate`
-takes a closed `{creator, invoice_id, amount, asset}`; a different amount or asset is
-`409 total_mismatch`; the response echoes `amount`, `asset`, `accepted_assets` and
-`payment_amounts`. The proposal accept-by stays `min(proposal_acceptance_window,
-payment_window / 2)`, so a 1,800 second window gives a 15 minute accept-by and a 30 minute
-payment deadline. A request that accepts only USDT has no Bitcoin address: its settlement
-is never an Electrum target. Fixtures captured from the real services over PostgreSQL are
-under `docs/fixtures/marketplace-payment-request-prepare-activate/`.
+over `min(payment_window, conversion_payment_window)` when what is offered crosses BTC,
+else over `payment_window`; never clamped) and, when the feed is unavailable or stale,
+`503 dependency_unavailable`. Changing the amount, asset, window, description or the
+filter (omitted counts as different from any list) under the same `operation_id` is
+`409 operation_conflict`. `POST /marketplace/payment-requests/activate` takes a closed
+`{creator, invoice_id, amount, asset}`; a different amount or asset is `409 total_mismatch`;
+the response echoes `amount`, `asset`, `accepted_assets` and `payment_amounts`. The
+proposal accept-by stays `min(proposal_acceptance_window, payment_window / 2)`, so a
+1,800 second window gives a 15 minute accept-by and a 30 minute payment deadline. A request
+that offers only USDT has no Bitcoin address: its settlement is never an Electrum target.
+Fixtures captured from the real services over PostgreSQL are under
+`docs/fixtures/marketplace-payment-request-prepare-activate/`.
 
 Marketplace preparation reserves invoice identity and private payment material but
 does not create an active invoice or enqueue publication. Its Creator-scoped

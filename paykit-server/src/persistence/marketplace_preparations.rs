@@ -36,7 +36,10 @@ pub struct MarketplacePreparationInput<'a> {
     pub reference: &'a str,
     pub operation_id: &'a str,
     pub request_binding: &'a [u8],
-    pub terms: &'a MarketplaceTerms,
+    /// Exact amount in `asset`'s base units.
+    pub amount: u64,
+    /// Denomination of `amount`.
+    pub asset: CriterionAsset,
     pub payment_window_seconds: u64,
     pub prepare_ttl_seconds: u64,
     pub payloads: &'a dyn MarketplacePreparationPayloadFactory,
@@ -995,11 +998,16 @@ impl MarketplacePreparationStore {
             .checked_add(ttl)
             .ok_or(PersistenceError::InvalidInput)?;
         let payloads = input.payloads.for_child_index(creator.next_child_index)?;
+        let terms = MarketplaceTerms::from_intent(
+            &payloads.payment_request_intent,
+            input.amount,
+            input.asset,
+        )?;
         let quote = validate_intent(
             &payloads.payment_request_intent,
             input.reader,
             input.reference,
-            input.terms,
+            &terms,
         )?;
         let invoice_id = Uuid::new_v4();
         let envelope = PreparationEnvelope {
@@ -1008,7 +1016,7 @@ impl MarketplacePreparationStore {
             request_binding: input.request_binding.to_vec(),
             reader: input.reader.to_string(),
             reference: input.reference.to_owned(),
-            terms: input.terms.clone(),
+            terms: terms.clone(),
             payment_window_seconds: input.payment_window_seconds,
             prepare_ttl_seconds: input.prepare_ttl_seconds,
             prepared_at,
@@ -1055,7 +1063,7 @@ impl MarketplacePreparationStore {
             .map_err(|_| PersistenceError::Unavailable)?;
         Ok(MarketplacePreparationResult {
             invoice_id,
-            terms: input.terms.clone(),
+            terms,
             quote,
             prepared_at,
             prepare_expires_at,
@@ -2331,7 +2339,7 @@ impl MarketplacePreparationStore {
             || envelope.request_binding != input.request_binding
             || envelope.reader != input.reader.to_string()
             || envelope.reference != input.reference
-            || envelope.terms != *input.terms
+            || !envelope.terms_match(input.amount, input.asset)
             || envelope.payment_window_seconds != input.payment_window_seconds
             || envelope.prepared_at != row.prepared_at
             || envelope.prepare_expires_at != row.prepare_expires_at

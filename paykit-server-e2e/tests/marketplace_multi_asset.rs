@@ -317,6 +317,7 @@ impl Rig {
         )
     }
 
+    /// An empty `accepted` omits the optional filter: offer everything the seller enabled.
     async fn prepare(
         &self,
         operation: &str,
@@ -325,20 +326,19 @@ impl Rig {
         accepted: &[&str],
         window: u64,
     ) -> (StatusCode, Vec<u8>) {
-        self.post(
-            PREPARE,
-            serde_json::json!({
-                "creator": CREATOR,
-                "reader": reader().to_string(),
-                "reference": REFERENCE,
-                "operation_id": operation,
-                "amount": amount,
-                "asset": asset,
-                "accepted_assets": accepted,
-                "payment_window_seconds": window,
-            }),
-        )
-        .await
+        let mut body = serde_json::json!({
+            "creator": CREATOR,
+            "reader": reader().to_string(),
+            "reference": REFERENCE,
+            "operation_id": operation,
+            "amount": amount,
+            "asset": asset,
+            "payment_window_seconds": window,
+        });
+        if !accepted.is_empty() {
+            body["accepted_assets"] = serde_json::json!(accepted);
+        }
+        self.post(PREPARE, body).await
     }
 
     async fn activate(&self, invoice_id: &str, amount: &str, asset: &str) -> (StatusCode, Vec<u8>) {
@@ -509,12 +509,86 @@ async fn every_denomination_and_accepted_set_prepares_over_the_signed_route() {
 }
 
 #[tokio::test]
+async fn omitted_filter_derives_the_sellers_rails_and_a_filter_only_narrows() {
+    for (seller, usdt_enabled, name, rails) in [
+        (BOTH_RAILS, true, "derived-btc-usdt", vec!["BTC", "USDT"]),
+        (
+            Seller {
+                bitcoin: true,
+                usdt: false,
+            },
+            true,
+            "derived-btc",
+            vec!["BTC"],
+        ),
+        (
+            Seller {
+                bitcoin: false,
+                usdt: true,
+            },
+            true,
+            "derived-usdt",
+            vec!["USDT"],
+        ),
+        (
+            BOTH_RAILS,
+            false,
+            "derived-btc-without-usdt-config",
+            vec!["BTC"],
+        ),
+    ] {
+        let rig = rig(seller, usdt_enabled).await;
+        let (status, body) = rig.prepare(name, "500", "USD", &[], 1_800).await;
+        assert_eq!(status, StatusCode::OK, "{name}");
+        assert_eq!(
+            json(&body)["accepted_assets"],
+            serde_json::json!(rails),
+            "{name}"
+        );
+        common::assert_fixture(FIXTURES, &format!("prepare-usd-{name}"), &body, &VOLATILE);
+        rig.cleanup().await;
+    }
+
+    // Seller shares USDT but the Shop's toggle is off: the filter narrows to BTC and
+    // the proposal carries no USDT endpoint.
+    let rig = rig(BOTH_RAILS, true).await;
+    let (status, body) = rig.prepare("narrowed", "500", "USD", &["BTC"], 1_800).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json(&body)["accepted_assets"], serde_json::json!(["BTC"]));
+    assert!(json(&body)["payment_amounts"]["USDT"].is_null());
+    // A filter naming a rail the seller lacks is narrowed, not refused.
+    rig.cleanup().await;
+    let btc_only = rig_seller_btc().await;
+    let (status, body) = btc_only
+        .prepare("partial", "500", "USD", &["BTC", "USDT"], 1_800)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json(&body)["accepted_assets"], serde_json::json!(["BTC"]));
+    // Omitted and an explicit filter are different requests under one operation id.
+    let (status, _) = btc_only.prepare("partial", "500", "USD", &[], 1_800).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    btc_only.cleanup().await;
+}
+
+async fn rig_seller_btc() -> Rig {
+    rig(
+        Seller {
+            bitcoin: true,
+            usdt: false,
+        },
+        true,
+    )
+    .await
+}
+
+#[tokio::test]
 async fn proposal_carries_exactly_the_accepted_rails_and_the_fixed_rates() {
     let rig = rig(BOTH_RAILS, true).await;
     for (operation, asset, amount, accepted) in [
         ("dual", "USD", "500", vec!["BTC", "USDT"]),
         ("btc-only", "BTC", "50000", vec!["BTC"]),
         ("usdt-only", "USD", "500", vec!["USDT"]),
+        ("derived", "USD", "500", vec![]),
     ] {
         let (status, prepared) = rig
             .prepare(operation, amount, asset, &accepted, 1_800)
@@ -525,10 +599,10 @@ async fn proposal_carries_exactly_the_accepted_rails_and_the_fixed_rates() {
     }
     let outbox = OutboxStore::new(rig.database.pool(), crypto());
     let claims = outbox
-        .claim(uuid::Uuid::new_v4(), 3, Duration::from_secs(30))
+        .claim(uuid::Uuid::new_v4(), 4, Duration::from_secs(30))
         .await
         .unwrap();
-    assert_eq!(claims.len(), 3);
+    assert_eq!(claims.len(), 4);
     let mut seen = Vec::new();
     for claim in &claims {
         let intent = outbox.delivery_intent(claim).unwrap();
@@ -547,6 +621,14 @@ async fn proposal_carries_exactly_the_accepted_rails_and_the_fixed_rates() {
                 "btc".to_owned(),
                 vec!["btc-bitcoin-p2wpkh".to_owned()],
                 Vec::<String>::new()
+            ),
+            (
+                "usd".to_owned(),
+                vec![
+                    "btc-bitcoin-p2wpkh".to_owned(),
+                    "usdt-arbitrum-address".to_owned()
+                ],
+                vec!["btc".to_owned(), "usdt".to_owned()]
             ),
             (
                 "usd".to_owned(),
@@ -649,7 +731,7 @@ async fn typed_refusals_persist_nothing_and_have_stable_bodies() {
     )
     .await;
     let (status, body) = usdt_less
-        .prepare("no-usdt", "500", "USD", &["BTC", "USDT"], 1_800)
+        .prepare("no-usdt", "500", "USD", &["USDT"], 1_800)
         .await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     common::assert_fixture(FIXTURES, "seller-setup-pending-usdt", &body, &VOLATILE);

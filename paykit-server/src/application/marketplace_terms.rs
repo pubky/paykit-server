@@ -50,6 +50,23 @@ impl MarketplaceTerms {
         })
     }
 
+    /// The terms a stored intent actually offers: the accepted assets are exactly the
+    /// rails it carries endpoints for.
+    pub fn from_intent(
+        intent: &DeliveryIntentV1,
+        amount: u64,
+        asset: CriterionAsset,
+    ) -> Result<Self, PersistenceError> {
+        let record = InvoicePaymentRecordV1::from_intent(0, intent)?;
+        let accepted = [
+            record.has_bitcoin().then_some(AcceptedAsset::Btc),
+            record.has_usdt().then_some(AcceptedAsset::Usdt),
+        ]
+        .into_iter()
+        .flatten();
+        Self::new(amount, asset, accepted).map_err(|_| PersistenceError::InvalidInput)
+    }
+
     /// Parses a Locks-style base-unit integer amount string.
     pub fn parse_amount(value: &str) -> Result<u64, MarketplaceTermsError> {
         CriterionAmount::parse(value)

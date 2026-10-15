@@ -47,8 +47,10 @@ pub struct PrepareMarketplaceRequest {
     pub amount: u64,
     /// Denomination of `amount`.
     pub asset: CriterionAsset,
-    /// Assets the buyer may pay with: non-empty and unique.
-    pub accepted_assets: Vec<AcceptedAsset>,
+    /// Optional narrowing of the seller's enabled receiving options. When omitted,
+    /// the request offers every asset the seller has set up. When present it is a
+    /// non-empty, unique subset filter that never adds a rail.
+    pub accepted_assets: Option<Vec<AcceptedAsset>>,
     pub operation_id: String,
     pub payment_window_seconds: u64,
     pub description: Option<String>,
@@ -216,18 +218,18 @@ impl PrepareMarketplaceService {
         request: PrepareMarketplaceRequest,
     ) -> Result<MarketplacePreparationResult, PrepareMarketplaceError> {
         let started = Instant::now();
-        let terms = MarketplaceTerms::new(
-            request.amount,
-            request.asset,
-            request.accepted_assets.iter().copied(),
-        )
-        .map_err(|_| {
+        let filter =
+            normalized_filter(request.accepted_assets.as_deref()).inspect_err(|&error| {
+                diagnose("request_terms", error);
+            })?;
+        if request.amount == 0 {
             diagnose("request_terms", PrepareMarketplaceError::InvalidRequest);
-            PrepareMarketplaceError::InvalidRequest
-        })?;
-        let request_binding = request_binding(&request, &terms).inspect_err(|&error| {
-            diagnose("request_binding", error);
-        })?;
+            return Err(PrepareMarketplaceError::InvalidRequest);
+        }
+        let request_binding =
+            request_binding(&request, filter.as_deref()).inspect_err(|&error| {
+                diagnose("request_binding", error);
+            })?;
         // PostgreSQL creator-row locking serializes commits across processes. This
         // process-local lock only prevents duplicate mutable external reads here.
         let operation_lock = marketplace_operation_lock(&request.creator, &request.operation_id);
@@ -255,7 +257,8 @@ impl PrepareMarketplaceService {
                         reference: &request.reference,
                         operation_id: &request.operation_id,
                         request_binding: &request_binding,
-                        terms: &terms,
+                        amount: request.amount,
+                        asset: request.asset,
                         payment_window_seconds: request.payment_window_seconds,
                         prepare_ttl_seconds: self.prepare_ttl.as_secs(),
                         payloads: &ReplayOnlyPayloads,
@@ -272,10 +275,9 @@ impl PrepareMarketplaceService {
             MarketplacePreparationPreflight::New => {}
         }
 
-        self.validate_request(&request, &terms)
-            .inspect_err(|&error| {
-                diagnose("request_validation", error);
-            })?;
+        self.validate_request(&request).inspect_err(|&error| {
+            diagnose("request_validation", error);
+        })?;
 
         tokio::time::timeout(
             remaining_at(started, self.request_deadline, "creator_session")?,
@@ -366,25 +368,36 @@ impl PrepareMarketplaceService {
         .await
         .map_err(|_| deadline("seller_receiving_details"))?
         .map_err(|error| store_failure("seller_receiving_details", error))?;
-        let bitcoin = receiving
-            .bitcoin
-            .filter(|_| terms.accepts(AcceptedAsset::Btc));
+        // The seller's setup decides what can be offered, exactly as for Locks
+        // invoices; a filter only narrows that set and never adds a rail.
+        let allowed = |asset: AcceptedAsset| filter.as_ref().is_none_or(|set| set.contains(&asset));
+        let bitcoin = receiving.bitcoin.filter(|_| allowed(AcceptedAsset::Btc));
         let usdt = receiving
             .usdt
-            .filter(|_| terms.accepts(AcceptedAsset::Usdt));
-        let missing = match (
-            terms.accepts(AcceptedAsset::Btc) && bitcoin.is_none(),
-            terms.accepts(AcceptedAsset::Usdt) && usdt.is_none(),
-        ) {
-            (false, false) => None,
-            (true, false) => Some(MissingSellerRails::Bitcoin),
-            (false, true) => Some(MissingSellerRails::Usdt),
-            (true, true) => Some(MissingSellerRails::BitcoinAndUsdt),
-        };
-        if let Some(missing) = missing {
-            let error = PrepareMarketplaceError::SellerSetupPending(missing);
+            .filter(|_| self.usdt_enabled && allowed(AcceptedAsset::Usdt));
+        let offered: Vec<_> = [
+            bitcoin.as_ref().map(|_| AcceptedAsset::Btc),
+            usdt.as_ref().map(|_| AcceptedAsset::Usdt),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let Ok(terms) = MarketplaceTerms::new(request.amount, request.asset, offered) else {
+            let error = refusal_without_rails(filter.as_deref(), self.usdt_enabled);
             diagnose("seller_receiving_details_check", error);
             return Err(error);
+        };
+        let cap = if terms.crosses_bitcoin_rate() {
+            self.payment_window_cap.min(self.conversion_payment_window)
+        } else {
+            self.payment_window_cap
+        };
+        if request.payment_window_seconds > cap.as_secs() {
+            diagnose(
+                "payment_window_cap",
+                PrepareMarketplaceError::PaymentWindowExceedsCap,
+            );
+            return Err(PrepareMarketplaceError::PaymentWindowExceedsCap);
         }
         // One feed read, fixed here for the life of the preparation: activation never
         // refetches, so the buyer's quote cannot move after the order is shown.
@@ -442,7 +455,8 @@ impl PrepareMarketplaceService {
                 reference: &request.reference,
                 operation_id: &request.operation_id,
                 request_binding: &request_binding,
-                terms: &terms,
+                amount: request.amount,
+                asset: request.asset,
                 payment_window_seconds: request.payment_window_seconds,
                 prepare_ttl_seconds: self.prepare_ttl.as_secs(),
                 payloads: &payloads,
@@ -581,7 +595,6 @@ impl PrepareMarketplaceService {
     fn validate_request(
         &self,
         request: &PrepareMarketplaceRequest,
-        terms: &MarketplaceTerms,
     ) -> Result<(), PrepareMarketplaceError> {
         let reference = uuid::Uuid::parse_str(&request.reference)
             .map_err(|_| PrepareMarketplaceError::InvalidRequest)?;
@@ -604,49 +617,75 @@ impl PrepareMarketplaceService {
         }
         PaymentReference::new(request.reference.clone())
             .map_err(|_| PrepareMarketplaceError::InvalidRequest)?;
-        if !self.usdt_enabled
-            && (terms.accepts(AcceptedAsset::Usdt) || terms.asset() == CriterionAsset::Usdt)
-        {
-            return Err(PrepareMarketplaceError::AssetUnsupported);
-        }
-        let cap = if terms.crosses_bitcoin_rate() {
-            self.payment_window_cap.min(self.conversion_payment_window)
-        } else {
-            self.payment_window_cap
-        };
-        if request.payment_window_seconds > cap.as_secs() {
+        if request.payment_window_seconds > self.payment_window_cap.as_secs() {
             return Err(PrepareMarketplaceError::PaymentWindowExceedsCap);
         }
         Ok(())
     }
 }
 
+/// A present filter must be non-empty and unique; it is kept in canonical order.
+fn normalized_filter(
+    filter: Option<&[AcceptedAsset]>,
+) -> Result<Option<Vec<AcceptedAsset>>, PrepareMarketplaceError> {
+    let Some(filter) = filter else {
+        return Ok(None);
+    };
+    let mut set = filter.to_vec();
+    set.sort();
+    if set.is_empty() || set.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(PrepareMarketplaceError::InvalidRequest);
+    }
+    Ok(Some(set))
+}
+
+/// Why nothing could be offered: the deployment cannot do the only asset asked for,
+/// or the seller has not set up any asset the request allows.
+fn refusal_without_rails(
+    filter: Option<&[AcceptedAsset]>,
+    usdt_enabled: bool,
+) -> PrepareMarketplaceError {
+    use AcceptedAsset::{Btc, Usdt};
+    match filter {
+        None => PrepareMarketplaceError::SellerSetupPending(MissingSellerRails::Bitcoin),
+        Some([Usdt]) if !usdt_enabled => PrepareMarketplaceError::AssetUnsupported,
+        Some(set) => PrepareMarketplaceError::SellerSetupPending(
+            match (set.contains(&Btc), set.contains(&Usdt)) {
+                (true, true) => MissingSellerRails::BitcoinAndUsdt,
+                (false, true) => MissingSellerRails::Usdt,
+                _ => MissingSellerRails::Bitcoin,
+            },
+        ),
+    }
+}
+
 fn request_binding(
     request: &PrepareMarketplaceRequest,
-    terms: &MarketplaceTerms,
+    filter: Option<&[AcceptedAsset]>,
 ) -> Result<Vec<u8>, PrepareMarketplaceError> {
     let mut binding = serde_json::json!({
-        "accepted_assets": terms
-            .accepted_assets()
-            .iter()
-            .map(|asset| asset.as_str())
-            .collect::<Vec<_>>(),
-        "amount": terms.amount().to_string(),
-        "asset": terms.asset().as_str(),
+        "amount": request.amount.to_string(),
+        "asset": request.asset.as_str(),
         "creator": request.creator.to_string(),
         "operation_id": request.operation_id,
         "payment_window_seconds": request.payment_window_seconds,
         "reader": request.reader.to_string(),
         "reference": request.reference,
     });
+    let fields = binding
+        .as_object_mut()
+        .expect("static request binding is an object");
+    if let Some(filter) = filter {
+        fields.insert(
+            "accepted_assets".into(),
+            filter.iter().map(|asset| asset.as_str()).collect(),
+        );
+    }
     if let Some(description) = &request.description {
-        binding
-            .as_object_mut()
-            .expect("static request binding is an object")
-            .insert(
-                "description".into(),
-                serde_json::Value::String(description.clone()),
-            );
+        fields.insert(
+            "description".into(),
+            serde_json::Value::String(description.clone()),
+        );
     }
     serde_json_canonicalizer::to_vec(&binding).map_err(|_| PrepareMarketplaceError::InvalidRequest)
 }
