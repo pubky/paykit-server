@@ -58,8 +58,9 @@ worker compares the intent's immutable `proposal_expires_at` with PostgreSQL
 `permanently_failed` with the closed `proposal_expired` diagnostic; it is never
 claimed again and no Reader or SDK operation is retried. This check also runs
 after restart, so a retry deadline cannot be extended by downtime or process
-clock drift. Cancellation intents have no proposal deadline and keep their
-existing delivery semantics.
+clock drift. Cancellation intents retry until the canceled request's immutable
+payment deadline. At or after that boundary, undelivered cancellation work is
+retained as `cancellation_expired` without another Reader or SDK call.
 
 `handed_off` means durable shared SDK queue association, not remote delivery. A separately fenced reconciliation claim runs the SDK outbound processor and checks the exact stored outbound ID and app ownership in durable Creator SDK state. Only `OutboundPrivateMessageStatus::Sent` advances the row to `delivered`, meaning successful Encrypted Link send, not payer application acknowledgement. SDK `Pending`, `Sending`, and retry-backoff `Failed` records remain retryable. Missing records, `Invalid`, `RecoveryRequired`, and `Superseded` records are retained as `permanently_failed`; they never imply delivery or trigger a new proposal. Transport/storage errors remain retryable, and permanent errors retain only a non-secret error class.
 
@@ -94,8 +95,11 @@ waiting, normal handed-off reconciliation, proposal expiry, and retained permane
 failure stay visible in durable row state without degrading every Creator.
 Adapter construction, dependency reads, SDK proposal/cancellation execution,
 systemic link storage/identity/transport failures, and reconciliation failures
-still degrade delivery readiness; PostgreSQL worker failures independently
-degrade `outbox` readiness.
+for still-actionable work degrade delivery readiness. Proposal reconciliation
+continues after its acceptance deadline so a later durable `Sent` state can
+still promote the row to `delivered`, but one buyer's post-deadline retry does
+not degrade global readiness. PostgreSQL worker failures independently degrade
+`outbox` readiness.
 
 Enqueue scheduling admits at most `outbox.batch_size` concurrent Creators, with
 one task per Creator. Completion frees a slot without waiting for unrelated tasks.
