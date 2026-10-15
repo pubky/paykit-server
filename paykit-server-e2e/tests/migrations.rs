@@ -40,6 +40,10 @@ const MARKETPLACE_OBSERVATION_MIGRATION: &str =
     include_str!("../../paykit-server/migrations/0015_marketplace_bitcoin_observations.sql");
 const RESOLUTION_MIGRATION: &str =
     include_str!("../../paykit-server/migrations/0016_marketplace_resolution_immutability.sql");
+const OPTIONAL_RAIL_MIGRATION: &str =
+    include_str!("../../paykit-server/migrations/0017_marketplace_optional_bitcoin_rail.sql");
+const USDT_OBSERVATION_MIGRATION: &str =
+    include_str!("../../paykit-server/migrations/0018_marketplace_usdt_observations.sql");
 
 /// PostgreSQL advisory locks are server-wide, not database-scoped. These
 /// migration tests deliberately use the production migration lock key, so
@@ -81,7 +85,7 @@ async fn migrations_create_the_required_schema_and_are_restart_safe() {
             .fetch_all(pool)
             .await
             .unwrap();
-    assert_eq!(applied_versions, (1..=17).collect::<Vec<_>>());
+    assert_eq!(applied_versions, (1..=18).collect::<Vec<_>>());
 
     let settlement_address_nullable: String = sqlx::query_scalar(
         "SELECT is_nullable FROM information_schema.columns
@@ -92,6 +96,25 @@ async fn migrations_create_the_required_schema_and_are_restart_safe() {
     .await
     .unwrap();
     assert_eq!(settlement_address_nullable, "YES");
+    let usdt_owner_nullable: String = sqlx::query_scalar(
+        "SELECT is_nullable FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = 'usdt_observations'
+           AND column_name = 'invoice_id'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(usdt_owner_nullable, "YES");
+    let usdt_owner_guards: i64 = sqlx::query_scalar(
+        "SELECT (SELECT count(*) FROM pg_constraint
+                 WHERE conname = 'usdt_observation_exactly_one_owner')
+              + (SELECT count(*) FROM pg_trigger
+                 WHERE tgname = 'usdt_observation_owner_immutable')",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(usdt_owner_guards, 2);
     let claim_trigger: String = sqlx::query_scalar(
         "SELECT pg_get_triggerdef(oid) FROM pg_trigger
          WHERE tgname = 'marketplace_settlements_claim_global_bitcoin_address'",
@@ -798,6 +821,101 @@ async fn observation_migration_upgrades_existing_locks_evidence_without_rewritin
             .execute(pool)
             .await,
     );
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn usdt_migration_keeps_locks_receipts_and_pins_one_immutable_owner() {
+    let _migration_test_guard = migration_test_lock().lock().await;
+    let database = TestDatabase::create().await;
+    let pool = database.pool();
+    apply_pre_settlement_migrations(pool).await;
+    for migration in [
+        SETTLEMENT_MIGRATION,
+        MARKETPLACE_OBSERVATION_MIGRATION,
+        RESOLUTION_MIGRATION,
+        OPTIONAL_RAIL_MIGRATION,
+    ] {
+        sqlx::raw_sql(migration).execute(pool).await.unwrap();
+    }
+    let creator_id = insert_creator(pool).await;
+    insert_invoice(pool, creator_id, b"usdt-bundle", b"usdt-request").await;
+    let invoice_id: Uuid =
+        sqlx::query_scalar("SELECT id FROM invoices WHERE payment_request_lookup_hash = $1")
+            .bind(b"usdt-request".as_slice())
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    let transfer_hash = vec![81_u8; 32];
+    sqlx::query(
+        "INSERT INTO usdt_observations
+         (id, invoice_id, transfer_lookup_hash, observation_envelope, confirmations,
+          present, finalized)
+         VALUES ($1, $2, $3, $4, 3, TRUE, FALSE)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(invoice_id)
+    .bind(&transfer_hash)
+    .bind(b"encrypted-usdt-observation".as_slice())
+    .execute(pool)
+    .await
+    .unwrap();
+
+    sqlx::raw_sql(USDT_OBSERVATION_MIGRATION)
+        .execute(pool)
+        .await
+        .unwrap();
+    let upgraded: (Option<Uuid>, Option<Uuid>, Vec<u8>, i32) = sqlx::query_as(
+        "SELECT invoice_id, marketplace_preparation_id, observation_envelope, confirmations
+         FROM usdt_observations WHERE transfer_lookup_hash = $1",
+    )
+    .bind(&transfer_hash)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        upgraded,
+        (
+            Some(invoice_id),
+            None,
+            b"encrypted-usdt-observation".to_vec(),
+            3
+        )
+    );
+    assert_check_violation(
+        sqlx::query(
+            "UPDATE usdt_observations SET invoice_id = NULL WHERE transfer_lookup_hash = $1",
+        )
+        .bind(&transfer_hash)
+        .execute(pool)
+        .await,
+    );
+    assert_check_violation(
+        sqlx::query(
+            "UPDATE usdt_observations SET transfer_lookup_hash = $2 WHERE transfer_lookup_hash = $1",
+        )
+        .bind(&transfer_hash)
+        .bind(vec![82_u8; 32])
+        .execute(pool)
+        .await,
+    );
+    assert_check_violation(
+        sqlx::query(
+            "INSERT INTO usdt_observations
+             (id, transfer_lookup_hash, observation_envelope, confirmations, present, finalized)
+             VALUES ($1, $2, $3, 0, TRUE, FALSE)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(vec![83_u8; 32])
+        .bind(b"ownerless".as_slice())
+        .execute(pool)
+        .await,
+    );
+    sqlx::query("UPDATE usdt_observations SET confirmations = 9 WHERE transfer_lookup_hash = $1")
+        .bind(&transfer_hash)
+        .execute(pool)
+        .await
+        .unwrap();
     database.cleanup().await;
 }
 

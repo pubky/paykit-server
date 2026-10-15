@@ -1,3 +1,8 @@
+#[allow(dead_code)]
+pub mod arbitrum;
+#[allow(dead_code)]
+pub mod marketplace_rig;
+
 use paykit_lib::{
     PaykitAppId, PaymentAmount, PaymentEndpointIdentifier, PaymentEndpointPayload,
     PaymentReference, PaymentRequestTerms,
