@@ -384,6 +384,7 @@ fn input_with_ttl_and_window<'a>(
         asset: CriterionAsset::Btc,
         payment_window_seconds,
         prepare_ttl_seconds,
+        prepare_deadline: common::deadline_after(prepare_ttl_seconds),
         payloads: &Payloads,
     }
 }
@@ -1667,6 +1668,44 @@ async fn prepared_resolution_and_activation_serialize_without_unresolved_publica
         }
         other => panic!("unexpected activation result: {other:?}"),
     }
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn sub_microsecond_deadline_is_stored_as_postgresql_keeps_it() {
+    let database = TestDatabase::create().await;
+    let store = store(&database).await;
+    let creator = creator();
+    let reader = reader();
+    let deadline = (OffsetDateTime::now_utc() + time::Duration::minutes(15))
+        .replace_nanosecond(123_456_789)
+        .unwrap();
+    let mut prepared_input = input(&creator, &reader, "nanos", b"nanos");
+    prepared_input.prepare_deadline = Some(deadline);
+    let prepared = store.prepare(prepared_input).await.unwrap();
+    assert_eq!(
+        prepared.prepare_expires_at(),
+        deadline.replace_nanosecond(123_456_000).unwrap()
+    );
+    let stored: OffsetDateTime = sqlx::query_scalar(
+        "SELECT prepare_expires_at FROM marketplace_payment_preparations WHERE id = $1",
+    )
+    .bind(prepared.invoice_id())
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(stored, prepared.prepare_expires_at());
+    store
+        .activate(MarketplaceActivationInput {
+            creator: &creator,
+            invoice_id: prepared.invoice_id(),
+            amount: 100,
+            asset: CriterionAsset::Btc,
+            proposal_acceptance_window: std::time::Duration::from_secs(30 * 60),
+        })
+        .await
+        .unwrap()
+        .unwrap();
     database.cleanup().await;
 }
 

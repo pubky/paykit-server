@@ -155,7 +155,7 @@ impl AppRegistryDiscovery for ReadyRegistry {
 
 /// BTC/USD feed double. `failing` makes every read fail, like a stale or down feed.
 struct Feed {
-    price: &'static str,
+    price: std::sync::Mutex<&'static str>,
     failing: AtomicBool,
     calls: AtomicUsize,
 }
@@ -167,7 +167,7 @@ impl ExchangeRates for Feed {
         if self.failing.load(Ordering::SeqCst) {
             return Err(CreateInvoiceError::Unavailable);
         }
-        Ok(self.price.to_owned())
+        Ok((*self.price.lock().unwrap()).to_owned())
     }
 }
 
@@ -226,6 +226,15 @@ const BOTH_RAILS: Seller = Seller {
 };
 
 async fn rig(seller: Seller, usdt_enabled: bool) -> Rig {
+    rig_with(seller, usdt_enabled, Duration::from_secs(15 * 60), None).await
+}
+
+async fn rig_with(
+    seller: Seller,
+    usdt_enabled: bool,
+    prepare_ttl: Duration,
+    request_deadline: Option<Duration>,
+) -> Rig {
     let database = TestDatabase::create().await;
     run_migrations(database.pool()).await.unwrap();
     let creators = CreatorStore::new(database.pool(), crypto());
@@ -248,26 +257,28 @@ async fn rig(seller: Seller, usdt_enabled: bool) -> Rig {
         .unwrap();
     let store = Arc::new(MarketplacePreparationStore::new(database.pool(), crypto()));
     let feed = Arc::new(Feed {
-        price: "81000",
+        price: std::sync::Mutex::new("81000"),
         failing: AtomicBool::new(false),
         calls: AtomicUsize::new(0),
     });
     let credentials: Arc<dyn CreatorReceivingProvider> = Arc::new(creators);
-    let preparation = Arc::new(
-        PrepareMarketplaceService::new(
-            Arc::new(ReadySession),
-            Arc::new(ReadyRegistry),
-            credentials,
-            store.clone(),
-            paykit_lib::PaykitAppId::new("paykit-server").unwrap(),
-            BitcoinNetwork::Mainnet,
-            Duration::from_secs(24 * 60 * 60),
-            Duration::from_secs(15 * 60),
-        )
-        .with_usdt(usdt_enabled)
-        .with_conversion_payment_window(Duration::from_secs(60 * 60))
-        .with_exchange_rates(feed.clone()),
-    );
+    let mut preparation = PrepareMarketplaceService::new(
+        Arc::new(ReadySession),
+        Arc::new(ReadyRegistry),
+        credentials,
+        store.clone(),
+        paykit_lib::PaykitAppId::new("paykit-server").unwrap(),
+        BitcoinNetwork::Mainnet,
+        Duration::from_secs(24 * 60 * 60),
+        prepare_ttl,
+    )
+    .with_usdt(usdt_enabled)
+    .with_conversion_payment_window(Duration::from_secs(60 * 60))
+    .with_exchange_rates(feed.clone());
+    if let Some(request_deadline) = request_deadline {
+        preparation = preparation.with_request_deadline(request_deadline);
+    }
+    let preparation = Arc::new(preparation);
     let lifecycle = Arc::new(MarketplaceLifecycleService::new(
         store.clone(),
         Duration::from_secs(30 * 60),
@@ -1135,5 +1146,175 @@ async fn usdt_only_request_expires_at_read_time_without_a_bitcoin_watcher() {
             .await
             .unwrap();
     assert_eq!(stored, None);
+    rig.cleanup().await;
+}
+
+/// Holds the Creator row `FOR UPDATE`, as a concurrent preparation, activation or
+/// observation of the same seller would.
+async fn hold_creator_row(rig: &Rig) -> sqlx::Transaction<'static, sqlx::Postgres> {
+    let mut held = rig.database.pool().begin().await.unwrap();
+    sqlx::query("SELECT id FROM creators FOR UPDATE")
+        .execute(&mut *held)
+        .await
+        .unwrap();
+    held
+}
+
+async fn database_now(rig: &Rig) -> OffsetDateTime {
+    sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(rig.database.pool())
+        .await
+        .unwrap()
+}
+
+fn spawn_prepare(
+    rig: &Arc<Rig>,
+    operation: &'static str,
+) -> tokio::task::JoinHandle<(StatusCode, Vec<u8>)> {
+    let rig = rig.clone();
+    tokio::spawn(async move {
+        rig.prepare(operation, "500", "USD", &["BTC", "USDT"], 1_800)
+            .await
+    })
+}
+
+async fn count_preparations(rig: &Rig) -> (i64, i64) {
+    (
+        sqlx::query_scalar("SELECT count(*) FROM marketplace_payment_preparations")
+            .fetch_one(rig.database.pool())
+            .await
+            .unwrap(),
+        sqlx::query_scalar("SELECT next_child_index FROM creators")
+            .fetch_one(rig.database.pool())
+            .await
+            .unwrap(),
+    )
+}
+
+/// The quote's whole life is fixed when the rate is accepted. A wait for the Creator row
+/// that outlasts it, even one that also crosses the request deadline (so the caller sees
+/// a timeout), must not commit a preparation with a fresh TTL around the old rate.
+#[tokio::test]
+async fn creator_lock_wait_past_the_quote_deadline_commits_nothing_and_never_revives_the_rate() {
+    let rig = Arc::new(
+        rig_with(
+            BOTH_RAILS,
+            true,
+            Duration::from_secs(2),
+            Some(Duration::from_secs(1)),
+        )
+        .await,
+    );
+    let held = hold_creator_row(&rig).await;
+    let waiting = spawn_prepare(&rig, "stale-quote");
+    tokio::time::sleep(Duration::from_millis(3_000)).await;
+    held.rollback().await.unwrap();
+
+    let (status, body) = waiting.await.unwrap();
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(json(&body)["error"]["code"], "dependency_timeout");
+    assert_eq!(
+        count_preparations(&rig).await,
+        (0, 0),
+        "no preparation row and no address index"
+    );
+    assert_eq!(rig.feed.calls.load(Ordering::SeqCst), 1);
+
+    // The exact retry is a new request: it reads the feed again, so the old rate is gone.
+    *rig.feed.price.lock().unwrap() = "90000";
+    let (status, retry) = rig
+        .prepare("stale-quote", "500", "USD", &["BTC", "USDT"], 1_800)
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&retry)
+    );
+    assert_eq!(json(&retry)["payment_amounts"]["BTC"], "5556");
+    assert_eq!(json(&retry)["rates"]["BTC"], "0.000011111111111111");
+    assert_eq!(rig.feed.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(count_preparations(&rig).await, (1, 1));
+    Arc::into_inner(rig).unwrap().cleanup().await;
+}
+
+/// The same refusal without the request deadline getting involved.
+#[tokio::test]
+async fn creator_lock_wait_past_the_quote_deadline_is_refused_even_when_the_request_is_still_live()
+{
+    let rig = Arc::new(rig_with(BOTH_RAILS, true, Duration::from_secs(2), None).await);
+    let held = hold_creator_row(&rig).await;
+    let waiting = spawn_prepare(&rig, "slow-lock");
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    held.commit().await.unwrap();
+    let (status, body) = waiting.await.unwrap();
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(json(&body)["error"]["code"], "dependency_timeout");
+    assert_eq!(count_preparations(&rig).await, (0, 0));
+    Arc::into_inner(rig).unwrap().cleanup().await;
+}
+
+/// A wait that ends inside the quote's life still commits, and the preparation ends
+/// exactly where the quote's life was fixed, not a full TTL after the lock was won.
+#[tokio::test]
+async fn creator_lock_wait_inside_the_quote_deadline_keeps_the_fixed_expiry() {
+    let ttl = 6;
+    let rig = Arc::new(rig_with(BOTH_RAILS, true, Duration::from_secs(ttl), None).await);
+    let started = database_now(&rig).await;
+    let held = hold_creator_row(&rig).await;
+    let waiting = spawn_prepare(&rig, "inside");
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    let released = database_now(&rig).await;
+    held.commit().await.unwrap();
+
+    let (status, body) = waiting.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let expires = OffsetDateTime::parse(
+        json(&body)["prepare_expires_at"].as_str().unwrap(),
+        &Rfc3339,
+    )
+    .unwrap();
+    let ttl = time::Duration::seconds(i64::try_from(ttl).unwrap());
+    assert!(
+        expires >= started + ttl && expires < started + ttl + time::Duration::seconds(1),
+        "expiry {expires} is the acceptance time plus the TTL, started {started}"
+    );
+    assert!(
+        expires < released + ttl - time::Duration::seconds(1),
+        "expiry {expires} must not be lock time {released} plus the TTL"
+    );
+    let stored: (OffsetDateTime, OffsetDateTime) = sqlx::query_as(
+        "SELECT prepared_at, prepare_expires_at FROM marketplace_payment_preparations",
+    )
+    .fetch_one(rig.database.pool())
+    .await
+    .unwrap();
+    assert_eq!(stored.1 - stored.0, ttl);
+    assert_eq!(stored.1, expires);
+    let (status, _) = rig.activate(&invoice_id(&body), "500", "USD").await;
+    assert_eq!(status, StatusCode::OK);
+    Arc::into_inner(rig).unwrap().cleanup().await;
+}
+
+/// Replay returns the stored preparation, with its original rate and expiry, even after
+/// the fixed deadline and while the feed is down; activation after it is `prepare_expired`.
+#[tokio::test]
+async fn exact_replay_after_the_fixed_deadline_returns_the_stored_preparation() {
+    let rig = rig_with(BOTH_RAILS, true, Duration::from_secs(2), None).await;
+    let (status, prepared) = rig
+        .prepare("replay", "500", "USD", &["BTC", "USDT"], 1_800)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    tokio::time::sleep(Duration::from_millis(2_300)).await;
+    rig.feed.failing.store(true, Ordering::SeqCst);
+    let (status, replay) = rig
+        .prepare("replay", "500", "USD", &["BTC", "USDT"], 1_800)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json(&replay), json(&prepared));
+    assert_eq!(rig.feed.calls.load(Ordering::SeqCst), 1);
+    let (status, body) = rig.activate(&invoice_id(&prepared), "500", "USD").await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(json(&body)["error"]["code"], "prepare_expired");
     rig.cleanup().await;
 }
