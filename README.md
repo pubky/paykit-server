@@ -106,7 +106,15 @@ the seller has not set up is absent rather than a refusal. Every combination is 
 including both assets in one request. USD and USDT are fixed parity (rate `"1"`). Any
 pairing that crosses BTC reads the Blocktank BTC/USD feed once at prepare (ten-minute
 freshness, as Locks invoices do) and stores it as a fixed conversion in the preparation;
-activation never refetches it. Each payable amount is rounded up to its own endpoint
+activation never refetches it. The preparation's whole life is fixed on the database clock
+when that quote is accepted: `prepare_expires_at` is the acceptance time plus the
+preparation TTL (15 minutes by default), whatever happens afterwards. A wait for the
+Creator row that outlasts it, including one that also crosses the 15-second request
+deadline, commits nothing and answers `503 dependency_timeout`; the exact retry reads the
+feed again, so a stale rate is never given a new TTL. A quote is therefore at most the
+feed's ten-minute freshness plus the TTL old when it can last be activated. Exact replay of
+an already committed preparation still returns it, with its original rate and expiry.
+Each payable amount is rounded up to its own endpoint
 unit. The `200` response echoes `amount`, `asset`, the offered `accepted_assets`,
 `payment_amounts` (per offered asset, in that asset's base units), the fixed `rates`
 (payment-asset units per one requested-asset unit; `{}` when none) and
