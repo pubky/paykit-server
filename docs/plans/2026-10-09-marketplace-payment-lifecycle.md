@@ -59,7 +59,7 @@ Accepted behavior:
 4. Same scoped operation identity plus changed binding returns structured `409 operation_conflict` before mutable external work. A new operation ID creates a new invoice.
 5. Exact replay/conflict resolution precedes session checks, address allocation, outbox insertion, and SDK work.
 6. `payment_window_seconds` is a positive integer. Bind it immutably during preparation and reject values above the relevant configured policy cap; never clamp and never accept an absolute payment deadline.
-7. Preparation time and expiry use the database clock. Configured prepare TTL defaults to 15 minutes.
+7. Preparation time and expiry use the database clock. Configured prepare TTL defaults to 15 minutes. The expiry is fixed once, when the quote is accepted (the feed read for a BTC-crossing request, the same point otherwise): the service reads the database clock then and passes `accepted_at + TTL` as an absolute deadline. After acquiring the Creator-row lock, persistence refuses with `PersistenceError::DeadlineElapsed` (HTTP `503 dependency_timeout`, nothing committed) if `clock_timestamp()` has reached it, and never starts a new TTL; `prepared_at` is the instant the quote was fixed, so `prepare_expires_at - prepared_at` is always the TTL. Exact replay is resolved under the same lock before that check and returns the stored result.
 8. Preparation remains unpublished: no claimable proposal outbox row and no SDK publication or cancellation.
 9. Do not return a payment deadline during preparation. Payment window begins only when activation commits.
 10. Reject unknown fields and fork-only fields including `stack_id`, `allocation_mode`, `nonce_sats`, address fingerprint, and caller-provided `resolved_at`.
@@ -120,6 +120,7 @@ Decision PK1 (John, 15 Oct 2026): one Paykit request carries every asset the sel
 - The request binding covers amount, asset, the sorted filter when present, window and description, so any change under the same `operation_id` is `409 operation_conflict`.
 - Preparation envelope version 2 stores the offered terms. Version 1 envelopes written by rc11 to rc16 still decode as `{BTC, total_sats, [BTC]}` so rows prepared or activated before the upgrade keep activating, observing and reporting status. A version 1 `operation_id` cannot replay under the new binding and is an `operation_conflict`.
 - `seller_setup_pending` names only rails the deployment can offer: on a deployment without `[usdt]` a `["BTC","USDT"]` filter on a seller with no Bitcoin names Bitcoin alone.
+- Quote age: the feed is at most ten minutes old when read and the preparation ends one TTL (15 minutes) after that, a bound that holds whatever lock waits occur, so a quote is at most about 25 minutes old when it can last be activated, plus the payment window. Fixing the deadline on the database clock, with comparison on the same clock, leaves no app-versus-database skew in the bound.
 - A settlement's `payment_expired_at` only stops Electrum discovery of its Bitcoin address after the deadline; the status route derives `expired` from the deadline at read time. A request that offers only USDT has no address to stop watching, so it never needs a stored expiry.
 - Migration `0017_marketplace_optional_bitcoin_rail.sql` makes the settlement's Bitcoin address optional: a request that offers only USDT activates with no address to claim or watch, and its settlement is never an Electrum target.
 
@@ -176,6 +177,7 @@ Decision PK1 (John, 15 Oct 2026): one Paykit request carries every asset the sel
 ## Verification required for multi-asset prepare and activate
 
 - Every denomination and filter combination prepares over the signed route with the expected endpoints, rates and payable amounts; an omitted filter offers what the seller enabled; exact replay never reads the feed.
+- A Creator-row lock wait that outlasts the fixed quote deadline (with and without crossing the request deadline) commits nothing, keeps the address index and never lets the exact retry reuse the old rate; a wait that ends inside it commits with `prepare_expires_at` equal to the fixed deadline; exact replay after the deadline returns the stored preparation.
 - Refusals persist nothing and keep the address index: nothing to offer (each missing rail), USDT-only filter without `[usdt]`, window over cap (including 3,601 s on a BTC-crossing request while parity requests keep the ordinary cap), unavailable or stale feed.
 - The feed failing at activation does not affect activation; the stored rates are the ones proposed.
 - A 1,800 second window gives a 15 minute accept-by and a 30 minute payment deadline.

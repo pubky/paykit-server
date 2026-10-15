@@ -99,6 +99,7 @@ async fn prepare(
             asset: CriterionAsset::Btc,
             payment_window_seconds,
             prepare_ttl_seconds: 15 * 60,
+            prepare_deadline: common::deadline_after(15 * 60),
             payloads: &Payloads,
         })
         .await

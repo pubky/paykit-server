@@ -175,9 +175,9 @@ fn map_store(error: MarketplaceLifecyclePersistenceError) -> MarketplaceLifecycl
         MarketplaceLifecyclePersistenceError::Persistence(PersistenceError::InvalidInput) => {
             MarketplaceLifecycleError::InvalidRequest
         }
-        MarketplaceLifecyclePersistenceError::Persistence(PersistenceError::Unavailable) => {
-            MarketplaceLifecycleError::Unavailable
-        }
+        MarketplaceLifecyclePersistenceError::Persistence(
+            PersistenceError::Unavailable | PersistenceError::DeadlineElapsed,
+        ) => MarketplaceLifecycleError::Unavailable,
         MarketplaceLifecyclePersistenceError::Persistence(
             PersistenceError::DeploymentMismatch
             | PersistenceError::CorruptOrMissing

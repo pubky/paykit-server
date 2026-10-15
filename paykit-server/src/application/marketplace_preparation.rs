@@ -11,6 +11,7 @@ use paykit_lib::{
     ConversionRate, PaykitAppId, PaymentAmount, PaymentConversion, PaymentEndpointIdentifier,
     PaymentEndpointPayload, PaymentReference, PaymentRequestTerms,
 };
+use time::OffsetDateTime;
 
 use crate::{
     application::{
@@ -116,6 +117,9 @@ pub trait MarketplacePreparationPersistence: Send + Sync {
         &self,
         input: MarketplacePreparationInput<'_>,
     ) -> Result<MarketplacePreparationResult, PersistenceError>;
+
+    /// The database clock, the one clock a preparation's expiry is fixed and judged on.
+    async fn database_time(&self) -> Result<OffsetDateTime, PersistenceError>;
 }
 
 #[async_trait]
@@ -134,6 +138,10 @@ impl MarketplacePreparationPersistence for MarketplacePreparationStore {
         input: MarketplacePreparationInput<'_>,
     ) -> Result<MarketplacePreparationResult, PersistenceError> {
         MarketplacePreparationStore::prepare(self, input).await
+    }
+
+    async fn database_time(&self) -> Result<OffsetDateTime, PersistenceError> {
+        MarketplacePreparationStore::database_time(self).await
     }
 }
 
@@ -261,6 +269,7 @@ impl PrepareMarketplaceService {
                         asset: request.asset,
                         payment_window_seconds: request.payment_window_seconds,
                         prepare_ttl_seconds: self.prepare_ttl.as_secs(),
+                        prepare_deadline: None,
                         payloads: &ReplayOnlyPayloads,
                     }),
                 )
@@ -442,6 +451,23 @@ impl PrepareMarketplaceService {
             bitcoin,
             usdt,
         };
+        // The preparation's whole life is fixed here, on the database clock, when the
+        // quote is accepted. A wait for the Creator row can only use up that life: the
+        // store refuses once the deadline has passed and never starts a new TTL.
+        let accepted_at = tokio::time::timeout(
+            remaining_at(started, self.request_deadline, "quote_clock")?,
+            self.store.database_time(),
+        )
+        .await
+        .map_err(|_| deadline("quote_clock"))?
+        .map_err(|error| store_failure("quote_clock", error))?;
+        let prepare_deadline = time::Duration::try_from(self.prepare_ttl)
+            .ok()
+            .and_then(|ttl| accepted_at.checked_add(ttl))
+            .ok_or_else(|| {
+                diagnose("quote_clock", PrepareMarketplaceError::Unavailable);
+                PrepareMarketplaceError::Unavailable
+            })?;
         remaining_at(started, self.request_deadline, "prepare_store")?;
         // Do not cancel a PostgreSQL mutation at the HTTP deadline: COMMIT may
         // otherwise win while this request reports timeout. Await one factual
@@ -459,6 +485,7 @@ impl PrepareMarketplaceService {
                 asset: request.asset,
                 payment_window_seconds: request.payment_window_seconds,
                 prepare_ttl_seconds: self.prepare_ttl.as_secs(),
+                prepare_deadline: Some(prepare_deadline),
                 payloads: &payloads,
             })
             .await
@@ -724,6 +751,7 @@ fn registry_failure(stage: &'static str, error: RegistryDiscoveryError) -> Prepa
 fn map_store(error: PersistenceError) -> PrepareMarketplaceError {
     match error {
         PersistenceError::Conflict => PrepareMarketplaceError::Conflict,
+        PersistenceError::DeadlineElapsed => PrepareMarketplaceError::DeadlineExceeded,
         PersistenceError::InvalidInput => PrepareMarketplaceError::InvalidRequest,
         PersistenceError::DeploymentMismatch
         | PersistenceError::CorruptOrMissing

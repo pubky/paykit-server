@@ -279,6 +279,7 @@ struct FakeStore {
     captured_reference: Mutex<Option<String>>,
     captured_metadata: Mutex<Option<serde_json::Map<String, serde_json::Value>>>,
     captured_binding: Mutex<Option<Vec<u8>>>,
+    captured_deadline: Mutex<Option<Option<time::OffsetDateTime>>>,
 }
 
 impl FakeStore {
@@ -291,6 +292,7 @@ impl FakeStore {
             captured_reference: Mutex::new(None),
             captured_metadata: Mutex::new(None),
             captured_binding: Mutex::new(None),
+            captured_deadline: Mutex::new(None),
         }
     }
 
@@ -303,6 +305,7 @@ impl FakeStore {
             captured_reference: Mutex::new(None),
             captured_metadata: Mutex::new(None),
             captured_binding: Mutex::new(None),
+            captured_deadline: Mutex::new(None),
         }
     }
 }
@@ -325,6 +328,7 @@ impl MarketplacePreparationPersistence for FakeStore {
         input: MarketplacePreparationInput<'_>,
     ) -> Result<MarketplacePreparationResult, PersistenceError> {
         self.prepare_calls.fetch_add(1, Ordering::SeqCst);
+        *self.captured_deadline.lock().unwrap() = Some(input.prepare_deadline);
         if let Some(error) = self.prepare_error {
             return Err(error);
         }
@@ -351,6 +355,10 @@ impl MarketplacePreparationPersistence for FakeStore {
             &input,
             self.preflight == MarketplacePreparationPreflight::ExactReplay,
         ))
+    }
+
+    async fn database_time(&self) -> Result<time::OffsetDateTime, PersistenceError> {
+        Ok(time::OffsetDateTime::UNIX_EPOCH)
     }
 }
 
@@ -402,6 +410,10 @@ impl MarketplacePreparationPersistence for ConcurrentStore {
             input.payloads.for_child_index(0)?;
         }
         Ok(bitcoin_result(&input, replayed))
+    }
+
+    async fn database_time(&self) -> Result<time::OffsetDateTime, PersistenceError> {
+        Ok(time::OffsetDateTime::UNIX_EPOCH)
     }
 }
 
@@ -1158,6 +1170,10 @@ async fn setup_pending_emits_exact_redacted_failure_stage() {
     }));
 }
 
+/// The fake database clock, well away from the epoch the fixed results use.
+const DATABASE_NOW: time::OffsetDateTime =
+    time::OffsetDateTime::UNIX_EPOCH.saturating_add(time::Duration::seconds(1_000_000));
+
 const USDT_ADDRESS: &str = "0x1111111111111111111111111111111111111111";
 
 struct RailCredentials {
@@ -1205,6 +1221,9 @@ impl ExchangeRates for FixedRates {
 #[derive(Default)]
 struct CapturingStore {
     bindings: Mutex<Vec<Vec<u8>>>,
+    deadlines: Mutex<Vec<Option<time::OffsetDateTime>>>,
+    clock_reads: AtomicUsize,
+    clock_fails: AtomicBool,
     terms: Mutex<Option<paykit_server::application::semantic_intent::PaymentTermsV1>>,
     prepare_calls: AtomicUsize,
 }
@@ -1226,6 +1245,7 @@ impl MarketplacePreparationPersistence for CapturingStore {
         input: MarketplacePreparationInput<'_>,
     ) -> Result<MarketplacePreparationResult, PersistenceError> {
         self.prepare_calls.fetch_add(1, Ordering::SeqCst);
+        self.deadlines.lock().unwrap().push(input.prepare_deadline);
         let payloads = input.payloads.for_child_index(0)?;
         let terms = MarketplaceTerms::from_intent(
             &payloads.payment_request_intent,
@@ -1243,6 +1263,14 @@ impl MarketplacePreparationPersistence for CapturingStore {
             time::OffsetDateTime::UNIX_EPOCH + time::Duration::minutes(15),
             false,
         ))
+    }
+
+    async fn database_time(&self) -> Result<time::OffsetDateTime, PersistenceError> {
+        self.clock_reads.fetch_add(1, Ordering::SeqCst);
+        if self.clock_fails.load(Ordering::SeqCst) {
+            return Err(PersistenceError::Unavailable);
+        }
+        Ok(DATABASE_NOW)
     }
 }
 
@@ -2032,4 +2060,72 @@ async fn prepare_route_maps_typed_refusals_to_stable_bodies() {
             serde_json::json!({"error":{"code":code,"message":message}})
         );
     }
+}
+
+#[tokio::test]
+async fn preparation_deadline_is_the_database_time_of_quote_acceptance_plus_ttl() {
+    use CriterionAsset::Usd;
+    for (filter, reads_feed) in [(Some(vec![BTC, USDT]), true), (Some(vec![USDT]), false)] {
+        let rig = rig(true, true, true, Some(FEED));
+        rig.service
+            .prepare(multi_request(500, Usd, filter.as_deref(), 3_600))
+            .await
+            .unwrap();
+        assert_eq!(
+            rig.store.deadlines.lock().unwrap().as_slice(),
+            [Some(DATABASE_NOW + time::Duration::minutes(15))],
+            "one rule for every request, fed by the database clock: {filter:?}"
+        );
+        assert_eq!(rig.store.clock_reads.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            rig.rates.calls.load(Ordering::SeqCst),
+            usize::from(reads_feed)
+        );
+    }
+}
+
+#[tokio::test]
+async fn exact_replay_hands_persistence_no_deadline_and_a_conflict_creates_nothing() {
+    let replay = service(MarketplacePreparationPreflight::ExactReplay);
+    assert!(
+        replay
+            .service
+            .prepare(request(86_400))
+            .await
+            .unwrap()
+            .replayed()
+    );
+    assert_eq!(*replay.store.captured_deadline.lock().unwrap(), Some(None));
+
+    let conflict = service(MarketplacePreparationPreflight::Conflict);
+    assert_eq!(
+        conflict.service.prepare(request(86_400)).await,
+        Err(PrepareMarketplaceError::Conflict)
+    );
+    assert_eq!(*conflict.store.captured_deadline.lock().unwrap(), None);
+
+    let new = service(MarketplacePreparationPreflight::New);
+    new.service.prepare(request(86_400)).await.unwrap();
+    assert!(matches!(
+        *new.store.captured_deadline.lock().unwrap(),
+        Some(Some(_))
+    ));
+}
+
+#[tokio::test]
+async fn unreadable_database_clock_refuses_before_creating_anything() {
+    let rig = rig(true, true, true, Some(FEED));
+    rig.store.clock_fails.store(true, Ordering::SeqCst);
+    assert_eq!(
+        rig.service
+            .prepare(multi_request(
+                500,
+                CriterionAsset::Usd,
+                Some(&[USDT]),
+                3_600
+            ))
+            .await,
+        Err(PrepareMarketplaceError::Unavailable)
+    );
+    assert_eq!(rig.store.prepare_calls.load(Ordering::SeqCst), 0);
 }

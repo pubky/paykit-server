@@ -145,7 +145,7 @@ impl AppRegistryDiscovery for ReadyRegistry {
 
 /// BTC/USD feed double. `failing` makes every read fail, like a stale or down feed.
 pub struct Feed {
-    pub price: &'static str,
+    pub price: std::sync::Mutex<&'static str>,
     pub failing: AtomicBool,
     pub calls: AtomicUsize,
 }
@@ -157,7 +157,7 @@ impl ExchangeRates for Feed {
         if self.failing.load(Ordering::SeqCst) {
             return Err(CreateInvoiceError::Unavailable);
         }
-        Ok(self.price.to_owned())
+        Ok((*self.price.lock().unwrap()).to_owned())
     }
 }
 
@@ -216,6 +216,15 @@ pub const BOTH_RAILS: Seller = Seller {
 };
 
 pub async fn rig(seller: Seller, usdt_enabled: bool) -> Rig {
+    rig_with(seller, usdt_enabled, Duration::from_secs(15 * 60), None).await
+}
+
+pub async fn rig_with(
+    seller: Seller,
+    usdt_enabled: bool,
+    prepare_ttl: Duration,
+    request_deadline: Option<Duration>,
+) -> Rig {
     let database = TestDatabase::create().await;
     run_migrations(database.pool()).await.unwrap();
     let creators = CreatorStore::new(database.pool(), crypto());
@@ -238,26 +247,28 @@ pub async fn rig(seller: Seller, usdt_enabled: bool) -> Rig {
         .unwrap();
     let store = Arc::new(MarketplacePreparationStore::new(database.pool(), crypto()));
     let feed = Arc::new(Feed {
-        price: "81000",
+        price: std::sync::Mutex::new("81000"),
         failing: AtomicBool::new(false),
         calls: AtomicUsize::new(0),
     });
     let credentials: Arc<dyn CreatorReceivingProvider> = Arc::new(creators);
-    let preparation = Arc::new(
-        PrepareMarketplaceService::new(
-            Arc::new(ReadySession),
-            Arc::new(ReadyRegistry),
-            credentials,
-            store.clone(),
-            paykit_lib::PaykitAppId::new("paykit-server").unwrap(),
-            BitcoinNetwork::Mainnet,
-            Duration::from_secs(24 * 60 * 60),
-            Duration::from_secs(15 * 60),
-        )
-        .with_usdt(usdt_enabled)
-        .with_conversion_payment_window(Duration::from_secs(60 * 60))
-        .with_exchange_rates(feed.clone()),
-    );
+    let mut preparation = PrepareMarketplaceService::new(
+        Arc::new(ReadySession),
+        Arc::new(ReadyRegistry),
+        credentials,
+        store.clone(),
+        paykit_lib::PaykitAppId::new("paykit-server").unwrap(),
+        BitcoinNetwork::Mainnet,
+        Duration::from_secs(24 * 60 * 60),
+        prepare_ttl,
+    )
+    .with_usdt(usdt_enabled)
+    .with_conversion_payment_window(Duration::from_secs(60 * 60))
+    .with_exchange_rates(feed.clone());
+    if let Some(request_deadline) = request_deadline {
+        preparation = preparation.with_request_deadline(request_deadline);
+    }
+    let preparation = Arc::new(preparation);
     let lifecycle = Arc::new(MarketplaceLifecycleService::new(
         store.clone(),
         Duration::from_secs(30 * 60),

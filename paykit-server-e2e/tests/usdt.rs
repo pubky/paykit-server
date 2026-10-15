@@ -847,6 +847,7 @@ async fn locks_ignores_a_transfer_a_marketplace_request_already_owns() {
             asset: CriterionAsset::Usdt,
             payment_window_seconds: 86_400,
             prepare_ttl_seconds: 900,
+            prepare_deadline: common::deadline_after(900),
             payloads: &MarketplacePayload,
         })
         .await

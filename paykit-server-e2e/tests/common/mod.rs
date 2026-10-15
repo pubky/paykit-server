@@ -102,3 +102,10 @@ pub fn assert_fixture(directory: &str, name: &str, body: &[u8], volatile: &[(&st
     });
     assert_eq!(rendered, expected, "fixture {directory}/{name}.json");
 }
+
+/// The end of a preparation fixed `seconds` from now, as the service fixes it when it
+/// accepts a quote. Store-level tests use the host clock, which is the database's.
+#[allow(dead_code)]
+pub fn deadline_after(seconds: u64) -> Option<time::OffsetDateTime> {
+    Some(time::OffsetDateTime::now_utc() + time::Duration::seconds(i64::try_from(seconds).unwrap()))
+}

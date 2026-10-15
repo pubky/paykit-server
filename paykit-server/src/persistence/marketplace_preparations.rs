@@ -44,6 +44,9 @@ pub struct MarketplacePreparationInput<'a> {
     pub asset: CriterionAsset,
     pub payment_window_seconds: u64,
     pub prepare_ttl_seconds: u64,
+    /// Absolute end of the preparation on the database clock, fixed by the caller when
+    /// it accepted the quote. `None` only for an exact replay, which creates nothing.
+    pub prepare_deadline: Option<OffsetDateTime>,
     pub payloads: &'a dyn MarketplacePreparationPayloadFactory,
 }
 
@@ -893,6 +896,14 @@ impl MarketplacePreparationStore {
         Ok(applied)
     }
 
+    /// The database clock, for fixing a preparation's expiry on the clock that judges it.
+    pub async fn database_time(&self) -> Result<OffsetDateTime, PersistenceError> {
+        sqlx::query_scalar("SELECT clock_timestamp()")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|_| PersistenceError::Unavailable)
+    }
+
     /// Resolves replay or changed binding before mutable external work.
     pub async fn preflight(
         &self,
@@ -992,12 +1003,28 @@ impl MarketplacePreparationStore {
             return Ok(result);
         }
 
-        let prepared_at: OffsetDateTime = sqlx::query_scalar("SELECT clock_timestamp()")
+        // The Creator lock may have been waited on for a long time. The preparation
+        // keeps the life fixed when the quote was accepted; it never starts a new one.
+        let prepare_expires_at = input
+            .prepare_deadline
+            .ok_or(PersistenceError::InvalidInput)
+            .and_then(|deadline| {
+                // PostgreSQL stores microseconds; the envelope must hold the same instant.
+                deadline
+                    .replace_nanosecond(deadline.nanosecond() / 1_000 * 1_000)
+                    .map_err(|_| PersistenceError::InvalidInput)
+            })?;
+        let locked_at: OffsetDateTime = sqlx::query_scalar("SELECT clock_timestamp()")
             .fetch_one(&mut *tx)
             .await
             .map_err(|_| PersistenceError::Unavailable)?;
-        let prepare_expires_at = prepared_at
-            .checked_add(ttl)
+        if locked_at >= prepare_expires_at {
+            return Err(PersistenceError::DeadlineElapsed);
+        }
+        // `prepared_at` is the instant the quote was fixed, so the stored lifetime
+        // stays exactly the configured TTL.
+        let prepared_at = prepare_expires_at
+            .checked_sub(ttl)
             .ok_or(PersistenceError::InvalidInput)?;
         let payloads = input.payloads.for_child_index(creator.next_child_index)?;
         let terms = MarketplaceTerms::from_intent(
