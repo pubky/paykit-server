@@ -15,7 +15,10 @@ use paykit_server::{
     },
     config::BitcoinNetwork,
     crypto::{Crypto, EncryptedEnvelope, EnvelopeContext},
-    domain::locks::{CreatorPubky, ReaderPubky, parse_creator, parse_reader},
+    domain::{
+        invoice::CriterionAsset,
+        locks::{CreatorPubky, ReaderPubky, parse_creator, parse_reader},
+    },
     persistence::{
         CreatorCredentials, CreatorStore, MarketplaceActivationInput,
         MarketplaceLifecyclePersistenceError, MarketplacePreparationInput,
@@ -214,13 +217,13 @@ struct DescribedPayloads {
 }
 
 #[derive(Serialize, Deserialize)]
-struct StoredPreparationEnvelopeV1 {
+struct StoredPreparationEnvelope {
     version: u8,
     operation_id: String,
     request_binding: Vec<u8>,
     reader: String,
     reference: String,
-    total_sats: u64,
+    terms: paykit_server::application::marketplace_terms::MarketplaceTerms,
     payment_window_seconds: u64,
     prepare_ttl_seconds: u64,
     prepared_at: OffsetDateTime,
@@ -308,7 +311,9 @@ fn application_request(description: String, operation_id: &str) -> PrepareMarket
         creator: creator(),
         reader: reader(),
         reference: "7cceb26d-9042-4ea6-bfcb-01bbd778d76e".into(),
-        amount_sats: 100,
+        amount: 100,
+        asset: CriterionAsset::Btc,
+        accepted_assets: None,
         operation_id: operation_id.into(),
         payment_window_seconds: 24 * 60 * 60,
         description: Some(description),
@@ -360,7 +365,8 @@ async fn final_frame_capacity_is_checked_before_preparation_persists() {
         .activate(MarketplaceActivationInput {
             creator: &creator,
             invoice_id: prepared.invoice_id(),
-            total_sats: 100,
+            amount: 100,
+            asset: CriterionAsset::Btc,
             proposal_acceptance_window: std::time::Duration::from_nanos(999_999_999),
         })
         .await
@@ -430,9 +436,11 @@ fn input_with_ttl_and_window<'a>(
         reference: "7cceb26d-9042-4ea6-bfcb-01bbd778d76e",
         operation_id,
         request_binding,
-        total_sats: 100,
+        amount: 100,
+        asset: CriterionAsset::Btc,
         payment_window_seconds,
         prepare_ttl_seconds,
+        prepare_deadline: common::deadline_after(prepare_ttl_seconds),
         payloads: &Payloads,
     }
 }
@@ -454,7 +462,7 @@ async fn stored_preparation_envelope(
     database: &TestDatabase,
     creator: &CreatorPubky,
     invoice_id: uuid::Uuid,
-) -> StoredPreparationEnvelopeV1 {
+) -> StoredPreparationEnvelope {
     let encrypted: Vec<u8> = sqlx::query_scalar(
         "SELECT preparation_envelope FROM marketplace_payment_preparations WHERE id = $1",
     )
@@ -492,7 +500,8 @@ async fn marketplace_post_deadline_reconciliation_remains_deliverable_without_de
         .activate(MarketplaceActivationInput {
             creator: &creator,
             invoice_id: prepared.invoice_id(),
-            total_sats: 100,
+            amount: 100,
+            asset: CriterionAsset::Btc,
             proposal_acceptance_window: Duration::from_secs(1),
         })
         .await
@@ -682,7 +691,7 @@ async fn preparation_is_durable_unpublished_and_replay_first() {
         .await
         .unwrap();
     assert!(!first.replayed());
-    assert_eq!(first.total_sats(), 100);
+    assert_eq!(first.terms().amount(), 100);
     assert_eq!(
         first.prepare_expires_at() - first.prepared_at(),
         time::Duration::seconds(1)
@@ -729,7 +738,8 @@ async fn preparation_is_durable_unpublished_and_replay_first() {
         .unwrap();
     assert!(replay.replayed());
     assert_eq!(replay.invoice_id(), first.invoice_id());
-    assert_eq!(replay.total_sats(), first.total_sats());
+    assert_eq!(replay.terms(), first.terms());
+    assert_eq!(replay.quote(), first.quote());
     assert!(replay.prepare_expires_at() < time::OffsetDateTime::now_utc());
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT next_child_index FROM creators")
@@ -904,6 +914,7 @@ async fn activation_and_prepare_replay_share_creator_before_preparation_lock_ord
         .prepare(input(&creator, &reader, operation_id, request_binding))
         .await
         .unwrap();
+    let prepared_id = prepared.invoice_id();
 
     let lock_key = i64::from_be_bytes(uuid::Uuid::new_v4().as_bytes()[..8].try_into().unwrap());
     let mut activation_gate = database.pool().begin().await.unwrap();
@@ -939,8 +950,9 @@ async fn activation_and_prepare_replay_share_creator_before_preparation_lock_ord
             activation_store
                 .activate(MarketplaceActivationInput {
                     creator: &creator,
-                    invoice_id: prepared.invoice_id(),
-                    total_sats: 100,
+                    invoice_id: prepared_id,
+                    amount: 100,
+                    asset: CriterionAsset::Btc,
                     proposal_acceptance_window: std::time::Duration::from_secs(30 * 60),
                 })
                 .await
@@ -969,8 +981,8 @@ async fn activation_and_prepare_replay_share_creator_before_preparation_lock_ord
     let replayed = replayed.unwrap().unwrap();
     assert!(!activated.replayed());
     assert!(replayed.replayed());
-    assert_eq!(activated.invoice_id(), prepared.invoice_id());
-    assert_eq!(replayed.invoice_id(), prepared.invoice_id());
+    assert_eq!(activated.invoice_id(), prepared_id);
+    assert_eq!(replayed.invoice_id(), prepared_id);
 
     database.cleanup().await;
 }
@@ -1084,20 +1096,22 @@ async fn activate_starts_db_window_once_and_void_competes_on_the_preparation_row
         ))
         .await
         .unwrap();
+    let prepared_id = prepared.invoice_id();
 
     let barrier = Arc::new(tokio::sync::Barrier::new(3));
     let activate = tokio::spawn({
         let barrier = barrier.clone();
         let store = first_store.clone();
         let creator = creator.clone();
-        let invoice_id = prepared.invoice_id();
+        let invoice_id = prepared_id;
         async move {
             barrier.wait().await;
             store
                 .activate(MarketplaceActivationInput {
                     creator: &creator,
                     invoice_id,
-                    total_sats: 100,
+                    amount: 100,
+                    asset: CriterionAsset::Btc,
                     proposal_acceptance_window: std::time::Duration::from_secs(30 * 60),
                 })
                 .await
@@ -1107,7 +1121,7 @@ async fn activate_starts_db_window_once_and_void_competes_on_the_preparation_row
         let barrier = barrier.clone();
         let store = second_store.clone();
         let creator = creator.clone();
-        let invoice_id = prepared.invoice_id();
+        let invoice_id = prepared_id;
         async move {
             barrier.wait().await;
             store.void(&creator, invoice_id).await
@@ -1136,13 +1150,13 @@ async fn activate_starts_db_window_once_and_void_competes_on_the_preparation_row
     );
     let state: String =
         sqlx::query_scalar("SELECT state FROM marketplace_payment_preparations WHERE id = $1")
-            .bind(prepared.invoice_id())
+            .bind(prepared_id)
             .fetch_one(database.pool())
             .await
             .unwrap();
     let outbox_count: i64 =
         sqlx::query_scalar("SELECT count(*) FROM outbox WHERE marketplace_preparation_id = $1")
-            .bind(prepared.invoice_id())
+            .bind(prepared_id)
             .fetch_one(database.pool())
             .await
             .unwrap();
@@ -1150,7 +1164,7 @@ async fn activate_starts_db_window_once_and_void_competes_on_the_preparation_row
     let settlement_count: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM marketplace_settlements WHERE preparation_id = $1",
     )
-    .bind(prepared.invoice_id())
+    .bind(prepared_id)
     .fetch_one(database.pool())
     .await
     .unwrap();
@@ -1161,13 +1175,14 @@ async fn activate_starts_db_window_once_and_void_competes_on_the_preparation_row
             activated.payment_deadline() - activated.activated_at(),
             time::Duration::days(1)
         );
-        assert_eq!(activated.total_sats(), 100);
+        assert_eq!(activated.terms().amount(), 100);
         assert!(!activated.replayed());
         let replay = first_store
             .activate(MarketplaceActivationInput {
                 creator: &creator,
-                invoice_id: prepared.invoice_id(),
-                total_sats: 100,
+                invoice_id: prepared_id,
+                amount: 100,
+                asset: CriterionAsset::Btc,
                 proposal_acceptance_window: std::time::Duration::from_secs(30 * 60),
             })
             .await
@@ -1180,7 +1195,7 @@ async fn activate_starts_db_window_once_and_void_competes_on_the_preparation_row
             sqlx::query_scalar::<_, i64>(
                 "SELECT count(*) FROM outbox WHERE marketplace_preparation_id = $1",
             )
-            .bind(prepared.invoice_id())
+            .bind(prepared_id)
             .fetch_one(database.pool())
             .await
             .unwrap(),
@@ -1191,7 +1206,7 @@ async fn activate_starts_db_window_once_and_void_competes_on_the_preparation_row
             sqlx::query_scalar::<_, i64>(
                 "SELECT count(*) FROM marketplace_settlements WHERE preparation_id = $1",
             )
-            .bind(prepared.invoice_id())
+            .bind(prepared_id)
             .fetch_one(database.pool())
             .await
             .unwrap(),
@@ -1202,7 +1217,7 @@ async fn activate_starts_db_window_once_and_void_competes_on_the_preparation_row
             "SELECT payment_status, confirmation_count, amount_matched
              FROM marketplace_settlements WHERE preparation_id = $1",
         )
-        .bind(prepared.invoice_id())
+        .bind(prepared_id)
         .fetch_one(database.pool())
         .await
         .unwrap();
@@ -1222,12 +1237,12 @@ async fn activate_starts_db_window_once_and_void_competes_on_the_preparation_row
         );
     } else {
         let replay = second_store
-            .void(&creator, prepared.invoice_id())
+            .void(&creator, prepared_id)
             .await
             .unwrap()
             .unwrap();
         assert!(replay.replayed());
-        assert_eq!(replay.invoice_id(), prepared.invoice_id());
+        assert_eq!(replay.invoice_id(), prepared_id);
     }
 
     database.cleanup().await;
@@ -1267,7 +1282,8 @@ async fn settlement_address_collision_is_integrity_failure_and_rolls_back_activa
         .activate(MarketplaceActivationInput {
             creator: &first_creator,
             invoice_id: first.invoice_id(),
-            total_sats: 100,
+            amount: 100,
+            asset: CriterionAsset::Btc,
             proposal_acceptance_window: std::time::Duration::from_secs(30 * 60),
         })
         .await
@@ -1277,7 +1293,8 @@ async fn settlement_address_collision_is_integrity_failure_and_rolls_back_activa
             .activate(MarketplaceActivationInput {
                 creator: &second_creator,
                 invoice_id: second.invoice_id(),
-                total_sats: 100,
+                amount: 100,
+                asset: CriterionAsset::Btc,
                 proposal_acceptance_window: std::time::Duration::from_secs(30 * 60),
             })
             .await,
@@ -1340,7 +1357,8 @@ async fn activation_rejects_wrong_total_expiry_and_prepared_resolution_without_p
             .activate(MarketplaceActivationInput {
                 creator: &creator,
                 invoice_id: wrong_total.invoice_id(),
-                total_sats: 101,
+                amount: 101,
+                asset: CriterionAsset::Btc,
                 proposal_acceptance_window: std::time::Duration::from_secs(30 * 60),
             })
             .await,
@@ -1363,7 +1381,8 @@ async fn activation_rejects_wrong_total_expiry_and_prepared_resolution_without_p
             .activate(MarketplaceActivationInput {
                 creator: &creator,
                 invoice_id: expired.invoice_id(),
-                total_sats: 101,
+                amount: 101,
+                asset: CriterionAsset::Btc,
                 proposal_acceptance_window: std::time::Duration::from_secs(30 * 60),
             })
             .await,
@@ -1393,7 +1412,8 @@ async fn activation_rejects_wrong_total_expiry_and_prepared_resolution_without_p
             .activate(MarketplaceActivationInput {
                 creator: &creator,
                 invoice_id: resolved.invoice_id(),
-                total_sats: 101,
+                amount: 101,
+                asset: CriterionAsset::Btc,
                 proposal_acceptance_window: std::time::Duration::from_secs(30 * 60),
             })
             .await,
@@ -1453,7 +1473,8 @@ async fn resolution_annotates_prepared_active_and_voided_without_changing_lifecy
         .activate(MarketplaceActivationInput {
             creator: &creator,
             invoice_id: active.invoice_id(),
-            total_sats: 100,
+            amount: 100,
+            asset: CriterionAsset::Btc,
             proposal_acceptance_window: std::time::Duration::from_secs(30 * 60),
         })
         .await
@@ -1615,6 +1636,7 @@ async fn concurrent_same_resolution_replays_one_db_timestamp() {
         ))
         .await
         .unwrap();
+    let prepared_id = prepared.invoice_id();
     let barrier = Arc::new(tokio::sync::Barrier::new(3));
     let first = tokio::spawn({
         let barrier = barrier.clone();
@@ -1624,7 +1646,7 @@ async fn concurrent_same_resolution_replays_one_db_timestamp() {
             first_store
                 .resolve(
                     &creator,
-                    prepared.invoice_id(),
+                    prepared_id,
                     MarketplaceResolutionOutcome::PaidManually,
                 )
                 .await
@@ -1638,7 +1660,7 @@ async fn concurrent_same_resolution_replays_one_db_timestamp() {
             second_store
                 .resolve(
                     &creator,
-                    prepared.invoice_id(),
+                    prepared_id,
                     MarketplaceResolutionOutcome::PaidManually,
                 )
                 .await
@@ -1670,6 +1692,7 @@ async fn concurrent_different_resolutions_commit_one_immutable_outcome() {
         ))
         .await
         .unwrap();
+    let prepared_id = prepared.invoice_id();
     let barrier = Arc::new(tokio::sync::Barrier::new(3));
     let first = tokio::spawn({
         let barrier = barrier.clone();
@@ -1679,7 +1702,7 @@ async fn concurrent_different_resolutions_commit_one_immutable_outcome() {
             first_store
                 .resolve(
                     &creator,
-                    prepared.invoice_id(),
+                    prepared_id,
                     MarketplaceResolutionOutcome::Refunded,
                 )
                 .await
@@ -1693,7 +1716,7 @@ async fn concurrent_different_resolutions_commit_one_immutable_outcome() {
             second_store
                 .resolve(
                     &creator,
-                    prepared.invoice_id(),
+                    prepared_id,
                     MarketplaceResolutionOutcome::Abandoned,
                 )
                 .await
@@ -1720,7 +1743,7 @@ async fn concurrent_different_resolutions_commit_one_immutable_outcome() {
     let stored: String = sqlx::query_scalar(
         "SELECT business_outcome FROM marketplace_payment_preparations WHERE id = $1",
     )
-    .bind(prepared.invoice_id())
+    .bind(prepared_id)
     .fetch_one(database.pool())
     .await
     .unwrap();
@@ -1730,7 +1753,7 @@ async fn concurrent_different_resolutions_commit_one_immutable_outcome() {
          SET business_outcome = 'paid_manually', resolved_at = clock_timestamp()
          WHERE id = $1",
     )
-    .bind(prepared.invoice_id())
+    .bind(prepared_id)
     .execute(database.pool())
     .await
     .unwrap_err();
@@ -1756,6 +1779,7 @@ async fn prepared_resolution_and_activation_serialize_without_unresolved_publica
         ))
         .await
         .unwrap();
+    let prepared_id = prepared.invoice_id();
     let barrier = Arc::new(tokio::sync::Barrier::new(3));
     let activate = tokio::spawn({
         let barrier = barrier.clone();
@@ -1765,8 +1789,9 @@ async fn prepared_resolution_and_activation_serialize_without_unresolved_publica
             activation_store
                 .activate(MarketplaceActivationInput {
                     creator: &creator,
-                    invoice_id: prepared.invoice_id(),
-                    total_sats: 100,
+                    invoice_id: prepared_id,
+                    amount: 100,
+                    asset: CriterionAsset::Btc,
                     proposal_acceptance_window: std::time::Duration::from_secs(30 * 60),
                 })
                 .await
@@ -1780,7 +1805,7 @@ async fn prepared_resolution_and_activation_serialize_without_unresolved_publica
             resolution_store
                 .resolve(
                     &creator,
-                    prepared.invoice_id(),
+                    prepared_id,
                     MarketplaceResolutionOutcome::Abandoned,
                 )
                 .await
@@ -1792,13 +1817,13 @@ async fn prepared_resolution_and_activation_serialize_without_unresolved_publica
     assert!(!resolved.replayed());
     let state: String =
         sqlx::query_scalar("SELECT state FROM marketplace_payment_preparations WHERE id = $1")
-            .bind(prepared.invoice_id())
+            .bind(prepared_id)
             .fetch_one(database.pool())
             .await
             .unwrap();
     let outbox_count: i64 =
         sqlx::query_scalar("SELECT count(*) FROM outbox WHERE marketplace_preparation_id = $1")
-            .bind(prepared.invoice_id())
+            .bind(prepared_id)
             .fetch_one(database.pool())
             .await
             .unwrap();
@@ -1813,6 +1838,44 @@ async fn prepared_resolution_and_activation_serialize_without_unresolved_publica
         }
         other => panic!("unexpected activation result: {other:?}"),
     }
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn sub_microsecond_deadline_is_stored_as_postgresql_keeps_it() {
+    let database = TestDatabase::create().await;
+    let store = store(&database).await;
+    let creator = creator();
+    let reader = reader();
+    let deadline = (OffsetDateTime::now_utc() + time::Duration::minutes(15))
+        .replace_nanosecond(123_456_789)
+        .unwrap();
+    let mut prepared_input = input(&creator, &reader, "nanos", b"nanos");
+    prepared_input.prepare_deadline = Some(deadline);
+    let prepared = store.prepare(prepared_input).await.unwrap();
+    assert_eq!(
+        prepared.prepare_expires_at(),
+        deadline.replace_nanosecond(123_456_000).unwrap()
+    );
+    let stored: OffsetDateTime = sqlx::query_scalar(
+        "SELECT prepare_expires_at FROM marketplace_payment_preparations WHERE id = $1",
+    )
+    .bind(prepared.invoice_id())
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(stored, prepared.prepare_expires_at());
+    store
+        .activate(MarketplaceActivationInput {
+            creator: &creator,
+            invoice_id: prepared.invoice_id(),
+            amount: 100,
+            asset: CriterionAsset::Btc,
+            proposal_acceptance_window: std::time::Duration::from_secs(30 * 60),
+        })
+        .await
+        .unwrap()
+        .unwrap();
     database.cleanup().await;
 }
 
@@ -1838,7 +1901,8 @@ async fn shortest_payment_window_still_has_a_usable_proposal_interval() {
         .activate(MarketplaceActivationInput {
             creator: &creator,
             invoice_id: prepared.invoice_id(),
-            total_sats: 100,
+            amount: 100,
+            asset: CriterionAsset::Btc,
             proposal_acceptance_window: std::time::Duration::from_secs(30 * 60),
         })
         .await
@@ -1897,7 +1961,8 @@ async fn configured_subsecond_policy_wins_below_half_payment_window() {
         .activate(MarketplaceActivationInput {
             creator: &creator,
             invoice_id: prepared.invoice_id(),
-            total_sats: 100,
+            amount: 100,
+            asset: CriterionAsset::Btc,
             proposal_acceptance_window: std::time::Duration::from_millis(750),
         })
         .await
@@ -1961,7 +2026,7 @@ async fn authenticated_invalid_stored_intent_is_corrupt_not_caller_input() {
     let plaintext = crypto
         .decrypt(&context, &EncryptedEnvelope::from_bytes(encrypted))
         .unwrap();
-    let mut envelope: StoredPreparationEnvelopeV1 = postcard::from_bytes(&plaintext).unwrap();
+    let mut envelope: StoredPreparationEnvelope = postcard::from_bytes(&plaintext).unwrap();
     envelope.reference = "53efc9fd-72b2-47b7-94c4-1d66dcad0018".into();
     let tampered = crypto
         .encrypt(&context, &postcard::to_allocvec(&envelope).unwrap())
@@ -1980,7 +2045,8 @@ async fn authenticated_invalid_stored_intent_is_corrupt_not_caller_input() {
             .activate(MarketplaceActivationInput {
                 creator: &creator,
                 invoice_id: prepared.invoice_id(),
-                total_sats: 100,
+                amount: 100,
+                asset: CriterionAsset::Btc,
                 proposal_acceptance_window: std::time::Duration::from_secs(30 * 60),
             })
             .await,
