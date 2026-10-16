@@ -146,8 +146,9 @@ impl InvoiceStore {
         };
         let scan = verifier
             .payment_scan(&context, &record.payment_proofs)
-            .await;
-        let mut observed = false;
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        let mut observed = 0;
         for candidate in &scan.candidates {
             let identity = &candidate.identity;
             let identity_hash = self.crypto.usdt_transfer_lookup_hash(identity.as_bytes());
@@ -167,7 +168,7 @@ impl InvoiceStore {
                 continue;
             }
             if existing.is_some_and(|(skip, _, _)| skip) {
-                observed = true;
+                observed += 1;
                 continue;
             }
             let verified = match verifier.verify_candidate(&context, candidate).await {
@@ -178,7 +179,10 @@ impl InvoiceStore {
                         .finish_payment_scan(
                             &scan,
                             observed
-                                || existing.is_some_and(|(_, present, owned)| present && owned),
+                                + usize::from(
+                                    existing.is_some_and(|(_, present, owned)| present && owned),
+                                )
+                                == scan.candidates.len(),
                         )
                         .await;
                     return Err(PersistenceError::Unavailable);
@@ -186,9 +190,10 @@ impl InvoiceStore {
             };
             match verified {
                 Some(transfer) => {
-                    observed |= self
-                        .apply_usdt_transfer(&row, creator_hash, &payment, transfer)
-                        .await?;
+                    observed += usize::from(
+                        self.apply_usdt_transfer(&row, creator_hash, &payment, transfer)
+                            .await?,
+                    );
                 }
                 None => {
                     if !existing.is_some_and(|(_, present, owned)| present && owned) {
@@ -220,7 +225,9 @@ impl InvoiceStore {
                 }
             }
         }
-        verifier.finish_payment_scan(&scan, observed).await;
+        verifier
+            .finish_payment_scan(&scan, observed == scan.candidates.len())
+            .await;
         Ok(())
     }
 

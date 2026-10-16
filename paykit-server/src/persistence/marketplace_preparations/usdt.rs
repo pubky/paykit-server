@@ -118,8 +118,9 @@ impl MarketplacePreparationStore {
         };
         let scan = verifier
             .payment_scan(&context, &record.payment_proofs)
-            .await;
-        let mut observed = false;
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        let mut observed = 0;
         for candidate in &scan.candidates {
             let identity = &candidate.identity;
             let identity_hash = self.crypto.usdt_transfer_lookup_hash(identity.as_bytes());
@@ -138,7 +139,7 @@ impl MarketplacePreparationStore {
                 continue;
             }
             if existing.is_some_and(|(skip, _, _)| skip) {
-                observed = true;
+                observed += 1;
                 continue;
             }
             let verified = match verifier.verify_candidate(&context, candidate).await {
@@ -149,7 +150,10 @@ impl MarketplacePreparationStore {
                         .finish_payment_scan(
                             &scan,
                             observed
-                                || existing.is_some_and(|(_, present, owned)| present && owned),
+                                + usize::from(
+                                    existing.is_some_and(|(_, present, owned)| present && owned),
+                                )
+                                == scan.candidates.len(),
                         )
                         .await;
                     return Err(PersistenceError::Unavailable);
@@ -157,9 +161,10 @@ impl MarketplacePreparationStore {
             };
             match verified {
                 Some(transfer) => {
-                    observed |= self
-                        .apply_usdt_transfer(&target, creator_hash, transfer)
-                        .await?;
+                    observed += usize::from(
+                        self.apply_usdt_transfer(&target, creator_hash, transfer)
+                            .await?,
+                    );
                 }
                 None => {
                     if !existing.is_some_and(|(_, present, owned)| present && owned) {
@@ -187,7 +192,9 @@ impl MarketplacePreparationStore {
                 }
             }
         }
-        verifier.finish_payment_scan(&scan, observed).await;
+        verifier
+            .finish_payment_scan(&scan, observed == scan.candidates.len())
+            .await;
         Ok(())
     }
 

@@ -243,6 +243,118 @@ async fn missing_receipts_defer_repeated_scans_without_creating_observations() {
 }
 
 #[tokio::test]
+async fn present_receipts_do_not_accelerate_missing_receipt_retries() {
+    let rig = rig(BOTH_RAILS, true).await;
+    let rpc = Rpc::start().await;
+    let request = offered(&rig, 0, &[]).await;
+    chain(&rpc, |chain| chain.timestamp = request.at(0));
+    submit(&rig, &rpc, 0).await;
+    let creator_id = creator_row(&rig).await;
+    for finalized in [false, true] {
+        sqlx::query("UPDATE usdt_observations SET finalized = $1")
+            .bind(finalized)
+            .execute(rig.database.pool())
+            .await
+            .unwrap();
+        let verifier = ArbitrumVerifier::new(rpc.url.clone()).unwrap();
+        let mut evidence = record(0);
+        let mut missing = common::arbitrum::proof(0);
+        missing
+            .proof
+            .insert("transaction_hash".into(), json!(format!("0x{:064x}", 2)));
+        evidence.payment_proofs.push(missing);
+        rpc.requests.lock().unwrap().clear();
+        for _ in 0..3 {
+            rig.store
+                .observe_usdt_request(creator_id, &creator(), &evidence, &verifier)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            rpc.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(method, _)| method == "eth_getTransactionReceipt")
+                .count(),
+            1
+        );
+        assert_eq!(rig.status(&request.invoice).await["paid_asset"], "USDT");
+    }
+    rig.cleanup().await;
+}
+
+#[tokio::test]
+async fn oversized_proof_sets_do_not_perform_verification_or_change_observations() {
+    let rig = rig(BOTH_RAILS, true).await;
+    let rpc = Rpc::start().await;
+    let request = offered(&rig, 0, &[]).await;
+    chain(&rpc, |chain| chain.timestamp = request.at(0));
+    let creator_id = creator_row(&rig).await;
+    let mut evidence = record(0);
+    evidence.payment_proofs = vec![common::arbitrum::proof(0); 129];
+    for _ in 0..2 {
+        assert!(matches!(
+            rig.store
+                .observe_usdt_request(creator_id, &creator(), &evidence, &rpc.verifier)
+                .await,
+            Err(paykit_server::persistence::PersistenceError::Unavailable)
+        ));
+    }
+    assert!(rpc.requests.lock().unwrap().is_empty());
+    assert!(rig.status(&request.invoice).await["paid_asset"].is_null());
+    evidence.payment_proofs.truncate(128);
+    rig.store
+        .observe_usdt_request(creator_id, &creator(), &evidence, &rpc.verifier)
+        .await
+        .unwrap();
+    assert_eq!(rig.status(&request.invoice).await["paid_asset"], "USDT");
+    evidence.payment_proofs.push(common::arbitrum::proof(0));
+    age_receipts(&rig).await;
+    rpc.requests.lock().unwrap().clear();
+    assert!(matches!(
+        rig.store
+            .observe_usdt_request(creator_id, &creator(), &evidence, &rpc.verifier)
+            .await,
+        Err(paykit_server::persistence::PersistenceError::Unavailable)
+    ));
+    assert!(rpc.requests.lock().unwrap().is_empty());
+    assert_eq!(rig.status(&request.invoice).await["paid_asset"], "USDT");
+    rig.cleanup().await;
+}
+
+#[tokio::test]
+async fn conflicting_account_attestations_preserve_verified_receipts() {
+    let rig = rig(BOTH_RAILS, true).await;
+    let rpc = Rpc::start().await;
+    let request = offered(&rig, 0, &[]).await;
+    chain(&rpc, |chain| chain.timestamp = request.at(0));
+    let creator_id = creator_row(&rig).await;
+    let mut evidence = record(0);
+    let mut incorrect = common::arbitrum::proof(1);
+    incorrect.payment_reference = evidence.payment_proofs[0].payment_reference.clone();
+    evidence.payment_proofs = vec![common::arbitrum::proof(0); 8];
+    evidence.payment_proofs.push(incorrect);
+    rig.store
+        .observe_usdt_request(creator_id, &creator(), &evidence, &rpc.verifier)
+        .await
+        .unwrap();
+    assert_eq!(rig.status(&request.invoice).await["paid_asset"], "USDT");
+    age_receipts(&rig).await;
+    rig.store
+        .observe_usdt_request(creator_id, &creator(), &evidence, &rpc.verifier)
+        .await
+        .unwrap();
+    assert_eq!(rig.status(&request.invoice).await["paid_asset"], "USDT");
+    chain(&rpc, |chain| chain.reorg = true);
+    // An eligible refresh can still invalidate the receipt from canonical chain evidence.
+    age_receipts(&rig).await;
+    submit(&rig, &rpc, 0).await;
+    assert!(rig.status(&request.invoice).await["paid_asset"].is_null());
+    rig.cleanup().await;
+}
+
+#[tokio::test]
 async fn verified_usdt_proof_reaches_a_dual_asset_request_and_sets_the_paid_asset() {
     let rig = rig(BOTH_RAILS, true).await;
     let rpc = Rpc::start().await;

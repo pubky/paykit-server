@@ -383,7 +383,8 @@ async fn invoices_share_an_address_but_never_share_payment_evidence() {
     let mut evidence = record(0);
     let mut incorrect = proof(1);
     incorrect.payment_reference = evidence.payment_proofs[0].payment_reference.clone();
-    evidence.payment_proofs.insert(0, incorrect.clone());
+    evidence.payment_proofs = vec![proof(0); 7];
+    evidence.payment_proofs.push(incorrect.clone());
     evidence.payment_proofs.push(incorrect);
     store
         .observe_usdt_request(
@@ -395,7 +396,19 @@ async fn invoices_share_an_address_but_never_share_payment_evidence() {
         )
         .await
         .unwrap();
+    store
+        .observe_usdt_request(
+            creator_id,
+            &creator,
+            &evidence,
+            &rpc.verifier,
+            Some(&bundles[0]),
+        )
+        .await
+        .unwrap();
     assert_eq!(status(&store, &bundles[0]).await, (true, 2));
+    // Check provider failures independently of the conflicting attestations.
+    evidence.payment_proofs = vec![proof(0)];
     rpc.chain.lock().unwrap().unavailable = true;
     assert!(matches!(
         store
@@ -475,6 +488,40 @@ async fn invoices_share_an_address_but_never_share_payment_evidence() {
             .unwrap()
             .finalized
     );
+    rpc.chain.lock().unwrap().unavailable = false;
+    for finalized in [false, true] {
+        sqlx::query(
+            "UPDATE usdt_observations SET finalized = $1, present = TRUE, checked_at = NOW()",
+        )
+        .bind(finalized)
+        .execute(database.pool())
+        .await
+        .unwrap();
+        let verifier = ArbitrumVerifier::new(rpc.url.clone()).unwrap();
+        let mut evidence = record(0);
+        let mut missing = proof(0);
+        missing
+            .proof
+            .insert("transaction_hash".into(), json!(format!("0x{:064x}", 2)));
+        evidence.payment_proofs.push(missing);
+        rpc.requests.lock().unwrap().clear();
+        for _ in 0..3 {
+            store
+                .observe_usdt_request(creator_id, &creator, &evidence, &verifier, None)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            rpc.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(method, _)| method == "eth_getTransactionReceipt")
+                .count(),
+            1
+        );
+        assert_eq!(status(&store, &bundles[0]).await, (true, 2));
+    }
     database.cleanup().await;
 }
 
