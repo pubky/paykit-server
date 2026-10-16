@@ -28,10 +28,10 @@ hkdf = "0.13"
 hmac = "0.13"
 humantime-serde = "1"
 locks-core = { git = "https://github.com/pubky/locks.git", tag = "v0.1.0-rc13" }
-paykit-lib = { git = "https://github.com/pubky/paykit-rs.git", rev = "03d4f05721e92d3944cb4d5af4b2c98c4390a5a8" }
-paykit-sdk = { git = "https://github.com/pubky/paykit-rs.git", rev = "03d4f05721e92d3944cb4d5af4b2c98c4390a5a8" }
-pubky = "=0.15.0"
-pubky-testnet = "=0.15.0"
+paykit-lib = "=0.1.0"
+paykit-sdk = "=0.1.0"
+pubky = "=0.16.2"
+pubky-testnet = "=0.16.2"
 prometheus-client = "0.25"
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 postcard = { version = "1.1", features = ["use-std"] }

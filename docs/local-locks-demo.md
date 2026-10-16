@@ -14,14 +14,14 @@ and exact Locks release selected in `Cargo.toml`:
 
 ```bash
 docker buildx build --load \
-  --build-context paykit-lib='https://github.com/pubky/paykit-rs.git#03d4f05721e92d3944cb4d5af4b2c98c4390a5a8:paykit-lib' \
-  --build-context paykit-sdk='https://github.com/pubky/paykit-rs.git#03d4f05721e92d3944cb4d5af4b2c98c4390a5a8:paykit-sdk' \
+  --build-context paykit-lib='https://github.com/pubky/paykit-rs.git#dd8e75e5588cf7a0b3b45cacbab9125576ee90df:paykit-lib' \
+  --build-context paykit-sdk='https://github.com/pubky/paykit-rs.git#dd8e75e5588cf7a0b3b45cacbab9125576ee90df:paykit-sdk' \
   --build-context locks='https://github.com/pubky/locks.git#v0.1.0-rc13' \
   -f Dockerfile.local \
   -t paykit-server:local .
 ```
 
-The Paykit contexts use the `v0.1.0-rc74` release at the immutable revision pinned in `Cargo.toml`.
+The Paykit contexts use the immutable `v0.1.0` release revision matching the crate versions in `Cargo.toml`.
 These contexts are anonymously reachable and reproducible. Update the URLs
 together with the corresponding `Cargo.toml` pins; exact dependency-pin matches
 make source drift fail closed.
@@ -44,7 +44,7 @@ Crate-level `paykit-lib` and `paykit-sdk` contexts avoid transferring the Paykit
 Rust workspace target directory and require no Docker-owned files in that
 repository. The Locks context applies its existing source-tree exclusions.
 
-Builder runs [`scripts/prepare-local-docker-sources.sh`](../scripts/prepare-local-docker-sources.sh) against copied manifests to resolve `paykit-lib`, `paykit-sdk`, and `locks-core` from named contexts. Committed Git dependency declarations and lockfile remain unchanged. No SSH agent or Cargo credentials are mounted. Exact dependency-pin matches make source drift fail closed.
+Builder runs [`scripts/prepare-local-docker-sources.sh`](../scripts/prepare-local-docker-sources.sh) against copied manifests to resolve `paykit-lib`, `paykit-sdk`, and `locks-core` from named contexts. Cargo reconciles the copied lockfile with those local sources. Committed dependency declarations and lockfile remain unchanged. No SSH agent or Cargo credentials are mounted. Exact dependency-pin matches make source drift fail closed.
 
 ## Runtime image
 
@@ -63,9 +63,9 @@ Final pinned Debian image:
 
 Supply `PAYKIT_CONFIG`, `PAYKIT_DATABASE_URL`, and `PAYKIT_MASTER_KEY` at runtime. Mount generated ignored local config. The calling Compose definition owns mounts, environment values, infrastructure image pins, and helper command overrides.
 
-The deployed Pubky Homeserver must run 0.15 or newer. Rebuilding this image does
-not upgrade the homeserver managed by the calling Compose stack. The SDK's
-five-minute uncertain-write cooldown remains in place; see the
+Every serving Pubky Homeserver must run 0.16.2 or newer with the required GCS
+behavior. Rebuilding this image does not upgrade the homeserver managed by the
+calling Compose stack or drain older writes. Coordinate all writers; see the
 [shared-state deployment requirements](../README.md#persistence-startup-and-upgrades).
 
 ## Generated local config contract

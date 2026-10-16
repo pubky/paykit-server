@@ -13,9 +13,9 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 
 COPY . /build/paykit-server
 
-# locks-core, paykit-lib and paykit-sdk resolve from their pinned public git
-# sources in Cargo.toml. Dockerfile.local rewrites them to path dependencies for
-# local worktree builds; a published image must build the pinned revisions.
+# Dependencies resolve from the public sources pinned in Cargo.toml and Cargo.lock.
+# Dockerfile.local uses path dependencies for local worktree builds; published
+# images use the committed dependency pins.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/build/paykit-server/target \
