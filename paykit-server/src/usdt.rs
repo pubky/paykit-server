@@ -80,7 +80,7 @@ pub struct ArbitrumVerifier {
     client: reqwest::Client,
     url: url::Url,
     chain_tip: Arc<Mutex<Option<(Instant, ChainTip)>>>,
-    scans: Arc<Mutex<HashMap<blake3::Hash, ScanState>>>,
+    scans: Arc<Mutex<ScanCache>>,
 }
 
 const CHAIN_TIP_TTL: Duration = Duration::from_secs(5);
@@ -98,9 +98,44 @@ const UNMATCHED_RETRY_DELAY: Duration = Duration::from_secs(15);
 
 struct ScanState {
     fingerprint: blake3::Hash,
-    cursor: usize,
+    // None reserves a slot whose first scan has not run.
+    cursor: Option<usize>,
     retry_at: Instant,
     last_used: Instant,
+}
+
+#[derive(Default)]
+struct ScanCache {
+    requests: HashMap<blake3::Hash, ScanState>,
+    waiting: Option<(blake3::Hash, blake3::Hash)>,
+    last_admitted: Option<blake3::Hash>,
+}
+
+impl ScanCache {
+    fn oldest_ready(&self, now: Instant) -> Option<blake3::Hash> {
+        self.requests
+            .iter()
+            .filter(|(_, state)| state.retry_at <= now)
+            .min_by_key(|(_, state)| state.last_used)
+            .map(|(key, _)| *key)
+    }
+
+    fn defer(&mut self, key: blake3::Hash, fingerprint: blake3::Hash) {
+        // Circular key order prevents a stable reconciliation order from starving later requests.
+        let rank = |key: blake3::Hash| {
+            (
+                self.last_admitted
+                    .is_some_and(|last| key.as_bytes() <= last.as_bytes()),
+                *key.as_bytes(),
+            )
+        };
+        if self
+            .waiting
+            .is_none_or(|(waiting, _)| rank(key) <= rank(waiting))
+        {
+            self.waiting = Some((key, fingerprint));
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -128,7 +163,7 @@ impl ArbitrumVerifier {
             client,
             url,
             chain_tip: Arc::new(Mutex::new(None)),
-            scans: Arc::new(Mutex::new(HashMap::new())),
+            scans: Arc::new(Mutex::new(ScanCache::default())),
         })
     }
 
@@ -161,35 +196,53 @@ impl ArbitrumVerifier {
             return Ok(scan);
         }
         let now = Instant::now();
-        let mut scans = self.scans.lock().await;
-        if !scans.contains_key(&key)
-            && scans.len() >= MAX_SCAN_REQUESTS
-            && let Some(oldest) = scans
-                .iter()
-                .min_by_key(|(_, state)| state.last_used)
-                .map(|(key, _)| *key)
+        let mut cache = self.scans.lock().await;
+        if cache
+            .requests
+            .get(&key)
+            .is_none_or(|state| state.cursor.is_some())
+            && let Some((waiting, fingerprint)) = cache.waiting
+            && let Some(oldest) = cache.oldest_ready(now)
         {
-            scans.remove(&oldest);
+            cache.requests.remove(&oldest);
+            cache.requests.insert(
+                waiting,
+                ScanState {
+                    fingerprint,
+                    cursor: None,
+                    retry_at: now + UNMATCHED_RETRY_DELAY,
+                    last_used: now,
+                },
+            );
+            cache.waiting = None;
+            cache.last_admitted = Some(waiting);
         }
-        let state = scans.entry(key).or_insert(ScanState {
+        if !cache.requests.contains_key(&key) && cache.requests.len() >= MAX_SCAN_REQUESTS {
+            let Some(oldest) = cache.oldest_ready(now) else {
+                cache.defer(key, fingerprint);
+                return Ok(scan);
+            };
+            cache.requests.remove(&oldest);
+        }
+        let state = cache.requests.entry(key).or_insert(ScanState {
             fingerprint,
-            cursor: 0,
+            cursor: None,
             retry_at: now,
             last_used: now,
         });
         if state.fingerprint != fingerprint {
             state.fingerprint = fingerprint;
             state.retry_at = now;
-            state.cursor = 0;
+            state.cursor = None;
         }
         state.last_used = now;
-        if state.retry_at > now {
+        if state.retry_at > now && state.cursor.is_some() {
             return Ok(scan);
         }
-        let cursor = state.cursor;
-        state.cursor = state.cursor.wrapping_add(MAX_SCAN_CANDIDATES);
+        let cursor = state.cursor.unwrap_or(0);
+        state.cursor = Some(cursor.wrapping_add(MAX_SCAN_CANDIDATES));
         state.retry_at = now + UNMATCHED_RETRY_DELAY;
-        drop(scans);
+        drop(cache);
 
         let mut candidates = BTreeMap::<String, PaymentCandidate>::new();
         for record in proofs {
@@ -220,7 +273,7 @@ impl ArbitrumVerifier {
     pub(crate) async fn finish_payment_scan(&self, scan: &PaymentScan, all_observed: bool) {
         if all_observed
             && !scan.candidates.is_empty()
-            && let Some(state) = self.scans.lock().await.get_mut(&scan.key)
+            && let Some(state) = self.scans.lock().await.requests.get_mut(&scan.key)
             && state.fingerprint == scan.fingerprint
         {
             state.retry_at = Instant::now();
@@ -545,4 +598,159 @@ fn quantity(value: &Value) -> Result<u64, VerificationError> {
         .and_then(|v| v.strip_prefix("0x"))
         .and_then(|v| u64::from_str_radix(v, 16).ok())
         .ok_or(VerificationError::Unavailable)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn recoverable_proof() -> PaymentProofRecord {
+        let signature = Secp256k1::new().sign_ecdsa_recoverable(
+            &Message::from_digest([1; 32]),
+            &secp256k1::SecretKey::from_slice(&[1; 32]).unwrap(),
+        );
+        let (recovery, compact) = signature.serialize_compact();
+        let mut signature = compact.to_vec();
+        signature.push(27 + recovery.to_i32() as u8);
+        serde_json::from_value(json!({
+            "event_id": "00000000-0000-4000-8000-000000000001", "stream_item_id": 1,
+            "payment_reference": "payment", "payment_app_id": "paykit-server",
+            "payment_endpoint_identifier": USDT_ENDPOINT,
+            "recorded_at": "2026-10-07T00:00:00Z",
+            "proof": {
+                "type": "erc20-transfer-eip712", "chain_id": USDT_CHAIN_ID,
+                "transaction_hash": format!("0x{}", "11".repeat(32)),
+                "receipt_log_index": "0",
+                "signature": format!("0x{}", alloy_primitives::hex::encode(signature)),
+            }
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn scan_capacity_preserves_active_retry_delays() {
+        let verifier = ArbitrumVerifier::new("http://127.0.0.1:1".parse().unwrap()).unwrap();
+        let recipient =
+            UsdtAddress::try_from("0x2222222222222222222222222222222222222222".to_owned()).unwrap();
+        let context = PaymentContext {
+            payer: "payer",
+            payee: "payee",
+            request_id: "0",
+            reference: "payment",
+            recipient: &recipient,
+        };
+        let proofs = [recoverable_proof()];
+        let mut admitted = Vec::new();
+        for _ in 0..2 {
+            let mut candidates = 0;
+            for index in 0..=MAX_SCAN_REQUESTS {
+                let request_id = index.to_string();
+                let scan = verifier
+                    .payment_scan(
+                        &PaymentContext {
+                            request_id: &request_id,
+                            ..context
+                        },
+                        &proofs,
+                    )
+                    .await
+                    .unwrap();
+                candidates += scan.candidates.len();
+                verifier.finish_payment_scan(&scan, false).await;
+            }
+            admitted.push(candidates);
+        }
+        assert_eq!(admitted, [MAX_SCAN_REQUESTS, 0]);
+        assert_eq!(
+            verifier.scans.lock().await.requests.len(),
+            MAX_SCAN_REQUESTS
+        );
+
+        // A corrected proof remains eligible for an already admitted request.
+        let mut corrected = proofs.clone();
+        corrected[0]
+            .proof
+            .insert("receipt_log_index".into(), json!("1"));
+        let corrected_scan = verifier.payment_scan(&context, &corrected).await.unwrap();
+        assert_eq!(corrected_scan.candidates.len(), 1);
+        verifier.finish_payment_scan(&corrected_scan, true).await;
+
+        // A completed scan releases its slot without evicting any active cooldown.
+        let pending_id = MAX_SCAN_REQUESTS.to_string();
+        let pending = PaymentContext {
+            request_id: &pending_id,
+            ..context
+        };
+        let scan = verifier.payment_scan(&pending, &proofs).await.unwrap();
+        assert_eq!(scan.candidates.len(), 1);
+        assert_eq!(
+            verifier.scans.lock().await.requests.len(),
+            MAX_SCAN_REQUESTS
+        );
+        assert!(
+            verifier
+                .payment_scan(&pending, &proofs)
+                .await
+                .unwrap()
+                .candidates
+                .is_empty()
+        );
+
+        // Once its delay expires, an unchanged request can retry normally.
+        verifier
+            .scans
+            .lock()
+            .await
+            .requests
+            .get_mut(&scan.key)
+            .unwrap()
+            .retry_at = Instant::now();
+        assert_eq!(
+            verifier
+                .payment_scan(&pending, &proofs)
+                .await
+                .unwrap()
+                .candidates
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_requests_progress_in_stable_reconciliation_order() {
+        let verifier = ArbitrumVerifier::new("http://127.0.0.1:1".parse().unwrap()).unwrap();
+        let recipient =
+            UsdtAddress::try_from("0x2222222222222222222222222222222222222222".to_owned()).unwrap();
+        let proofs = [recoverable_proof()];
+        let mut seen = BTreeSet::new();
+        for _ in 0..8 {
+            // Advance every retained delay to its expiry without sleeping in the test.
+            for state in verifier.scans.lock().await.requests.values_mut() {
+                state.retry_at = Instant::now();
+            }
+            let mut admitted = 0;
+            for index in 0..MAX_SCAN_REQUESTS + 3 {
+                let request_id = index.to_string();
+                let context = PaymentContext {
+                    payer: "payer",
+                    payee: "payee",
+                    request_id: &request_id,
+                    reference: "payment",
+                    recipient: &recipient,
+                };
+                let scan = verifier.payment_scan(&context, &proofs).await.unwrap();
+                if !scan.candidates.is_empty() {
+                    seen.insert(index);
+                    admitted += 1;
+                }
+                verifier.finish_payment_scan(&scan, false).await;
+            }
+            assert!(admitted <= MAX_SCAN_REQUESTS);
+            assert!(verifier.scans.lock().await.requests.len() <= MAX_SCAN_REQUESTS);
+            if seen.len() == MAX_SCAN_REQUESTS + 3 {
+                break;
+            }
+        }
+        assert_eq!(seen.len(), MAX_SCAN_REQUESTS + 3);
+    }
 }
