@@ -89,7 +89,7 @@ async fn migrations_create_the_required_schema_and_are_restart_safe() {
             .fetch_all(pool)
             .await
             .unwrap();
-    assert_eq!(applied_versions, (1..=21).collect::<Vec<_>>());
+    assert_eq!(applied_versions, (1..=22).collect::<Vec<_>>());
 
     let rotation_columns: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM information_schema.columns

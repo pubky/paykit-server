@@ -7,17 +7,21 @@ use paykit_server::{
         semantic_intent::DeliveryIntentV1,
     },
     crypto::{Crypto, EncryptedEnvelope, EnvelopeContext},
-    domain::locks::{CreatorPubky, ReaderPubky, parse_bundle_id, parse_creator, parse_reader},
+    domain::locks::{
+        CreatorPubky, ReaderPubky, parse_addressed_lock_resource, parse_bundle_id, parse_creator,
+        parse_reader,
+    },
     persistence::{
         AtomicInvoiceInput, CreatorCredentials, CreatorStore, InvoicePayloadFactory,
-        InvoicePayloads, InvoiceStore, OutboxStore, PaymentRequestLifecycleStore, PersistenceError,
-        run_migrations,
+        InvoicePayloads, InvoiceStore, OutboxStore, PaymentDrainStore,
+        PaymentRequestLifecycleStore, PersistenceError, run_migrations,
     },
 };
 use paykit_server_e2e::postgres::TestDatabase;
 use sqlx::Row;
 
 const CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
+const LOCK_RESOURCE: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/app.locks/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json";
 mod common;
 
 struct TestPayloads;
@@ -327,6 +331,219 @@ async fn rotation_cancels_proposed_preserves_accepted_and_exact_replays_old_bund
         .unwrap();
     assert_eq!(replay.invoice_id(), proposed.invoice_id());
     assert!(replay.replayed());
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn drain_reuses_authenticated_rotation_cancellation() {
+    let database = TestDatabase::create().await;
+    let store = invoice_store(&database).await;
+    let creator = creator();
+    let reader = reader();
+    let lock_resource = parse_addressed_lock_resource(LOCK_RESOURCE).unwrap();
+    let canonical_lock = lock_resource.to_string();
+    let created = store
+        .create_atomic(AtomicInvoiceInput {
+            creator: &creator,
+            reader: &reader,
+            bundle_binding: b"rotation-then-drain-bundle",
+            lock_resource_binding: canonical_lock.as_bytes(),
+            payment_request_binding: b"rotation-then-drain-request",
+            invoice_payloads: &TEST_PAYLOADS,
+            proposal_acceptance_seconds: 60 * 60,
+            payment_window_seconds: 24 * 60 * 60,
+        })
+        .await
+        .unwrap();
+    let request_id = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO payment_request_lifecycles
+         (invoice_id, sdk_payment_request_id, request_state, last_event_at,
+          last_stream_item_id)
+         VALUES ($1, $2, 'proposed', NOW(), 1)",
+    )
+    .bind(created.invoice_id())
+    .bind(&request_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+
+    let lifecycles = PaymentRequestLifecycleStore::new(database.pool(), crypto());
+    let evidence = lifecycles
+        .required_receive_targets_for_creator_rotation(&creator)
+        .await
+        .unwrap();
+    let creators = CreatorStore::new(database.pool(), crypto());
+    let current = creators.load(&creator).await.unwrap();
+    let replacement = CreatorCredentials::new(
+        creator,
+        "rotated-session".into(),
+        current.paykit_identity_secret().clone(),
+        Some(paykit_server::domain::receiving::BitcoinAccount {
+            xpub: "replacement-xpub".to_owned().into(),
+            account_index: 7,
+        }),
+        None,
+    );
+    let rotation = creators
+        .rotate_bitcoin_account_after_receive(&lifecycles, &replacement, &evidence)
+        .await
+        .unwrap();
+    assert_eq!(rotation.cancellation_pending_count, 1);
+    let rotation_cancellation_id: uuid::Uuid = sqlx::query_scalar(
+        "SELECT cancellation_outbox_id
+         FROM creator_bitcoin_account_rotation_items
+         WHERE classification = 'cancellation_pending'",
+    )
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    let rotation_only_drain_required: bool =
+        sqlx::query_scalar("SELECT cancellation_drain_required FROM outbox WHERE id = $1")
+            .bind(rotation_cancellation_id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert!(!rotation_only_drain_required);
+
+    let drain = PaymentDrainStore::new(database.pool(), crypto())
+        .create(&lock_resource)
+        .await
+        .unwrap();
+    assert!(drain.completed());
+    assert_eq!(drain.cancellation_enqueued_count(), 1);
+    let drain_cancellation_id: uuid::Uuid = sqlx::query_scalar(
+        "SELECT cancellation_outbox_id FROM payment_drain_cancellations
+         WHERE drain_id = $1 AND sdk_payment_request_id = $2",
+    )
+    .bind(drain.drain_id())
+    .bind(&request_id)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(drain_cancellation_id, rotation_cancellation_id);
+    let reused_drain_required: bool =
+        sqlx::query_scalar("SELECT cancellation_drain_required FROM outbox WHERE id = $1")
+            .bind(rotation_cancellation_id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert!(reused_drain_required);
+    let cancellation_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM outbox
+         WHERE intent_kind = 'payment_request_cancellation'",
+    )
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(cancellation_count, 1);
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn drain_rejects_unauthenticated_or_unowned_cancellation() {
+    let database = TestDatabase::create().await;
+    let store = invoice_store(&database).await;
+    let creator = creator();
+    let reader = reader();
+    let lock_resource = parse_addressed_lock_resource(LOCK_RESOURCE).unwrap();
+    let canonical_lock = lock_resource.to_string();
+    let created = store
+        .create_atomic(AtomicInvoiceInput {
+            creator: &creator,
+            reader: &reader,
+            bundle_binding: b"mismatched-rotation-drain-bundle",
+            lock_resource_binding: canonical_lock.as_bytes(),
+            payment_request_binding: b"mismatched-rotation-drain-request",
+            invoice_payloads: &TEST_PAYLOADS,
+            proposal_acceptance_seconds: 60 * 60,
+            payment_window_seconds: 24 * 60 * 60,
+        })
+        .await
+        .unwrap();
+    let request_id = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO payment_request_lifecycles
+         (invoice_id, sdk_payment_request_id, request_state, last_event_at,
+          last_stream_item_id)
+         VALUES ($1, $2, 'proposed', NOW(), 1)",
+    )
+    .bind(created.invoice_id())
+    .bind(&request_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+
+    let lifecycles = PaymentRequestLifecycleStore::new(database.pool(), crypto());
+    let evidence = lifecycles
+        .required_receive_targets_for_creator_rotation(&creator)
+        .await
+        .unwrap();
+    let creators = CreatorStore::new(database.pool(), crypto());
+    let current = creators.load(&creator).await.unwrap();
+    let replacement = CreatorCredentials::new(
+        creator,
+        "rotated-session".into(),
+        current.paykit_identity_secret().clone(),
+        Some(paykit_server::domain::receiving::BitcoinAccount {
+            xpub: "replacement-xpub".to_owned().into(),
+            account_index: 7,
+        }),
+        None,
+    );
+    creators
+        .rotate_bitcoin_account_after_receive(&lifecycles, &replacement, &evidence)
+        .await
+        .unwrap();
+    let cancellation_id: uuid::Uuid = sqlx::query_scalar(
+        "SELECT cancellation_outbox_id
+         FROM creator_bitcoin_account_rotation_items
+         WHERE classification = 'cancellation_pending'",
+    )
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    let original_envelope: Vec<u8> =
+        sqlx::query_scalar("SELECT intent_envelope FROM outbox WHERE id = $1")
+            .bind(cancellation_id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    sqlx::query("UPDATE outbox SET intent_envelope = $1 WHERE id = $2")
+        .bind(b"unauthenticated-cancellation".as_slice())
+        .bind(cancellation_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+
+    let drains = PaymentDrainStore::new(database.pool(), crypto());
+    assert_eq!(
+        drains.create(&lock_resource).await,
+        Err(PersistenceError::CorruptOrMissing)
+    );
+    sqlx::query("UPDATE outbox SET intent_envelope = $1 WHERE id = $2")
+        .bind(original_envelope)
+        .bind(cancellation_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    sqlx::query(
+        "DELETE FROM creator_bitcoin_account_rotation_items
+         WHERE classification = 'cancellation_pending'",
+    )
+    .execute(database.pool())
+    .await
+    .unwrap();
+
+    assert_eq!(
+        drains.create(&lock_resource).await,
+        Err(PersistenceError::Conflict)
+    );
+    let durable_drains: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_drains")
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+    assert_eq!(durable_drains, 0);
     database.cleanup().await;
 }
 

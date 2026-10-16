@@ -460,9 +460,10 @@ impl OutboxStore {
         .map_err(|_| PersistenceError::Unavailable)
     }
 
-    /// Canonical acceptance makes a queued cancellation obsolete. Call only
-    /// after receiving and projecting target peer under Creator-local SDK fence.
-    pub async fn cancellation_target_is_accepted(
+    /// Canonical acceptance makes rotation-only cancellation obsolete. A
+    /// frozen drain cancellation remains required through drain cleanup. Call
+    /// only after receiving and projecting target peer under Creator-local SDK fence.
+    pub async fn rotation_cancellation_target_is_accepted(
         &self,
         claim: &ClaimedOutbox,
     ) -> Result<bool, PersistenceError> {
@@ -478,6 +479,7 @@ impl OutboxStore {
                       cancellation.marketplace_preparation_id
                  WHERE cancellation.id = $1
                    AND cancellation.intent_kind = 'payment_request_cancellation'
+                   AND NOT cancellation.cancellation_drain_required
                    AND lifecycle.request_state IN (
                        'accepted', 'proof_submitted', 'active_recurring'
                    )

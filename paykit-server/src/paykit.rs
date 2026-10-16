@@ -364,7 +364,7 @@ impl PaykitAdapter {
             .await
             .map_err(|_| HandoffFailure::Retryable(RetryableHandoffStage::AdapterUnavailable))?;
             if store
-                .cancellation_target_is_accepted(claim)
+                .rotation_cancellation_target_is_accepted(claim)
                 .await
                 .map_err(|_| HandoffFailure::Retryable(RetryableHandoffStage::AdapterUnavailable))?
             {
