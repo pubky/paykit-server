@@ -99,6 +99,7 @@ struct ExistingDrainRow {
 struct InvoiceLifecycleRow {
     invoice_id: Uuid,
     request_state: Option<String>,
+    terminal_fallback: Option<String>,
     sdk_payment_request_id: Option<String>,
     last_event_at: Option<OffsetDateTime>,
 }
@@ -559,6 +560,20 @@ impl PaymentDrainStore {
 
         let rows = sqlx::query_as::<_, InvoiceLifecycleRow>(
             "SELECT invoices.id AS invoice_id, lifecycle.request_state,
+                    CASE WHEN EXISTS (
+                        SELECT 1
+                        FROM creator_bitcoin_account_rotation_items rotation_item
+                        WHERE rotation_item.invoice_id = invoices.id
+                          AND rotation_item.classification = 'proposal_suppressed'
+                    ) THEN 'canceled'
+                    WHEN EXISTS (
+                        SELECT 1
+                        FROM outbox proposal
+                        WHERE proposal.invoice_id = invoices.id
+                          AND proposal.intent_kind = 'payment_request_proposal'
+                          AND proposal.status = 'permanently_failed'
+                          AND proposal.error_class = 'proposal_expired'
+                    ) THEN 'proposal_expired' END AS terminal_fallback,
                     lifecycle.sdk_payment_request_id, lifecycle.last_event_at
              FROM invoices
              LEFT JOIN payment_request_lifecycles AS lifecycle
@@ -592,19 +607,25 @@ impl PaymentDrainStore {
             let parsed = attempts
                 .iter()
                 .map(|attempt| {
-                    let state = attempt
-                        .request_state
-                        .as_deref()
-                        .and_then(PaymentRequestLifecycleState::parse)
-                        .ok_or(PersistenceError::CorruptOrMissing)?;
-                    let payment_request_id = attempt
-                        .sdk_payment_request_id
-                        .as_deref()
-                        .ok_or(PersistenceError::CorruptOrMissing)?;
-                    let last_event_at = attempt
-                        .last_event_at
-                        .ok_or(PersistenceError::CorruptOrMissing)?;
-                    Ok((state, payment_request_id, last_event_at))
+                    if let Some(request_state) = attempt.request_state.as_deref() {
+                        let state = PaymentRequestLifecycleState::parse(request_state)
+                            .ok_or(PersistenceError::CorruptOrMissing)?;
+                        let payment_request_id = attempt
+                            .sdk_payment_request_id
+                            .as_deref()
+                            .ok_or(PersistenceError::CorruptOrMissing)?;
+                        let last_event_at = attempt
+                            .last_event_at
+                            .ok_or(PersistenceError::CorruptOrMissing)?;
+                        Ok((state, Some(payment_request_id), Some(last_event_at)))
+                    } else {
+                        let state = attempt
+                            .terminal_fallback
+                            .as_deref()
+                            .and_then(PaymentRequestLifecycleState::parse)
+                            .ok_or(PersistenceError::CorruptOrMissing)?;
+                        Ok((state, None, None))
+                    }
                 })
                 .collect::<Result<Vec<_>, PersistenceError>>()?;
 
@@ -688,9 +709,11 @@ impl PaymentDrainStore {
                     return Err(PersistenceError::CorruptOrMissing);
                 };
                 for (_, payment_request_id, _) in proposed_attempts {
+                    let payment_request_id =
+                        payment_request_id.ok_or(PersistenceError::CorruptOrMissing)?;
                     let cancellation = DeliveryIntentV1::payment_request_cancellation(
                         proposal,
-                        (*payment_request_id).to_owned(),
+                        payment_request_id.to_owned(),
                     )
                     .map_err(|_| PersistenceError::CorruptOrMissing)?;
                     let outbox_id = Uuid::new_v4();
@@ -705,7 +728,7 @@ impl PaymentDrainStore {
                         .map_err(|_| PersistenceError::CorruptOrMissing)?;
                     cancellations.push(PreparedCancellation {
                         invoice_id,
-                        payment_request_id: (*payment_request_id).to_owned(),
+                        payment_request_id: payment_request_id.to_owned(),
                         outbox_id,
                         envelope,
                     });
