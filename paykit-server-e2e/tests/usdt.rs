@@ -1,20 +1,33 @@
 use std::sync::Arc;
 
+use async_trait::async_trait;
+use axum::{
+    Extension,
+    body::{Body, to_bytes},
+    http::{Request, StatusCode},
+};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use ed25519_dalek::{Signer, SigningKey};
+use tower::ServiceExt;
+
 use paykit_lib::{
     PaykitAppId, PaymentAmount, PaymentEndpointIdentifier, PaymentEndpointPayload,
     PaymentReference, PaymentRequestTerms,
 };
-use paykit_sdk::PaykitIdentitySecretKey;
+use paykit_sdk::{PaykitIdentitySecretKey, PaymentRequestRecord};
 use paykit_server::{
     application::{
-        payment_request_status::{PaymentRequestStatusOperations, PaymentRequestStatusSummary},
+        payment_request_status::{
+            PaymentRequestStatusError, PaymentRequestStatusOperations, PaymentRequestStatusSummary,
+        },
         semantic_intent::DeliveryIntentV1,
     },
     crypto::Crypto,
     domain::{
         invoice::CriterionAsset,
         locks::{
-            BundleId, parse_addressed_lock_resource, parse_bundle_id, parse_creator, parse_reader,
+            BundleId, CreatorPubky, parse_addressed_lock_resource, parse_bundle_id, parse_creator,
+            parse_reader,
         },
         receiving::{USDT_ENDPOINT, UsdtAddress},
     },
@@ -436,7 +449,7 @@ async fn invoices_share_an_address_but_never_share_payment_evidence() {
         .await
         .unwrap();
     assert_eq!(status(&store, &bundles[1]).await, (false, 0));
-    let restarted = InvoiceStore::new(database.pool(), crypto);
+    let restarted = InvoiceStore::new(database.pool(), crypto.clone());
     rpc.chain.lock().unwrap().reorg = true;
     restarted
         .observe_usdt_request(
@@ -489,9 +502,39 @@ async fn invoices_share_an_address_but_never_share_payment_evidence() {
             .finalized
     );
     rpc.chain.lock().unwrap().unavailable = false;
-    for finalized in [false, true] {
+    for (finalized, legacy) in [(false, false), (false, true), (true, false)] {
+        rpc.chain.lock().unwrap().finalized = finalized;
+        let (observation_id, envelope): (uuid::Uuid, Vec<u8>) = sqlx::query_as(
+            "SELECT id, observation_envelope FROM usdt_observations WHERE invoice_id = $1",
+        )
+        .bind(ids[0])
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+        let context = paykit_server::crypto::EnvelopeContext::usdt_observation(
+            crypto.lookup_hash(creator.to_string().as_bytes()),
+            observation_id,
+            ids[0],
+        );
+        let plaintext = crypto
+            .decrypt(
+                &context,
+                &paykit_server::crypto::EncryptedEnvelope::from_bytes(envelope),
+            )
+            .unwrap();
+        if legacy {
+            let envelope = crypto
+                .encrypt(&context, &plaintext[..plaintext.len() - 20])
+                .unwrap();
+            sqlx::query("UPDATE usdt_observations SET observation_envelope = $1 WHERE id = $2")
+                .bind(envelope.as_bytes())
+                .bind(observation_id)
+                .execute(database.pool())
+                .await
+                .unwrap();
+        }
         sqlx::query(
-            "UPDATE usdt_observations SET finalized = $1, present = TRUE, checked_at = NOW()",
+            "UPDATE usdt_observations SET finalized = $1, present = TRUE, confirmations = 2, checked_at = NOW()",
         )
         .bind(finalized)
         .execute(database.pool())
@@ -521,6 +564,51 @@ async fn invoices_share_an_address_but_never_share_payment_evidence() {
             1
         );
         assert_eq!(status(&store, &bundles[0]).await, (true, 2));
+        if !finalized {
+            let (code, body) =
+                status_response(&store, creator_id, &evidence, &verifier, &bundles[0]).await;
+            assert_eq!(code, StatusCode::OK);
+            assert_eq!(body["usdt_arbitrum"]["amount_matched"], true);
+            if legacy {
+                let envelope: Vec<u8> = sqlx::query_scalar(
+                    "SELECT observation_envelope FROM usdt_observations WHERE id = $1",
+                )
+                .bind(observation_id)
+                .fetch_one(database.pool())
+                .await
+                .unwrap();
+                assert_eq!(
+                    crypto
+                        .decrypt(
+                            &context,
+                            &paykit_server::crypto::EncryptedEnvelope::from_bytes(envelope)
+                        )
+                        .unwrap(),
+                    plaintext
+                );
+            }
+            // Forced refresh must not reopen discovery of the missing receipt.
+            store
+                .observe_usdt_request(creator_id, &creator, &evidence, &verifier, None)
+                .await
+                .unwrap();
+            rpc.chain.lock().unwrap().reorg = true;
+            let (code, body) =
+                status_response(&store, creator_id, &evidence, &verifier, &bundles[0]).await;
+            assert_eq!(code, StatusCode::OK);
+            assert!(body["usdt_arbitrum"].is_null());
+            assert_eq!(status(&store, &bundles[0]).await, (false, 0));
+            assert_eq!(
+                rpc.requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(method, _)| method == "eth_getTransactionReceipt")
+                    .count(),
+                3,
+            );
+            rpc.chain.lock().unwrap().reorg = false;
+        }
     }
     // Overflowing discovery does not suppress independently owned receipt refreshes.
     let mut evidence = record(0);
@@ -545,37 +633,130 @@ async fn invoices_share_an_address_but_never_share_payment_evidence() {
         (wrong_sender, false),
         (original, true),
     ] {
+        let unavailable = chain_state.unavailable;
         *rpc.chain.lock().unwrap() = chain_state;
         sqlx::query("UPDATE usdt_observations SET checked_at = NOW() - INTERVAL '2 minutes'")
             .execute(database.pool())
             .await
             .unwrap();
         let verifier = ArbitrumVerifier::new(rpc.url.clone()).unwrap();
-        assert!(matches!(
-            store
-                .observe_usdt_request(creator_id, &creator, &evidence, &verifier, None)
-                .await,
-            Err(PersistenceError::Unavailable)
-        ));
+        let result = store
+            .observe_usdt_request(creator_id, &creator, &evidence, &verifier, None)
+            .await;
+        assert_eq!(result.is_err(), unavailable);
+        let (code, body) =
+            status_response(&store, creator_id, &evidence, &verifier, &bundles[0]).await;
+        assert_eq!(
+            code,
+            if unavailable {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::OK
+            }
+        );
+        if !unavailable {
+            assert_eq!(body["usdt_arbitrum"].is_object(), paid);
+        }
         assert_eq!(status(&store, &bundles[0]).await.0, paid);
     }
     // An explicit invoice status read bypasses the present-receipt background interval.
     rpc.chain.lock().unwrap().reorg = true;
     let verifier = ArbitrumVerifier::new(rpc.url.clone()).unwrap();
-    assert!(
-        store
+    let (code, body) = status_response(&store, creator_id, &evidence, &verifier, &bundles[0]).await;
+    assert_eq!(code, StatusCode::OK);
+    assert!(body["usdt_arbitrum"].is_null());
+    assert_eq!(status(&store, &bundles[0]).await, (false, 0));
+    // Finalized receipts remain available without contacting an unavailable provider.
+    rpc.chain.lock().unwrap().reorg = false;
+    rpc.chain.lock().unwrap().finalized = true;
+    sqlx::query("UPDATE usdt_observations SET checked_at = NOW() - INTERVAL '2 minutes'")
+        .execute(database.pool())
+        .await
+        .unwrap();
+    let verifier = ArbitrumVerifier::new(rpc.url.clone()).unwrap();
+    let (code, body) = status_response(&store, creator_id, &evidence, &verifier, &bundles[0]).await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(body["usdt_arbitrum"]["finalized"], true);
+    rpc.chain.lock().unwrap().unavailable = true;
+    rpc.requests.lock().unwrap().clear();
+    let (code, body) = status_response(&store, creator_id, &evidence, &verifier, &bundles[0]).await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(body["usdt_arbitrum"]["finalized"], true);
+    assert!(rpc.requests.lock().unwrap().is_empty());
+    database.cleanup().await;
+}
+
+// Supplies received SDK records at the status port; persistence, RPC, auth and HTTP are real.
+struct ReceiptStatus {
+    store: InvoiceStore,
+    creator_id: uuid::Uuid,
+    record: PaymentRequestRecord,
+    verifier: ArbitrumVerifier,
+}
+
+#[async_trait]
+impl PaymentRequestStatusOperations for ReceiptStatus {
+    async fn lookup(
+        &self,
+        creator: &CreatorPubky,
+        bundle: &BundleId,
+    ) -> Result<Option<PaymentRequestStatusSummary>, PaymentRequestStatusError> {
+        self.store
             .observe_usdt_request(
-                creator_id,
-                &creator,
-                &evidence,
-                &verifier,
-                Some(&bundles[0])
+                self.creator_id,
+                creator,
+                &self.record,
+                &self.verifier,
+                Some(bundle),
             )
             .await
-            .is_err()
-    );
-    assert_eq!(status(&store, &bundles[0]).await, (false, 0));
-    database.cleanup().await;
+            .map_err(|_| PaymentRequestStatusError::Unavailable)?;
+        PaymentRequestStatusOperations::lookup(&self.store, creator, bundle).await
+    }
+}
+
+async fn status_response(
+    store: &InvoiceStore,
+    creator_id: uuid::Uuid,
+    record: &PaymentRequestRecord,
+    verifier: &ArbitrumVerifier,
+    bundle: &BundleId,
+) -> (StatusCode, Value) {
+    use paykit_server::http::{
+        auth::signature_preimage, payment_requests::payment_requests_router,
+    };
+    let key = SigningKey::from_bytes(&[7; 32]);
+    let router = payment_requests_router(Arc::new(ReceiptStatus {
+        store: store.clone(),
+        creator_id,
+        record: record.clone(),
+        verifier: verifier.clone(),
+    }))
+    .layer(Extension(common::marketplace_rig::signed_auth(&key)));
+    let body =
+        serde_json::to_vec(&json!({"creator":CREATOR,"bundle_id":bundle.to_string()})).unwrap();
+    let signature = key.sign(&signature_preimage(
+        "POST",
+        "/payment-requests/status",
+        &body,
+    ));
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/payment-requests/status")
+                .header(
+                    "X-Paykit-Signature",
+                    URL_SAFE_NO_PAD.encode(signature.to_bytes()),
+                )
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let code = response.status();
+    let body = to_bytes(response.into_body(), 32 * 1024).await.unwrap();
+    (code, serde_json::from_slice(&body).unwrap())
 }
 
 async fn payment_status(store: &InvoiceStore, bundle: &BundleId) -> PaymentRequestStatusSummary {

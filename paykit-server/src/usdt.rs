@@ -148,6 +148,32 @@ pub(crate) struct PaymentCandidate {
 }
 
 impl PaymentCandidate {
+    pub(crate) fn from_proofs(
+        context: &PaymentContext<'_>,
+        proofs: &[PaymentProofRecord],
+    ) -> Option<BTreeMap<String, Self>> {
+        if proofs.len() > MAX_REQUEST_PROOFS {
+            return None;
+        }
+        let mut candidates = BTreeMap::<String, PaymentCandidate>::new();
+        for record in proofs {
+            if let Ok((_, hash, index, sender)) = parse_proof(context, record) {
+                let identity = format!("{USDT_CHAIN_ID}:{hash:#x}:{index}");
+                candidates
+                    .entry(identity.clone())
+                    .or_insert_with(|| PaymentCandidate {
+                        identity,
+                        hash,
+                        index,
+                        senders: BTreeSet::new(),
+                    })
+                    .senders
+                    .insert(sender);
+            }
+        }
+        Some(candidates)
+    }
+
     /// Uses the sender authenticated when the owned observation was recorded.
     pub(crate) fn from_observation(
         identity: &str,
@@ -204,10 +230,10 @@ impl ArbitrumVerifier {
         &self,
         context: &PaymentContext<'_>,
         proofs: &[PaymentProofRecord],
-    ) -> Result<PaymentScan, VerificationError> {
+    ) -> Option<PaymentScan> {
         // Keep all attestations for an event together; partial sets can hide its valid signer.
         if proofs.len() > MAX_REQUEST_PROOFS {
-            return Err(VerificationError::Unavailable);
+            return None;
         }
         let key = blake3::hash(
             &serde_json::to_vec(&(
@@ -226,7 +252,7 @@ impl ArbitrumVerifier {
             candidates: Vec::new(),
         };
         if proofs.is_empty() {
-            return Ok(scan);
+            return Some(scan);
         }
         let now = Instant::now();
         let mut cache = self.scans.lock().await;
@@ -253,7 +279,7 @@ impl ArbitrumVerifier {
         if !cache.requests.contains_key(&key) && cache.requests.len() >= MAX_SCAN_REQUESTS {
             let Some(oldest) = cache.oldest_ready(now) else {
                 cache.defer(key, fingerprint);
-                return Ok(scan);
+                return Some(scan);
             };
             cache.requests.remove(&oldest);
         }
@@ -270,29 +296,14 @@ impl ArbitrumVerifier {
         }
         state.last_used = now;
         if state.retry_at > now && state.cursor.is_some() {
-            return Ok(scan);
+            return Some(scan);
         }
         let cursor = state.cursor.unwrap_or(0);
         state.cursor = Some(cursor.wrapping_add(MAX_SCAN_CANDIDATES));
         state.retry_at = now + UNMATCHED_RETRY_DELAY;
         drop(cache);
 
-        let mut candidates = BTreeMap::<String, PaymentCandidate>::new();
-        for record in proofs {
-            if let Ok((_, hash, index, sender)) = parse_proof(context, record) {
-                let identity = format!("{USDT_CHAIN_ID}:{hash:#x}:{index}");
-                candidates
-                    .entry(identity.clone())
-                    .or_insert_with(|| PaymentCandidate {
-                        identity,
-                        hash,
-                        index,
-                        senders: BTreeSet::new(),
-                    })
-                    .senders
-                    .insert(sender);
-            }
-        }
+        let candidates = PaymentCandidate::from_proofs(context, proofs)?;
         let candidates: Vec<_> = candidates.into_values().collect();
         if !candidates.is_empty() {
             let cursor = cursor % candidates.len();
@@ -300,7 +311,7 @@ impl ArbitrumVerifier {
                 .map(|offset| candidates[(cursor + offset) % candidates.len()].clone())
                 .collect();
         }
-        Ok(scan)
+        Some(scan)
     }
 
     pub(crate) async fn finish_payment_scan(&self, scan: &PaymentScan, all_observed: bool) {

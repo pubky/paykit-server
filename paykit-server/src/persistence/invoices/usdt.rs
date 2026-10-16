@@ -5,7 +5,7 @@ use crate::usdt::{
     ArbitrumVerifier, MAX_SCAN_CANDIDATES, PaymentCandidate, PaymentContext, VerificationError,
     VerifiedTransfer,
 };
-use paykit_sdk::{PaymentRequestLocalRole, PaymentRequestRecord};
+use paykit_sdk::{PaymentProofRecord, PaymentRequestLocalRole, PaymentRequestRecord};
 
 #[derive(Serialize, Deserialize)]
 struct TransferFacts {
@@ -156,16 +156,24 @@ impl InvoiceStore {
             reference: &terms.payment_reference,
             recipient: &recipient,
         };
+        // Status refreshes owned receipts even while discovery of new evidence is deferred.
         let scan = verifier
             .payment_scan(&context, &record.payment_proofs)
             .await
-            .ok();
+            .filter(|scan| bundle.is_none() || !scan.candidates.is_empty());
         let owned_candidates;
         let candidates = match &scan {
             Some(scan) => &scan.candidates,
             None => {
                 owned_candidates = self
-                    .owned_usdt_candidates(&row, creator_hash, &payment, bundle.is_some())
+                    .owned_usdt_candidates(
+                        &row,
+                        creator_hash,
+                        &payment,
+                        bundle.is_some(),
+                        &context,
+                        &record.payment_proofs,
+                    )
                     .await?;
                 &owned_candidates
             }
@@ -238,10 +246,8 @@ impl InvoiceStore {
             verifier
                 .finish_payment_scan(scan, observed == candidates.len())
                 .await;
-            Ok(())
-        } else {
-            Err(PersistenceError::Unavailable)
         }
+        Ok(())
     }
 
     async fn owned_usdt_candidates(
@@ -250,6 +256,8 @@ impl InvoiceStore {
         creator_hash: LookupHash,
         payment: &InvoicePaymentRecordV1,
         force: bool,
+        context: &PaymentContext<'_>,
+        proofs: &[PaymentProofRecord],
     ) -> Result<Vec<PaymentCandidate>, PersistenceError> {
         let observations: Vec<UsdtObservationRow> = sqlx::query_as(
             "SELECT id, observation_envelope, transfer_lookup_hash, confirmations, finalized
@@ -265,6 +273,7 @@ impl InvoiceStore {
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
         let mut candidates = Vec::new();
+        let mut legacy_candidates = None;
         for observation in observations {
             let (facts, sender) = self.transfer_facts(
                 observation.id,
@@ -273,11 +282,22 @@ impl InvoiceStore {
                 observation.observation_envelope,
                 observation.transfer_lookup_hash,
             )?;
-            if let Some(sender) = sender {
-                candidates.push(
+            let candidate = if let Some(sender) = sender {
+                Some(
                     PaymentCandidate::from_observation(&facts.identity, sender)
                         .map_err(|_| PersistenceError::CorruptOrMissing)?,
-                );
+                )
+            } else {
+                if legacy_candidates.is_none() {
+                    legacy_candidates = PaymentCandidate::from_proofs(context, proofs);
+                }
+                legacy_candidates
+                    .as_ref()
+                    .and_then(|candidates| candidates.get(&facts.identity))
+                    .cloned()
+            };
+            if let Some(candidate) = candidate {
+                candidates.push(candidate);
             } else {
                 // Unsupported histories cannot sustain nonfinal credit without an attestation anchor.
                 let identity_hash = self

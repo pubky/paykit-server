@@ -294,12 +294,10 @@ async fn oversized_proof_sets_preserve_observation_revalidation() {
     let mut evidence = record(0);
     evidence.payment_proofs = vec![common::arbitrum::proof(0); 129];
     for _ in 0..2 {
-        assert!(matches!(
-            rig.store
-                .observe_usdt_request(creator_id, &creator(), &evidence, &rpc.verifier)
-                .await,
-            Err(paykit_server::persistence::PersistenceError::Unavailable)
-        ));
+        rig.store
+            .observe_usdt_request(creator_id, &creator(), &evidence, &rpc.verifier)
+            .await
+            .unwrap();
     }
     assert!(rpc.requests.lock().unwrap().is_empty());
     assert!(rig.status(&request.invoice).await["paid_asset"].is_null());
@@ -333,12 +331,10 @@ async fn oversized_proof_sets_preserve_observation_revalidation() {
         rpc.requests.lock().unwrap().clear();
         // A fresh verifier must use the durable attestation, including after a reorg.
         let verifier = ArbitrumVerifier::new(rpc.url.clone()).unwrap();
-        assert!(matches!(
-            rig.store
-                .observe_usdt_request(creator_id, &creator(), &evidence, &verifier)
-                .await,
-            Err(paykit_server::persistence::PersistenceError::Unavailable)
-        ));
+        rig.store
+            .observe_usdt_request(creator_id, &creator(), &evidence, &verifier)
+            .await
+            .unwrap();
         assert_eq!(
             rig.status(&request.invoice).await["paid_asset"] == "USDT",
             paid
@@ -355,23 +351,19 @@ async fn oversized_proof_sets_preserve_observation_revalidation() {
         rpc.requests.lock().unwrap().clear();
         // Refresh timestamps also bound overflow retries across verifier restarts.
         let verifier = ArbitrumVerifier::new(rpc.url.clone()).unwrap();
-        assert!(
-            rig.store
-                .observe_usdt_request(creator_id, &creator(), &evidence, &verifier)
-                .await
-                .is_err()
-        );
+        rig.store
+            .observe_usdt_request(creator_id, &creator(), &evidence, &verifier)
+            .await
+            .unwrap();
         assert!(rpc.requests.lock().unwrap().is_empty());
     }
     chain(&rpc, |chain| chain.unavailable = true);
     age_receipts(&rig).await;
     rpc.requests.lock().unwrap().clear();
-    assert!(
-        rig.store
-            .observe_usdt_request(creator_id, &creator(), &evidence, &rpc.verifier)
-            .await
-            .is_err()
-    );
+    rig.store
+        .observe_usdt_request(creator_id, &creator(), &evidence, &rpc.verifier)
+        .await
+        .unwrap();
     assert!(rpc.requests.lock().unwrap().is_empty());
     assert_eq!(rig.status(&request.invoice).await["paid_asset"], "USDT");
     rig.cleanup().await;
@@ -419,7 +411,7 @@ async fn legacy_receipts_gain_sender_anchors_on_verified_refresh() {
             .store
             .observe_usdt_request(creator_id, &creator(), &evidence, &verifier)
             .await;
-        assert_eq!(result.is_err(), oversized);
+        result.unwrap();
         assert_eq!(
             rig.status(&request.invoice).await["paid_asset"] == "USDT",
             !oversized
@@ -480,12 +472,10 @@ async fn owned_receipt_refreshes_are_bounded_and_resume_in_order() {
     evidence.payment_proofs = vec![common::arbitrum::proof(0); 129];
     for expected in [8, 1, 0] {
         rpc.requests.lock().unwrap().clear();
-        assert!(
-            rig.store
-                .observe_usdt_request(creator_id, &creator(), &evidence, &rpc.verifier)
-                .await
-                .is_err()
-        );
+        rig.store
+            .observe_usdt_request(creator_id, &creator(), &evidence, &rpc.verifier)
+            .await
+            .unwrap();
         assert_eq!(
             rpc.requests
                 .lock()

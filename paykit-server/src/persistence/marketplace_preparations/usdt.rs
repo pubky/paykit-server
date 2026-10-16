@@ -121,8 +121,7 @@ impl MarketplacePreparationStore {
         };
         let scan = verifier
             .payment_scan(&context, &record.payment_proofs)
-            .await
-            .ok();
+            .await;
         let owned_candidates;
         let candidates = match &scan {
             Some(scan) => &scan.candidates,
@@ -199,10 +198,8 @@ impl MarketplacePreparationStore {
             verifier
                 .finish_payment_scan(scan, observed == candidates.len())
                 .await;
-            Ok(())
-        } else {
-            Err(PersistenceError::Unavailable)
         }
+        Ok(())
     }
 
     async fn owned_usdt_candidates(
