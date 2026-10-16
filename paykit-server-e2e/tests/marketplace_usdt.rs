@@ -285,6 +285,87 @@ async fn present_receipts_do_not_accelerate_missing_receipt_retries() {
 }
 
 #[tokio::test]
+async fn failed_receipt_refreshes_preserve_retry_intervals() {
+    let rig = rig(BOTH_RAILS, true).await;
+    let rpc = Rpc::start().await;
+    let request = offered(&rig, 0, &[]).await;
+    chain(&rpc, |chain| chain.timestamp = request.at(0));
+    submit(&rig, &rpc, 0).await;
+    let creator_id = creator_row(&rig).await;
+    chain(&rpc, |chain| chain.unavailable = true);
+    for proof_count in [1, 129] {
+        let mut evidence = record(0);
+        evidence.payment_proofs = vec![common::arbitrum::proof(0); proof_count];
+        age_receipts(&rig).await;
+        let verifier = ArbitrumVerifier::new(rpc.url.clone()).unwrap();
+        rpc.requests.lock().unwrap().clear();
+        assert!(
+            rig.store
+                .observe_usdt_request(creator_id, &creator(), &evidence, &verifier)
+                .await
+                .is_err()
+        );
+        for retry in [
+            verifier.clone(),
+            ArbitrumVerifier::new(rpc.url.clone()).unwrap(),
+        ] {
+            rig.store
+                .observe_usdt_request(creator_id, &creator(), &evidence, &retry)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            rpc.requests.lock().unwrap().len(),
+            1,
+            "one failed RPC attempt, including across restart"
+        );
+        assert_eq!(rig.status(&request.invoice).await["paid_asset"], "USDT");
+        sqlx::query("UPDATE usdt_observations SET checked_at = NOW() - INTERVAL '20 seconds'")
+            .execute(rig.database.pool())
+            .await
+            .unwrap();
+        let verifier = ArbitrumVerifier::new(rpc.url.clone()).unwrap();
+        rig.store
+            .observe_usdt_request(creator_id, &creator(), &evidence, &verifier)
+            .await
+            .unwrap();
+        assert_eq!(
+            rpc.requests.lock().unwrap().len(),
+            1,
+            "present receipts keep the full minute delay"
+        );
+    }
+    age_receipts(&rig).await;
+    chain(&rpc, |chain| {
+        chain.unavailable = false;
+        chain.reorg = true;
+    });
+    submit(&rig, &rpc, 0).await;
+    assert!(rig.status(&request.invoice).await["paid_asset"].is_null());
+    // Removed observations also retain their shorter retry interval across outages.
+    sqlx::query("UPDATE usdt_observations SET checked_at = NOW() - INTERVAL '20 seconds'")
+        .execute(rig.database.pool())
+        .await
+        .unwrap();
+    chain(&rpc, |chain| chain.unavailable = true);
+    rpc.requests.lock().unwrap().clear();
+    let verifier = ArbitrumVerifier::new(rpc.url.clone()).unwrap();
+    assert!(
+        rig.store
+            .observe_usdt_request(creator_id, &creator(), &record(0), &verifier)
+            .await
+            .is_err()
+    );
+    let restarted = ArbitrumVerifier::new(rpc.url.clone()).unwrap();
+    rig.store
+        .observe_usdt_request(creator_id, &creator(), &record(0), &restarted)
+        .await
+        .unwrap();
+    assert_eq!(rpc.requests.lock().unwrap().len(), 1);
+    rig.cleanup().await;
+}
+
+#[tokio::test]
 async fn oversized_proof_sets_preserve_observation_revalidation() {
     let rig = rig(BOTH_RAILS, true).await;
     let rpc = Rpc::start().await;

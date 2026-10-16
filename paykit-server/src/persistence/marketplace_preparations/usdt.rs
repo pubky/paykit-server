@@ -153,30 +153,23 @@ impl MarketplacePreparationStore {
                 observed += 1;
                 continue;
             }
-            if scan.is_none() {
-                sqlx::query("UPDATE usdt_observations SET checked_at = NOW() WHERE marketplace_preparation_id = $1 AND transfer_lookup_hash = $2 AND NOT finalized")
+            if existing.is_some() {
+                // Reserve before RPC so failures and restarts retain the refresh interval.
+                let reserved = sqlx::query(
+                    "UPDATE usdt_observations SET checked_at = NOW()
+                     WHERE marketplace_preparation_id = $1 AND transfer_lookup_hash = $2 AND NOT finalized
+                       AND (checked_at > NOW() OR checked_at <= NOW() -
+                         CASE WHEN present THEN INTERVAL '1 minute' ELSE INTERVAL '15 seconds' END)")
                     .bind(target.preparation_id).bind(identity_hash.as_bytes().as_slice())
                     .execute(&self.pool).await.map_err(|_| PersistenceError::Unavailable)?;
+                if reserved.rows_affected() == 0 {
+                    continue;
+                }
             }
             let verified = match verifier.verify_candidate(&context, candidate).await {
                 Ok(value) => value,
                 Err(VerificationError::InvalidProof) => None,
-                Err(VerificationError::Unavailable) => {
-                    if let Some(scan) = &scan {
-                        verifier
-                            .finish_payment_scan(
-                                scan,
-                                observed
-                                    + usize::from(
-                                        existing
-                                            .is_some_and(|(_, present, owned)| present && owned),
-                                    )
-                                    == candidates.len(),
-                            )
-                            .await;
-                    }
-                    return Err(PersistenceError::Unavailable);
-                }
+                Err(VerificationError::Unavailable) => return Err(PersistenceError::Unavailable),
             };
             match verified {
                 Some(transfer) => {
