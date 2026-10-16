@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use paykit_sdk::PaykitIdentitySecretKey;
 use paykit_server::{
@@ -141,6 +141,30 @@ async fn invoice_store(database: &TestDatabase) -> InvoiceStore {
         .await
         .unwrap();
     InvoiceStore::new(database.pool(), crypto)
+}
+
+async fn wait_for_lock_wait(database: &TestDatabase, query_fragment: &str) {
+    let pattern = format!("%{query_fragment}%");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let blocked: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM pg_stat_activity
+                 WHERE datname = current_database()
+                   AND wait_event_type = 'Lock'
+                   AND query LIKE $1",
+            )
+            .bind(&pattern)
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+            if blocked > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("expected query containing {query_fragment:?} to wait on a lock"));
 }
 
 fn input<'a>(
@@ -437,6 +461,128 @@ async fn drain_reuses_authenticated_rotation_cancellation() {
     .await
     .unwrap();
     assert_eq!(cancellation_count, 1);
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn obsolete_transition_rechecks_concurrent_drain_promotion_under_row_lock() {
+    let database = TestDatabase::create().await;
+    let store = invoice_store(&database).await;
+    let creator = creator();
+    let reader = reader();
+    let created = store
+        .create_atomic(input(
+            &creator,
+            &reader,
+            b"obsolete-drain-race-bundle",
+            b"obsolete-drain-race-request",
+        ))
+        .await
+        .unwrap();
+    let request_id = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO payment_request_lifecycles
+         (invoice_id, sdk_payment_request_id, request_state, last_event_at,
+          last_stream_item_id)
+         VALUES ($1, $2, 'proposed', NOW(), 1)",
+    )
+    .bind(created.invoice_id())
+    .bind(&request_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+
+    let lifecycles = PaymentRequestLifecycleStore::new(database.pool(), crypto());
+    let evidence = lifecycles
+        .required_receive_targets_for_creator_rotation(&creator)
+        .await
+        .unwrap();
+    let creators = CreatorStore::new(database.pool(), crypto());
+    let current = creators.load(&creator).await.unwrap();
+    let replacement = CreatorCredentials::new(
+        creator,
+        "rotated-session".into(),
+        current.paykit_identity_secret().clone(),
+        Some(paykit_server::domain::receiving::BitcoinAccount {
+            xpub: "replacement-xpub".to_owned().into(),
+            account_index: 7,
+        }),
+        None,
+    );
+    creators
+        .rotate_bitcoin_account_after_receive(&lifecycles, &replacement, &evidence)
+        .await
+        .unwrap();
+    let cancellation_id: uuid::Uuid = sqlx::query_scalar(
+        "SELECT cancellation_outbox_id
+         FROM creator_bitcoin_account_rotation_items
+         WHERE classification = 'cancellation_pending'",
+    )
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE payment_request_lifecycles
+         SET request_state = 'accepted', state_event_id = $1,
+             last_stream_item_id = last_stream_item_id + 1,
+             last_event_at = last_event_at + INTERVAL '1 second'
+         WHERE invoice_id = $2",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(created.invoice_id())
+    .execute(database.pool())
+    .await
+    .unwrap();
+
+    let outbox = OutboxStore::new(database.pool(), crypto());
+    let claim = outbox
+        .claim(uuid::Uuid::new_v4(), 10, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|claim| claim.id() == cancellation_id)
+        .expect("rotation cancellation is claimable");
+    assert!(
+        outbox
+            .rotation_cancellation_target_is_accepted(&claim)
+            .await
+            .unwrap(),
+        "rotation-only acceptance observation permits obsolete transition"
+    );
+
+    let mut drain_promotion = database.pool().begin().await.unwrap();
+    sqlx::query("SELECT id FROM outbox WHERE id = $1 FOR UPDATE")
+        .bind(cancellation_id)
+        .fetch_one(&mut *drain_promotion)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE outbox SET cancellation_drain_required = TRUE WHERE id = $1")
+        .bind(cancellation_id)
+        .execute(&mut *drain_promotion)
+        .await
+        .unwrap();
+
+    let obsolete = tokio::spawn({
+        let outbox = outbox.clone();
+        async move { outbox.mark_cancellation_obsolete(&claim).await }
+    });
+    wait_for_lock_wait(&database, "SELECT id FROM outbox WHERE id = $1 FOR UPDATE").await;
+    drain_promotion.commit().await.unwrap();
+
+    assert!(
+        !obsolete.await.unwrap().unwrap(),
+        "committed drain ownership must fence obsolete transition"
+    );
+    let retained: (String, Option<String>, bool, bool) = sqlx::query_as(
+        "SELECT status, error_class, cancellation_drain_required,
+                claim_token IS NOT NULL
+         FROM outbox WHERE id = $1",
+    )
+    .bind(cancellation_id)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(retained, ("leased".into(), None, true, true));
     database.cleanup().await;
 }
 

@@ -752,13 +752,27 @@ impl OutboxStore {
         &self,
         claim: &ClaimedOutbox,
     ) -> Result<bool, PersistenceError> {
-        self.transition(
-            claim,
-            "permanently_failed",
-            Some("cancellation_obsolete"),
-            None,
+        let Some((mut transaction, now)) = self.transition_fence(claim.id).await? else {
+            return Ok(false);
+        };
+        let changed = sqlx::query(
+            "UPDATE outbox
+             SET status = 'permanently_failed', error_class = 'cancellation_obsolete',
+                 lease_owner = NULL, claim_token = NULL, lease_expires_at = NULL, updated_at = $3
+             WHERE id = $1 AND status = 'leased' AND claim_token = $2
+               AND lease_expires_at > $3 AND NOT cancellation_drain_required",
         )
+        .bind(claim.id)
+        .bind(claim.claim_token)
+        .bind(now)
+        .execute(&mut *transaction)
         .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        transaction
+            .commit()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        Ok(changed.rows_affected() == 1)
     }
 
     pub async fn mark_retryable(
