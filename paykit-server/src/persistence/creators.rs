@@ -527,41 +527,6 @@ impl CreatorStore {
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
 
-        // Legacy preparations predate the generation column. Authenticate their
-        // encrypted terms before backfilling only Bitcoin-bearing rows.
-        let legacy_preparations: Vec<(Uuid, Vec<u8>)> = sqlx::query_as(
-            "SELECT id, preparation_envelope FROM marketplace_payment_preparations
-             WHERE creator_id = $1 AND bitcoin_account_generation IS NULL
-             ORDER BY id FOR UPDATE",
-        )
-        .bind(row.id)
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(|_| PersistenceError::Unavailable)?;
-        for (preparation_id, envelope) in legacy_preparations {
-            let plaintext = self
-                .crypto
-                .decrypt(
-                    &EnvelopeContext::marketplace_preparation(hash, preparation_id),
-                    &EncryptedEnvelope::from_bytes(envelope),
-                )
-                .map_err(|_| PersistenceError::CorruptOrMissing)?;
-            if super::marketplace_preparations::PreparationEnvelope::decode(&plaintext)?
-                .has_bitcoin()
-            {
-                sqlx::query(
-                    "UPDATE marketplace_payment_preparations
-                     SET bitcoin_account_generation = $2
-                     WHERE id = $1 AND bitcoin_account_generation IS NULL",
-                )
-                .bind(preparation_id)
-                .bind(current_generation)
-                .execute(&mut *tx)
-                .await
-                .map_err(|_| PersistenceError::Unavailable)?;
-            }
-        }
-
         let marketplace_rows: Vec<(Uuid, String)> = sqlx::query_as(
             "SELECT id, state FROM marketplace_payment_preparations
              WHERE creator_id = $1 AND bitcoin_account_generation = $2
@@ -721,10 +686,12 @@ impl CreatorStore {
                 .execute(&mut *tx)
                 .await
                 .map_err(|_| PersistenceError::Unavailable)?;
-                continue;
             }
 
             if proposed.is_empty() {
+                if accepted {
+                    continue;
+                }
                 if parsed.is_empty()
                     && (proposal.3.is_some()
                         || matches!(proposal.2.as_str(), "handed_off" | "delivered"))

@@ -128,6 +128,8 @@ impl PaymentRequestLifecycleStore {
         transaction: &mut Transaction<'_, Postgres>,
         creator_id: Uuid,
     ) -> Result<Vec<RequiredReceiveTarget>, PersistenceError> {
+        self.backfill_legacy_marketplace_bitcoin_generation(transaction, creator_id)
+            .await?;
         let rows = sqlx::query_as::<_, RequiredReceiveTargetRow>(
             "SELECT DISTINCT ON (proposal.id)
                     proposal.id, creator.creator_lookup_hash, proposal.intent_envelope
@@ -162,6 +164,56 @@ impl PaymentRequestLifecycleStore {
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
         self.decode_required_receive_targets(rows)
+    }
+
+    async fn backfill_legacy_marketplace_bitcoin_generation(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        creator_id: Uuid,
+    ) -> Result<(), PersistenceError> {
+        let (creator_lookup_hash, generation): (Vec<u8>, i64) = sqlx::query_as(
+            "SELECT creator_lookup_hash, bitcoin_account_generation
+             FROM creators WHERE id = $1 FOR UPDATE",
+        )
+        .bind(creator_id)
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?
+        .ok_or(PersistenceError::CorruptOrMissing)?;
+        let creator_lookup_hash = lookup_hash(&creator_lookup_hash)?;
+        let legacy: Vec<(Uuid, Vec<u8>)> = sqlx::query_as(
+            "SELECT id, preparation_envelope FROM marketplace_payment_preparations
+             WHERE creator_id = $1 AND bitcoin_account_generation IS NULL
+             ORDER BY id FOR UPDATE",
+        )
+        .bind(creator_id)
+        .fetch_all(&mut **transaction)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        for (preparation_id, envelope) in legacy {
+            let plaintext = self
+                .crypto
+                .decrypt(
+                    &EnvelopeContext::marketplace_preparation(creator_lookup_hash, preparation_id),
+                    &EncryptedEnvelope::from_bytes(envelope),
+                )
+                .map_err(|_| PersistenceError::CorruptOrMissing)?;
+            if super::marketplace_preparations::PreparationEnvelope::decode(&plaintext)?
+                .has_bitcoin()
+            {
+                sqlx::query(
+                    "UPDATE marketplace_payment_preparations
+                     SET bitcoin_account_generation = $2
+                     WHERE id = $1 AND bitcoin_account_generation IS NULL",
+                )
+                .bind(preparation_id)
+                .bind(generation)
+                .execute(&mut **transaction)
+                .await
+                .map_err(|_| PersistenceError::Unavailable)?;
+            }
+        }
+        Ok(())
     }
 
     pub async fn required_receive_targets_for_lock(

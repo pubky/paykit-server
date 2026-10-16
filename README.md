@@ -646,7 +646,8 @@ other authorized apps through the SDK's recovery flow.
 - One Electrum endpoint; no failover pool.
 - `tcp://` Electrum has no transport authentication; use a CA-valid `ssl://` endpoint for production.
 - No configured Creator-count bound or runtime eviction.
-- One xpub/account index per Creator; no xpub, account, master-key, or immutable-invariant rotation.
+- One current xpub/account index per Creator. Explicit reconnect can rotate that Bitcoin
+  account after lifecycle reconciliation; no master-key or immutable-invariant rotation.
 - BTC and optional direct USDT0 on Arbitrum One, with fixed denomination conversion; no bridging or asset swaps.
 - No public payer inbox or proof-submission API, and no receipt issuance.
 - No spending custody, refunds, credits, or change.
@@ -667,7 +668,8 @@ the server. A standard Arbitrum JSON-RPC endpoint must support `eth_chainId`,
 
 Setup requests the existing Bitcoin account plus `usdt-address-v1`. The user can
 skip USDT without blocking Bitcoin. Reconnect can add a previously omitted USDT
-address but cannot change an already-approved address or Bitcoin account.
+address but cannot change an already-approved USDT address. An explicit full companion
+claim may rotate the Bitcoin account through the reconciliation and cutover flow above.
 Signed `POST /setup/status` accepts two optional fields that answer different
 questions and return the same `{status}` response:
 

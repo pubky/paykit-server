@@ -232,6 +232,7 @@ async fn rotation_cancels_proposed_preserves_accepted_and_exact_replays_old_bund
         .unwrap();
     let proposed_request_id = uuid::Uuid::new_v4().to_string();
     let accepted_request_id = uuid::Uuid::new_v4().to_string();
+    let accepted_owner_proposed_sibling_id = uuid::Uuid::new_v4().to_string();
     for (invoice_id, request_id, state, cursor) in [
         (
             proposed.invoice_id(),
@@ -244,6 +245,12 @@ async fn rotation_cancels_proposed_preserves_accepted_and_exact_replays_old_bund
             accepted_request_id.as_str(),
             "accepted",
             2_i64,
+        ),
+        (
+            accepted.invoice_id(),
+            accepted_owner_proposed_sibling_id.as_str(),
+            "proposed",
+            3_i64,
         ),
     ] {
         sqlx::query(
@@ -267,8 +274,8 @@ async fn rotation_cancels_proposed_preserves_accepted_and_exact_replays_old_bund
         .unwrap();
     assert_eq!(
         evidence.len(),
-        1,
-        "accepted requests cannot still change rotation classification"
+        2,
+        "a proposed sibling still requires receive before its accepted owner is classified"
     );
     let creators = CreatorStore::new(database.pool(), crypto());
     let current = creators.load(&creator).await.unwrap();
@@ -286,7 +293,7 @@ async fn rotation_cancels_proposed_preserves_accepted_and_exact_replays_old_bund
         .rotate_bitcoin_account_after_receive(&lifecycles, &replacement, &evidence)
         .await
         .unwrap();
-    assert_eq!(rotation.cancellation_pending_count, 1);
+    assert_eq!(rotation.cancellation_pending_count, 2);
     let classifications: Vec<String> = sqlx::query_scalar(
         "SELECT classification FROM creator_bitcoin_account_rotation_items
          ORDER BY classification",
@@ -294,15 +301,21 @@ async fn rotation_cancels_proposed_preserves_accepted_and_exact_replays_old_bund
     .fetch_all(database.pool())
     .await
     .unwrap();
-    assert_eq!(classifications, vec!["accepted", "cancellation_pending"]);
-    let cancellation_targets: Vec<String> = sqlx::query_scalar(
+    assert_eq!(
+        classifications,
+        vec!["accepted", "cancellation_pending", "cancellation_pending"]
+    );
+    let mut cancellation_targets: Vec<String> = sqlx::query_scalar(
         "SELECT cancellation_target_payment_request_id FROM outbox
          WHERE intent_kind = 'payment_request_cancellation'",
     )
     .fetch_all(database.pool())
     .await
     .unwrap();
-    assert_eq!(cancellation_targets, vec![proposed_request_id]);
+    cancellation_targets.sort();
+    let mut expected_targets = vec![proposed_request_id, accepted_owner_proposed_sibling_id];
+    expected_targets.sort();
+    assert_eq!(cancellation_targets, expected_targets);
     let replay = store
         .create_atomic(input(
             &creator,

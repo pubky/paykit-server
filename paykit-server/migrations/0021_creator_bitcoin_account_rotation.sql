@@ -12,9 +12,32 @@ UPDATE invoices
 SET bitcoin_account_generation = 0
 WHERE bitcoin_address_lookup_hash IS NOT NULL;
 
+-- Encrypted legacy preparations stay NULL here: runtime target discovery
+-- authenticates each envelope, backfills only Bitcoin-bearing rows under the
+-- Creator fence, commits, then receives remote lifecycle state before cutover.
 ALTER TABLE marketplace_payment_preparations
     ADD COLUMN bitcoin_account_generation BIGINT
         CHECK (bitcoin_account_generation >= 0);
+
+-- Rotation can retain one accepted attempt while durably canceling one or more
+-- proposed siblings for the same Marketplace owner. Preserve one proposal per
+-- preparation while allowing one cancellation per target request.
+ALTER TABLE outbox
+    DROP CONSTRAINT outbox_marketplace_preparation_id_key;
+
+CREATE UNIQUE INDEX outbox_marketplace_proposal_unique
+    ON outbox (marketplace_preparation_id)
+    WHERE marketplace_preparation_id IS NOT NULL
+      AND intent_kind = 'payment_request_proposal';
+
+CREATE UNIQUE INDEX outbox_marketplace_cancellation_unique
+    ON outbox (
+        marketplace_preparation_id,
+        cancellation_target_payment_request_id,
+        intent_kind
+    )
+    WHERE marketplace_preparation_id IS NOT NULL
+      AND intent_kind = 'payment_request_cancellation';
 
 CREATE TABLE creator_bitcoin_account_rotations (
     id UUID PRIMARY KEY,
