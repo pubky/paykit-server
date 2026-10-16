@@ -1,6 +1,7 @@
 //! Direct Arbitrum USDT0 receipts and Paykit ERC-20 account attestations.
 
 use std::{
+    collections::{BTreeMap, BTreeSet, HashMap},
     str::FromStr,
     sync::Arc,
     time::{Duration, Instant},
@@ -13,7 +14,7 @@ use secp256k1::{
     Message, Secp256k1,
     ecdsa::{RecoverableSignature, RecoveryId},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use time::OffsetDateTime;
 use tokio::sync::Mutex;
@@ -79,6 +80,7 @@ pub struct ArbitrumVerifier {
     client: reqwest::Client,
     url: url::Url,
     chain_tip: Arc<Mutex<Option<(Instant, ChainTip)>>>,
+    scans: Arc<Mutex<HashMap<blake3::Hash, ScanState>>>,
 }
 
 const CHAIN_TIP_TTL: Duration = Duration::from_secs(5);
@@ -87,6 +89,30 @@ const CHAIN_TIP_TTL: Duration = Duration::from_secs(5);
 struct ChainTip {
     head: u64,
     finalized: Option<u64>,
+}
+
+const MAX_SCAN_CANDIDATES: usize = 8;
+const MAX_SCAN_REQUESTS: usize = 1024;
+const UNMATCHED_RETRY_DELAY: Duration = Duration::from_secs(15);
+
+struct ScanState {
+    fingerprint: blake3::Hash,
+    cursor: usize,
+    retry_at: Instant,
+    last_used: Instant,
+}
+
+#[derive(Clone, Serialize)]
+pub(crate) struct PaymentCandidate {
+    pub(crate) identity: String,
+    hash: B256,
+    index: usize,
+    senders: BTreeSet<Address>,
+}
+
+pub(crate) struct PaymentScan {
+    key: blake3::Hash,
+    pub(crate) candidates: Vec<PaymentCandidate>,
 }
 
 impl ArbitrumVerifier {
@@ -100,7 +126,91 @@ impl ArbitrumVerifier {
             client,
             url,
             chain_tip: Arc::new(Mutex::new(None)),
+            scans: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    pub(crate) async fn payment_scan(
+        &self,
+        context: &PaymentContext<'_>,
+        proofs: &[PaymentProofRecord],
+    ) -> PaymentScan {
+        let mut candidates = BTreeMap::<String, PaymentCandidate>::new();
+        for record in proofs {
+            if let Ok((_, hash, index, sender)) = parse_proof(context, record) {
+                let identity = format!("{USDT_CHAIN_ID}:{hash:#x}:{index}");
+                candidates
+                    .entry(identity.clone())
+                    .or_insert_with(|| PaymentCandidate {
+                        identity,
+                        hash,
+                        index,
+                        senders: BTreeSet::new(),
+                    })
+                    .senders
+                    .insert(sender);
+            }
+        }
+        let candidates: Vec<_> = candidates.into_values().collect();
+        let key = blake3::hash(
+            &serde_json::to_vec(&(
+                context.payer,
+                context.payee,
+                context.request_id,
+                context.reference,
+                context.recipient,
+            ))
+            .expect("payment context is serializable"),
+        );
+        let fingerprint = blake3::hash(
+            &serde_json::to_vec(&candidates).expect("payment candidates are serializable"),
+        );
+        let mut scan = PaymentScan {
+            key,
+            candidates: Vec::new(),
+        };
+        if candidates.is_empty() {
+            return scan;
+        }
+        let now = Instant::now();
+        let mut scans = self.scans.lock().await;
+        if !scans.contains_key(&key)
+            && scans.len() >= MAX_SCAN_REQUESTS
+            && let Some(oldest) = scans
+                .iter()
+                .min_by_key(|(_, state)| state.last_used)
+                .map(|(key, _)| *key)
+        {
+            scans.remove(&oldest);
+        }
+        let state = scans.entry(key).or_insert(ScanState {
+            fingerprint,
+            cursor: 0,
+            retry_at: now,
+            last_used: now,
+        });
+        if state.fingerprint != fingerprint {
+            state.fingerprint = fingerprint;
+            state.retry_at = now;
+            state.cursor = 0;
+        }
+        state.last_used = now;
+        if state.retry_at > now {
+            return scan;
+        }
+        let count = candidates.len().min(MAX_SCAN_CANDIDATES);
+        scan.candidates = (0..count)
+            .map(|offset| candidates[(state.cursor + offset) % candidates.len()].clone())
+            .collect();
+        state.cursor = (state.cursor + count) % candidates.len();
+        state.retry_at = now + UNMATCHED_RETRY_DELAY;
+        scan
+    }
+
+    pub(crate) async fn finish_payment_scan(&self, scan: &PaymentScan, observed: bool) {
+        if observed && let Some(state) = self.scans.lock().await.get_mut(&scan.key) {
+            state.retry_at = Instant::now();
+        }
     }
 
     async fn chain_tip(&self, minimum_block: u64) -> Result<ChainTip, VerificationError> {
@@ -174,10 +284,29 @@ impl ArbitrumVerifier {
         context: &PaymentContext<'_>,
         record: &PaymentProofRecord,
     ) -> Result<Option<VerifiedTransfer>, VerificationError> {
-        let (proof, hash, index, sender) = parse_proof(context, record)?;
+        let (_, hash, index, sender) = parse_proof(context, record)?;
+        self.verify_candidate(
+            context,
+            &PaymentCandidate {
+                identity: format!("{USDT_CHAIN_ID}:{hash:#x}:{index}"),
+                hash,
+                index,
+                senders: BTreeSet::from([sender]),
+            },
+        )
+        .await
+    }
+
+    pub(crate) async fn verify_candidate(
+        &self,
+        context: &PaymentContext<'_>,
+        candidate: &PaymentCandidate,
+    ) -> Result<Option<VerifiedTransfer>, VerificationError> {
+        let hash = candidate.hash;
+        let index = candidate.index;
         let mut tip = self.chain_tip(0).await?;
         let receipt = self
-            .call("eth_getTransactionReceipt", json!([proof.transaction_hash]))
+            .call("eth_getTransactionReceipt", json!([hash]))
             .await?;
         if receipt.is_null() {
             return Ok(None);
@@ -212,7 +341,13 @@ impl ArbitrumVerifier {
             .as_array()
             .ok_or(VerificationError::Unavailable)?;
         let log = logs.get(index).ok_or(VerificationError::InvalidProof)?;
-        let amount = transfer_amount(log, sender, context.recipient, hash, &receipt["blockHash"])?;
+        let sender = parse_hash(&log["topics"][1]).map_err(|_| VerificationError::InvalidProof)?;
+        let sender = candidate
+            .senders
+            .iter()
+            .find(|address| address.into_word() == sender)
+            .ok_or(VerificationError::InvalidProof)?;
+        let amount = transfer_amount(log, *sender, context.recipient, hash, &receipt["blockHash"])?;
         let confirmations = tip
             .head
             .checked_sub(number)

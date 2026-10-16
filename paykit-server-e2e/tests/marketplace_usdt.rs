@@ -169,6 +169,80 @@ async fn observe_bitcoin(rig: &Rig, sats: u64, confirmations: u32, byte: u8, at:
 const TX_HASH: &str = "0x1111111111111111111111111111111111111111111111111111111111111111";
 
 #[tokio::test]
+async fn missing_receipts_defer_repeated_scans_without_creating_observations() {
+    let rig = rig(BOTH_RAILS, true).await;
+    let rpc = Rpc::start().await;
+    let request = offered(&rig, 0, &[]).await;
+    let mut evidence = record(0);
+    evidence
+        .payment_proofs
+        .push(evidence.payment_proofs[0].clone());
+    let creator_id = creator_row(&rig).await;
+    chain(&rpc, |chain| chain.receipt = Value::Null);
+    for _ in 0..3 {
+        rig.store
+            .observe_usdt_request(creator_id, &creator(), &evidence, &rpc.verifier)
+            .await
+            .unwrap();
+    }
+    let calls = rpc
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(method, _)| method == "eth_getTransactionReceipt")
+        .count();
+    assert_eq!(calls, 1);
+    let observations: i64 = sqlx::query_scalar("SELECT count(*) FROM usdt_observations")
+        .fetch_one(rig.database.pool())
+        .await
+        .unwrap();
+    assert_eq!(observations, 0);
+    assert!(rig.status(&request.invoice).await["usdt_arbitrum"].is_null());
+    // A changed candidate set is eligible immediately, with bounded work per pass.
+    evidence.payment_proofs = (1..=10)
+        .map(|index| {
+            let mut proof = common::arbitrum::proof(0);
+            proof
+                .proof
+                .insert("transaction_hash".into(), json!(format!("0x{index:064x}")));
+            proof
+        })
+        .collect();
+    rpc.requests.lock().unwrap().clear();
+    for _ in 0..2 {
+        rig.store
+            .observe_usdt_request(creator_id, &creator(), &evidence, &rpc.verifier)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        rpc.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(method, _)| method == "eth_getTransactionReceipt")
+            .count(),
+        8
+    );
+    tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+    rig.store
+        .observe_usdt_request(creator_id, &creator(), &evidence, &rpc.verifier)
+        .await
+        .unwrap();
+    let hashes: std::collections::BTreeSet<_> = rpc
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(method, _)| method == "eth_getTransactionReceipt")
+        .map(|(_, params)| params[0].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(hashes.len(), 10, "later candidates are not starved");
+    rig.cleanup().await;
+}
+
+#[tokio::test]
 async fn verified_usdt_proof_reaches_a_dual_asset_request_and_sets_the_paid_asset() {
     let rig = rig(BOTH_RAILS, true).await;
     let rpc = Rpc::start().await;

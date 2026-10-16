@@ -5,7 +5,7 @@ use paykit_sdk::{PaymentRequestLocalRole, PaymentRequestRecord};
 use super::*;
 use crate::{
     application::marketplace_status::MarketplaceUsdtStatus,
-    domain::receiving::{USDT_CHAIN_ID, USDT_ENDPOINT},
+    domain::receiving::USDT_CHAIN_ID,
     usdt::{ArbitrumVerifier, PaymentContext, VerificationError, VerifiedTransfer},
 };
 
@@ -116,19 +116,17 @@ impl MarketplacePreparationStore {
             reference: &terms.payment_reference,
             recipient: &recipient,
         };
-        let mut candidates = std::collections::BTreeMap::<_, Vec<_>>::new();
-        for proof in &record.payment_proofs {
-            if proof.payment_endpoint_identifier == USDT_ENDPOINT
-                && let Ok(identity) = crate::usdt::payment_identity(&context, proof)
-            {
-                candidates.entry(identity).or_default().push(proof);
-            }
-        }
-        for (identity, proofs) in candidates {
+        let scan = verifier
+            .payment_scan(&context, &record.payment_proofs)
+            .await;
+        let mut observed = false;
+        for candidate in &scan.candidates {
+            let identity = &candidate.identity;
             let identity_hash = self.crypto.usdt_transfer_lookup_hash(identity.as_bytes());
-            let skip: Option<bool> = sqlx::query_scalar(
+            let existing: Option<(bool, bool, bool)> = sqlx::query_as(
                 "SELECT COALESCE(finalized OR (marketplace_preparation_id = $2 AND present
-                    AND checked_at <= NOW() AND checked_at > NOW() - INTERVAL '1 minute'), FALSE)
+                    AND checked_at <= NOW() AND checked_at > NOW() - INTERVAL '1 minute'), FALSE),
+                    present, COALESCE(marketplace_preparation_id = $2, FALSE)
                  FROM usdt_observations WHERE transfer_lookup_hash = $1",
             )
             .bind(identity_hash.as_bytes().as_slice())
@@ -136,29 +134,37 @@ impl MarketplacePreparationStore {
             .fetch_optional(&self.pool)
             .await
             .map_err(|_| PersistenceError::Unavailable)?;
-            if skip == Some(true) {
+            if existing.is_some_and(|(_, _, owned)| !owned) {
                 continue;
             }
-            // Corrective proofs cannot erase another valid account attestation for the same event.
-            let mut verified = None;
-            for proof in proofs {
-                match verifier.verify(&context, proof).await {
-                    Ok(Some(transfer)) => {
-                        verified = Some(transfer);
-                        break;
-                    }
-                    Ok(None) | Err(VerificationError::InvalidProof) => {}
-                    Err(VerificationError::Unavailable) => {
-                        return Err(PersistenceError::Unavailable);
-                    }
-                }
+            if existing.is_some_and(|(skip, _, _)| skip) {
+                observed = true;
+                continue;
             }
+            let verified = match verifier.verify_candidate(&context, candidate).await {
+                Ok(value) => value,
+                Err(VerificationError::InvalidProof) => None,
+                Err(VerificationError::Unavailable) => {
+                    verifier
+                        .finish_payment_scan(
+                            &scan,
+                            observed
+                                || existing.is_some_and(|(_, present, owned)| present && owned),
+                        )
+                        .await;
+                    return Err(PersistenceError::Unavailable);
+                }
+            };
             match verified {
                 Some(transfer) => {
-                    self.apply_usdt_transfer(&target, creator_hash, transfer)
+                    observed |= self
+                        .apply_usdt_transfer(&target, creator_hash, transfer)
                         .await?;
                 }
                 None => {
+                    if !existing.is_some_and(|(_, present, owned)| present && owned) {
+                        continue;
+                    }
                     let mut tx = self
                         .pool
                         .begin()
@@ -181,6 +187,7 @@ impl MarketplacePreparationStore {
                 }
             }
         }
+        verifier.finish_payment_scan(&scan, observed).await;
         Ok(())
     }
 
@@ -189,7 +196,7 @@ impl MarketplacePreparationStore {
         target: &UsdtTarget,
         creator_hash: LookupHash,
         transfer: VerifiedTransfer,
-    ) -> Result<(), PersistenceError> {
+    ) -> Result<bool, PersistenceError> {
         let transfer_hash = self
             .crypto
             .usdt_transfer_lookup_hash(transfer.identity.as_bytes());
@@ -211,7 +218,7 @@ impl MarketplacePreparationStore {
             // The unique transfer identity fences a receipt owned elsewhere, and a
             // finalized receipt is never rewritten.
             if owner != Some(target.preparation_id) || finalized {
-                return Ok(());
+                return Ok(owner == Some(target.preparation_id));
             }
         }
         let id = existing.map_or_else(Uuid::new_v4, |(id, _, _)| id);
@@ -256,9 +263,12 @@ impl MarketplacePreparationStore {
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
         if owner != Some(target.preparation_id) {
-            return Ok(());
+            return Ok(false);
         }
-        tx.commit().await.map_err(|_| PersistenceError::Unavailable)
+        tx.commit()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        Ok(true)
     }
 
     fn decode_preparation_envelope(

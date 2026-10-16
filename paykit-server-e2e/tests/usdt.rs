@@ -372,6 +372,7 @@ async fn invoices_share_an_address_but_never_share_payment_evidence() {
         .unwrap();
     assert_eq!(status(&store, &bundles[0]).await, (false, 0));
     rpc.chain.lock().unwrap().reorg = false;
+    tokio::time::sleep(std::time::Duration::from_secs(15)).await;
     restarted
         .observe_usdt_request(creator_id, &creator, &record(0), &rpc.verifier, None)
         .await
@@ -898,4 +899,36 @@ async fn locks_ignores_a_transfer_a_marketplace_request_already_owns() {
     .await
     .unwrap();
     assert_eq!(owners, (0, 1));
+    // Evidence owned by a different request cannot keep unmatched scans hot.
+    for finalized in [false, true] {
+        sqlx::query("UPDATE usdt_observations SET finalized = $1")
+            .bind(finalized)
+            .execute(database.pool())
+            .await
+            .unwrap();
+        let verifier = ArbitrumVerifier::new(rpc.url.clone()).unwrap();
+        let mut evidence = record(0);
+        let mut missing = proof(0);
+        missing
+            .proof
+            .insert("transaction_hash".into(), json!(format!("0x{:064x}", 2)));
+        evidence.payment_proofs.push(missing);
+        rpc.chain.lock().unwrap().receipt = Value::Null;
+        rpc.requests.lock().unwrap().clear();
+        for _ in 0..3 {
+            invoices
+                .observe_usdt_request(creator_id, &creator, &evidence, &verifier, Some(&bundle))
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            rpc.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(method, _)| method == "eth_getTransactionReceipt")
+                .count(),
+            1
+        );
+    }
 }
