@@ -16,7 +16,7 @@ use uuid::Uuid;
 mod common;
 
 use common::{
-    arbitrum::{Rpc, fixture, record},
+    arbitrum::{BLOCK, Rpc, fixture, record},
     marketplace_rig::*,
 };
 
@@ -285,7 +285,7 @@ async fn present_receipts_do_not_accelerate_missing_receipt_retries() {
 }
 
 #[tokio::test]
-async fn oversized_proof_sets_do_not_perform_verification_or_change_observations() {
+async fn oversized_proof_sets_preserve_observation_revalidation() {
     let rig = rig(BOTH_RAILS, true).await;
     let rpc = Rpc::start().await;
     let request = offered(&rig, 0, &[]).await;
@@ -310,16 +310,193 @@ async fn oversized_proof_sets_do_not_perform_verification_or_change_observations
         .unwrap();
     assert_eq!(rig.status(&request.invoice).await["paid_asset"], "USDT");
     evidence.payment_proofs.push(common::arbitrum::proof(0));
+    let original = rpc.chain.lock().unwrap().clone();
+    let mut reorg = original.clone();
+    reorg.reorg = true;
+    let mut missing = original.clone();
+    missing.receipt = Value::Null;
+    let mut wrong_sender = original.clone();
+    wrong_sender.receipt["logs"][1]["topics"][1] = json!(BLOCK);
+    let mut finalized = original.clone();
+    finalized.finalized = true;
+    for (chain_state, paid) in [
+        (original.clone(), true),
+        (reorg, false),
+        (original.clone(), true),
+        (missing, false),
+        (original.clone(), true),
+        (wrong_sender, false),
+        (finalized, true),
+    ] {
+        *rpc.chain.lock().unwrap() = chain_state;
+        age_receipts(&rig).await;
+        rpc.requests.lock().unwrap().clear();
+        // A fresh verifier must use the durable attestation, including after a reorg.
+        let verifier = ArbitrumVerifier::new(rpc.url.clone()).unwrap();
+        assert!(matches!(
+            rig.store
+                .observe_usdt_request(creator_id, &creator(), &evidence, &verifier)
+                .await,
+            Err(paykit_server::persistence::PersistenceError::Unavailable)
+        ));
+        assert_eq!(
+            rig.status(&request.invoice).await["paid_asset"] == "USDT",
+            paid
+        );
+        assert_eq!(
+            rpc.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(method, _)| method == "eth_getTransactionReceipt")
+                .count(),
+            1
+        );
+        rpc.requests.lock().unwrap().clear();
+        // Refresh timestamps also bound overflow retries across verifier restarts.
+        let verifier = ArbitrumVerifier::new(rpc.url.clone()).unwrap();
+        assert!(
+            rig.store
+                .observe_usdt_request(creator_id, &creator(), &evidence, &verifier)
+                .await
+                .is_err()
+        );
+        assert!(rpc.requests.lock().unwrap().is_empty());
+    }
+    chain(&rpc, |chain| chain.unavailable = true);
     age_receipts(&rig).await;
     rpc.requests.lock().unwrap().clear();
-    assert!(matches!(
+    assert!(
         rig.store
             .observe_usdt_request(creator_id, &creator(), &evidence, &rpc.verifier)
-            .await,
-        Err(paykit_server::persistence::PersistenceError::Unavailable)
-    ));
+            .await
+            .is_err()
+    );
     assert!(rpc.requests.lock().unwrap().is_empty());
     assert_eq!(rig.status(&request.invoice).await["paid_asset"], "USDT");
+    rig.cleanup().await;
+}
+
+#[tokio::test]
+async fn legacy_receipts_gain_sender_anchors_on_verified_refresh() {
+    use paykit_server::crypto::{EncryptedEnvelope, EnvelopeContext};
+    let rig = rig(BOTH_RAILS, true).await;
+    let rpc = Rpc::start().await;
+    let request = offered(&rig, 0, &[]).await;
+    chain(&rpc, |chain| chain.timestamp = request.at(0));
+    submit(&rig, &rpc, 0).await;
+    let creator_id = creator_row(&rig).await;
+    let crypto = Crypto::from_master_key(&[7; 32]).unwrap();
+    let (id, bytes): (Uuid, Vec<u8>) =
+        sqlx::query_as("SELECT id, observation_envelope FROM usdt_observations")
+            .fetch_one(rig.database.pool())
+            .await
+            .unwrap();
+    let context = EnvelopeContext::usdt_observation_for_marketplace(
+        crypto.lookup_hash(creator().to_string().as_bytes()),
+        id,
+        Uuid::parse_str(&request.invoice).unwrap(),
+    );
+    let plaintext = crypto
+        .decrypt(&context, &EncryptedEnvelope::from_bytes(bytes))
+        .unwrap();
+    let legacy = crypto
+        .encrypt(&context, &plaintext[..plaintext.len() - 20])
+        .unwrap();
+    for oversized in [false, true] {
+        sqlx::query("UPDATE usdt_observations SET observation_envelope = $1")
+            .bind(legacy.as_bytes())
+            .execute(rig.database.pool())
+            .await
+            .unwrap();
+        age_receipts(&rig).await;
+        let mut evidence = record(0);
+        if oversized {
+            evidence.payment_proofs = vec![common::arbitrum::proof(0); 129];
+        }
+        let verifier = ArbitrumVerifier::new(rpc.url.clone()).unwrap();
+        let result = rig
+            .store
+            .observe_usdt_request(creator_id, &creator(), &evidence, &verifier)
+            .await;
+        assert_eq!(result.is_err(), oversized);
+        assert_eq!(
+            rig.status(&request.invoice).await["paid_asset"] == "USDT",
+            !oversized
+        );
+        if !oversized {
+            let upgraded: Vec<u8> =
+                sqlx::query_scalar("SELECT observation_envelope FROM usdt_observations")
+                    .fetch_one(rig.database.pool())
+                    .await
+                    .unwrap();
+            assert_eq!(
+                crypto
+                    .decrypt(&context, &EncryptedEnvelope::from_bytes(upgraded))
+                    .unwrap(),
+                plaintext
+            );
+        }
+    }
+    rig.cleanup().await;
+}
+
+#[tokio::test]
+async fn owned_receipt_refreshes_are_bounded_and_resume_in_order() {
+    use paykit_server::crypto::{EncryptedEnvelope, EnvelopeContext};
+    let rig = rig(BOTH_RAILS, true).await;
+    let rpc = Rpc::start().await;
+    let request = offered(&rig, 0, &[]).await;
+    let creator_id = creator_row(&rig).await;
+    let crypto = Crypto::from_master_key(&[7; 32]).unwrap();
+    let creator_hash = crypto.lookup_hash(creator().to_string().as_bytes());
+    let preparation = Uuid::parse_str(&request.invoice).unwrap();
+    // Seed independent owned observations; all their receipts are absent from this RPC.
+    for byte in 1..=9 {
+        insert_receipt(&rig, &request, byte, REQUIRED_USDT, 0, 2, false).await;
+    }
+    let rows: Vec<(Uuid, Vec<u8>)> =
+        sqlx::query_as("SELECT id, observation_envelope FROM usdt_observations")
+            .fetch_all(rig.database.pool())
+            .await
+            .unwrap();
+    for (id, bytes) in rows {
+        let context =
+            EnvelopeContext::usdt_observation_for_marketplace(creator_hash, id, preparation);
+        let mut plaintext = crypto
+            .decrypt(&context, &EncryptedEnvelope::from_bytes(bytes))
+            .unwrap();
+        plaintext.extend_from_slice(&[1; 20]);
+        let envelope = crypto.encrypt(&context, &plaintext).unwrap();
+        sqlx::query("UPDATE usdt_observations SET observation_envelope = $1 WHERE id = $2")
+            .bind(envelope.as_bytes())
+            .bind(id)
+            .execute(rig.database.pool())
+            .await
+            .unwrap();
+    }
+    age_receipts(&rig).await;
+    let mut evidence = record(0);
+    evidence.payment_proofs = vec![common::arbitrum::proof(0); 129];
+    for expected in [8, 1, 0] {
+        rpc.requests.lock().unwrap().clear();
+        assert!(
+            rig.store
+                .observe_usdt_request(creator_id, &creator(), &evidence, &rpc.verifier)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            rpc.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(method, _)| method == "eth_getTransactionReceipt")
+                .count(),
+            expected
+        );
+    }
+    assert!(rig.status(&request.invoice).await["paid_asset"].is_null());
     rig.cleanup().await;
 }
 

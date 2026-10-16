@@ -67,6 +67,7 @@ pub struct VerifiedTransfer {
     pub(crate) timestamp: OffsetDateTime,
     pub(crate) confirmations: u32,
     pub(crate) finalized: bool,
+    pub(crate) sender: [u8; 20],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -92,7 +93,7 @@ struct ChainTip {
 }
 
 const MAX_REQUEST_PROOFS: usize = 128;
-const MAX_SCAN_CANDIDATES: usize = 8;
+pub(crate) const MAX_SCAN_CANDIDATES: usize = 8;
 const MAX_SCAN_REQUESTS: usize = 1024;
 const UNMATCHED_RETRY_DELAY: Duration = Duration::from_secs(15);
 
@@ -144,6 +145,38 @@ pub(crate) struct PaymentCandidate {
     hash: B256,
     index: usize,
     senders: BTreeSet<Address>,
+}
+
+impl PaymentCandidate {
+    /// Uses the sender authenticated when the owned observation was recorded.
+    pub(crate) fn from_observation(
+        identity: &str,
+        sender: [u8; 20],
+    ) -> Result<Self, VerificationError> {
+        let mut parts = identity.split(':');
+        let (Some(chain), Some(hash), Some(index), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return Err(VerificationError::InvalidProof);
+        };
+        if chain != USDT_CHAIN_ID {
+            return Err(VerificationError::InvalidProof);
+        }
+        let hash = B256::from_str(canonical_hex(hash, 32)?)
+            .map_err(|_| VerificationError::InvalidProof)?;
+        let index = index
+            .parse::<usize>()
+            .map_err(|_| VerificationError::InvalidProof)?;
+        if identity != format!("{USDT_CHAIN_ID}:{hash:#x}:{index}") {
+            return Err(VerificationError::InvalidProof);
+        }
+        Ok(Self {
+            identity: identity.to_owned(),
+            hash,
+            index,
+            senders: BTreeSet::from([Address::from(sender)]),
+        })
+    }
 }
 
 pub(crate) struct PaymentScan {
@@ -428,6 +461,7 @@ impl ArbitrumVerifier {
             timestamp,
             confirmations,
             finalized,
+            sender: sender.into_array(),
         }))
     }
 }

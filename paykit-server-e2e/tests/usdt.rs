@@ -522,6 +522,59 @@ async fn invoices_share_an_address_but_never_share_payment_evidence() {
         );
         assert_eq!(status(&store, &bundles[0]).await, (true, 2));
     }
+    // Overflowing discovery does not suppress independently owned receipt refreshes.
+    let mut evidence = record(0);
+    evidence.payment_proofs = vec![proof(0); 129];
+    sqlx::query("UPDATE usdt_observations SET finalized = FALSE")
+        .execute(database.pool())
+        .await
+        .unwrap();
+    let mut original = rpc.chain.lock().unwrap().clone();
+    original.finalized = false;
+    let mut reorg = original.clone();
+    reorg.reorg = true;
+    let mut wrong_sender = original.clone();
+    wrong_sender.receipt["logs"][1]["topics"][1] = json!(BLOCK);
+    let mut unavailable = original.clone();
+    unavailable.unavailable = true;
+    for (chain_state, paid) in [
+        (original.clone(), true),
+        (unavailable, true),
+        (reorg, false),
+        (original.clone(), true),
+        (wrong_sender, false),
+        (original, true),
+    ] {
+        *rpc.chain.lock().unwrap() = chain_state;
+        sqlx::query("UPDATE usdt_observations SET checked_at = NOW() - INTERVAL '2 minutes'")
+            .execute(database.pool())
+            .await
+            .unwrap();
+        let verifier = ArbitrumVerifier::new(rpc.url.clone()).unwrap();
+        assert!(matches!(
+            store
+                .observe_usdt_request(creator_id, &creator, &evidence, &verifier, None)
+                .await,
+            Err(PersistenceError::Unavailable)
+        ));
+        assert_eq!(status(&store, &bundles[0]).await.0, paid);
+    }
+    // An explicit invoice status read bypasses the present-receipt background interval.
+    rpc.chain.lock().unwrap().reorg = true;
+    let verifier = ArbitrumVerifier::new(rpc.url.clone()).unwrap();
+    assert!(
+        store
+            .observe_usdt_request(
+                creator_id,
+                &creator,
+                &evidence,
+                &verifier,
+                Some(&bundles[0])
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(status(&store, &bundles[0]).await, (false, 0));
     database.cleanup().await;
 }
 
