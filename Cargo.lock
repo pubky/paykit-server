@@ -3474,7 +3474,8 @@ dependencies = [
 [[package]]
 name = "locks-core"
 version = "0.1.0"
-source = "git+https://github.com/pubky/locks.git?tag=v0.1.0#ac8e893b4cb9d21b7736a431b511acd3efdfb83a"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "780f349f56f10e658358cb897cd5dc1bcc03c297250a31efd6fa62f819bd74f5"
 dependencies = [
  "base32",
  "blake3",
