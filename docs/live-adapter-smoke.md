@@ -7,9 +7,11 @@ passing deterministic suite does not establish external interoperability.
 ## Pubky App Registry and Payment Request
 
 Use a local static Pubky testnet compatible with the pinned `pubky` and
-`pubky-testnet` 0.15.0 dependencies, with Pubky Homeserver 0.15 or newer. It must
+`pubky-testnet` 0.16.2 dependencies, with Pubky Homeserver 0.16.2 or newer. It must
 expose the SDK's fixed localhost testnet ports. Upgrading client dependencies
-does not upgrade a separately operated homeserver.
+does not upgrade a separately operated homeserver. Shared-state recovery also
+requires the GCS behavior and coordinated writers described in the
+[deployment requirements](../README.md#persistence-startup-and-upgrades).
 Do not run against a retained integration fixture without its
 operator's approval: this test creates identities and sends a test Payment Request.
 

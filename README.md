@@ -34,9 +34,14 @@ Before submitting changes, read [`CONTRIBUTING.md`](CONTRIBUTING.md). Report sec
 
 The [architecture contract](docs/architecture.md) describes shared identity,
 credential ownership, and immutable invoice attribution. Rust dependencies pin
-the Paykit `v0.1.0-rc74` release by exact revision in `Cargo.toml` and
-`Cargo.lock`: `03d4f05721e92d3944cb4d5af4b2c98c4390a5a8`.
-Direct `pubky` and `pubky-testnet` dependencies are pinned to `0.15.0`.
+the published `paykit-lib` and `paykit-sdk` crates to `0.1.0` in `Cargo.toml` and
+`Cargo.lock`. Direct `pubky` and `pubky-testnet` dependencies are pinned to `0.16.2`.
+
+Shared-state recovery requires Homeserver `0.16.2` or newer with the required GCS
+behavior on every serving instance. Drain older writes and coordinate all
+writers before adopting this release; updating the dependency does not deploy
+Homeservers or establish operational readiness. See the
+[Paykit 0.1.0 integration requirements](https://github.com/pubky/paykit-rs/releases/tag/v0.1.0).
 
 ## Executable boundary
 
@@ -199,7 +204,7 @@ terms and requires operator attention. Exact activation and void replay still re
 stored `200` response. Persisted-state and database-integrity faults fail with
 non-retryable `500 internal_error`, not `503 dependency_unavailable`.
 
-`POST /setup/status` is the readiness check for an authenticated Creator. Its closed body is `{"creator":"pubky..."}` with optional `asset: "BTC"`, `"USD"`, or `"USDT"` to check whether approved receiving details can accept that denomination, and optional `accepted_asset: "BTC"` or `"USDT"` to check whether the Creator has approved receiving details for that payment asset (see [Direct USDT0 invoices](#direct-usdt0-invoices)). Every signed route verifies Ed25519 over `b"paykit-http-signature-v1\0" + uppercase_method + b"\0" + exact_query_free_path + b"\0" + exact_raw_body`; there is no body-only fallback. It returns exactly one coarse state: `ready` when the persisted session, delegated key, App Registry entry, and hosted state are usable; `setup_required` when authority is absent or confirmed invalid; and `unavailable` for validation timeouts and storage, rate-limit, server, DNS, or transport failures. Reading the hosted state takes the Creator's shared-state write lock, which Bitkit, the outbox workers and concurrent status checks also hold, sometimes through the SDK's 5-minute uncertain-write cooldown; when that lock is busy and this process read the Creator's hosted state within the last 10 minutes, that read stands and the other checks decide the answer, so a busy lock alone never turns a ready Creator `unavailable`. Untyped Pubky 401 responses are also `unavailable`: they cannot distinguish revoked grants from recoverable PoP failures. A revoked grant reported this way requires explicit reconnect. Callers must not convert `unavailable` into a new authorization flow.
+`POST /setup/status` is the readiness check for an authenticated Creator. Its closed body is `{"creator":"pubky..."}` with optional `asset: "BTC"`, `"USD"`, or `"USDT"` to check whether approved receiving details can accept that denomination, and optional `accepted_asset: "BTC"` or `"USDT"` to check whether the Creator has approved receiving details for that payment asset (see [Direct USDT0 invoices](#direct-usdt0-invoices)). Every signed route verifies Ed25519 over `b"paykit-http-signature-v1\0" + uppercase_method + b"\0" + exact_query_free_path + b"\0" + exact_raw_body`; there is no body-only fallback. It returns exactly one coarse state: `ready` when the persisted session, delegated key, App Registry entry, and hosted state are usable; `setup_required` when authority is absent or confirmed invalid; and `unavailable` for validation timeouts and storage, rate-limit, server, DNS, or transport failures. Reading the hosted state takes the Creator's shared-state write lock, which Bitkit, the outbox workers and concurrent status checks also hold, including during uncertain-write reconciliation; when that lock is busy and this process read the Creator's hosted state within the last 10 minutes, that read stands and the other checks decide the answer, so a busy lock alone never turns a ready Creator `unavailable`. Untyped Pubky 401 responses are also `unavailable`: they cannot distinguish revoked grants from recoverable PoP failures. A revoked grant reported this way requires explicit reconnect. Callers must not convert `unavailable` into a new authorization flow.
 
 ### Setup iframe
 
@@ -313,11 +318,14 @@ Different Creators may use the same numeric child index because their xpubs and 
 
 PostgreSQL stores server credentials, address allocation, invoices, and delivery intents. The Paykit SDK stores encrypted identity-wide state on the Creator's homeserver under WebDAV locks; it is not cached as an authoritative PostgreSQL SDK blob. Other authorized apps can advance the same links and delivery queue. A background worker receives private messages and processes outbound work without executing wallet payments.
 
-Shared hosted-state deployments require Pubky Homeserver **0.15 or newer**.
+Shared hosted-state deployments require Pubky Homeserver **0.16.2 or newer**
+with the required GCS behavior on every serving instance.
 Upgrade the deployed homeserver separately; updating Server's client dependencies
 does not upgrade that service. The SDK still requires commit-time fencing of
-expired lock holders and durable publication of complete files. Its five-minute
-uncertain-write cooldown remains in place and does not replace those requirements.
+expired lock holders and durable publication of complete files. It reconciles
+uncertain writes using exact ciphertext and per-attempt markers. Drain older
+writes and coordinate all writers before adoption; recovery does not replace
+those storage guarantees.
 
 Startup holds a session advisory lock while applying the single schema baseline. Before binding HTTP it verifies immutable deployment metadata and authenticates every persisted Creator credential, invoice payment record, and payment observation. Missing, corrupt, swapped, conflicting, or wrong-key database state aborts startup with a secret-free error. Hosted Paykit state is checked during SDK operations and setup readiness; failures do not create a replacement local state.
 

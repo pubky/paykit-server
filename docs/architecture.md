@@ -52,10 +52,12 @@ receives private events and processes queued delivery without executing payments
 The local reader demo likewise uses hosted SDK state; its encrypted local file
 retains only the app/Creator binding and a process ownership lock.
 
-Deployed Pubky Homeserver instances must run 0.15 or newer. Shared-state safety
-requires commit-time fencing of expired lock holders and durable publication of
-complete files; the SDK's five-minute uncertain-write cooldown remains in place
-and is not a substitute for those storage guarantees.
+Every serving Pubky Homeserver instance must run 0.16.2 or newer with the required
+GCS behavior. Shared-state safety requires commit-time fencing of expired lock
+holders and durable publication of complete files. The SDK reconciles uncertain
+writes using exact ciphertext and per-attempt markers; older writes must be
+drained and all writers coordinated before adoption. Recovery is not a substitute
+for those storage guarantees.
 
 ## Invoice and settlement invariants
 
