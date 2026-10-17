@@ -1,19 +1,27 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use paykit_sdk::PaykitIdentitySecretKey;
 use paykit_server::{
-    application::semantic_intent::DeliveryIntentV1,
+    application::{
+        payment_request_status::{PaymentRequestStatusOperations, PaymentState},
+        semantic_intent::DeliveryIntentV1,
+    },
     crypto::{Crypto, EncryptedEnvelope, EnvelopeContext},
-    domain::locks::{CreatorPubky, ReaderPubky, parse_bundle_id, parse_creator, parse_reader},
+    domain::locks::{
+        CreatorPubky, ReaderPubky, parse_addressed_lock_resource, parse_bundle_id, parse_creator,
+        parse_reader,
+    },
     persistence::{
         AtomicInvoiceInput, CreatorCredentials, CreatorStore, InvoicePayloadFactory,
-        InvoicePayloads, InvoiceStore, PersistenceError, run_migrations,
+        InvoicePayloads, InvoiceStore, OutboxStore, PaymentDrainStore,
+        PaymentRequestLifecycleStore, PersistenceError, run_migrations,
     },
 };
 use paykit_server_e2e::postgres::TestDatabase;
 use sqlx::Row;
 
 const CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
+const LOCK_RESOURCE: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/app.locks/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json";
 mod common;
 
 struct TestPayloads;
@@ -21,6 +29,33 @@ impl InvoicePayloadFactory for TestPayloads {
     fn for_child_index(&self, child_index: i64) -> Result<InvoicePayloads, PersistenceError> {
         Ok(InvoicePayloads {
             payment_request_intent: payment_intent(format!("test-address-{child_index}")),
+        })
+    }
+}
+
+struct GenerationPayloads(i64);
+impl InvoicePayloadFactory for GenerationPayloads {
+    fn expected_bitcoin_account_generation(&self) -> Option<i64> {
+        Some(self.0)
+    }
+
+    fn for_child_index(&self, child_index: i64) -> Result<InvoicePayloads, PersistenceError> {
+        TestPayloads.for_child_index(child_index)
+    }
+}
+
+struct ReaderPayloads(ReaderPubky);
+impl InvoicePayloadFactory for ReaderPayloads {
+    fn expected_bitcoin_account_generation(&self) -> Option<i64> {
+        Some(0)
+    }
+
+    fn for_child_index(&self, child_index: i64) -> Result<InvoicePayloads, PersistenceError> {
+        Ok(InvoicePayloads {
+            payment_request_intent: common::payment_intent(
+                &self.0,
+                format!("test-address-{child_index}"),
+            ),
         })
     }
 }
@@ -51,7 +86,7 @@ fn payment_intent(address: String) -> DeliveryIntentV1 {
     common::payment_intent(&reader(), address)
 }
 
-static TEST_PAYLOADS: TestPayloads = TestPayloads;
+static TEST_PAYLOADS: GenerationPayloads = GenerationPayloads(0);
 
 fn crypto() -> Arc<Crypto> {
     Arc::new(Crypto::from_master_key(&[7; 32]).unwrap())
@@ -108,6 +143,30 @@ async fn invoice_store(database: &TestDatabase) -> InvoiceStore {
     InvoiceStore::new(database.pool(), crypto)
 }
 
+async fn wait_for_lock_wait(database: &TestDatabase, query_fragment: &str) {
+    let pattern = format!("%{query_fragment}%");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let blocked: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM pg_stat_activity
+                 WHERE datname = current_database()
+                   AND wait_event_type = 'Lock'
+                   AND query LIKE $1",
+            )
+            .bind(&pattern)
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+            if blocked > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("expected query containing {query_fragment:?} to wait on a lock"));
+}
+
 fn input<'a>(
     creator: &'a CreatorPubky,
     reader: &'a ReaderPubky,
@@ -125,6 +184,765 @@ fn input<'a>(
         proposal_acceptance_seconds: 60 * 60,
         payment_window_seconds: 24 * 60 * 60,
     }
+}
+
+#[tokio::test]
+async fn creator_generation_fences_stale_bitcoin_invoice_issuance() {
+    let database = TestDatabase::create().await;
+    let store = invoice_store(&database).await;
+    sqlx::query("UPDATE creators SET bitcoin_account_generation = 1")
+        .execute(database.pool())
+        .await
+        .unwrap();
+    let creator = creator();
+    let reader = reader();
+    let stale = GenerationPayloads(0);
+    let current = GenerationPayloads(1);
+    let make_input = |bundle: &'static [u8], payloads| AtomicInvoiceInput {
+        creator: &creator,
+        reader: &reader,
+        bundle_binding: bundle,
+        lock_resource_binding: bundle,
+        payment_request_binding: bundle,
+        invoice_payloads: payloads,
+        proposal_acceptance_seconds: 60 * 60,
+        payment_window_seconds: 24 * 60 * 60,
+    };
+    assert_eq!(
+        store
+            .create_atomic(make_input(b"stale-generation", &stale))
+            .await,
+        Err(PersistenceError::Conflict)
+    );
+    let created = store
+        .create_atomic(make_input(b"current-generation", &current))
+        .await
+        .unwrap();
+    let generation: Option<i64> =
+        sqlx::query_scalar("SELECT bitcoin_account_generation FROM invoices WHERE id = $1")
+            .bind(created.invoice_id())
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(generation, Some(1));
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn rotation_cancels_proposed_preserves_accepted_and_exact_replays_old_bundle() {
+    let database = TestDatabase::create().await;
+    let store = invoice_store(&database).await;
+    let creator = creator();
+    let reader = reader();
+    let proposed = store
+        .create_atomic(input(
+            &creator,
+            &reader,
+            b"rotation-proposed-bundle",
+            b"rotation-proposed-request",
+        ))
+        .await
+        .unwrap();
+    let accepted_reader = second_reader();
+    let accepted_payloads = ReaderPayloads(accepted_reader.clone());
+    let accepted = store
+        .create_atomic(AtomicInvoiceInput {
+            creator: &creator,
+            reader: &accepted_reader,
+            bundle_binding: b"rotation-accepted-bundle",
+            lock_resource_binding: b"rotation-accepted-request",
+            payment_request_binding: b"rotation-accepted-request",
+            invoice_payloads: &accepted_payloads,
+            proposal_acceptance_seconds: 60 * 60,
+            payment_window_seconds: 24 * 60 * 60,
+        })
+        .await
+        .unwrap();
+    let proposed_request_id = uuid::Uuid::new_v4().to_string();
+    let accepted_request_id = uuid::Uuid::new_v4().to_string();
+    let accepted_owner_proposed_sibling_id = uuid::Uuid::new_v4().to_string();
+    for (invoice_id, request_id, state, cursor) in [
+        (
+            proposed.invoice_id(),
+            proposed_request_id.as_str(),
+            "proposed",
+            1_i64,
+        ),
+        (
+            accepted.invoice_id(),
+            accepted_request_id.as_str(),
+            "accepted",
+            2_i64,
+        ),
+        (
+            accepted.invoice_id(),
+            accepted_owner_proposed_sibling_id.as_str(),
+            "proposed",
+            3_i64,
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO payment_request_lifecycles
+             (invoice_id, sdk_payment_request_id, request_state, last_event_at,
+              last_stream_item_id)
+             VALUES ($1, $2, $3, NOW(), $4)",
+        )
+        .bind(invoice_id)
+        .bind(request_id)
+        .bind(state)
+        .bind(cursor)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    }
+    let lifecycles = PaymentRequestLifecycleStore::new(database.pool(), crypto());
+    let evidence = lifecycles
+        .required_receive_targets_for_creator_rotation(&creator)
+        .await
+        .unwrap();
+    assert_eq!(
+        evidence.len(),
+        2,
+        "a proposed sibling still requires receive before its accepted owner is classified"
+    );
+    let creators = CreatorStore::new(database.pool(), crypto());
+    let current = creators.load(&creator).await.unwrap();
+    let replacement = CreatorCredentials::new(
+        creator.clone(),
+        "rotated-session".into(),
+        current.paykit_identity_secret().clone(),
+        Some(paykit_server::domain::receiving::BitcoinAccount {
+            xpub: "replacement-xpub".to_owned().into(),
+            account_index: 7,
+        }),
+        None,
+    );
+    let rotation = creators
+        .rotate_bitcoin_account_after_receive(&lifecycles, &replacement, &evidence)
+        .await
+        .unwrap();
+    assert_eq!(rotation.cancellation_pending_count, 2);
+    let classifications: Vec<String> = sqlx::query_scalar(
+        "SELECT classification FROM creator_bitcoin_account_rotation_items
+         ORDER BY classification",
+    )
+    .fetch_all(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        classifications,
+        vec!["accepted", "cancellation_pending", "cancellation_pending"]
+    );
+    let mut cancellation_targets: Vec<String> = sqlx::query_scalar(
+        "SELECT cancellation_target_payment_request_id FROM outbox
+         WHERE intent_kind = 'payment_request_cancellation'",
+    )
+    .fetch_all(database.pool())
+    .await
+    .unwrap();
+    cancellation_targets.sort();
+    let mut expected_targets = vec![proposed_request_id, accepted_owner_proposed_sibling_id];
+    expected_targets.sort();
+    assert_eq!(cancellation_targets, expected_targets);
+    let replay = store
+        .create_atomic(input(
+            &creator,
+            &reader,
+            b"rotation-proposed-bundle",
+            b"rotation-proposed-request",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(replay.invoice_id(), proposed.invoice_id());
+    assert!(replay.replayed());
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn drain_reuses_authenticated_rotation_cancellation() {
+    let database = TestDatabase::create().await;
+    let store = invoice_store(&database).await;
+    let creator = creator();
+    let reader = reader();
+    let lock_resource = parse_addressed_lock_resource(LOCK_RESOURCE).unwrap();
+    let canonical_lock = lock_resource.to_string();
+    let created = store
+        .create_atomic(AtomicInvoiceInput {
+            creator: &creator,
+            reader: &reader,
+            bundle_binding: b"rotation-then-drain-bundle",
+            lock_resource_binding: canonical_lock.as_bytes(),
+            payment_request_binding: b"rotation-then-drain-request",
+            invoice_payloads: &TEST_PAYLOADS,
+            proposal_acceptance_seconds: 60 * 60,
+            payment_window_seconds: 24 * 60 * 60,
+        })
+        .await
+        .unwrap();
+    let request_id = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO payment_request_lifecycles
+         (invoice_id, sdk_payment_request_id, request_state, last_event_at,
+          last_stream_item_id)
+         VALUES ($1, $2, 'proposed', NOW(), 1)",
+    )
+    .bind(created.invoice_id())
+    .bind(&request_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+
+    let lifecycles = PaymentRequestLifecycleStore::new(database.pool(), crypto());
+    let evidence = lifecycles
+        .required_receive_targets_for_creator_rotation(&creator)
+        .await
+        .unwrap();
+    let creators = CreatorStore::new(database.pool(), crypto());
+    let current = creators.load(&creator).await.unwrap();
+    let replacement = CreatorCredentials::new(
+        creator,
+        "rotated-session".into(),
+        current.paykit_identity_secret().clone(),
+        Some(paykit_server::domain::receiving::BitcoinAccount {
+            xpub: "replacement-xpub".to_owned().into(),
+            account_index: 7,
+        }),
+        None,
+    );
+    let rotation = creators
+        .rotate_bitcoin_account_after_receive(&lifecycles, &replacement, &evidence)
+        .await
+        .unwrap();
+    assert_eq!(rotation.cancellation_pending_count, 1);
+    let rotation_cancellation_id: uuid::Uuid = sqlx::query_scalar(
+        "SELECT cancellation_outbox_id
+         FROM creator_bitcoin_account_rotation_items
+         WHERE classification = 'cancellation_pending'",
+    )
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    let rotation_only_drain_required: bool =
+        sqlx::query_scalar("SELECT cancellation_drain_required FROM outbox WHERE id = $1")
+            .bind(rotation_cancellation_id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert!(!rotation_only_drain_required);
+
+    let drain = PaymentDrainStore::new(database.pool(), crypto())
+        .create(&lock_resource)
+        .await
+        .unwrap();
+    assert!(drain.completed());
+    assert_eq!(drain.cancellation_enqueued_count(), 1);
+    let drain_cancellation_id: uuid::Uuid = sqlx::query_scalar(
+        "SELECT cancellation_outbox_id FROM payment_drain_cancellations
+         WHERE drain_id = $1 AND sdk_payment_request_id = $2",
+    )
+    .bind(drain.drain_id())
+    .bind(&request_id)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(drain_cancellation_id, rotation_cancellation_id);
+    let reused_drain_required: bool =
+        sqlx::query_scalar("SELECT cancellation_drain_required FROM outbox WHERE id = $1")
+            .bind(rotation_cancellation_id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert!(reused_drain_required);
+    let cancellation_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM outbox
+         WHERE intent_kind = 'payment_request_cancellation'",
+    )
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(cancellation_count, 1);
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn obsolete_transition_rechecks_concurrent_drain_promotion_under_row_lock() {
+    let database = TestDatabase::create().await;
+    let store = invoice_store(&database).await;
+    let creator = creator();
+    let reader = reader();
+    let created = store
+        .create_atomic(input(
+            &creator,
+            &reader,
+            b"obsolete-drain-race-bundle",
+            b"obsolete-drain-race-request",
+        ))
+        .await
+        .unwrap();
+    let request_id = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO payment_request_lifecycles
+         (invoice_id, sdk_payment_request_id, request_state, last_event_at,
+          last_stream_item_id)
+         VALUES ($1, $2, 'proposed', NOW(), 1)",
+    )
+    .bind(created.invoice_id())
+    .bind(&request_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+
+    let lifecycles = PaymentRequestLifecycleStore::new(database.pool(), crypto());
+    let evidence = lifecycles
+        .required_receive_targets_for_creator_rotation(&creator)
+        .await
+        .unwrap();
+    let creators = CreatorStore::new(database.pool(), crypto());
+    let current = creators.load(&creator).await.unwrap();
+    let replacement = CreatorCredentials::new(
+        creator,
+        "rotated-session".into(),
+        current.paykit_identity_secret().clone(),
+        Some(paykit_server::domain::receiving::BitcoinAccount {
+            xpub: "replacement-xpub".to_owned().into(),
+            account_index: 7,
+        }),
+        None,
+    );
+    creators
+        .rotate_bitcoin_account_after_receive(&lifecycles, &replacement, &evidence)
+        .await
+        .unwrap();
+    let cancellation_id: uuid::Uuid = sqlx::query_scalar(
+        "SELECT cancellation_outbox_id
+         FROM creator_bitcoin_account_rotation_items
+         WHERE classification = 'cancellation_pending'",
+    )
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE payment_request_lifecycles
+         SET request_state = 'accepted', state_event_id = $1,
+             last_stream_item_id = last_stream_item_id + 1,
+             last_event_at = last_event_at + INTERVAL '1 second'
+         WHERE invoice_id = $2",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(created.invoice_id())
+    .execute(database.pool())
+    .await
+    .unwrap();
+
+    let outbox = OutboxStore::new(database.pool(), crypto());
+    let claim = outbox
+        .claim(uuid::Uuid::new_v4(), 10, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|claim| claim.id() == cancellation_id)
+        .expect("rotation cancellation is claimable");
+    assert!(
+        outbox
+            .rotation_cancellation_target_is_accepted(&claim)
+            .await
+            .unwrap(),
+        "rotation-only acceptance observation permits obsolete transition"
+    );
+
+    let mut drain_promotion = database.pool().begin().await.unwrap();
+    sqlx::query("SELECT id FROM outbox WHERE id = $1 FOR UPDATE")
+        .bind(cancellation_id)
+        .fetch_one(&mut *drain_promotion)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE outbox SET cancellation_drain_required = TRUE WHERE id = $1")
+        .bind(cancellation_id)
+        .execute(&mut *drain_promotion)
+        .await
+        .unwrap();
+
+    let obsolete = tokio::spawn({
+        let outbox = outbox.clone();
+        async move { outbox.mark_cancellation_obsolete(&claim).await }
+    });
+    wait_for_lock_wait(&database, "SELECT id FROM outbox WHERE id = $1 FOR UPDATE").await;
+    drain_promotion.commit().await.unwrap();
+
+    assert!(
+        !obsolete.await.unwrap().unwrap(),
+        "committed drain ownership must fence obsolete transition"
+    );
+    let retained: (String, Option<String>, bool, bool) = sqlx::query_as(
+        "SELECT status, error_class, cancellation_drain_required,
+                claim_token IS NOT NULL
+         FROM outbox WHERE id = $1",
+    )
+    .bind(cancellation_id)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(retained, ("leased".into(), None, true, true));
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn drain_rejects_unauthenticated_or_unowned_cancellation() {
+    let database = TestDatabase::create().await;
+    let store = invoice_store(&database).await;
+    let creator = creator();
+    let reader = reader();
+    let lock_resource = parse_addressed_lock_resource(LOCK_RESOURCE).unwrap();
+    let canonical_lock = lock_resource.to_string();
+    let created = store
+        .create_atomic(AtomicInvoiceInput {
+            creator: &creator,
+            reader: &reader,
+            bundle_binding: b"mismatched-rotation-drain-bundle",
+            lock_resource_binding: canonical_lock.as_bytes(),
+            payment_request_binding: b"mismatched-rotation-drain-request",
+            invoice_payloads: &TEST_PAYLOADS,
+            proposal_acceptance_seconds: 60 * 60,
+            payment_window_seconds: 24 * 60 * 60,
+        })
+        .await
+        .unwrap();
+    let request_id = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO payment_request_lifecycles
+         (invoice_id, sdk_payment_request_id, request_state, last_event_at,
+          last_stream_item_id)
+         VALUES ($1, $2, 'proposed', NOW(), 1)",
+    )
+    .bind(created.invoice_id())
+    .bind(&request_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+
+    let lifecycles = PaymentRequestLifecycleStore::new(database.pool(), crypto());
+    let evidence = lifecycles
+        .required_receive_targets_for_creator_rotation(&creator)
+        .await
+        .unwrap();
+    let creators = CreatorStore::new(database.pool(), crypto());
+    let current = creators.load(&creator).await.unwrap();
+    let replacement = CreatorCredentials::new(
+        creator,
+        "rotated-session".into(),
+        current.paykit_identity_secret().clone(),
+        Some(paykit_server::domain::receiving::BitcoinAccount {
+            xpub: "replacement-xpub".to_owned().into(),
+            account_index: 7,
+        }),
+        None,
+    );
+    creators
+        .rotate_bitcoin_account_after_receive(&lifecycles, &replacement, &evidence)
+        .await
+        .unwrap();
+    let cancellation_id: uuid::Uuid = sqlx::query_scalar(
+        "SELECT cancellation_outbox_id
+         FROM creator_bitcoin_account_rotation_items
+         WHERE classification = 'cancellation_pending'",
+    )
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    let original_envelope: Vec<u8> =
+        sqlx::query_scalar("SELECT intent_envelope FROM outbox WHERE id = $1")
+            .bind(cancellation_id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    sqlx::query("UPDATE outbox SET intent_envelope = $1 WHERE id = $2")
+        .bind(b"unauthenticated-cancellation".as_slice())
+        .bind(cancellation_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+
+    let drains = PaymentDrainStore::new(database.pool(), crypto());
+    assert_eq!(
+        drains.create(&lock_resource).await,
+        Err(PersistenceError::CorruptOrMissing)
+    );
+    sqlx::query("UPDATE outbox SET intent_envelope = $1 WHERE id = $2")
+        .bind(original_envelope)
+        .bind(cancellation_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    sqlx::query(
+        "DELETE FROM creator_bitcoin_account_rotation_items
+         WHERE classification = 'cancellation_pending'",
+    )
+    .execute(database.pool())
+    .await
+    .unwrap();
+
+    assert_eq!(
+        drains.create(&lock_resource).await,
+        Err(PersistenceError::Conflict)
+    );
+    let durable_drains: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_drains")
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+    assert_eq!(durable_drains, 0);
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn rotation_waits_for_admitted_proposal_then_cancels_it() {
+    let database = TestDatabase::create().await;
+    let store = invoice_store(&database).await;
+    let created = store
+        .create_atomic(input(
+            &creator(),
+            &reader(),
+            b"rotation-worker-first-bundle",
+            b"rotation-worker-first-request",
+        ))
+        .await
+        .unwrap();
+    let creators = CreatorStore::new(database.pool(), crypto());
+    let outbox = OutboxStore::new(database.pool(), crypto());
+    let lifecycles = PaymentRequestLifecycleStore::new(database.pool(), crypto());
+    let creator_id: uuid::Uuid = sqlx::query_scalar("SELECT id FROM creators")
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+    let claim = outbox
+        .claim_for_creator(
+            uuid::Uuid::new_v4(),
+            creator_id,
+            std::time::Duration::from_secs(30),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let worker_fence = creators
+        .acquire_setup_lock_for_creator_id(claim.creator_id())
+        .await
+        .unwrap();
+    assert!(outbox.claim_handoff_eligible(&claim).await.unwrap());
+
+    let current = creators.load(&creator()).await.unwrap();
+    let replacement = CreatorCredentials::new(
+        creator(),
+        "rotated-session".into(),
+        current.paykit_identity_secret().clone(),
+        Some(paykit_server::domain::receiving::BitcoinAccount {
+            xpub: "replacement-xpub".to_owned().into(),
+            account_index: 7,
+        }),
+        None,
+    );
+    let evidence = lifecycles
+        .required_receive_targets_for_creator_rotation(&creator())
+        .await
+        .unwrap();
+    let rotation_started = Arc::new(tokio::sync::Notify::new());
+    let rotation = tokio::spawn({
+        let creators = creators.clone();
+        let lifecycles = lifecycles.clone();
+        let rotation_started = rotation_started.clone();
+        async move {
+            rotation_started.notify_one();
+            let fence = creators.acquire_setup_lock(&creator()).await.unwrap();
+            let result = creators
+                .rotate_bitcoin_account_after_receive(&lifecycles, &replacement, &evidence)
+                .await;
+            fence.release().await.unwrap();
+            result
+        }
+    });
+    rotation_started.notified().await;
+    tokio::task::yield_now().await;
+    assert!(
+        !rotation.is_finished(),
+        "cutover must wait for admitted worker"
+    );
+
+    let request_id = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO payment_request_lifecycles
+         (invoice_id, sdk_payment_request_id, request_state, last_event_at, last_stream_item_id)
+         VALUES ($1, $2, 'proposed', NOW(), 1)",
+    )
+    .bind(created.invoice_id())
+    .bind(&request_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    worker_fence.release().await.unwrap();
+
+    assert_eq!(
+        rotation.await.unwrap(),
+        Err(PersistenceError::Unavailable),
+        "newly projected current work must invalidate stale receive evidence"
+    );
+    let evidence = lifecycles
+        .required_receive_targets_for_creator_rotation(&creator())
+        .await
+        .unwrap();
+    let current = creators.load(&creator()).await.unwrap();
+    let replacement = CreatorCredentials::new(
+        creator(),
+        "rotated-session".into(),
+        current.paykit_identity_secret().clone(),
+        Some(paykit_server::domain::receiving::BitcoinAccount {
+            xpub: "replacement-xpub".to_owned().into(),
+            account_index: 7,
+        }),
+        None,
+    );
+    let result = creators
+        .rotate_bitcoin_account_after_receive(&lifecycles, &replacement, &evidence)
+        .await
+        .unwrap();
+    assert_eq!(result.cancellation_pending_count, 1);
+    let cancellation_target: String = sqlx::query_scalar(
+        "SELECT cancellation_target_payment_request_id FROM outbox
+         WHERE intent_kind = 'payment_request_cancellation'",
+    )
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(cancellation_target, request_id);
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn admitted_proposal_rechecks_eligibility_after_rotation_wins() {
+    let database = TestDatabase::create().await;
+    let store = invoice_store(&database).await;
+    let bundle = parse_bundle_id("000G40R40M30E209185GR38E1W").unwrap();
+    let created = store
+        .create_atomic(input(
+            &creator(),
+            &reader(),
+            bundle.to_string().as_bytes(),
+            b"rotation-cutover-first-request",
+        ))
+        .await
+        .unwrap();
+    let creators = CreatorStore::new(database.pool(), crypto());
+    let outbox = OutboxStore::new(database.pool(), crypto());
+    let lifecycles = PaymentRequestLifecycleStore::new(database.pool(), crypto());
+    let creator_id: uuid::Uuid = sqlx::query_scalar("SELECT id FROM creators")
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+    let claim = outbox
+        .claim_for_creator(
+            uuid::Uuid::new_v4(),
+            creator_id,
+            std::time::Duration::from_secs(30),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+    let cutover_fence = creators.acquire_setup_lock(&creator()).await.unwrap();
+    let worker_started = Arc::new(tokio::sync::Notify::new());
+    let worker = tokio::spawn({
+        let creators = creators.clone();
+        let outbox = outbox.clone();
+        let worker_started = worker_started.clone();
+        async move {
+            worker_started.notify_one();
+            let fence = creators
+                .acquire_setup_lock_for_creator_id(claim.creator_id())
+                .await
+                .unwrap();
+            let eligible = outbox.claim_handoff_eligible(&claim).await.unwrap();
+            fence.release().await.unwrap();
+            eligible
+        }
+    });
+    worker_started.notified().await;
+    tokio::task::yield_now().await;
+    assert!(
+        !worker.is_finished(),
+        "worker must wait for durable cutover"
+    );
+
+    let current = creators.load(&creator()).await.unwrap();
+    let replacement = CreatorCredentials::new(
+        creator(),
+        "rotated-session".into(),
+        current.paykit_identity_secret().clone(),
+        Some(paykit_server::domain::receiving::BitcoinAccount {
+            xpub: "replacement-xpub".to_owned().into(),
+            account_index: 7,
+        }),
+        None,
+    );
+    let evidence = lifecycles
+        .required_receive_targets_for_creator_rotation(&creator())
+        .await
+        .unwrap();
+    let result = creators
+        .rotate_bitcoin_account_after_receive(&lifecycles, &replacement, &evidence)
+        .await
+        .unwrap();
+    assert_eq!(result.cancellation_pending_count, 0);
+    cutover_fence.release().await.unwrap();
+
+    assert!(
+        !worker.await.unwrap(),
+        "suppressed proposal must not reach SDK"
+    );
+    let classification: String = sqlx::query_scalar(
+        "SELECT classification FROM creator_bitcoin_account_rotation_items
+         WHERE invoice_id = $1",
+    )
+    .bind(created.invoice_id())
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(classification, "proposal_suppressed");
+    let suppressed: (
+        String,
+        Option<uuid::Uuid>,
+        Option<uuid::Uuid>,
+        Option<time::OffsetDateTime>,
+    ) = sqlx::query_as(
+        "SELECT status, lease_owner, claim_token, lease_expires_at
+             FROM outbox WHERE invoice_id = $1 AND intent_kind = 'payment_request_proposal'",
+    )
+    .bind(created.invoice_id())
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(suppressed, ("permanently_failed".into(), None, None, None));
+    let status = PaymentRequestStatusOperations::lookup(&store, &creator(), &bundle)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        status.request_state(),
+        paykit_server::domain::payment_request_lifecycle::PaymentRequestLifecycleState::Canceled
+    );
+    assert_eq!(status.payment_state(), PaymentState::Undetected);
+
+    sqlx::query("UPDATE invoices SET payment_expired_at = payment_deadline WHERE id = $1")
+        .bind(created.invoice_id())
+        .execute(database.pool())
+        .await
+        .unwrap();
+    let expired = PaymentRequestStatusOperations::lookup(&store, &creator(), &bundle)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        expired.request_state(),
+        paykit_server::domain::payment_request_lifecycle::PaymentRequestLifecycleState::Canceled
+    );
+    assert_eq!(expired.payment_state(), PaymentState::Expired);
+    database.cleanup().await;
 }
 
 #[tokio::test]

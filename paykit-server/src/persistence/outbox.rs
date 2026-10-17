@@ -275,6 +275,17 @@ impl OutboxStore {
                      'payment_request_proposal', \
                      'payment_request_cancellation', 'reconciliation' \
                    ) \
+                   AND NOT (o.intent_kind = 'payment_request_cancellation' AND ( \
+                       EXISTS ( \
+                           SELECT 1 FROM invoices invoice \
+                           WHERE invoice.id = o.invoice_id \
+                             AND invoice.payment_deadline <= clock_timestamp() \
+                       ) OR EXISTS ( \
+                           SELECT 1 FROM marketplace_payment_preparations preparation \
+                           WHERE preparation.id = o.marketplace_preparation_id \
+                             AND preparation.payment_deadline <= clock_timestamp() \
+                       ) \
+                   )) \
                    AND (o.intent_kind <> 'payment_request_proposal' OR ( \
                        o.proposal_lookup_hash IS NOT NULL AND (EXISTS ( \
                            SELECT 1 FROM invoices invoice \
@@ -444,6 +455,37 @@ impl OutboxStore {
         )
         .bind(claim.id)
         .bind(claim.claim_token)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)
+    }
+
+    /// Canonical acceptance makes rotation-only cancellation obsolete. A
+    /// frozen drain cancellation remains required through drain cleanup. Call
+    /// only after receiving and projecting target peer under Creator-local SDK fence.
+    pub async fn rotation_cancellation_target_is_accepted(
+        &self,
+        claim: &ClaimedOutbox,
+    ) -> Result<bool, PersistenceError> {
+        sqlx::query_scalar(
+            "SELECT EXISTS (
+                 SELECT 1
+                 FROM outbox cancellation
+                 JOIN payment_request_lifecycles lifecycle
+                   ON lifecycle.sdk_payment_request_id =
+                      cancellation.cancellation_target_payment_request_id
+                  AND lifecycle.invoice_id IS NOT DISTINCT FROM cancellation.invoice_id
+                  AND lifecycle.marketplace_preparation_id IS NOT DISTINCT FROM
+                      cancellation.marketplace_preparation_id
+                 WHERE cancellation.id = $1
+                   AND cancellation.intent_kind = 'payment_request_cancellation'
+                   AND NOT cancellation.cancellation_drain_required
+                   AND lifecycle.request_state IN (
+                       'accepted', 'proof_submitted', 'active_recurring'
+                   )
+             )",
+        )
+        .bind(claim.id)
         .fetch_one(&self.pool)
         .await
         .map_err(|_| PersistenceError::Unavailable)
@@ -706,30 +748,31 @@ impl OutboxStore {
             .await
     }
 
-    pub async fn mark_cancellation_expired(
+    pub async fn mark_cancellation_obsolete(
         &self,
         claim: &ClaimedOutbox,
     ) -> Result<bool, PersistenceError> {
-        self.transition(
-            claim,
-            "permanently_failed",
-            Some("cancellation_expired"),
-            None,
+        let Some((mut transaction, now)) = self.transition_fence(claim.id).await? else {
+            return Ok(false);
+        };
+        let changed = sqlx::query(
+            "UPDATE outbox
+             SET status = 'permanently_failed', error_class = 'cancellation_obsolete',
+                 lease_owner = NULL, claim_token = NULL, lease_expires_at = NULL, updated_at = $3
+             WHERE id = $1 AND status = 'leased' AND claim_token = $2
+               AND lease_expires_at > $3 AND NOT cancellation_drain_required",
         )
+        .bind(claim.id)
+        .bind(claim.claim_token)
+        .bind(now)
+        .execute(&mut *transaction)
         .await
-    }
-
-    pub async fn mark_handed_off_cancellation_expired(
-        &self,
-        claim: &ClaimedHandoff,
-    ) -> Result<bool, PersistenceError> {
-        self.reconciliation_transition(
-            claim,
-            "permanently_failed",
-            Some("cancellation_expired"),
-            None,
-        )
-        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        transaction
+            .commit()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        Ok(changed.rows_affected() == 1)
     }
 
     pub async fn mark_retryable(

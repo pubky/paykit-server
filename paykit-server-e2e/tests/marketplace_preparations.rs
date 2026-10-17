@@ -23,8 +23,8 @@ use paykit_server::{
         CreatorCredentials, CreatorStore, MarketplaceActivationInput,
         MarketplaceLifecyclePersistenceError, MarketplacePreparationInput,
         MarketplacePreparationPayloadFactory, MarketplacePreparationPayloads,
-        MarketplacePreparationStore, MarketplaceResolutionOutcome, OutboxStore, PersistenceError,
-        run_migrations,
+        MarketplacePreparationStore, MarketplaceResolutionOutcome, OutboxStore,
+        PaymentRequestLifecycleStore, PersistenceError, run_migrations,
     },
     workers::outbox::{Adapter, HandoffError, HandoffResult, process_reconciliation},
 };
@@ -233,6 +233,10 @@ struct StoredPreparationEnvelope {
 }
 
 impl MarketplacePreparationPayloadFactory for Payloads {
+    fn expected_bitcoin_account_generation(&self) -> Option<i64> {
+        Some(0)
+    }
+
     fn for_child_index(
         &self,
         child_index: i64,
@@ -244,6 +248,21 @@ impl MarketplacePreparationPayloadFactory for Payloads {
                 "7cceb26d-9042-4ea6-bfcb-01bbd778d76e".into(),
             ),
         })
+    }
+}
+
+struct GenerationPayloads(i64);
+
+impl MarketplacePreparationPayloadFactory for GenerationPayloads {
+    fn expected_bitcoin_account_generation(&self) -> Option<i64> {
+        Some(self.0)
+    }
+
+    fn for_child_index(
+        &self,
+        child_index: i64,
+    ) -> Result<MarketplacePreparationPayloads, PersistenceError> {
+        Payloads.for_child_index(child_index)
     }
 }
 
@@ -456,6 +475,401 @@ fn input_with_payloads<'a>(
         payloads,
         ..input(creator, reader, operation_id, request_binding)
     }
+}
+
+#[tokio::test]
+async fn rotation_voids_old_preparation_and_new_operation_uses_current_generation() {
+    let database = TestDatabase::create().await;
+    let store = store(&database).await;
+    let creator = creator();
+    let reader = reader();
+    let old = store
+        .prepare(input(
+            &creator,
+            &reader,
+            "rotation-old-operation",
+            b"rotation-old-request",
+        ))
+        .await
+        .unwrap();
+    let creators = CreatorStore::new(database.pool(), crypto());
+    let current = creators.load(&creator).await.unwrap();
+    let replacement = CreatorCredentials::new(
+        creator.clone(),
+        "rotated-session".into(),
+        current.paykit_identity_secret().clone(),
+        Some(paykit_server::domain::receiving::BitcoinAccount {
+            xpub: "replacement-xpub".to_owned().into(),
+            account_index: 1,
+        }),
+        None,
+    );
+    let lifecycles = PaymentRequestLifecycleStore::new(database.pool(), crypto());
+    let rotation = creators
+        .rotate_bitcoin_account_after_receive(&lifecycles, &replacement, &[])
+        .await
+        .unwrap();
+    assert_eq!(rotation.voided_preparation_count, 1);
+    let state: String =
+        sqlx::query_scalar("SELECT state FROM marketplace_payment_preparations WHERE id = $1")
+            .bind(old.invoice_id())
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(state, "voided");
+    assert_eq!(
+        store
+            .activate(MarketplaceActivationInput {
+                creator: &creator,
+                invoice_id: old.invoice_id(),
+                amount: 100,
+                asset: CriterionAsset::Btc,
+                proposal_acceptance_window: Duration::from_secs(60),
+            })
+            .await,
+        Err(MarketplaceLifecyclePersistenceError::LifecycleTerminal)
+    );
+
+    assert!(
+        store
+            .prepare(input_with_payloads(
+                &creator,
+                &reader,
+                "rotation-stale-operation",
+                b"rotation-stale-request",
+                &GenerationPayloads(0),
+            ))
+            .await
+            .is_err()
+    );
+    let new = store
+        .prepare(input_with_payloads(
+            &creator,
+            &reader,
+            "rotation-new-operation",
+            b"rotation-new-request",
+            &GenerationPayloads(1),
+        ))
+        .await
+        .unwrap();
+    assert_ne!(new.invoice_id(), old.invoice_id());
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn rotation_preserves_accepted_marketplace_owner_and_durably_cancels_proposed_sibling() {
+    let database = TestDatabase::create().await;
+    let preparations = store(&database).await;
+    let creator = creator();
+    let prepared = preparations
+        .prepare(input(
+            &creator,
+            &reader(),
+            "rotation-ambiguous-marketplace",
+            b"rotation-ambiguous-marketplace",
+        ))
+        .await
+        .unwrap();
+    preparations
+        .activate(MarketplaceActivationInput {
+            creator: &creator,
+            invoice_id: prepared.invoice_id(),
+            amount: 100,
+            asset: CriterionAsset::Btc,
+            proposal_acceptance_window: Duration::from_secs(60 * 60),
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+    let outbox = OutboxStore::new(database.pool(), crypto());
+    let proposal_claim = outbox
+        .claim(uuid::Uuid::new_v4(), 1, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .remove(0);
+    let accepted_request_id = uuid::Uuid::new_v4().to_string();
+    assert!(
+        outbox
+            .mark_handed_off(
+                &proposal_claim,
+                &HandoffResult::PaymentRequestProposal {
+                    outbound_message_id: 92,
+                    event_id: "ambiguous-marketplace-event".into(),
+                    payment_request_id: accepted_request_id.clone(),
+                },
+            )
+            .await
+            .unwrap()
+    );
+    let proposed_sibling_id = uuid::Uuid::new_v4().to_string();
+    for (request_id, state, cursor) in [
+        (accepted_request_id.as_str(), "accepted", 1_i64),
+        (proposed_sibling_id.as_str(), "proposed", 2_i64),
+    ] {
+        sqlx::query(
+            "INSERT INTO payment_request_lifecycles
+             (marketplace_preparation_id, sdk_payment_request_id, request_state,
+              last_event_at, last_stream_item_id)
+             VALUES ($1, $2, $3, clock_timestamp(), $4)",
+        )
+        .bind(prepared.invoice_id())
+        .bind(request_id)
+        .bind(state)
+        .bind(cursor)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    }
+
+    let lifecycles = PaymentRequestLifecycleStore::new(database.pool(), crypto());
+    let evidence = lifecycles
+        .required_receive_targets_for_creator_rotation(&creator)
+        .await
+        .unwrap();
+    assert_eq!(evidence.len(), 1);
+    let creators = CreatorStore::new(database.pool(), crypto());
+    let current = creators.load(&creator).await.unwrap();
+    let replacement = CreatorCredentials::new(
+        creator,
+        "rotated-session".into(),
+        current.paykit_identity_secret().clone(),
+        Some(paykit_server::domain::receiving::BitcoinAccount {
+            xpub: "replacement-xpub".to_owned().into(),
+            account_index: 1,
+        }),
+        None,
+    );
+    let rotation = creators
+        .rotate_bitcoin_account_after_receive(&lifecycles, &replacement, &evidence)
+        .await
+        .unwrap();
+    assert_eq!(rotation.cancellation_pending_count, 1);
+    let classifications: Vec<String> = sqlx::query_scalar(
+        "SELECT classification FROM creator_bitcoin_account_rotation_items
+         WHERE marketplace_preparation_id = $1 ORDER BY classification",
+    )
+    .bind(prepared.invoice_id())
+    .fetch_all(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(classifications, vec!["accepted", "cancellation_pending"]);
+
+    let restarted_outbox = OutboxStore::new(database.pool(), crypto());
+    let cancellation = restarted_outbox
+        .claim(uuid::Uuid::new_v4(), 1, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .remove(0);
+    let (kind, target): (String, String) = sqlx::query_as(
+        "SELECT intent_kind, cancellation_target_payment_request_id
+         FROM outbox WHERE id = $1",
+    )
+    .bind(cancellation.id())
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(kind, "payment_request_cancellation");
+    assert_eq!(target, proposed_sibling_id);
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn legacy_marketplace_rotation_receives_before_classifying_stale_proposed_state() {
+    let database = TestDatabase::create().await;
+    let preparations = store(&database).await;
+    let creator = creator();
+    let prepared = preparations
+        .prepare(input(
+            &creator,
+            &reader(),
+            "rotation-legacy-marketplace",
+            b"rotation-legacy-marketplace",
+        ))
+        .await
+        .unwrap();
+    preparations
+        .activate(MarketplaceActivationInput {
+            creator: &creator,
+            invoice_id: prepared.invoice_id(),
+            amount: 100,
+            asset: CriterionAsset::Btc,
+            proposal_acceptance_window: Duration::from_secs(60 * 60),
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    let outbox = OutboxStore::new(database.pool(), crypto());
+    let proposal_claim = outbox
+        .claim(uuid::Uuid::new_v4(), 1, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .remove(0);
+    let request_id = uuid::Uuid::new_v4().to_string();
+    assert!(
+        outbox
+            .mark_handed_off(
+                &proposal_claim,
+                &HandoffResult::PaymentRequestProposal {
+                    outbound_message_id: 93,
+                    event_id: "legacy-marketplace-event".into(),
+                    payment_request_id: request_id.clone(),
+                },
+            )
+            .await
+            .unwrap()
+    );
+    sqlx::query(
+        "INSERT INTO payment_request_lifecycles
+         (marketplace_preparation_id, sdk_payment_request_id, request_state,
+          last_event_at, last_stream_item_id)
+         VALUES ($1, $2, 'proposed', clock_timestamp(), 1)",
+    )
+    .bind(prepared.invoice_id())
+    .bind(&request_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE marketplace_payment_preparations
+         SET bitcoin_account_generation = NULL WHERE id = $1",
+    )
+    .bind(prepared.invoice_id())
+    .execute(database.pool())
+    .await
+    .unwrap();
+
+    let lifecycles = PaymentRequestLifecycleStore::new(database.pool(), crypto());
+    let evidence = lifecycles
+        .required_receive_targets_for_creator_rotation(&creator)
+        .await
+        .unwrap();
+    assert_eq!(
+        evidence.len(),
+        1,
+        "authenticated legacy Bitcoin work must be visible before remote receive"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT bitcoin_account_generation FROM marketplace_payment_preparations
+             WHERE id = $1",
+        )
+        .bind(prepared.invoice_id())
+        .fetch_one(database.pool())
+        .await
+        .unwrap(),
+        Some(0),
+        "target discovery commits authenticated legacy generation backfill"
+    );
+
+    sqlx::query(
+        "UPDATE payment_request_lifecycles
+         SET request_state = 'accepted', last_stream_item_id = 2,
+             last_event_at = clock_timestamp()
+         WHERE marketplace_preparation_id = $1 AND sdk_payment_request_id = $2",
+    )
+    .bind(prepared.invoice_id())
+    .bind(&request_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    let creators = CreatorStore::new(database.pool(), crypto());
+    let current = creators.load(&creator).await.unwrap();
+    let replacement = CreatorCredentials::new(
+        creator,
+        "rotated-session".into(),
+        current.paykit_identity_secret().clone(),
+        Some(paykit_server::domain::receiving::BitcoinAccount {
+            xpub: "replacement-xpub".to_owned().into(),
+            account_index: 1,
+        }),
+        None,
+    );
+    let rotation = creators
+        .rotate_bitcoin_account_after_receive(&lifecycles, &replacement, &evidence)
+        .await
+        .unwrap();
+    assert_eq!(rotation.cancellation_pending_count, 0);
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT classification FROM creator_bitcoin_account_rotation_items
+             WHERE marketplace_preparation_id = $1",
+        )
+        .bind(prepared.invoice_id())
+        .fetch_one(database.pool())
+        .await
+        .unwrap(),
+        "accepted"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM outbox
+             WHERE marketplace_preparation_id = $1
+               AND intent_kind = 'payment_request_cancellation'",
+        )
+        .bind(prepared.invoice_id())
+        .fetch_one(database.pool())
+        .await
+        .unwrap(),
+        0
+    );
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn legacy_marketplace_rotation_rejects_unauthenticated_generation_backfill() {
+    let database = TestDatabase::create().await;
+    let preparations = store(&database).await;
+    let creator = creator();
+    let prepared = preparations
+        .prepare(input(
+            &creator,
+            &reader(),
+            "rotation-corrupt-legacy-marketplace",
+            b"rotation-corrupt-legacy-marketplace",
+        ))
+        .await
+        .unwrap();
+    preparations
+        .activate(MarketplaceActivationInput {
+            creator: &creator,
+            invoice_id: prepared.invoice_id(),
+            amount: 100,
+            asset: CriterionAsset::Btc,
+            proposal_acceptance_window: Duration::from_secs(60 * 60),
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    sqlx::query(
+        "UPDATE marketplace_payment_preparations
+         SET bitcoin_account_generation = NULL, preparation_envelope = decode('00', 'hex')
+         WHERE id = $1",
+    )
+    .bind(prepared.invoice_id())
+    .execute(database.pool())
+    .await
+    .unwrap();
+
+    let lifecycles = PaymentRequestLifecycleStore::new(database.pool(), crypto());
+    assert_eq!(
+        lifecycles
+            .required_receive_targets_for_creator_rotation(&creator)
+            .await,
+        Err(PersistenceError::CorruptOrMissing)
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT bitcoin_account_generation FROM marketplace_payment_preparations
+             WHERE id = $1",
+        )
+        .bind(prepared.invoice_id())
+        .fetch_one(database.pool())
+        .await
+        .unwrap(),
+        None
+    );
+    database.cleanup().await;
 }
 
 async fn stored_preparation_envelope(

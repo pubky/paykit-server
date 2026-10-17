@@ -91,6 +91,131 @@ impl PaymentRequestLifecycleStore {
         }
     }
 
+    /// Counterparties whose Bitcoin-bearing requests may affect one Creator-wide
+    /// account-rotation snapshot.
+    pub async fn required_receive_targets_for_creator_rotation(
+        &self,
+        creator: &CreatorPubky,
+    ) -> Result<Vec<RequiredReceiveTarget>, PersistenceError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        let creator_hash = self.crypto.lookup_hash(creator.to_string().as_bytes());
+        let creator_id: Uuid =
+            sqlx::query_scalar("SELECT id FROM creators WHERE creator_lookup_hash = $1")
+                .bind(creator_hash.as_bytes().as_slice())
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(|_| PersistenceError::Unavailable)?
+                .ok_or(PersistenceError::CorruptOrMissing)?;
+        let targets = self
+            .required_receive_targets_for_creator_rotation_in_transaction(
+                &mut transaction,
+                creator_id,
+            )
+            .await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        Ok(targets)
+    }
+
+    pub(crate) async fn required_receive_targets_for_creator_rotation_in_transaction(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        creator_id: Uuid,
+    ) -> Result<Vec<RequiredReceiveTarget>, PersistenceError> {
+        self.backfill_legacy_marketplace_bitcoin_generation(transaction, creator_id)
+            .await?;
+        let rows = sqlx::query_as::<_, RequiredReceiveTargetRow>(
+            "SELECT DISTINCT ON (proposal.id)
+                    proposal.id, creator.creator_lookup_hash, proposal.intent_envelope
+             FROM outbox proposal
+             JOIN creators creator ON creator.id = proposal.creator_id
+             LEFT JOIN invoices invoice ON invoice.id = proposal.invoice_id
+             LEFT JOIN marketplace_payment_preparations preparation
+               ON preparation.id = proposal.marketplace_preparation_id
+             WHERE proposal.creator_id = $1
+               AND proposal.intent_kind = 'payment_request_proposal'
+               AND (
+                   invoice.bitcoin_account_generation = creator.bitcoin_account_generation
+                   OR preparation.bitcoin_account_generation = creator.bitcoin_account_generation
+               )
+               AND (
+                   (proposal.status IN ('handed_off', 'delivered') AND NOT EXISTS (
+                       SELECT 1 FROM payment_request_lifecycles lifecycle
+                       WHERE lifecycle.invoice_id = invoice.id
+                          OR lifecycle.marketplace_preparation_id = preparation.id
+                   ))
+                   OR EXISTS (
+                       SELECT 1 FROM payment_request_lifecycles lifecycle
+                       WHERE (lifecycle.invoice_id = invoice.id
+                              OR lifecycle.marketplace_preparation_id = preparation.id)
+                         AND lifecycle.request_state = 'proposed'
+                   )
+               )
+             ORDER BY proposal.id",
+        )
+        .bind(creator_id)
+        .fetch_all(&mut **transaction)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        self.decode_required_receive_targets(rows)
+    }
+
+    async fn backfill_legacy_marketplace_bitcoin_generation(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        creator_id: Uuid,
+    ) -> Result<(), PersistenceError> {
+        let (creator_lookup_hash, generation): (Vec<u8>, i64) = sqlx::query_as(
+            "SELECT creator_lookup_hash, bitcoin_account_generation
+             FROM creators WHERE id = $1 FOR UPDATE",
+        )
+        .bind(creator_id)
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?
+        .ok_or(PersistenceError::CorruptOrMissing)?;
+        let creator_lookup_hash = lookup_hash(&creator_lookup_hash)?;
+        let legacy: Vec<(Uuid, Vec<u8>)> = sqlx::query_as(
+            "SELECT id, preparation_envelope FROM marketplace_payment_preparations
+             WHERE creator_id = $1 AND bitcoin_account_generation IS NULL
+             ORDER BY id FOR UPDATE",
+        )
+        .bind(creator_id)
+        .fetch_all(&mut **transaction)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        for (preparation_id, envelope) in legacy {
+            let plaintext = self
+                .crypto
+                .decrypt(
+                    &EnvelopeContext::marketplace_preparation(creator_lookup_hash, preparation_id),
+                    &EncryptedEnvelope::from_bytes(envelope),
+                )
+                .map_err(|_| PersistenceError::CorruptOrMissing)?;
+            if super::marketplace_preparations::PreparationEnvelope::decode(&plaintext)?
+                .has_bitcoin()
+            {
+                sqlx::query(
+                    "UPDATE marketplace_payment_preparations
+                     SET bitcoin_account_generation = $2
+                     WHERE id = $1 AND bitcoin_account_generation IS NULL",
+                )
+                .bind(preparation_id)
+                .bind(generation)
+                .execute(&mut **transaction)
+                .await
+                .map_err(|_| PersistenceError::Unavailable)?;
+            }
+        }
+        Ok(())
+    }
+
     pub async fn required_receive_targets_for_lock(
         &self,
         creator_id: Uuid,
@@ -114,10 +239,10 @@ impl PaymentRequestLifecycleStore {
              WHERE invoice.creator_id = $1
                AND invoice.lock_resource_lookup_hash = $2
                AND (
-                   NOT EXISTS (
+                   (proposal.status <> 'permanently_failed' AND NOT EXISTS (
                        SELECT 1 FROM payment_request_lifecycles AS lifecycle
                        WHERE lifecycle.invoice_id = invoice.id
-                   )
+                   ))
                    OR EXISTS (
                        SELECT 1 FROM payment_request_lifecycles AS lifecycle
                        WHERE lifecycle.invoice_id = invoice.id
@@ -157,10 +282,10 @@ impl PaymentRequestLifecycleStore {
              WHERE invoice.creator_id = $1
                AND invoice.bundle_lookup_hash = $2
                AND (
-                   NOT EXISTS (
+                   (proposal.status <> 'permanently_failed' AND NOT EXISTS (
                        SELECT 1 FROM payment_request_lifecycles AS lifecycle
                        WHERE lifecycle.invoice_id = invoice.id
-                   )
+                   ))
                    OR EXISTS (
                        SELECT 1 FROM payment_request_lifecycles AS lifecycle
                        WHERE lifecycle.invoice_id = invoice.id
@@ -200,10 +325,10 @@ impl PaymentRequestLifecycleStore {
              WHERE invoice.creator_id = $1
                AND invoice.lock_resource_lookup_hash = $2
                AND (
-                   NOT EXISTS (
+                   (proposal.status <> 'permanently_failed' AND NOT EXISTS (
                        SELECT 1 FROM payment_request_lifecycles AS lifecycle
                        WHERE lifecycle.invoice_id = invoice.id
-                   )
+                   ))
                    OR EXISTS (
                        SELECT 1 FROM payment_request_lifecycles AS lifecycle
                        WHERE lifecycle.invoice_id = invoice.id
@@ -243,10 +368,10 @@ impl PaymentRequestLifecycleStore {
              WHERE invoice.creator_id = $1
                AND invoice.bundle_lookup_hash = $2
                AND (
-                   NOT EXISTS (
+                   (proposal.status <> 'permanently_failed' AND NOT EXISTS (
                        SELECT 1 FROM payment_request_lifecycles AS lifecycle
                        WHERE lifecycle.invoice_id = invoice.id
-                   )
+                   ))
                    OR EXISTS (
                        SELECT 1 FROM payment_request_lifecycles AS lifecycle
                        WHERE lifecycle.invoice_id = invoice.id

@@ -28,7 +28,7 @@ use crate::{
     application::{
         payment_drain::{PaymentDrainError, PaymentDrainResult},
         payment_request_status::{PaymentRequestStatusError, PaymentRequestStatusSummary},
-        semantic_intent::{DeliveryIntentV1, PaymentTermsV1},
+        semantic_intent::{DeliveryIntentV1, DeliveryOperationV1, PaymentTermsV1},
     },
     config::PaykitConfig,
     domain::{
@@ -45,7 +45,7 @@ use crate::{
     },
     workers::outbox::{
         Adapter, HandoffError, HandoffFailure, HandoffResult, RetryableHandoffCause,
-        claimed_handoff_steps, handoff_steps,
+        RetryableHandoffStage, claimed_handoff_steps, handoff_steps,
     },
 };
 
@@ -58,6 +58,7 @@ pub struct CreatorSessionProvider {
     client_id: String,
     cache: Arc<TokioMutex<Option<CachedSession>>>,
     payment_request_refreshes: Arc<payment_status::PaymentRequestRefreshes>,
+    verified_reconnect: bool,
 }
 
 impl CreatorSessionProvider {
@@ -87,6 +88,7 @@ impl CreatorSessionProvider {
             client_id: config.client_id.to_string(),
             cache: Arc::new(TokioMutex::new(None)),
             payment_request_refreshes: Arc::new(payment_status::PaymentRequestRefreshes::default()),
+            verified_reconnect: false,
         }
     }
 }
@@ -95,6 +97,9 @@ impl CreatorSessionProvider {
 impl PubkySessionProvider for CreatorSessionProvider {
     async fn load_session_access(&self) -> paykit_sdk::Result<Option<PubkySessionAccess>> {
         let mut cache = self.cache.lock().await;
+        if self.verified_reconnect {
+            return Ok(cache.as_ref().map(|cached| cached.access.clone()));
+        }
         let credentials = self
             .creators
             .load(&self.creator)
@@ -198,6 +203,28 @@ impl CreatorSessions {
             })
             .clone()
     }
+
+    /// Isolated provider for reconciliation before changed-account credentials
+    /// commit. Caller has already verified identity, session, and Paykit key.
+    pub(crate) fn verified_reconnect_provider(
+        &self,
+        creator: &CreatorPubky,
+        session_secret: &str,
+        access: PubkySessionAccess,
+    ) -> CreatorSessionProvider {
+        CreatorSessionProvider {
+            creators: self.creators.clone(),
+            creator: creator.clone(),
+            public_client: self.pubky.clone(),
+            client_id: self.config.client_id.to_string(),
+            cache: Arc::new(TokioMutex::new(Some(CachedSession {
+                session_secret: zeroize::Zeroizing::new(session_secret.to_owned()),
+                access,
+            }))),
+            payment_request_refreshes: Arc::new(payment_status::PaymentRequestRefreshes::default()),
+            verified_reconnect: true,
+        }
+    }
 }
 
 #[async_trait]
@@ -289,6 +316,7 @@ pub struct PaykitAdapter {
     payment_request_refreshes: Arc<payment_status::PaymentRequestRefreshes>,
     usdt: Option<(InvoiceStore, crate::usdt::ArbitrumVerifier)>,
     marketplace: Option<Arc<MarketplacePreparationStore>>,
+    lifecycles: Option<PaymentRequestLifecycleStore>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -330,6 +358,31 @@ impl PaykitAdapter {
             &self.mutation_lock,
             tokio::sync::OwnedMutexGuard::mutex(guard)
         ));
+        if matches!(
+            intent.operation(),
+            DeliveryOperationV1::PaymentRequestCancellation { .. }
+        ) {
+            let lifecycles = self.lifecycles.as_ref().ok_or(HandoffFailure::Retryable(
+                RetryableHandoffStage::AdapterUnavailable,
+            ))?;
+            let target =
+                parse_peer(intent.reader_pubky()).map_err(|_| HandoffFailure::Permanent)?;
+            self.refresh_payment_requests_locked(
+                lifecycles,
+                &[ReceiveTarget {
+                    counterparty: target,
+                }],
+            )
+            .await
+            .map_err(|_| HandoffFailure::Retryable(RetryableHandoffStage::AdapterUnavailable))?;
+            if store
+                .rotation_cancellation_target_is_accepted(claim)
+                .await
+                .map_err(|_| HandoffFailure::Retryable(RetryableHandoffStage::AdapterUnavailable))?
+            {
+                return Err(HandoffFailure::CancellationObsolete);
+            }
+        }
         claimed_handoff_steps(self, intent, store, claim).await
     }
 
@@ -446,7 +499,13 @@ impl PaykitAdapter {
             app_id: config.app_id.clone(),
             usdt: None,
             marketplace: None,
+            lifecycles: None,
         })
+    }
+
+    pub fn with_lifecycles(mut self, lifecycles: PaymentRequestLifecycleStore) -> Self {
+        self.lifecycles = Some(lifecycles);
+        self
     }
 
     pub fn with_usdt(
@@ -482,6 +541,27 @@ impl PaykitAdapter {
         self.project_payment_requests_locked(lifecycles, health)
             .await?;
         self.observe_usdt_requests(None).await
+    }
+
+    /// Reconciles every counterparty that can affect Bitcoin account rotation,
+    /// returning evidence for the subsequent serializable persistence snapshot.
+    pub async fn reconcile_for_bitcoin_account_rotation(
+        &self,
+        guard: &tokio::sync::OwnedMutexGuard<()>,
+        lifecycles: &PaymentRequestLifecycleStore,
+    ) -> Result<Vec<RequiredReceiveTarget>, LifecycleSyncError> {
+        assert!(Arc::ptr_eq(
+            &self.mutation_lock,
+            tokio::sync::OwnedMutexGuard::mutex(guard)
+        ));
+        let required_targets = lifecycles
+            .required_receive_targets_for_creator_rotation(&self.creator)
+            .await
+            .map_err(map_projection_persistence_error)?;
+        let parsed_targets = parse_receive_targets(&required_targets)?;
+        self.refresh_payment_requests_locked(lifecycles, &parsed_targets)
+            .await?;
+        Ok(required_targets)
     }
 
     async fn refresh_payment_requests_locked(

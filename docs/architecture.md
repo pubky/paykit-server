@@ -8,9 +8,13 @@ published Paykit SDK. Domain terminology follows the dependency's `THESAURUS.md`
 ## Authority and setup
 
 Bitkit grants Pubky access to `/pub/paykit/:rw` and delegates a generation-bound
-Paykit Identity Secret. Initial setup also requests a BIP84 account xpub; reconnect
-preserves the Bitcoin account for an existing Creator. When USDT is enabled, setup and reconnect also request an optional Arbitrum receiving address. The server never receives
-Bitcoin spending keys or the Pubky identity secret. Receiving details cannot change through reauthorization; a previously omitted USDT address may be added.
+Paykit Identity Secret. Initial setup also requests a BIP84 account xpub. Reconnect
+preserves it when the companion response omits account material; an explicit changed
+account is reconciled, generation-fenced, and rotated while historical accepted payments
+remain monitored. When USDT is enabled, setup and reconnect also request an optional
+Arbitrum receiving address. The server never receives Bitcoin spending keys or the Pubky
+identity secret. A previously omitted USDT address may be added, but an approved USDT
+address cannot change through reauthorization.
 
 The companion claim is bound to the AUTH identity, secret, and exact permission
 list. Before delegation or private app publication, the identity owner uses

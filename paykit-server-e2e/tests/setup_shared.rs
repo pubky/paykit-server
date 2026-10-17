@@ -5,13 +5,23 @@ use bitcoin::{
     bip32::{ChildNumber, Xpriv, Xpub},
     secp256k1::Secp256k1,
 };
+use locks_core::{
+    ids::CreatorPubky as RawCreatorPubky,
+    lock_policy::{
+        AccessPolicy, CONTENT_LOCK_VERSION, ContentLock, Criterion, LockLogic, LockServerConfig,
+        VerifierType,
+    },
+};
 use paykit_sdk::{
     ContactUpdate, PAYKIT_SESSION_CAPABILITIES, PaykitIdentitySecretKey, PubkyAuthCompanionClaim,
     PubkyLocalSecretKey, PubkyPublicKey, PubkySessionAccess, PubkySessionBootstrap,
     PubkySessionProvider, StorageAdapter,
 };
 use paykit_server::{
-    application::create_invoice::derive_bip84_p2wpkh_address,
+    application::create_invoice::{
+        CreateInvoiceRequest, CreateInvoiceService, LockFetchError, LockFetcher,
+        PaykitIntentBuilder, derive_bip84_p2wpkh_address,
+    },
     bitkit_claim::{
         ClaimError, QUERY_PARAMETER, encode_unsigned_payload, parse_auth_request,
         parse_reconnect_auth_request,
@@ -19,11 +29,18 @@ use paykit_server::{
     bitkit_setup::BitkitAuthStarter,
     config::{BitcoinNetwork, Config, ConfigEnvironment},
     crypto::Crypto,
-    domain::locks::{CreatorPubky, ReaderPubky, parse_creator, parse_reader},
+    domain::{
+        invoice::CriterionPaymentWindowHours,
+        locks::{
+            CreatorPubky, PubkyLockResource, ReaderPubky, parse_addressed_lock_resource,
+            parse_bundle_id, parse_creator, parse_reader,
+        },
+    },
     paykit::{CreatorSessionProvider, CreatorSessions},
     persistence::{
         AtomicInvoiceInput, AtomicInvoiceResult, CreatorStore, InvoicePayloadFactory,
-        InvoicePayloads, InvoiceStore, PersistenceError, run_migrations,
+        InvoicePayloads, InvoiceStore, PaymentRequestLifecycleStore, PersistenceError,
+        run_migrations,
     },
     real_setup::{AppPublisher, RealSetupCompleter, SharedAppPublisher},
     setup::{PollResult, SetupLimits, SetupService, StartedFlow, SystemClock},
@@ -31,6 +48,8 @@ use paykit_server::{
 };
 use paykit_server_e2e::postgres::TestDatabase;
 use pubky_testnet::EphemeralTestnet;
+use std::collections::BTreeMap;
+use std::str::FromStr;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -38,22 +57,31 @@ use std::sync::{
 use std::time::Duration;
 
 mod common;
+use common::marketplace_rig::{ReadyRegistry, ReadySession};
 #[path = "fixtures/sdk.rs"]
 mod sdk_fixtures;
 
-struct AccountPayloads<'a>(&'a ReaderPubky);
+struct AccountPayloads<'a> {
+    reader: &'a ReaderPubky,
+    account: u32,
+    generation: i64,
+}
 
 impl InvoicePayloadFactory for AccountPayloads<'_> {
+    fn expected_bitcoin_account_generation(&self) -> Option<i64> {
+        Some(self.generation)
+    }
+
     fn for_child_index(&self, child_index: i64) -> Result<InvoicePayloads, PersistenceError> {
         let address = derive_bip84_p2wpkh_address(
-            &account(0).to_string(),
-            0,
+            &account(self.account).to_string(),
+            self.account,
             &BitcoinNetwork::Testnet,
             child_index,
         )
         .unwrap();
         Ok(InvoicePayloads {
-            payment_request_intent: common::payment_intent(self.0, address.clone()),
+            payment_request_intent: common::payment_intent(self.reader, address.clone()),
         })
     }
 }
@@ -63,6 +91,8 @@ async fn allocate_invoice(
     creator: &CreatorPubky,
     reader: &ReaderPubky,
     binding: &[u8],
+    account: u32,
+    generation: i64,
 ) -> AtomicInvoiceResult {
     invoices
         .create_atomic(AtomicInvoiceInput {
@@ -71,7 +101,11 @@ async fn allocate_invoice(
             bundle_binding: binding,
             lock_resource_binding: binding,
             payment_request_binding: binding,
-            invoice_payloads: &AccountPayloads(reader),
+            invoice_payloads: &AccountPayloads {
+                reader,
+                account,
+                generation,
+            },
 
             proposal_acceptance_seconds: 60 * 60,
             payment_window_seconds: 24 * 60 * 60,
@@ -177,6 +211,41 @@ fn account(index: u32) -> Xpub {
     Xpub::from_priv(&secp, &key)
 }
 
+struct StaticLock(ContentLock);
+
+#[async_trait]
+impl LockFetcher for StaticLock {
+    async fn fetch(&self, _resource: &PubkyLockResource) -> Result<ContentLock, LockFetchError> {
+        Ok(self.0.clone())
+    }
+}
+
+fn creator_content_lock(creator: &CreatorPubky) -> ContentLock {
+    ContentLock {
+        version: CONTENT_LOCK_VERSION,
+        creator: RawCreatorPubky::from_str(&creator.to_string()).unwrap(),
+        primary_resource: None,
+        secondary_resources: BTreeMap::new(),
+        criteria: vec![Criterion {
+            criterion_id: "payment".into(),
+            verifier_type: VerifierType::PaykitPayment,
+            params: serde_json::json!({
+                "recipient_pubky": creator.to_string(),
+                "amount": "100",
+                "asset": "BTC"
+            }),
+        }],
+        lock_logic: LockLogic::All {
+            criteria: vec!["payment".into()],
+        },
+        access_policy: AccessPolicy {
+            requested_credential_ttl_seconds: 900,
+        },
+        lock_server: LockServerConfig { override_: None },
+        created_at: time::OffsetDateTime::UNIX_EPOCH,
+    }
+}
+
 async fn complete(
     service: &SetupService,
     bootstrap: &PubkySessionBootstrap,
@@ -236,8 +305,11 @@ async fn reconnect_payload(
         .unwrap();
     let request =
         parse_reconnect_auth_request(&flow.authorization_url, PAYKIT_SESSION_CAPABILITIES).unwrap();
-    assert_eq!(request.claim_type(), "paykit-access-v1");
-    assert!(!flow.authorization_url.contains("watch-only-account-v1"));
+    assert_eq!(
+        request.claim_type(),
+        "paykit-access-v1.watch-only-account-v1"
+    );
+    assert!(flow.authorization_url.contains("watch-only-account-v1"));
     approve_payload(service, bootstrap, root, flow, payload, true).await
 }
 
@@ -325,20 +397,17 @@ async fn real_setup_reconnect_preserves_pending_invoices_and_hosted_state() {
         .unwrap();
     let crypto = Arc::new(Crypto::from_master_key(&[1; 32]).unwrap());
     let creators = CreatorStore::new(database.pool(), crypto.clone());
-    let invoices = InvoiceStore::new(database.pool(), crypto);
-    let sessions = CreatorSessions::new(
-        creators.clone(),
-        client.clone(),
-        paykit_server::config::PaykitConfig {
-            client_id: pubky::ClientId::new("app.paykit.server").unwrap(),
-            app_id: paykit_lib::PaykitAppId::new("paykit-server").unwrap(),
-            network: paykit_server::config::PaykitNetwork::Testnet,
-            proposal_acceptance_window: Duration::from_secs(60 * 60),
-            payment_window: Duration::from_secs(24 * 60 * 60),
-            conversion_payment_window: std::time::Duration::from_secs(3600),
-            marketplace_prepare_ttl: Duration::from_secs(15 * 60),
-        },
-    );
+    let invoices = InvoiceStore::new(database.pool(), crypto.clone());
+    let paykit_config = paykit_server::config::PaykitConfig {
+        client_id: pubky::ClientId::new("app.paykit.server").unwrap(),
+        app_id: paykit_lib::PaykitAppId::new("paykit-server").unwrap(),
+        network: paykit_server::config::PaykitNetwork::Testnet,
+        proposal_acceptance_window: Duration::from_secs(60 * 60),
+        payment_window: Duration::from_secs(24 * 60 * 60),
+        conversion_payment_window: std::time::Duration::from_secs(3600),
+        marketplace_prepare_ttl: Duration::from_secs(15 * 60),
+    };
+    let sessions = CreatorSessions::new(creators.clone(), client.clone(), paykit_config.clone());
     let publisher = Arc::new(FailAfterPublication {
         creators: creators.clone(),
         sessions: sessions.clone(),
@@ -353,8 +422,12 @@ async fn real_setup_reconnect_preserves_pending_invoices_and_hosted_state() {
         )),
         publisher.clone(),
         creators.clone(),
-        sessions,
+        sessions.clone(),
         BitcoinNetwork::Testnet,
+    )
+    .with_bitcoin_rotation(
+        PaymentRequestLifecycleStore::new(database.pool(), crypto.clone()),
+        paykit_config,
     );
     let service = SetupService::new(
         vec!["https://app.example".into()],
@@ -454,20 +527,178 @@ async fn real_setup_reconnect_preserves_pending_invoices_and_hosted_state() {
         PollResult::Complete
     );
     assert!(creators.setup_complete(&creator).await.unwrap());
+
+    let old_credentials = creators.load(&creator).await.unwrap();
+    let old_access = sessions
+        .provider(&creator)
+        .load_session_access()
+        .await
+        .unwrap()
+        .unwrap();
+    bootstrap
+        .revoke_grant(old_credentials.session_secret(), &old_access)
+        .await
+        .unwrap();
+    let changed_account = encode_unsigned_payload(1, &account(1).encode(), &key);
+    let calls_before_rotation = publisher.calls.load(Ordering::SeqCst);
+    assert_eq!(
+        reconnect_payload(
+            &service,
+            &bootstrap,
+            &root,
+            &creator,
+            changed_account.as_slice()
+        )
+        .await,
+        PollResult::Complete,
+        "verified replacement grant must survive reconciliation after the old grant is revoked"
+    );
+    let changed = creators.load(&creator).await.unwrap();
+    assert_eq!(
+        changed.bitcoin_account().unwrap().xpub.as_str(),
+        account(1).to_string()
+    );
+    assert_eq!(
+        creators
+            .load_with_bitcoin_account_generation(&creator)
+            .await
+            .unwrap()
+            .1,
+        1
+    );
+    assert_eq!(
+        publisher.calls.load(Ordering::SeqCst),
+        calls_before_rotation + 1,
+        "changed-account reconnect must publish before completing setup"
+    );
+
     let reader = parse_reader(&contact.to_app_key()).unwrap();
-    let pending = allocate_invoice(&invoices, &creator, &reader, b"pending-before-reconnect").await;
-    assert_eq!(pending.reader_child_index(), 0);
-    let second = allocate_invoice(&invoices, &creator, &reader, b"second-before-reconnect").await;
-    assert_eq!(second.reader_child_index(), 1);
+    let lock = creator_content_lock(&creator);
+    let lock_resource =
+        parse_addressed_lock_resource(&format!("{creator}{}", lock.content_lock_path().unwrap()))
+            .unwrap();
+    let create_invoices = CreateInvoiceService::new(
+        Arc::new(ReadySession),
+        Arc::new(StaticLock(lock)),
+        Arc::new(ReadyRegistry),
+        common::app_id(),
+        Arc::new(creators.clone()),
+        BitcoinNetwork::Testnet,
+        Arc::new(invoices.clone()),
+        Arc::new(PaykitIntentBuilder::new(BitcoinNetwork::Testnet)),
+    );
+    let rotated_invoice = create_invoices
+        .create(CreateInvoiceRequest {
+            bundle_id: parse_bundle_id("000G40R40M30E209185GR38E1W").unwrap(),
+            lock_resource,
+            reader: reader.clone(),
+            payment_in: CriterionPaymentWindowHours::new(24).unwrap(),
+        })
+        .await
+        .unwrap();
+    let expected_address = derive_bip84_p2wpkh_address(
+        &account(1).to_string(),
+        1,
+        &BitcoinNetwork::Testnet,
+        rotated_invoice.reader_child_index(),
+    )
+    .unwrap();
+    let (stored_address_hash, stored_generation): (Vec<u8>, Option<i64>) = sqlx::query_as(
+        "SELECT bitcoin_address_lookup_hash, bitcoin_account_generation
+         FROM invoices WHERE id = $1",
+    )
+    .bind(rotated_invoice.invoice_id())
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(stored_generation, Some(1));
+    assert_eq!(
+        stored_address_hash,
+        crypto
+            .bitcoin_address_lookup_hash(expected_address.as_bytes())
+            .as_bytes(),
+        "next invoice must derive from the persisted replacement account"
+    );
+
+    sqlx::query(
+        "UPDATE outbox
+         SET status = 'delivered', sdk_outbound_message_id = '1',
+             sdk_event_id = 'event-unreachable', sdk_payment_request_id = 'request-unreachable'
+         WHERE id = $1",
+    )
+    .bind(rotated_invoice.payment_request_outbox_id())
+    .execute(database.pool())
+    .await
+    .unwrap();
+
+    // Current handed-off work without a projected lifecycle still fails closed.
+    let restored_account = encode_unsigned_payload(0, &account(0).encode(), &key);
+    assert_eq!(
+        reconnect_payload(
+            &service,
+            &bootstrap,
+            &root,
+            &creator,
+            restored_account.as_slice()
+        )
+        .await,
+        PollResult::Failed
+    );
+    assert_eq!(
+        creators
+            .load_with_bitcoin_account_generation(&creator)
+            .await
+            .unwrap()
+            .1,
+        1
+    );
+
+    // Once the unreachable target is historical, it must not block a later rotation.
+    sqlx::query("UPDATE invoices SET bitcoin_account_generation = 0 WHERE id = $1")
+        .bind(rotated_invoice.invoice_id())
+        .execute(database.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        reconnect_payload(
+            &service,
+            &bootstrap,
+            &root,
+            &creator,
+            restored_account.as_slice()
+        )
+        .await,
+        PollResult::Complete
+    );
+    let pending = allocate_invoice(
+        &invoices,
+        &creator,
+        &reader,
+        b"pending-before-reconnect",
+        0,
+        2,
+    )
+    .await;
+    assert_eq!(pending.reader_child_index(), 1);
+    let second = allocate_invoice(
+        &invoices,
+        &creator,
+        &reader,
+        b"second-before-reconnect",
+        0,
+        2,
+    )
+    .await;
+    assert_eq!(second.reader_child_index(), 2);
     let before_reconnect = business_rows(&database).await;
-    let original = creators.load(&creator).await.unwrap();
-    let publication_calls = publisher.calls.load(Ordering::SeqCst);
-    // Even a correctly signed combined reply cannot smuggle account bytes into reconnect.
+    // An explicitly repeated account is an authenticated no-op.
     let combined = encode_unsigned_payload(0, &account(0).encode(), &key);
     assert_eq!(
         reconnect_payload(&service, &bootstrap, &root, &creator, combined.as_slice()).await,
-        PollResult::Failed
+        PollResult::Complete
     );
+    let original = creators.load(&creator).await.unwrap();
+    let publication_calls = publisher.calls.load(Ordering::SeqCst);
     let other_root = PubkyLocalSecretKey::new(pubky::Keypair::random().secret_key());
     let other = bootstrap
         .sign_up(&other_root, &home, None, PAYKIT_SESSION_CAPABILITIES)
@@ -488,7 +719,7 @@ async fn real_setup_reconnect_preserves_pending_invoices_and_hosted_state() {
         complete(&service, &bootstrap, &root, &key, 1).await,
         PollResult::Failed
     );
-    // A different valid xpub at the same account index must also be rejected.
+    // Initial setup cannot rotate an existing Creator; reconnect owns that operation.
     let mut different = account(0);
     different.chain_code = account(1).chain_code;
     let payload = encode_unsigned_payload(0, &different.encode(), &key);
@@ -668,10 +899,10 @@ poll_interval = "1s"
         replay.payment_request_outbox_id(),
         pending.payment_request_outbox_id()
     );
-    assert_eq!(replay.reader_child_index(), 0);
+    assert_eq!(replay.reader_child_index(), 1);
     assert_eq!(business_rows(&database).await, before_reconnect);
-    let next = allocate_invoice(&invoices, &creator, &reader, b"after-key-rotation").await;
-    assert_eq!(next.reader_child_index(), 2);
+    let next = allocate_invoice(&invoices, &creator, &reader, b"after-key-rotation", 0, 2).await;
+    assert_eq!(next.reader_child_index(), 3);
     assert_ne!(next.invoice_id(), pending.invoice_id());
     let rotated_access = provider.load_session_access().await.unwrap().unwrap();
     assert_eq!(

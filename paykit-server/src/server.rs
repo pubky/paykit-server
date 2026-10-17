@@ -200,13 +200,16 @@ impl Server {
         if config.usdt.is_some() {
             auth_starter = auth_starter.with_usdt();
         }
-        let setup_completer = Arc::new(RealSetupCompleter::new(
-            auth_starter,
-            relay,
-            creators.clone(),
-            sessions.clone(),
-            config.deployment_invariants().bitcoin_network.clone(),
-        ));
+        let setup_completer = Arc::new(
+            RealSetupCompleter::new(
+                auth_starter,
+                relay,
+                creators.clone(),
+                sessions.clone(),
+                config.deployment_invariants().bitcoin_network.clone(),
+            )
+            .with_bitcoin_rotation(payment_request_lifecycles.clone(), config.paykit.clone()),
+        );
         let setup = SetupService::new_with_authorization_url_logging(
             config.setup.allowed_origins.clone(),
             setup_completer,
@@ -768,6 +771,7 @@ async fn creator_adapter(
     PaykitAdapter::new(creator_id, sessions, &workers.paykit)
         .map(|adapter| {
             adapter
+                .with_lifecycles(workers.payment_request_lifecycles.clone())
                 .with_usdt(workers.invoices.clone(), workers.usdt.clone())
                 .with_marketplace_usdt(workers.marketplace_preparations.clone())
         })
@@ -880,6 +884,13 @@ async fn process_creator_outbox(
     owner: Uuid,
     creator: Uuid,
 ) -> Result<Option<(bool, ProcessingHealth)>, PersistenceError> {
+    // Setup/rotation takes this PostgreSQL fence before the process-local SDK
+    // mutex. Keep the same ordering here to serialize external SDK effects with
+    // durable cutover across processes without lock inversion.
+    let mutation_fence = tokio::select! {
+        _ = runtime.cancelled() => return Ok(None),
+        fence = workers.creators.acquire_setup_lock_for_creator_id(creator) => fence?,
+    };
     let guard = tokio::select! {
         _ = runtime.cancelled() => return Ok(None),
         guard = creator_mutation_lock(creator).lock_owned() => guard,
@@ -983,7 +994,15 @@ async fn process_creator_outbox(
             "handed-off delivery deferred to transport maintenance"
         );
     }
-    result.map(Some)
+    let result = result.map(Some);
+    let unlocked = mutation_fence.release().await;
+    match result {
+        Err(error) => Err(error),
+        Ok(result) => {
+            unlocked?;
+            Ok(result)
+        }
+    }
 }
 
 async fn outbox_reconciliation_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtime>) {

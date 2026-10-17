@@ -1837,6 +1837,22 @@ async fn durable_cancellation_enqueue_is_sufficient_for_completion() {
     .await
     .unwrap();
 
+    let outbox = OutboxStore::new(database.pool(), crypto.clone());
+    let claim = outbox
+        .claim(Uuid::new_v4(), 10, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|claim| claim.id() == cancellation_outbox_id)
+        .expect("drain-required cancellation remains claimable after cleanup");
+    assert!(
+        !outbox
+            .rotation_cancellation_target_is_accepted(&claim)
+            .await
+            .unwrap(),
+        "acceptance after the frozen drain snapshot must not obsolete its cancellation"
+    );
+
     let (fresh_invoice, _) = insert_invoice(
         &database,
         &crypto,

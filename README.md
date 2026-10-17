@@ -234,8 +234,9 @@ capabilities. That owner-only scope includes
 The App Registry remains discovery metadata, not key authority.
 
 An existing Creator without signed key authorization is not ready until its
-authorizer publishes that record. Reconnect refreshes delegated credentials while
-preserving the account and invoices; signed authorization does not require a
+authorizer publishes that record. Reconnect refreshes delegated credentials and
+may explicitly rotate the Bitcoin account while preserving historical invoices;
+signed authorization does not require a
 database reset.
 
 Bitkit authorizes only `/pub/paykit/:rw` for Server. With USDT disabled, the server requests two independent
@@ -247,8 +248,10 @@ delegated key and generation against the Creator's signed Noise key authorizatio
 persists credentials, then
 publishes only the `paykit-server` app entry through the SDK. Other apps and
 shared history remain intact. Failed publication leaves setup incomplete and
-retryable. Reauthorization preserves the account/xpub and accepts only the same
-key or a newer generation. The server never receives the Pubky root secret or
+retryable. Reauthorization preserves an omitted or identical account. A different
+valid BIP84 account triggers atomic generation cutover and durable asynchronous
+cancellation of unaccepted old-account requests. The delegated Paykit key must be
+the same or a newer generation. The server never receives the Pubky root secret or
 Bitcoin spending keys.
 
 This Bitcoin setup requires both permissions. With `[usdt]` enabled, setup additionally requests optional `usdt-address-v1` and uses the JSON claim described below. The exact received list order binds the
@@ -256,16 +259,21 @@ SDK signature and relay channel; the 124-byte payload always puts watch-only
 account bytes before Paykit key material regardless of list order. Empty,
 duplicate, unknown, or one-only selections fail setup.
 Reconnect uses `GET /setup/reconnect?creator=pubky...&return_to=...&state=...`.
-The server requires an existing Creator and requests `paykit-access-v1`
-(41 unsigned bytes), adding optional `usdt-address-v1` when enabled. The AUTH identity must match that exact Creator; the xpub
-and account index come exclusively from stored credentials under the setup lock.
-No watch-only account is selected, allocated, or retransmitted on reconnect.
+The server requires an existing Creator and requests
+`paykit-access-v1.watch-only-account-v1`, adding optional `usdt-address-v1` when
+enabled. The AUTH identity must match that exact Creator. A signed 41-byte
+Paykit-only response omits Bitcoin rotation; a signed 124-byte response explicitly
+supplies the account. Changed account material must be valid BIP84 for the configured
+network; Bitcoin receiving cannot be removed.
 Initial setup cannot replace an existing binding; use reconnect even when retrying
 publication after credentials were stored. Client IDs and display names are never
 used to infer account bindings. Rejected
 or abandoned approval leaves existing credentials, pending invoices, assignments,
-and allocation indexes intact. Successful reauthorization can refresh the session
-or rotate the Paykit key without resetting that state. See the
+and allocation indexes intact. Successful reauthorization can refresh the session,
+rotate the Paykit key, or rotate the Bitcoin account. Rotation cancels each whole
+unaccepted mixed request, preserves accepted old-address monitoring under original
+deadline/finality rules, voids unpublished Bitcoin Marketplace preparations, and
+requires a new bundle/operation ID for replacement issuance. See the
 [companion contract](docs/bitkit-companion-claim.md) for exact wire bytes.
 
 The local Locks demo substitutes a Paykit-owned Cargo example for Bitkit. That
@@ -638,7 +646,8 @@ other authorized apps through the SDK's recovery flow.
 - One Electrum endpoint; no failover pool.
 - `tcp://` Electrum has no transport authentication; use a CA-valid `ssl://` endpoint for production.
 - No configured Creator-count bound or runtime eviction.
-- One xpub/account index per Creator; no xpub, account, master-key, or immutable-invariant rotation.
+- One current xpub/account index per Creator. Explicit reconnect can rotate that Bitcoin
+  account after lifecycle reconciliation; no master-key or immutable-invariant rotation.
 - BTC and optional direct USDT0 on Arbitrum One, with fixed denomination conversion; no bridging or asset swaps.
 - No public payer inbox or proof-submission API, and no receipt issuance.
 - No spending custody, refunds, credits, or change.
@@ -659,7 +668,8 @@ the server. A standard Arbitrum JSON-RPC endpoint must support `eth_chainId`,
 
 Setup requests the existing Bitcoin account plus `usdt-address-v1`. The user can
 skip USDT without blocking Bitcoin. Reconnect can add a previously omitted USDT
-address but cannot change an already-approved address or Bitcoin account.
+address but cannot change an already-approved USDT address. An explicit full companion
+claim may rotate the Bitcoin account through the reconciliation and cutover flow above.
 Signed `POST /setup/status` accepts two optional fields that answer different
 questions and return the same `{status}` response:
 

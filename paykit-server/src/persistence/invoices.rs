@@ -55,6 +55,7 @@ pub struct AtomicInvoiceInput<'a> {
     pub lock_resource_binding: &'a [u8],
     /// Exact payment-request binding for idempotent replay detection.
     pub payment_request_binding: &'a [u8],
+
     /// Derives the address and complete request only after this
     /// transaction has selected the permanent child index.
     pub invoice_payloads: &'a dyn InvoicePayloadFactory,
@@ -225,6 +226,12 @@ impl BitcoinObservationInput {
 
 /// Produces payloads after the creator-row lock determines the child index.
 pub trait InvoicePayloadFactory: Send + Sync {
+    /// Generation observed with the Bitcoin account used by this factory.
+    /// Test and non-Bitcoin factories default to no generation fence.
+    fn expected_bitcoin_account_generation(&self) -> Option<i64> {
+        None
+    }
+
     fn for_child_index(&self, child_index: i64) -> Result<InvoicePayloads, PersistenceError>;
 }
 
@@ -658,7 +665,7 @@ impl InvoiceStore {
             .await
             .map_err(|_| PersistenceError::Unavailable)?;
         let creator = sqlx::query_as::<_, CreatorRow>(
-            "SELECT id, creator_lookup_hash, next_child_index FROM creators \
+            "SELECT id, creator_lookup_hash, next_child_index, bitcoin_account_generation FROM creators \
              WHERE creator_lookup_hash = $1 FOR UPDATE",
         )
         .bind(creator_hash.as_bytes().as_slice())
@@ -881,7 +888,24 @@ impl InvoiceStore {
         invoice_id: Uuid,
     ) -> Result<Option<PaymentRequestStatusSummary>, PersistenceError> {
         let row = sqlx::query_as::<_, PaymentRequestStatusRow>(
-            "SELECT lifecycle.request_state, invoices.payment_status,
+            "SELECT COALESCE(
+                        lifecycle.request_state,
+                        CASE WHEN EXISTS (
+                            SELECT 1
+                            FROM creator_bitcoin_account_rotation_items rotation_item
+                            WHERE rotation_item.invoice_id = invoices.id
+                              AND rotation_item.classification = 'proposal_suppressed'
+                        ) THEN 'canceled'
+                        WHEN EXISTS (
+                            SELECT 1
+                            FROM outbox proposal
+                            WHERE proposal.invoice_id = invoices.id
+                              AND proposal.intent_kind = 'payment_request_proposal'
+                              AND proposal.status = 'permanently_failed'
+                              AND proposal.error_class = 'proposal_expired'
+                        ) THEN 'proposal_expired' END
+                    ) AS request_state,
+                    invoices.payment_status,
                     invoices.confirmation_count, invoices.amount_matched,
                     invoices.invoice_created_at, invoices.payment_deadline,
                     invoices.payment_expired_at,
@@ -1365,7 +1389,7 @@ impl InvoiceStore {
             .await
             .map_err(|_| PersistenceError::Unavailable)?;
         let creator = sqlx::query_as::<_, CreatorRow>(
-            "SELECT id, creator_lookup_hash, next_child_index \
+            "SELECT id, creator_lookup_hash, next_child_index, bitcoin_account_generation \
              FROM creators WHERE creator_lookup_hash = $1 FOR UPDATE",
         )
         .bind(creator_hash.as_bytes().as_slice())
@@ -1433,6 +1457,14 @@ impl InvoiceStore {
                 payment_deadline: existing.payment_deadline,
                 replayed: true,
             });
+        }
+
+        if input
+            .invoice_payloads
+            .expected_bitcoin_account_generation()
+            .is_some_and(|expected| expected != creator.bitcoin_account_generation)
+        {
+            return Err(PersistenceError::Conflict);
         }
 
         sqlx::query(
@@ -1574,9 +1606,9 @@ impl InvoiceStore {
               payment_record_envelope, bitcoin_address_lookup_hash,
               derivation_index_lookup_hash, payment_status, invoice_created_at,
               proposal_expires_at, payment_deadline, proposal_acceptance_seconds,
-              payment_window_seconds) \
+              payment_window_seconds, bitcoin_account_generation) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'undetected',
-                     $12, $13, $14, $15, $16)",
+                     $12, $13, $14, $15, $16, $17)",
         )
         .bind(invoice_id)
         .bind(creator.id)
@@ -1598,6 +1630,12 @@ impl InvoiceStore {
         .bind(payment_deadline)
         .bind(proposal_acceptance_seconds)
         .bind(payment_window_seconds)
+        .bind(
+            input
+                .invoice_payloads
+                .expected_bitcoin_account_generation()
+                .map(|_| creator.bitcoin_account_generation),
+        )
         .execute(&mut *tx)
         .await
         .map_err(|_| PersistenceError::Conflict)?;
@@ -1791,6 +1829,7 @@ struct CreatorRow {
     id: Uuid,
     creator_lookup_hash: Vec<u8>,
     next_child_index: i64,
+    bitcoin_account_generation: i64,
 }
 
 fn parse_canonical_bitcoin_outpoint(value: &str) -> Result<BitcoinOutpoint, PersistenceError> {

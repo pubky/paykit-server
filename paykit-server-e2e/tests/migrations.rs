@@ -48,6 +48,10 @@ const USDT_VALIDATION_MIGRATION: &str =
     include_str!("../../paykit-server/migrations/0019_validate_marketplace_usdt_constraints.sql");
 const USDT_INDEX_MIGRATION: &str =
     include_str!("../../paykit-server/migrations/0020_marketplace_usdt_observation_index.sql");
+const CREATOR_ROTATION_MIGRATION: &str =
+    include_str!("../../paykit-server/migrations/0021_creator_bitcoin_account_rotation.sql");
+const DRAIN_CANCELLATION_OWNERSHIP_MIGRATION: &str =
+    include_str!("../../paykit-server/migrations/0022_payment_drain_cancellation_ownership.sql");
 
 /// PostgreSQL advisory locks are server-wide, not database-scoped. These
 /// migration tests deliberately use the production migration lock key, so
@@ -89,7 +93,20 @@ async fn migrations_create_the_required_schema_and_are_restart_safe() {
             .fetch_all(pool)
             .await
             .unwrap();
-    assert_eq!(applied_versions, (1..=20).collect::<Vec<_>>());
+    assert_eq!(applied_versions, (1..=22).collect::<Vec<_>>());
+
+    let rotation_columns: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM information_schema.columns
+         WHERE table_schema = 'public'
+           AND (table_name, column_name) IN
+               (('creators', 'bitcoin_account_generation'),
+                ('invoices', 'bitcoin_account_generation'),
+                ('marketplace_payment_preparations', 'bitcoin_account_generation'))",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(rotation_columns, 3);
 
     let settlement_address_nullable: String = sqlx::query_scalar(
         "SELECT is_nullable FROM information_schema.columns
@@ -194,6 +211,219 @@ async fn migrations_create_the_required_schema_and_are_restart_safe() {
     .await
     .unwrap();
     assert_ne!(creator_id, Uuid::nil());
+
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn drain_ownership_migration_preserves_cleaned_cancellation() {
+    let _migration_test_guard = migration_test_lock().lock().await;
+    let database = TestDatabase::create().await;
+    let pool = database.pool();
+    apply_migrations_through_creator_rotation(pool).await;
+    let (cancellation_id, _, _) = seed_cleaned_drain_cancellation(pool).await;
+
+    sqlx::raw_sql(DRAIN_CANCELLATION_OWNERSHIP_MIGRATION)
+        .execute(pool)
+        .await
+        .unwrap();
+    let drain_required: bool =
+        sqlx::query_scalar("SELECT cancellation_drain_required FROM outbox WHERE id = $1")
+            .bind(cancellation_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert!(drain_required);
+
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn drain_ownership_migration_preserves_cleaned_cancellation_adopted_by_rotation() {
+    let _migration_test_guard = migration_test_lock().lock().await;
+    let database = TestDatabase::create().await;
+    let pool = database.pool();
+    apply_migrations_through_creator_rotation(pool).await;
+    let (cancellation_id, creator_id, invoice_id) = seed_cleaned_drain_cancellation(pool).await;
+
+    let rotation_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO creator_bitcoin_account_rotations (
+             id, creator_id, from_generation, to_generation, cancellation_count
+         ) VALUES ($1, $2, 0, 1, 1)",
+    )
+    .bind(rotation_id)
+    .bind(creator_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO creator_bitcoin_account_rotation_items (
+             rotation_id, invoice_id, sdk_payment_request_id, classification,
+             cancellation_outbox_id, created_at
+         ) SELECT $1, $2, cancellation_target_payment_request_id,
+                  'cancellation_pending', id, created_at + INTERVAL '1 second'
+           FROM outbox WHERE id = $3",
+    )
+    .bind(rotation_id)
+    .bind(invoice_id)
+    .bind(cancellation_id)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    sqlx::raw_sql(DRAIN_CANCELLATION_OWNERSHIP_MIGRATION)
+        .execute(pool)
+        .await
+        .unwrap();
+    let drain_required: bool =
+        sqlx::query_scalar("SELECT cancellation_drain_required FROM outbox WHERE id = $1")
+            .bind(cancellation_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert!(drain_required);
+
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn drain_ownership_migration_rejects_ambiguous_cleaned_rotation_cancellation() {
+    let _migration_test_guard = migration_test_lock().lock().await;
+    let database = TestDatabase::create().await;
+    let pool = database.pool();
+    apply_migrations_through_creator_rotation(pool).await;
+    let (cancellation_id, creator_id, invoice_id) = seed_cleaned_drain_cancellation(pool).await;
+
+    let rotation_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO creator_bitcoin_account_rotations (
+             id, creator_id, from_generation, to_generation, cancellation_count
+         ) VALUES ($1, $2, 0, 1, 1)",
+    )
+    .bind(rotation_id)
+    .bind(creator_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO creator_bitcoin_account_rotation_items (
+             rotation_id, invoice_id, sdk_payment_request_id, classification,
+             cancellation_outbox_id, created_at
+         ) SELECT $1, $2, cancellation_target_payment_request_id,
+                  'cancellation_pending', id, created_at
+           FROM outbox WHERE id = $3",
+    )
+    .bind(rotation_id)
+    .bind(invoice_id)
+    .bind(cancellation_id)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let error = sqlx::raw_sql(DRAIN_CANCELLATION_OWNERSHIP_MIGRATION)
+        .execute(pool)
+        .await
+        .expect_err("ambiguous cleaned cancellation must block the upgrade");
+    assert!(
+        error
+            .to_string()
+            .contains("ambiguous cleaned cancellation ownership"),
+        "unexpected migration error: {error}"
+    );
+
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn drain_ownership_migration_keeps_post_cleanup_rotation_cancellation_rotation_only() {
+    let _migration_test_guard = migration_test_lock().lock().await;
+    let database = TestDatabase::create().await;
+    let pool = database.pool();
+    apply_migrations_through_creator_rotation(pool).await;
+
+    let creator_id = insert_creator(pool).await;
+    insert_invoice(
+        pool,
+        creator_id,
+        b"rotation-only-bundle",
+        b"rotation-only-request",
+    )
+    .await;
+    let (invoice_id, lock_hash): (Uuid, Vec<u8>) =
+        sqlx::query_as("SELECT id, lock_resource_lookup_hash FROM invoices WHERE creator_id = $1")
+            .bind(creator_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    sqlx::query(
+        "INSERT INTO lock_payment_generations (
+             creator_id, lock_resource_lookup_hash, current_generation,
+             last_cleanup_token, updated_at
+         ) VALUES ($1, $2, 1, $3, clock_timestamp())",
+    )
+    .bind(creator_id)
+    .bind(&lock_hash)
+    .bind(vec![7_u8; 32])
+    .execute(pool)
+    .await
+    .unwrap();
+    let rotation_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO creator_bitcoin_account_rotations (
+             id, creator_id, from_generation, to_generation, cancellation_count
+         ) VALUES ($1, $2, 0, 1, 1)",
+    )
+    .bind(rotation_id)
+    .bind(creator_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    let cancellation_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO outbox (
+             id, creator_id, invoice_id, intent_envelope, status, intent_kind,
+             cancellation_target_payment_request_id, created_at
+         ) SELECT $1, $2, $3, $4, 'queued', 'payment_request_cancellation', $5,
+                  updated_at + INTERVAL '1 second'
+           FROM lock_payment_generations
+           WHERE creator_id = $2 AND lock_resource_lookup_hash = $6",
+    )
+    .bind(cancellation_id)
+    .bind(creator_id)
+    .bind(invoice_id)
+    .bind(b"encrypted-rotation-cancellation".as_slice())
+    .bind("rotation-only-payment-request")
+    .bind(&lock_hash)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO creator_bitcoin_account_rotation_items (
+             rotation_id, invoice_id, sdk_payment_request_id, classification,
+             cancellation_outbox_id, created_at
+         ) SELECT $1, $2, cancellation_target_payment_request_id,
+                  'cancellation_pending', id, created_at
+           FROM outbox WHERE id = $3",
+    )
+    .bind(rotation_id)
+    .bind(invoice_id)
+    .bind(cancellation_id)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    sqlx::raw_sql(DRAIN_CANCELLATION_OWNERSHIP_MIGRATION)
+        .execute(pool)
+        .await
+        .unwrap();
+    let drain_required: bool =
+        sqlx::query_scalar("SELECT cancellation_drain_required FROM outbox WHERE id = $1")
+            .bind(cancellation_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert!(!drain_required);
 
     database.cleanup().await;
 }
@@ -1099,6 +1329,145 @@ async fn apply_pre_settlement_migrations(pool: &PgPool) {
             .unwrap();
     }
     transaction.commit().await.unwrap();
+}
+
+async fn apply_migrations_through_creator_rotation(pool: &PgPool) {
+    apply_pre_settlement_migrations(pool).await;
+    for migration in [
+        SETTLEMENT_MIGRATION,
+        MARKETPLACE_OBSERVATION_MIGRATION,
+        RESOLUTION_MIGRATION,
+        OPTIONAL_RAIL_MIGRATION,
+        USDT_OBSERVATION_MIGRATION,
+        USDT_VALIDATION_MIGRATION,
+        USDT_INDEX_MIGRATION,
+        CREATOR_ROTATION_MIGRATION,
+    ] {
+        sqlx::raw_sql(migration).execute(pool).await.unwrap();
+    }
+}
+
+async fn seed_cleaned_drain_cancellation(pool: &PgPool) -> (Uuid, Uuid, Uuid) {
+    let creator_id = insert_creator(pool).await;
+    insert_invoice(
+        pool,
+        creator_id,
+        b"cleaned-drain-bundle",
+        b"cleaned-drain-request",
+    )
+    .await;
+    let (invoice_id, lock_hash): (Uuid, Vec<u8>) =
+        sqlx::query_as("SELECT id, lock_resource_lookup_hash FROM invoices WHERE creator_id = $1")
+            .bind(creator_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    let request_id = "cleaned-drain-payment-request";
+    sqlx::query(
+        "INSERT INTO payment_request_lifecycles (
+             sdk_payment_request_id, invoice_id, request_state,
+             last_outbound_message_id, last_event_at
+         ) VALUES ($1, $2, 'proposed', 1, clock_timestamp())",
+    )
+    .bind(request_id)
+    .bind(invoice_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    let cancellation_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO outbox (
+             id, creator_id, invoice_id, intent_envelope, status, intent_kind,
+             cancellation_target_payment_request_id
+         ) VALUES ($1, $2, $3, $4, 'queued',
+                   'payment_request_cancellation', $5)",
+    )
+    .bind(cancellation_id)
+    .bind(creator_id)
+    .bind(invoice_id)
+    .bind(b"encrypted-cancellation".as_slice())
+    .bind(request_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO lock_payment_generations (
+             creator_id, lock_resource_lookup_hash, last_cleanup_token
+         ) VALUES ($1, $2, $3)",
+    )
+    .bind(creator_id)
+    .bind(&lock_hash)
+    .bind(vec![7_u8; 32])
+    .execute(pool)
+    .await
+    .unwrap();
+    let drain_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO payment_drains (
+             id, creator_id, lock_resource_lookup_hash, lock_resource_generation,
+             lock_resource_envelope, status, accepted_count, terminal_count,
+             cancellation_enqueued_count, cancellation_set_hash, item_set_hash,
+             completed_at
+         ) VALUES ($1, $2, $3, 0, $4, 'completed', 0, 0, 1, $5, $6,
+                   clock_timestamp())",
+    )
+    .bind(drain_id)
+    .bind(creator_id)
+    .bind(&lock_hash)
+    .bind(b"encrypted-lock".as_slice())
+    .bind(vec![8_u8; 32])
+    .bind(vec![9_u8; 32])
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE lock_payment_generations SET active_drain_id = $1
+         WHERE creator_id = $2 AND lock_resource_lookup_hash = $3",
+    )
+    .bind(drain_id)
+    .bind(creator_id)
+    .bind(&lock_hash)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO payment_drain_items (drain_id, invoice_id, classification)
+         VALUES ($1, $2, 'cancellation_enqueued')",
+    )
+    .bind(drain_id)
+    .bind(invoice_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO payment_drain_cancellations (
+             drain_id, invoice_id, sdk_payment_request_id, cancellation_outbox_id
+         ) VALUES ($1, $2, $3, $4)",
+    )
+    .bind(drain_id)
+    .bind(invoice_id)
+    .bind(request_id)
+    .bind(cancellation_id)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    sqlx::query("DELETE FROM payment_drains WHERE id = $1")
+        .bind(drain_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    let retained_before_upgrade: (bool, i64) = sqlx::query_as(
+        "SELECT EXISTS(SELECT 1 FROM outbox WHERE id = $1),
+                (SELECT count(*) FROM payment_drain_cancellations
+                 WHERE cancellation_outbox_id = $1)",
+    )
+    .bind(cancellation_id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(retained_before_upgrade, (true, 0));
+    (cancellation_id, creator_id, invoice_id)
 }
 
 async fn insert_creator(pool: &PgPool) -> Uuid {
