@@ -117,7 +117,7 @@ fn valid_lock() -> ContentLock {
         criteria: vec![Criterion {
             criterion_id: "payment".into(),
             verifier_type: VerifierType::PaykitPayment,
-            params: serde_json::json!({"recipient_pubky":CREATOR,"amount":"50000","asset":"BTC"}),
+            params: serde_json::json!({"recipient_pubky":CREATOR,"amount":"50000","asset":"BTC","payment_in":24}),
         }],
         lock_logic: LockLogic::All {
             criteria: vec!["payment".into()],
@@ -432,10 +432,37 @@ async fn invalid_locks_policy_never_persists_an_invoice() {
     invalid.criteria[0].params = serde_json::json!({
         "recipient_pubky": CREATOR,
         "amount": "0",
-        "asset": "BTC"
+        "asset": "BTC",
+        "payment_in": 24
     });
     let locks = Arc::new(FakeLocks {
         result: Ok(invalid),
+        calls: AtomicUsize::default(),
+    });
+    let store = Arc::new(FakeStore::with_preflight(InvoicePreflight::New));
+
+    assert_eq!(
+        service(session.clone(), locks.clone(), store.clone())
+            .create(request())
+            .await,
+        Err(CreateInvoiceError::InvalidRequest)
+    );
+    assert_eq!(session.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(locks.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(store.create_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn mismatched_lock_payment_window_never_persists_an_invoice() {
+    let session = Arc::new(FakeSession {
+        result: Ok(()),
+        calls: AtomicUsize::default(),
+        creators: Mutex::new(vec![]),
+    });
+    let mut mismatched = valid_lock();
+    mismatched.criteria[0].params["payment_in"] = serde_json::json!(48);
+    let locks = Arc::new(FakeLocks {
+        result: Ok(mismatched),
         calls: AtomicUsize::default(),
     });
     let store = Arc::new(FakeStore::with_preflight(InvoicePreflight::New));
