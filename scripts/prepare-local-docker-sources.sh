@@ -5,13 +5,13 @@ manifest=${1:-Cargo.toml}
 lockfile=${2:-Cargo.lock}
 
 sed -i \
-    -e 's#locks-core = { git = "https://github.com/pubky/locks.git", tag = "v0.1.0-rc13" }#locks-core = { path = "/build/locks/locks-core" }#' \
+    -e 's#locks-core = { git = "https://github.com/pubky/locks.git", tag = "v0.1.0" }#locks-core = { path = "/build/locks/locks-core" }#' \
     -e 's#paykit-lib = "=0.1.0"#paykit-lib = { path = "/build/paykit-rs/paykit-lib" }#' \
     -e 's#paykit-sdk = "=0.1.0"#paykit-sdk = { path = "/build/paykit-rs/paykit-sdk" }#' \
     "$manifest"
 
 sed -i \
-    -e '/source = "git+https:\/\/github.com\/pubky\/locks.git?tag=v0.1.0-rc13#5e5ed00463688046716d2fb1022eecd9c8997b56"/d' \
+    -e '/source = "git+https:\/\/github.com\/pubky\/locks.git?tag=v0.1.0#ac8e893b4cb9d21b7736a431b511acd3efdfb83a"/d' \
     "$lockfile"
 
 grep -Fx 'locks-core = { path = "/build/locks/locks-core" }' "$manifest"

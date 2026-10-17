@@ -954,6 +954,13 @@ fn validate_lock(
         .iter()
         .find(|criterion| criterion.verifier_type == VerifierType::PaykitPayment)
         .ok_or(CreateInvoiceError::InvalidRequest)?;
+    let params = criterion
+        .paykit_payment_params()
+        .map_err(|_| CreateInvoiceError::InvalidRequest)?
+        .ok_or(CreateInvoiceError::InvalidRequest)?;
+    if params.payment_in() != request.payment_in.get() {
+        return Err(CreateInvoiceError::InvalidRequest);
+    }
     CriterionAsset::parse(
         criterion
             .params

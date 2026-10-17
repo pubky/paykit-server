@@ -510,7 +510,7 @@ drain_timeout = "2s"
         criteria: vec![Criterion {
             criterion_id: "payment".into(),
             verifier_type: VerifierType::PaykitPayment,
-            params: json!({"recipient_pubky":creator.to_app_key(), "amount":SATS.to_string(), "asset":"BTC"}),
+            params: json!({"recipient_pubky":creator.to_app_key(), "amount":SATS.to_string(), "asset":"BTC", "payment_in":24}),
         }],
         lock_logic: LockLogic::All {
             criteria: vec!["payment".into()],

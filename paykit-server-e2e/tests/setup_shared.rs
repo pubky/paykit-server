@@ -232,7 +232,8 @@ fn creator_content_lock(creator: &CreatorPubky) -> ContentLock {
             params: serde_json::json!({
                 "recipient_pubky": creator.to_string(),
                 "amount": "100",
-                "asset": "BTC"
+                "asset": "BTC",
+                "payment_in": 24
             }),
         }],
         lock_logic: LockLogic::All {
