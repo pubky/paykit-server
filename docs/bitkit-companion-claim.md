@@ -114,8 +114,9 @@ app, preserving invoices, reader assignments, old accepted-address observation,
 and the next address allocation index. Cancellation delivery is durable,
 asynchronous, and remains pending until canonical Paykit state confirms cancellation
 or prior acceptance. Publication failure retains retryable
-credentials with setup incomplete; it does not delete history or compensate by
-rewriting shared registry state.
+credentials. An initial or never-ready setup stays incomplete, while a failed
+reconnect keeps the Creator's prior readiness, including after a Bitcoin account
+rotation. Neither deletes history or compensates by rewriting shared registry state.
 
 ## Wire fixture
 

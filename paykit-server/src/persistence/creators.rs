@@ -423,6 +423,9 @@ impl CreatorStore {
     }
 
     /// Replaces credentials after validating immutable account identity and key monotonicity.
+    /// Prior readiness is preserved: a ready Creator stays eligible for status
+    /// checks and workers if the rest of the reconnect fails, and one that never
+    /// finished setup stays not ready.
     pub async fn reauthenticate(
         &self,
         replacement: &CreatorCredentials,
@@ -451,7 +454,7 @@ impl CreatorStore {
             )
             .map_err(|_| PersistenceError::CorruptOrMissing)?;
         sqlx::query(
-            "UPDATE creators SET credential_envelope = $1, setup_complete = FALSE, updated_at = NOW() WHERE id = $2",
+            "UPDATE creators SET credential_envelope = $1, updated_at = NOW() WHERE id = $2",
         )
         .bind(envelope.as_bytes())
         .bind(row.id)
@@ -813,7 +816,7 @@ impl CreatorStore {
         let updated = sqlx::query(
             "UPDATE creators
              SET credential_envelope = $1, bitcoin_account_generation = $2,
-                 setup_complete = FALSE, updated_at = clock_timestamp()
+                 updated_at = clock_timestamp()
              WHERE id = $3 AND bitcoin_account_generation = $4",
         )
         .bind(envelope.as_bytes())
