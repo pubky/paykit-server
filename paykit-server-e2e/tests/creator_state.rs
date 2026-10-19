@@ -738,8 +738,7 @@ async fn bitcoin_account_rotation_atomically_advances_generation_and_preserves_r
     assert_eq!(stored.session_secret(), "rotated-session");
     assert_eq!(stored.bitcoin_account().unwrap().xpub.as_str(), OTHER_XPUB);
     assert_eq!(stored.bitcoin_account().unwrap().account_index, 19);
-    assert!(!creators.setup_complete(&creator()).await.unwrap());
-    creators.mark_setup_complete(&creator()).await.unwrap();
+    // A reconnect that fails after the cutover must not take a ready Creator offline.
     assert!(creators.setup_complete(&creator()).await.unwrap());
     assert!(
         creators

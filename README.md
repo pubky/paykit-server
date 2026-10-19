@@ -255,9 +255,8 @@ publishes only the `paykit-server` app entry through the SDK. Other apps and
 shared history remain intact. Failed publication leaves a new Creator's setup
 incomplete and retryable. A reconnect stores the replacement credentials and keeps
 the Creator's prior readiness, so a failed reconnect neither makes a never-ready
-Creator ready nor removes a ready one from status checks and workers. A reconnect
-that changes the Bitcoin account clears readiness until setup completes.
-Reauthorization preserves an omitted or identical account. A different
+Creator ready nor removes a ready one from status checks and workers, including
+after a Bitcoin account cutover. Reauthorization preserves an omitted or identical account. A different
 valid BIP84 account triggers atomic generation cutover and durable asynchronous
 cancellation of unaccepted old-account requests. The delegated Paykit key must be
 the same or a newer generation. The server never receives the Pubky root secret or

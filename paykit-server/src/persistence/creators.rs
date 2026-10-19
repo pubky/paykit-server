@@ -816,7 +816,7 @@ impl CreatorStore {
         let updated = sqlx::query(
             "UPDATE creators
              SET credential_envelope = $1, bitcoin_account_generation = $2,
-                 setup_complete = FALSE, updated_at = clock_timestamp()
+                 updated_at = clock_timestamp()
              WHERE id = $3 AND bitcoin_account_generation = $4",
         )
         .bind(envelope.as_bytes())

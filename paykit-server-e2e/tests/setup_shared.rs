@@ -963,6 +963,39 @@ poll_interval = "1s"
         server.contact_records().await.unwrap()[0].public_key,
         contact
     );
+
+    // Bitkit shares a new account on every reconnect, so a failed publication after
+    // the account cutover must also keep a ready Creator ready.
+    let generation = creators
+        .load_with_bitcoin_account_generation(&creator)
+        .await
+        .unwrap()
+        .1;
+    publisher
+        .fail_before_publication
+        .store(true, Ordering::SeqCst);
+    let new_account = encode_unsigned_payload(2, &account(2).encode(), &replacement);
+    assert_eq!(
+        reconnect_payload(
+            &service,
+            &bootstrap,
+            &root,
+            &creator,
+            new_account.as_slice()
+        )
+        .await,
+        PollResult::Failed
+    );
+    let (cut_over, cut_over_generation) = creators
+        .load_with_bitcoin_account_generation(&creator)
+        .await
+        .unwrap();
+    assert_eq!(cut_over_generation, generation + 1);
+    assert_eq!(
+        cut_over.bitcoin_account().unwrap().xpub.as_str(),
+        account(2).to_string()
+    );
+    assert!(creators.setup_complete(&creator).await.unwrap());
     database.cleanup().await;
 }
 
