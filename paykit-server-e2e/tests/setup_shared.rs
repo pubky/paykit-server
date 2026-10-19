@@ -141,6 +141,7 @@ struct FailAfterPublication {
     sessions: CreatorSessions,
     creator: CreatorPubky,
     fail: AtomicBool,
+    fail_before_publication: AtomicBool,
     calls: AtomicUsize,
 }
 
@@ -171,6 +172,9 @@ impl AppPublisher for FailAfterPublication {
             "setup and workers must share one refreshed bearer"
         );
         self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.fail_before_publication.swap(false, Ordering::SeqCst) {
+            return Err(ClaimError::InvalidEnvelope);
+        }
         SharedAppPublisher.publish(access).await?;
         let registry = paykit_lib::get_paykit_app_registry(
             &worker.outbox_client.public_storage(),
@@ -413,6 +417,7 @@ async fn real_setup_reconnect_preserves_pending_invoices_and_hosted_state() {
         sessions: sessions.clone(),
         creator: creator.clone(),
         fail: AtomicBool::new(true),
+        fail_before_publication: AtomicBool::new(false),
         calls: AtomicUsize::new(0),
     });
     let completer = RealSetupCompleter::with_app_publisher(
@@ -529,17 +534,41 @@ async fn real_setup_reconnect_preserves_pending_invoices_and_hosted_state() {
     assert!(creators.setup_complete(&creator).await.unwrap());
 
     // A reconnect that fails after reauthentication keeps a ready Creator ready
-    // on the replacement session (pubky/paykit-server#105).
-    let ready_session = creators.load(&creator).await.unwrap();
-    publisher.fail.store(true, Ordering::SeqCst);
-    assert_eq!(
-        reconnect(&service, &bootstrap, &root, &key, &creator).await,
-        PollResult::Failed
-    );
-    assert!(creators.setup_complete(&creator).await.unwrap());
-    assert!(
-        creators.load(&creator).await.unwrap().session_secret() != ready_session.session_secret()
-    );
+    // on the replacement session (pubky/paykit-server#105), whether publication
+    // fails before its write or after it.
+    let paykit_app = paykit_lib::PaykitAppId::new("paykit-server").unwrap();
+    for fail in [&publisher.fail_before_publication, &publisher.fail] {
+        let ready_session = creators.load(&creator).await.unwrap();
+        fail.store(true, Ordering::SeqCst);
+        assert_eq!(
+            reconnect(&service, &bootstrap, &root, &key, &creator).await,
+            PollResult::Failed
+        );
+        assert!(creators.setup_complete(&creator).await.unwrap());
+        let replacement = creators.load(&creator).await.unwrap();
+        assert!(replacement.session_secret() != ready_session.session_secret());
+        let worker = sessions
+            .provider(&creator)
+            .load_session_access()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            worker.paykit_identity_secret_key.as_ref(),
+            Some(replacement.paykit_identity_secret())
+        );
+        let registry = paykit_lib::get_paykit_app_registry(
+            &worker.outbox_client.public_storage(),
+            &worker.public_key().unwrap().to_public_key().unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            registry.apps().get(&paykit_app),
+            Some(&paykit_server::real_setup::server_app())
+        );
+    }
 
     let old_credentials = creators.load(&creator).await.unwrap();
     let old_access = sessions

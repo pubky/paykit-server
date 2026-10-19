@@ -423,8 +423,9 @@ impl CreatorStore {
     }
 
     /// Replaces credentials after validating immutable account identity and key monotonicity.
-    /// Readiness is unchanged: a ready Creator keeps receiving if the rest of the
-    /// reconnect fails, and one that never finished setup stays not ready.
+    /// Prior readiness is preserved: a ready Creator stays eligible for status
+    /// checks and workers if the rest of the reconnect fails, and one that never
+    /// finished setup stays not ready.
     pub async fn reauthenticate(
         &self,
         replacement: &CreatorCredentials,
