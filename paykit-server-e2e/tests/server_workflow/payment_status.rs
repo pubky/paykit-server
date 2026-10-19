@@ -59,8 +59,15 @@ async fn status_receives_required_peer_without_consuming_unrelated_messages() {
     let creator_id = creators.ready_ids().await.unwrap()[0];
     set_whole_second_invoice_deadlines(&pool, &crypto, creator_id, &fixture.creator).await;
     let sessions = CreatorSessions::new(creators, pubky, paykit.clone());
-    let adapter =
-        PaykitAdapter::new(creator_id, sessions.provider(&fixture.creator), &paykit).unwrap();
+    let adapter = PaykitAdapter::new(creator_id, sessions.provider(&fixture.creator), &paykit)
+        .unwrap()
+        .with_usdt(
+            InvoiceStore::new(&pool, crypto.clone()),
+            Some(
+                paykit_server::usdt::ArbitrumVerifier::new("http://127.0.0.1:1".parse().unwrap())
+                    .unwrap(),
+            ),
+        );
     let outbox = OutboxStore::new(&pool, crypto.clone());
     let claim = outbox
         .claim(Uuid::new_v4(), 1, Duration::from_secs(60))
