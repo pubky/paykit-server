@@ -436,7 +436,7 @@ async fn real_setup_reconnect_preserves_pending_invoices_and_hosted_state() {
         SetupLimits {
             max_polls_per_flow: 2,
             max_polls: 10,
-            setup_per_ip_per_minute: 20,
+            setup_per_ip_per_minute: 30,
             max_pending_setup_flows: 10,
         },
     );
