@@ -1,4 +1,12 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    future::{Future, poll_fn},
+    pin::Pin,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+    task::Poll,
+};
 
 use async_trait::async_trait;
 use axum::{
@@ -15,9 +23,10 @@ use paykit_server::{
     },
     config::{Config, ConfigEnvironment},
     domain::locks::{BundleId, CreatorPubky, parse_bundle_id, parse_creator, parse_reader},
-    http::{auth::SignedLocksAuth, connection_status::connection_status_router},
+    http::{auth::SignedServiceAuth, connection_status::connection_status_router},
     persistence::PersistenceError,
 };
+use tokio::sync::Semaphore;
 use tower::ServiceExt;
 
 const CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
@@ -40,7 +49,7 @@ impl ConnectionBindingRepository for FakeBindings {
 }
 
 struct FakePeers {
-    result: Result<PaykitConnectionState, PersistenceError>,
+    result: Result<PaykitConnectionState, ConnectionStatusError>,
     calls: Mutex<Vec<(String, String)>>,
 }
 
@@ -50,7 +59,7 @@ impl PeerConnectionStateRepository for FakePeers {
         &self,
         creator: &CreatorPubky,
         binding: &ConnectionBinding,
-    ) -> Result<PaykitConnectionState, PersistenceError> {
+    ) -> Result<PaykitConnectionState, ConnectionStatusError> {
         self.calls
             .lock()
             .unwrap()
@@ -65,7 +74,7 @@ fn binding() -> ConnectionBinding {
 
 fn service(
     binding_result: Result<Option<ConnectionBinding>, PersistenceError>,
-    state_result: Result<PaykitConnectionState, PersistenceError>,
+    state_result: Result<PaykitConnectionState, ConnectionStatusError>,
 ) -> (Arc<ConnectionStatusService>, Arc<FakePeers>) {
     let peers = Arc::new(FakePeers {
         result: state_result,
@@ -127,8 +136,8 @@ fn config_for(key: &SigningKey) -> Config {
             r#"
 [http]
 listen_addr = "127.0.0.1:8080"
-[locks]
-trusted_public_key = "{key}"
+[signed_services]
+trusted_public_keys = ["{key}"]
 [setup]
 allowed_origins = ["https://app.example"]
 [paykit]
@@ -195,7 +204,7 @@ async fn endpoint_returns_full_closed_connection_state_vocabulary() {
         let key = SigningKey::from_bytes(&[7; 32]);
         let (service, _) = service(Ok(Some(binding())), Ok(state));
         let router = connection_status_router(service).layer(Extension(Arc::new(
-            SignedLocksAuth::from_config(&config_for(&key)),
+            SignedServiceAuth::from_config(&config_for(&key)),
         )));
         let request_body =
             format!(r#"{{"bundle_id":"{BUNDLE}","creator":"{CREATOR}"}}"#).into_bytes();
@@ -217,7 +226,7 @@ async fn endpoint_preserves_not_found_storage_and_auth_failures_as_errors() {
 
     let (missing, _) = service(Ok(None), Ok(PaykitConnectionState::None));
     let missing = connection_status_router(missing).layer(Extension(Arc::new(
-        SignedLocksAuth::from_config(&config_for(&key)),
+        SignedServiceAuth::from_config(&config_for(&key)),
     )));
     assert_eq!(
         missing
@@ -233,7 +242,7 @@ async fn endpoint_preserves_not_found_storage_and_auth_failures_as_errors() {
         Ok(PaykitConnectionState::None),
     );
     let unavailable = connection_status_router(unavailable).layer(Extension(Arc::new(
-        SignedLocksAuth::from_config(&config_for(&key)),
+        SignedServiceAuth::from_config(&config_for(&key)),
     )));
     assert_eq!(
         unavailable
@@ -246,7 +255,7 @@ async fn endpoint_preserves_not_found_storage_and_auth_failures_as_errors() {
 
     let (service, _) = service(Ok(Some(binding())), Ok(PaykitConnectionState::None));
     let invalid_signature = connection_status_router(service).layer(Extension(Arc::new(
-        SignedLocksAuth::from_config(&config_for(&key)),
+        SignedServiceAuth::from_config(&config_for(&key)),
     )));
     let other_key = SigningKey::from_bytes(&[8; 32]);
     assert_eq!(
@@ -260,11 +269,43 @@ async fn endpoint_preserves_not_found_storage_and_auth_failures_as_errors() {
 }
 
 #[tokio::test]
+async fn endpoint_distinguishes_busy_state_from_other_peer_read_failures() {
+    let key = SigningKey::from_bytes(&[7; 32]);
+    for (error, status, code) in [
+        (
+            ConnectionStatusError::Busy,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "dependency_unavailable",
+        ),
+        (
+            ConnectionStatusError::Unavailable,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+        ),
+    ] {
+        let (service, _) = service(Ok(Some(binding())), Err(error));
+        let router = connection_status_router(service).layer(Extension(Arc::new(
+            SignedServiceAuth::from_config(&config_for(&key)),
+        )));
+        let request_body =
+            format!(r#"{{"bundle_id":"{BUNDLE}","creator":"{CREATOR}"}}"#).into_bytes();
+        let response = router
+            .oneshot(signed_request(&key, request_body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status);
+        let response: serde_json::Value = serde_json::from_str(&body(response).await).unwrap();
+        assert_eq!(response["error"]["code"], code);
+        assert!(response.get("state").is_none());
+    }
+}
+
+#[tokio::test]
 async fn endpoint_rejects_signed_unknown_request_fields() {
     let key = SigningKey::from_bytes(&[7; 32]);
     let (service, peers) = service(Ok(Some(binding())), Ok(PaykitConnectionState::None));
     let router = connection_status_router(service).layer(Extension(Arc::new(
-        SignedLocksAuth::from_config(&config_for(&key)),
+        SignedServiceAuth::from_config(&config_for(&key)),
     )));
     let request_body =
         format!(r#"{{"bundle_id":"{BUNDLE}","creator":"{CREATOR}","reader":"{READER}"}}"#)
@@ -277,4 +318,219 @@ async fn endpoint_rejects_signed_unknown_request_fields() {
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert!(peers.calls.lock().unwrap().is_empty());
+}
+
+struct MutableBindings {
+    result: Mutex<Result<Option<ConnectionBinding>, PersistenceError>>,
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl ConnectionBindingRepository for MutableBindings {
+    async fn binding(
+        &self,
+        _: &CreatorPubky,
+        _: &BundleId,
+    ) -> Result<Option<ConnectionBinding>, PersistenceError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.result.lock().unwrap().clone()
+    }
+}
+
+struct PendingPeers {
+    calls: Mutex<Vec<(String, String)>>,
+    result: Mutex<Result<PaykitConnectionState, ConnectionStatusError>>,
+    release: Semaphore,
+}
+
+#[async_trait]
+impl PeerConnectionStateRepository for PendingPeers {
+    async fn connection_state(
+        &self,
+        creator: &CreatorPubky,
+        binding: &ConnectionBinding,
+    ) -> Result<PaykitConnectionState, ConnectionStatusError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((creator.to_string(), binding.reader().to_string()));
+        self.release.acquire().await.unwrap().forget();
+        *self.result.lock().unwrap()
+    }
+}
+
+fn pending_service() -> (
+    Arc<ConnectionStatusService>,
+    Arc<MutableBindings>,
+    Arc<PendingPeers>,
+) {
+    let bindings = Arc::new(MutableBindings {
+        result: Mutex::new(Ok(Some(binding()))),
+        calls: 0.into(),
+    });
+    let peers = Arc::new(PendingPeers {
+        calls: Mutex::new(Vec::new()),
+        result: Mutex::new(Ok(PaykitConnectionState::Connected)),
+        release: Semaphore::new(0),
+    });
+    (
+        Arc::new(ConnectionStatusService::new(
+            bindings.clone(),
+            peers.clone(),
+        )),
+        bindings,
+        peers,
+    )
+}
+
+async fn assert_pending<F: Future>(mut future: Pin<&mut F>) {
+    poll_fn(|cx| {
+        assert!(future.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn simultaneous_signed_polls_share_peer_read_but_check_each_binding() {
+    let (service, bindings, peers) = pending_service();
+    let key = SigningKey::from_bytes(&[7; 32]);
+    let router = connection_status_router(service).layer(Extension(Arc::new(
+        SignedServiceAuth::from_config(&config_for(&key)),
+    )));
+    let request_body = format!(r#"{{"bundle_id":"{BUNDLE}","creator":"{CREATOR}"}}"#).into_bytes();
+    let mut first = Box::pin(router.clone().oneshot(signed_request(&key, request_body)));
+    let other_bundle =
+        format!(r#"{{"bundle_id":"000G40R40M30E209185GR38E2W","creator":"{CREATOR}"}}"#)
+            .into_bytes();
+    let mut second = Box::pin(router.oneshot(signed_request(&key, other_bundle)));
+    assert_pending(first.as_mut()).await;
+    assert_pending(second.as_mut()).await;
+    assert_eq!(bindings.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(peers.calls.lock().unwrap().len(), 1);
+    peers.release.add_permits(1);
+    for response in [first.await.unwrap(), second.await.unwrap()] {
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body(response).await, r#"{"state":"connected"}"#);
+    }
+}
+
+#[tokio::test]
+async fn completed_states_and_errors_are_not_reused_by_later_polls() {
+    let (service, _, peers) = pending_service();
+    let creator = parse_creator(CREATOR).unwrap();
+    let bundle = parse_bundle_id(BUNDLE).unwrap();
+    for (index, result) in [
+        Ok(PaykitConnectionState::Connected),
+        Ok(PaykitConnectionState::RecoveryRequired),
+        Err(ConnectionStatusError::Busy),
+        Err(ConnectionStatusError::Unavailable),
+        Ok(PaykitConnectionState::Blocked),
+        Ok(PaykitConnectionState::None),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        *peers.result.lock().unwrap() = result;
+        let mut first = Box::pin(service.status(&creator, &bundle));
+        let mut second = Box::pin(service.status(&creator, &bundle));
+        assert_pending(first.as_mut()).await;
+        assert_pending(second.as_mut()).await;
+        assert_eq!(peers.calls.lock().unwrap().len(), index + 1);
+        peers.release.add_permits(1);
+        assert_eq!(first.await, result);
+        assert_eq!(second.await, result);
+    }
+}
+
+#[tokio::test]
+async fn pending_reads_do_not_bypass_missing_or_unavailable_invoice_bindings() {
+    let (service, bindings, peers) = pending_service();
+    let creator = parse_creator(CREATOR).unwrap();
+    let bundle = parse_bundle_id(BUNDLE).unwrap();
+    let mut pending = Box::pin(service.status(&creator, &bundle));
+    assert_pending(pending.as_mut()).await;
+    for (binding, expected) in [
+        (Ok(None), ConnectionStatusError::NotFound),
+        (
+            Err(PersistenceError::Unavailable),
+            ConnectionStatusError::Unavailable,
+        ),
+    ] {
+        *bindings.result.lock().unwrap() = binding;
+        assert_eq!(service.status(&creator, &bundle).await, Err(expected));
+    }
+    assert_eq!(peers.calls.lock().unwrap().len(), 1);
+    peers.release.add_permits(1);
+    assert_eq!(pending.await, Ok(PaykitConnectionState::Connected));
+}
+
+#[tokio::test]
+async fn completed_read_is_not_reused_while_an_earlier_waiter_is_unpolled() {
+    let (service, _, peers) = pending_service();
+    let creator = parse_creator(CREATOR).unwrap();
+    let bundle = parse_bundle_id(BUNDLE).unwrap();
+    let mut first = Box::pin(service.status(&creator, &bundle));
+    let mut waiter = Box::pin(service.status(&creator, &bundle));
+    assert_pending(first.as_mut()).await;
+    assert_pending(waiter.as_mut()).await;
+    peers.release.add_permits(1);
+    assert_eq!(first.await, Ok(PaykitConnectionState::Connected));
+    *peers.result.lock().unwrap() = Ok(PaykitConnectionState::Blocked);
+    let mut later = Box::pin(service.status(&creator, &bundle));
+    assert_pending(later.as_mut()).await;
+    assert_eq!(peers.calls.lock().unwrap().len(), 2);
+    assert_eq!(waiter.await, Ok(PaykitConnectionState::Connected));
+    peers.release.add_permits(1);
+    assert_eq!(later.await, Ok(PaykitConnectionState::Blocked));
+}
+
+#[tokio::test]
+async fn pending_reads_are_isolated_by_creator_and_persisted_reader() {
+    let (service, bindings, peers) = pending_service();
+    let creator = parse_creator(CREATOR).unwrap();
+    let other_creator = parse_creator(READER).unwrap();
+    let bundle = parse_bundle_id(BUNDLE).unwrap();
+    let mut first = Box::pin(service.status(&creator, &bundle));
+    assert_pending(first.as_mut()).await;
+    let mut other_owner = Box::pin(service.status(&other_creator, &bundle));
+    assert_pending(other_owner.as_mut()).await;
+    *bindings.result.lock().unwrap() =
+        Ok(Some(ConnectionBinding::new(parse_reader(CREATOR).unwrap())));
+    let mut other_reader = Box::pin(service.status(&creator, &bundle));
+    assert_pending(other_reader.as_mut()).await;
+    assert_eq!(
+        *peers.calls.lock().unwrap(),
+        vec![
+            (CREATOR.into(), READER.into()),
+            (READER.into(), READER.into()),
+            (CREATOR.into(), CREATOR.into()),
+        ]
+    );
+    peers.release.add_permits(3);
+    for result in [first.await, other_owner.await, other_reader.await] {
+        assert_eq!(result, Ok(PaykitConnectionState::Connected));
+    }
+}
+
+#[tokio::test]
+async fn canceled_poll_allows_waiter_and_subsequent_poll_to_read_again() {
+    let (service, _, peers) = pending_service();
+    let creator = parse_creator(CREATOR).unwrap();
+    let bundle = parse_bundle_id(BUNDLE).unwrap();
+    let mut first = Box::pin(service.status(&creator, &bundle));
+    let mut waiter = Box::pin(service.status(&creator, &bundle));
+    assert_pending(first.as_mut()).await;
+    assert_pending(waiter.as_mut()).await;
+    assert_eq!(peers.calls.lock().unwrap().len(), 1);
+    drop(first);
+    assert_pending(waiter.as_mut()).await;
+    assert_eq!(peers.calls.lock().unwrap().len(), 2);
+    drop(waiter);
+    peers.release.add_permits(1);
+    assert_eq!(
+        service.status(&creator, &bundle).await,
+        Ok(PaykitConnectionState::Connected)
+    );
+    assert_eq!(peers.calls.lock().unwrap().len(), 3);
 }

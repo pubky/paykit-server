@@ -1,6 +1,6 @@
 # Paykit Server closed TOML schema.
-# This is a template, not a runnable configuration: add the required trusted
-# Locks public key locally and provide secrets only through the environment.
+# This is a template, not a runnable configuration: add every trusted service
+# public key locally and provide secrets only through the environment.
 # Only executable-consumed keys are shown. The retired [inbox] section is rejected.
 
 [http]
@@ -11,9 +11,10 @@ listen_addr = "127.0.0.1:8080"
 # limiter key. At most 8.
 trusted_proxy_hops = 0
 
-[locks]
-# Use the exact Pubky rendered by Locks as credentials.lock_server_public_key.
-# trusted_public_key = "pubky<pubky-key>"
+[signed_services]
+# Non-empty, duplicate-free allowlist. Use exact canonical Pubkys rendered by
+# Locks and Marketplace services. Overlap old and new keys during rotation.
+# trusted_public_keys = ["pubky<locks-key>", "pubky<marketplace-key>"]
 
 [setup]
 # Configure exact HTTP(S) origins, or use ["*"] alone to accept any valid
@@ -36,6 +37,8 @@ proposal_acceptance_window = "1h"
 payment_window = "24h"
 # BTC conversion quotes expire sooner. Acceptance is capped at half this window.
 conversion_payment_window = "1h"
+# Unpublished Marketplace preparations may activate only within this DB-clock TTL.
+marketplace_prepare_ttl = "15m"
 # "testnet" targets the pinned Pubky client's fixed localhost testnet ports.
 # Run the Pubky static testnet; this is not a hosted public network.
 network = "testnet"
@@ -58,6 +61,13 @@ batch_size = 16
 lease_duration = "30s"
 retry_initial = "1s"
 retry_max = "5m"
+# Keep Encrypted Link establishment retries fast for this many outbox attempts
+# before switching to retry_initial/retry_max backoff, capped at 5s for link
+# establishment failures. Integer range: 1..=2147483647; default: 120.
+rapid_link_retry_attempts = 120
+# Integer milliseconds between rapid link-establishment retries. Range:
+# 1..=4294967295; default: 1000. For example, 500 means 0.5 seconds.
+rapid_link_retry_interval_ms = 1000
 
 [limits]
 request_body_bytes = 16384

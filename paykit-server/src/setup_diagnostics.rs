@@ -113,6 +113,7 @@ pub(crate) fn claim_failure_class(error: &ClaimError) -> SetupFailureClass {
         ClaimError::InvalidPayload => SetupFailureClass::InvalidPayload,
         ClaimError::InvalidEnvelope => SetupFailureClass::InvalidEnvelope,
         ClaimError::AuthenticationFailed => SetupFailureClass::Authentication,
+        ClaimError::TransientUnavailable => SetupFailureClass::Transport,
     }
 }
 
@@ -148,6 +149,7 @@ pub(crate) fn persistence_failure_class(error: &PersistenceError) -> SetupFailur
         PersistenceError::Unavailable => SetupFailureClass::Storage,
         PersistenceError::Conflict => SetupFailureClass::Conflict,
         PersistenceError::InvalidInput => SetupFailureClass::InvalidRequest,
+        PersistenceError::DeadlineElapsed => SetupFailureClass::Storage,
     }
 }
 

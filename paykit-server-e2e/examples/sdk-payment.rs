@@ -309,6 +309,9 @@ async fn checkout(
         terms.required_app_id.as_ref().map(|id| id.as_str()) == Some("paykit-server"),
         "Unexpected payment app"
     );
+    let proposal_stream_item_id = request
+        .proposal_stream_item_id
+        .context("Request has no proposal stream item")?;
     let id = PaymentRequestId::new(request.payment_request_id.clone())?;
     let resolved = payer
         .resolve_private_payment_request(creator.clone(), &id, None)
@@ -337,7 +340,9 @@ async fn checkout(
     payer
         .claim_payment_request_for_execution(creator.clone(), &id)
         .await?;
-    payer.accept_payment_request(creator.clone(), &id).await?;
+    payer
+        .accept_payment_request(creator.clone(), &id, proposal_stream_item_id)
+        .await?;
     payer
         .process_outbound_private_messages(creator.clone())
         .await?;
@@ -456,8 +461,8 @@ async fn main() -> Result<()> {
             r#"
 [http]
 listen_addr = "127.0.0.1:0"
-[locks]
-trusted_public_key = "{}"
+[signed_services]
+trusted_public_keys = ["{}"]
 [setup]
 allowed_origins = ["http://localhost:8080"]
 [paykit]
@@ -505,7 +510,7 @@ drain_timeout = "2s"
         criteria: vec![Criterion {
             criterion_id: "payment".into(),
             verifier_type: VerifierType::PaykitPayment,
-            params: json!({"recipient_pubky":creator.to_app_key(), "amount":SATS.to_string(), "asset":"BTC"}),
+            params: json!({"recipient_pubky":creator.to_app_key(), "amount":SATS.to_string(), "asset":"BTC", "payment_in":24}),
         }],
         lock_logic: LockLogic::All {
             criteria: vec!["payment".into()],

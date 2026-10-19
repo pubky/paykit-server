@@ -5,13 +5,23 @@ use bitcoin::{
     bip32::{ChildNumber, Xpriv, Xpub},
     secp256k1::Secp256k1,
 };
+use locks_core::{
+    ids::CreatorPubky as RawCreatorPubky,
+    lock_policy::{
+        AccessPolicy, CONTENT_LOCK_VERSION, ContentLock, Criterion, LockLogic, LockServerConfig,
+        VerifierType,
+    },
+};
 use paykit_sdk::{
     ContactUpdate, PAYKIT_SESSION_CAPABILITIES, PaykitIdentitySecretKey, PubkyAuthCompanionClaim,
     PubkyLocalSecretKey, PubkyPublicKey, PubkySessionAccess, PubkySessionBootstrap,
     PubkySessionProvider, StorageAdapter,
 };
 use paykit_server::{
-    application::create_invoice::derive_bip84_p2wpkh_address,
+    application::create_invoice::{
+        CreateInvoiceRequest, CreateInvoiceService, LockFetchError, LockFetcher,
+        PaykitIntentBuilder, derive_bip84_p2wpkh_address,
+    },
     bitkit_claim::{
         ClaimError, QUERY_PARAMETER, encode_unsigned_payload, parse_auth_request,
         parse_reconnect_auth_request,
@@ -19,11 +29,18 @@ use paykit_server::{
     bitkit_setup::BitkitAuthStarter,
     config::{BitcoinNetwork, Config, ConfigEnvironment},
     crypto::Crypto,
-    domain::locks::{CreatorPubky, ReaderPubky, parse_creator, parse_reader},
+    domain::{
+        invoice::CriterionPaymentWindowHours,
+        locks::{
+            CreatorPubky, PubkyLockResource, ReaderPubky, parse_addressed_lock_resource,
+            parse_bundle_id, parse_creator, parse_reader,
+        },
+    },
     paykit::{CreatorSessionProvider, CreatorSessions},
     persistence::{
         AtomicInvoiceInput, AtomicInvoiceResult, CreatorStore, InvoicePayloadFactory,
-        InvoicePayloads, InvoiceStore, PersistenceError, run_migrations,
+        InvoicePayloads, InvoiceStore, PaymentRequestLifecycleStore, PersistenceError,
+        run_migrations,
     },
     real_setup::{AppPublisher, RealSetupCompleter, SharedAppPublisher},
     setup::{PollResult, SetupLimits, SetupService, StartedFlow, SystemClock},
@@ -31,6 +48,8 @@ use paykit_server::{
 };
 use paykit_server_e2e::postgres::TestDatabase;
 use pubky_testnet::EphemeralTestnet;
+use std::collections::BTreeMap;
+use std::str::FromStr;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -38,22 +57,31 @@ use std::sync::{
 use std::time::Duration;
 
 mod common;
+use common::marketplace_rig::{ReadyRegistry, ReadySession};
 #[path = "fixtures/sdk.rs"]
 mod sdk_fixtures;
 
-struct AccountPayloads<'a>(&'a ReaderPubky);
+struct AccountPayloads<'a> {
+    reader: &'a ReaderPubky,
+    account: u32,
+    generation: i64,
+}
 
 impl InvoicePayloadFactory for AccountPayloads<'_> {
+    fn expected_bitcoin_account_generation(&self) -> Option<i64> {
+        Some(self.generation)
+    }
+
     fn for_child_index(&self, child_index: i64) -> Result<InvoicePayloads, PersistenceError> {
         let address = derive_bip84_p2wpkh_address(
-            &account(0).to_string(),
-            0,
+            &account(self.account).to_string(),
+            self.account,
             &BitcoinNetwork::Testnet,
             child_index,
         )
         .unwrap();
         Ok(InvoicePayloads {
-            payment_request_intent: common::payment_intent(self.0, address.clone()),
+            payment_request_intent: common::payment_intent(self.reader, address.clone()),
         })
     }
 }
@@ -63,6 +91,8 @@ async fn allocate_invoice(
     creator: &CreatorPubky,
     reader: &ReaderPubky,
     binding: &[u8],
+    account: u32,
+    generation: i64,
 ) -> AtomicInvoiceResult {
     invoices
         .create_atomic(AtomicInvoiceInput {
@@ -71,7 +101,11 @@ async fn allocate_invoice(
             bundle_binding: binding,
             lock_resource_binding: binding,
             payment_request_binding: binding,
-            invoice_payloads: &AccountPayloads(reader),
+            invoice_payloads: &AccountPayloads {
+                reader,
+                account,
+                generation,
+            },
 
             proposal_acceptance_seconds: 60 * 60,
             payment_window_seconds: 24 * 60 * 60,
@@ -177,6 +211,42 @@ fn account(index: u32) -> Xpub {
     Xpub::from_priv(&secp, &key)
 }
 
+struct StaticLock(ContentLock);
+
+#[async_trait]
+impl LockFetcher for StaticLock {
+    async fn fetch(&self, _resource: &PubkyLockResource) -> Result<ContentLock, LockFetchError> {
+        Ok(self.0.clone())
+    }
+}
+
+fn creator_content_lock(creator: &CreatorPubky) -> ContentLock {
+    ContentLock {
+        version: CONTENT_LOCK_VERSION,
+        creator: RawCreatorPubky::from_str(&creator.to_string()).unwrap(),
+        primary_resource: None,
+        secondary_resources: BTreeMap::new(),
+        criteria: vec![Criterion {
+            criterion_id: "payment".into(),
+            verifier_type: VerifierType::PaykitPayment,
+            params: serde_json::json!({
+                "recipient_pubky": creator.to_string(),
+                "amount": "100",
+                "asset": "BTC",
+                "payment_in": 24
+            }),
+        }],
+        lock_logic: LockLogic::All {
+            criteria: vec!["payment".into()],
+        },
+        access_policy: AccessPolicy {
+            requested_credential_ttl_seconds: 900,
+        },
+        lock_server: LockServerConfig { override_: None },
+        created_at: time::OffsetDateTime::UNIX_EPOCH,
+    }
+}
+
 async fn complete(
     service: &SetupService,
     bootstrap: &PubkySessionBootstrap,
@@ -236,8 +306,11 @@ async fn reconnect_payload(
         .unwrap();
     let request =
         parse_reconnect_auth_request(&flow.authorization_url, PAYKIT_SESSION_CAPABILITIES).unwrap();
-    assert_eq!(request.claim_type(), "paykit-access-v1");
-    assert!(!flow.authorization_url.contains("watch-only-account-v1"));
+    assert_eq!(
+        request.claim_type(),
+        "paykit-access-v1.watch-only-account-v1"
+    );
+    assert!(flow.authorization_url.contains("watch-only-account-v1"));
     approve_payload(service, bootstrap, root, flow, payload, true).await
 }
 
@@ -325,19 +398,17 @@ async fn real_setup_reconnect_preserves_pending_invoices_and_hosted_state() {
         .unwrap();
     let crypto = Arc::new(Crypto::from_master_key(&[1; 32]).unwrap());
     let creators = CreatorStore::new(database.pool(), crypto.clone());
-    let invoices = InvoiceStore::new(database.pool(), crypto);
-    let sessions = CreatorSessions::new(
-        creators.clone(),
-        client.clone(),
-        paykit_server::config::PaykitConfig {
-            client_id: pubky::ClientId::new("app.paykit.server").unwrap(),
-            app_id: paykit_lib::PaykitAppId::new("paykit-server").unwrap(),
-            network: paykit_server::config::PaykitNetwork::Testnet,
-            proposal_acceptance_window: Duration::from_secs(60 * 60),
-            payment_window: Duration::from_secs(24 * 60 * 60),
-            conversion_payment_window: std::time::Duration::from_secs(3600),
-        },
-    );
+    let invoices = InvoiceStore::new(database.pool(), crypto.clone());
+    let paykit_config = paykit_server::config::PaykitConfig {
+        client_id: pubky::ClientId::new("app.paykit.server").unwrap(),
+        app_id: paykit_lib::PaykitAppId::new("paykit-server").unwrap(),
+        network: paykit_server::config::PaykitNetwork::Testnet,
+        proposal_acceptance_window: Duration::from_secs(60 * 60),
+        payment_window: Duration::from_secs(24 * 60 * 60),
+        conversion_payment_window: std::time::Duration::from_secs(3600),
+        marketplace_prepare_ttl: Duration::from_secs(15 * 60),
+    };
+    let sessions = CreatorSessions::new(creators.clone(), client.clone(), paykit_config.clone());
     let publisher = Arc::new(FailAfterPublication {
         creators: creators.clone(),
         sessions: sessions.clone(),
@@ -352,8 +423,12 @@ async fn real_setup_reconnect_preserves_pending_invoices_and_hosted_state() {
         )),
         publisher.clone(),
         creators.clone(),
-        sessions,
+        sessions.clone(),
         BitcoinNetwork::Testnet,
+    )
+    .with_bitcoin_rotation(
+        PaymentRequestLifecycleStore::new(database.pool(), crypto.clone()),
+        paykit_config,
     );
     let service = SetupService::new(
         vec!["https://app.example".into()],
@@ -453,20 +528,178 @@ async fn real_setup_reconnect_preserves_pending_invoices_and_hosted_state() {
         PollResult::Complete
     );
     assert!(creators.setup_complete(&creator).await.unwrap());
+
+    let old_credentials = creators.load(&creator).await.unwrap();
+    let old_access = sessions
+        .provider(&creator)
+        .load_session_access()
+        .await
+        .unwrap()
+        .unwrap();
+    bootstrap
+        .revoke_grant(old_credentials.session_secret(), &old_access)
+        .await
+        .unwrap();
+    let changed_account = encode_unsigned_payload(1, &account(1).encode(), &key);
+    let calls_before_rotation = publisher.calls.load(Ordering::SeqCst);
+    assert_eq!(
+        reconnect_payload(
+            &service,
+            &bootstrap,
+            &root,
+            &creator,
+            changed_account.as_slice()
+        )
+        .await,
+        PollResult::Complete,
+        "verified replacement grant must survive reconciliation after the old grant is revoked"
+    );
+    let changed = creators.load(&creator).await.unwrap();
+    assert_eq!(
+        changed.bitcoin_account().unwrap().xpub.as_str(),
+        account(1).to_string()
+    );
+    assert_eq!(
+        creators
+            .load_with_bitcoin_account_generation(&creator)
+            .await
+            .unwrap()
+            .1,
+        1
+    );
+    assert_eq!(
+        publisher.calls.load(Ordering::SeqCst),
+        calls_before_rotation + 1,
+        "changed-account reconnect must publish before completing setup"
+    );
+
     let reader = parse_reader(&contact.to_app_key()).unwrap();
-    let pending = allocate_invoice(&invoices, &creator, &reader, b"pending-before-reconnect").await;
-    assert_eq!(pending.reader_child_index(), 0);
-    let second = allocate_invoice(&invoices, &creator, &reader, b"second-before-reconnect").await;
-    assert_eq!(second.reader_child_index(), 1);
+    let lock = creator_content_lock(&creator);
+    let lock_resource =
+        parse_addressed_lock_resource(&format!("{creator}{}", lock.content_lock_path().unwrap()))
+            .unwrap();
+    let create_invoices = CreateInvoiceService::new(
+        Arc::new(ReadySession),
+        Arc::new(StaticLock(lock)),
+        Arc::new(ReadyRegistry),
+        common::app_id(),
+        Arc::new(creators.clone()),
+        BitcoinNetwork::Testnet,
+        Arc::new(invoices.clone()),
+        Arc::new(PaykitIntentBuilder::new(BitcoinNetwork::Testnet)),
+    );
+    let rotated_invoice = create_invoices
+        .create(CreateInvoiceRequest {
+            bundle_id: parse_bundle_id("000G40R40M30E209185GR38E1W").unwrap(),
+            lock_resource,
+            reader: reader.clone(),
+            payment_in: CriterionPaymentWindowHours::new(24).unwrap(),
+        })
+        .await
+        .unwrap();
+    let expected_address = derive_bip84_p2wpkh_address(
+        &account(1).to_string(),
+        1,
+        &BitcoinNetwork::Testnet,
+        rotated_invoice.reader_child_index(),
+    )
+    .unwrap();
+    let (stored_address_hash, stored_generation): (Vec<u8>, Option<i64>) = sqlx::query_as(
+        "SELECT bitcoin_address_lookup_hash, bitcoin_account_generation
+         FROM invoices WHERE id = $1",
+    )
+    .bind(rotated_invoice.invoice_id())
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(stored_generation, Some(1));
+    assert_eq!(
+        stored_address_hash,
+        crypto
+            .bitcoin_address_lookup_hash(expected_address.as_bytes())
+            .as_bytes(),
+        "next invoice must derive from the persisted replacement account"
+    );
+
+    sqlx::query(
+        "UPDATE outbox
+         SET status = 'delivered', sdk_outbound_message_id = '1',
+             sdk_event_id = 'event-unreachable', sdk_payment_request_id = 'request-unreachable'
+         WHERE id = $1",
+    )
+    .bind(rotated_invoice.payment_request_outbox_id())
+    .execute(database.pool())
+    .await
+    .unwrap();
+
+    // Current handed-off work without a projected lifecycle still fails closed.
+    let restored_account = encode_unsigned_payload(0, &account(0).encode(), &key);
+    assert_eq!(
+        reconnect_payload(
+            &service,
+            &bootstrap,
+            &root,
+            &creator,
+            restored_account.as_slice()
+        )
+        .await,
+        PollResult::Failed
+    );
+    assert_eq!(
+        creators
+            .load_with_bitcoin_account_generation(&creator)
+            .await
+            .unwrap()
+            .1,
+        1
+    );
+
+    // Once the unreachable target is historical, it must not block a later rotation.
+    sqlx::query("UPDATE invoices SET bitcoin_account_generation = 0 WHERE id = $1")
+        .bind(rotated_invoice.invoice_id())
+        .execute(database.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        reconnect_payload(
+            &service,
+            &bootstrap,
+            &root,
+            &creator,
+            restored_account.as_slice()
+        )
+        .await,
+        PollResult::Complete
+    );
+    let pending = allocate_invoice(
+        &invoices,
+        &creator,
+        &reader,
+        b"pending-before-reconnect",
+        0,
+        2,
+    )
+    .await;
+    assert_eq!(pending.reader_child_index(), 1);
+    let second = allocate_invoice(
+        &invoices,
+        &creator,
+        &reader,
+        b"second-before-reconnect",
+        0,
+        2,
+    )
+    .await;
+    assert_eq!(second.reader_child_index(), 2);
     let before_reconnect = business_rows(&database).await;
-    let original = creators.load(&creator).await.unwrap();
-    let publication_calls = publisher.calls.load(Ordering::SeqCst);
-    // Even a correctly signed combined reply cannot smuggle account bytes into reconnect.
+    // An explicitly repeated account is an authenticated no-op.
     let combined = encode_unsigned_payload(0, &account(0).encode(), &key);
     assert_eq!(
         reconnect_payload(&service, &bootstrap, &root, &creator, combined.as_slice()).await,
-        PollResult::Failed
+        PollResult::Complete
     );
+    let original = creators.load(&creator).await.unwrap();
+    let publication_calls = publisher.calls.load(Ordering::SeqCst);
     let other_root = PubkyLocalSecretKey::new(pubky::Keypair::random().secret_key());
     let other = bootstrap
         .sign_up(&other_root, &home, None, PAYKIT_SESSION_CAPABILITIES)
@@ -487,7 +720,7 @@ async fn real_setup_reconnect_preserves_pending_invoices_and_hosted_state() {
         complete(&service, &bootstrap, &root, &key, 1).await,
         PollResult::Failed
     );
-    // A different valid xpub at the same account index must also be rejected.
+    // Initial setup cannot rotate an existing Creator; reconnect owns that operation.
     let mut different = account(0);
     different.chain_code = account(1).chain_code;
     let payload = encode_unsigned_payload(0, &different.encode(), &key);
@@ -569,8 +802,8 @@ async fn real_setup_reconnect_preserves_pending_invoices_and_hosted_state() {
         r#"
 [http]
 listen_addr = "127.0.0.1:0"
-[locks]
-trusted_public_key = "pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo"
+[signed_services]
+trusted_public_keys = ["pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo"]
 [setup]
 allowed_origins = ["https://app.example"]
 [paykit]
@@ -667,10 +900,10 @@ poll_interval = "1s"
         replay.payment_request_outbox_id(),
         pending.payment_request_outbox_id()
     );
-    assert_eq!(replay.reader_child_index(), 0);
+    assert_eq!(replay.reader_child_index(), 1);
     assert_eq!(business_rows(&database).await, before_reconnect);
-    let next = allocate_invoice(&invoices, &creator, &reader, b"after-key-rotation").await;
-    assert_eq!(next.reader_child_index(), 2);
+    let next = allocate_invoice(&invoices, &creator, &reader, b"after-key-rotation", 0, 2).await;
+    assert_eq!(next.reader_child_index(), 3);
     assert_ne!(next.invoice_id(), pending.invoice_id());
     let rotated_access = provider.load_session_access().await.unwrap().unwrap();
     assert_eq!(
@@ -690,4 +923,429 @@ poll_interval = "1s"
         contact
     );
     database.cleanup().await;
+}
+
+/// `POST /setup/status` `accepted_asset` against sellers created by the real
+/// setup and reconnect routes, with the Shop iframe's USDT claim selection.
+mod setup_status_readiness {
+    use super::*;
+    use axum::{
+        Extension,
+        body::{Body, to_bytes},
+        http::{Method, Request, StatusCode},
+    };
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    use ed25519_dalek::{Signer, SigningKey};
+    use paykit_server::{
+        application::create_invoice::{SessionValidationError, SessionValidator},
+        application::setup_status::SetupStatusService,
+        domain::receiving::USDT_TOKEN,
+        http::{auth::SignedServiceAuth, setup_status::setup_status_router},
+    };
+    use tower::ServiceExt;
+
+    const USDT_ADDRESS: &str = "0x2222222222222222222222222222222222222222";
+    const READY: &str = r#"{"status":"ready"}"#;
+    const SETUP_REQUIRED: &str = r#"{"status":"setup_required"}"#;
+
+    struct StoredAuthority {
+        creators: CreatorStore,
+        sessions: CreatorSessions,
+    }
+
+    #[async_trait]
+    impl SessionValidator for StoredAuthority {
+        async fn validate(&self, creator: &CreatorPubky) -> Result<(), SessionValidationError> {
+            if !self
+                .creators
+                .setup_complete(creator)
+                .await
+                .map_err(|_| SessionValidationError::Unavailable)?
+            {
+                return Err(SessionValidationError::Invalid);
+            }
+            let access = self
+                .sessions
+                .provider(creator)
+                .load_session_access()
+                .await
+                .map_err(|_| SessionValidationError::Unavailable)?
+                .ok_or(SessionValidationError::Invalid)?;
+            access
+                .session
+                .revalidate()
+                .await
+                .map_err(|_| SessionValidationError::Unavailable)?
+                .ok_or(SessionValidationError::Invalid)?;
+            Ok(())
+        }
+    }
+
+    struct Seller {
+        root: PubkyLocalSecretKey,
+        creator: CreatorPubky,
+        key: PaykitIdentitySecretKey,
+        _wallet: sdk_fixtures::HostedSdk,
+    }
+
+    async fn enroll(bootstrap: &PubkySessionBootstrap, home: &PubkyPublicKey) -> Seller {
+        let root_keypair = pubky::Keypair::random();
+        let root = PubkyLocalSecretKey::new(root_keypair.secret_key());
+        let wallet_auth = bootstrap
+            .sign_up(
+                &root,
+                home,
+                None,
+                paykit_sdk::PAYKIT_AUTHORIZER_SESSION_CAPABILITIES,
+            )
+            .await
+            .unwrap();
+        let creator = parse_creator(&wallet_auth.public_key.to_app_key()).unwrap();
+        let wallet = sdk_fixtures::hosted_sdk(wallet_auth.access, "bitkit", 0).await;
+        let key = root.derive_paykit_identity_secret_key(1).unwrap();
+        Seller {
+            root,
+            creator,
+            key,
+            _wallet: wallet,
+        }
+    }
+
+    fn payload(seller: &Seller, bitcoin: bool, usdt: Option<&str>) -> Vec<u8> {
+        let mut value = serde_json::json!({
+            "paykit_access": {
+                "key_generation": seller.key.key_generation(),
+                "secret": URL_SAFE_NO_PAD.encode(seller.key.as_bytes()),
+            }
+        });
+        if bitcoin {
+            value["bitcoin_account"] = serde_json::json!({
+                "account_index": 0,
+                "address_type": "nativeSegwit",
+                "xpub": account(0).to_string(),
+            });
+        }
+        if let Some(address) = usdt {
+            value["usdt-arbitrum-address"] = serde_json::json!({
+                "value": address,
+                "chain_id": "42161",
+                "token": USDT_TOKEN,
+            });
+        }
+        serde_json::to_vec(&value).unwrap()
+    }
+
+    async fn setup(
+        service: &SetupService,
+        bootstrap: &PubkySessionBootstrap,
+        seller: &Seller,
+        usdt: Option<&str>,
+    ) -> PollResult {
+        let flow = service
+            .begin("127.0.0.1".parse().unwrap(), "https://app.example", "setup")
+            .await
+            .unwrap();
+        assert!(flow.authorization_url.contains("usdt-address-v1"));
+        let payload = payload(seller, true, usdt);
+        approve_payload(service, bootstrap, &seller.root, flow, &payload, false).await
+    }
+
+    async fn reconnect_with_usdt(
+        service: &SetupService,
+        bootstrap: &PubkySessionBootstrap,
+        seller: &Seller,
+        usdt: Option<&str>,
+    ) -> PollResult {
+        let flow = service
+            .begin_reconnect(
+                "127.0.0.1".parse().unwrap(),
+                "https://app.example",
+                "reconnect",
+                &seller.creator,
+            )
+            .await
+            .unwrap();
+        assert!(flow.authorization_url.contains("usdt-address-v1"));
+        let payload = payload(seller, false, usdt);
+        approve_payload(service, bootstrap, &seller.root, flow, &payload, true).await
+    }
+
+    fn signing_config(key: &SigningKey) -> Config {
+        let key = pubky::PublicKey::from(
+            pubky::pkarr::PublicKey::try_from(key.verifying_key().as_bytes()).unwrap(),
+        )
+        .to_string();
+        Config::from_toml_and_environment(
+            &format!(
+                r#"
+[http]
+listen_addr = "127.0.0.1:8080"
+[signed_services]
+trusted_public_keys = ["{key}"]
+[setup]
+allowed_origins = ["https://app.example"]
+[paykit]
+client_id = "app.paykit.server"
+app_id = "paykit-server"
+network = "testnet"
+[bitcoin]
+network = "testnet"
+[electrum]
+endpoint = "ssl://electrum.example:50002"
+[outbox]
+poll_interval = "5s"
+[limits]
+request_body_bytes = 16384
+[rate_limits]
+signed_requests_per_second = 100
+signed_burst = 200
+"#
+            ),
+            ConfigEnvironment {
+                database_url: Some("postgres://paykit:secret@localhost/paykit".to_owned()),
+                master_key: Some("AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE".to_owned()),
+            },
+        )
+        .unwrap()
+    }
+
+    struct StatusRoute {
+        signer: SigningKey,
+        creators: CreatorStore,
+        sessions: CreatorSessions,
+        usdt_enabled: bool,
+    }
+
+    impl StatusRoute {
+        async fn ask(&self, body: String) -> (StatusCode, String) {
+            let service = SetupStatusService::new(Arc::new(StoredAuthority {
+                creators: self.creators.clone(),
+                sessions: self.sessions.clone(),
+            }))
+            .with_receiving(Arc::new(self.creators.clone()), self.usdt_enabled);
+            let router = setup_status_router(Arc::new(service)).layer(Extension(Arc::new(
+                SignedServiceAuth::from_config(&signing_config(&self.signer)),
+            )));
+            let body = body.into_bytes();
+            let preimage =
+                paykit_server::http::auth::signature_preimage("POST", "/setup/status", &body);
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri("/setup/status")
+                .header(
+                    "X-Paykit-Signature",
+                    URL_SAFE_NO_PAD.encode(self.signer.sign(&preimage).to_bytes()),
+                )
+                .body(Body::from(body))
+                .unwrap();
+            let response = router.oneshot(request).await.unwrap();
+            let status = response.status();
+            let body = String::from_utf8(
+                to_bytes(response.into_body(), 32 * 1024)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap();
+            (status, body)
+        }
+
+        async fn accepted(&self, creator: &CreatorPubky, accepted: &str) -> String {
+            let (status, body) = self
+                .ask(format!(
+                    r#"{{"accepted_asset":"{accepted}","creator":"{creator}"}}"#
+                ))
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            body
+        }
+
+        async fn denomination(&self, creator: &CreatorPubky, asset: &str) -> String {
+            let (status, body) = self
+                .ask(format!(r#"{{"asset":"{asset}","creator":"{creator}"}}"#))
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            body
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn accepted_asset_follows_real_setup_and_reconnect() {
+        let database = TestDatabase::create().await;
+        run_migrations(database.pool()).await.unwrap();
+        let postgres = std::env::var("TEST_DATABASE_URL").unwrap();
+        let testnet = EphemeralTestnet::builder()
+            .postgres(pubky_testnet::pubky_homeserver::ConnectionString::new(&postgres).unwrap())
+            .build()
+            .await
+            .unwrap();
+        let relay = http_relay::HttpRelay::builder()
+            .http_port(0)
+            .run()
+            .await
+            .unwrap();
+        let client = testnet.sdk().unwrap();
+        let bootstrap = PubkySessionBootstrap::with_pubky(client.clone(), "app.paykit.server")
+            .unwrap()
+            .with_auth_relay(relay.local_url().join("inbox").unwrap().as_str())
+            .unwrap();
+        let home = PubkyPublicKey::from_public_key(&testnet.homeserver_app().public_key());
+        let crypto = Arc::new(Crypto::from_master_key(&[1; 32]).unwrap());
+        let creators = CreatorStore::new(database.pool(), crypto);
+        let sessions = CreatorSessions::new(
+            creators.clone(),
+            client.clone(),
+            paykit_server::config::PaykitConfig {
+                client_id: pubky::ClientId::new("app.paykit.server").unwrap(),
+                app_id: paykit_lib::PaykitAppId::new("paykit-server").unwrap(),
+                network: paykit_server::config::PaykitNetwork::Testnet,
+                proposal_acceptance_window: Duration::from_secs(60 * 60),
+                payment_window: Duration::from_secs(24 * 60 * 60),
+                conversion_payment_window: Duration::from_secs(3600),
+                marketplace_prepare_ttl: Duration::from_secs(15 * 60),
+            },
+        );
+        let completer = RealSetupCompleter::new(
+            BitkitAuthStarter::new(bootstrap.clone()).with_usdt(),
+            Arc::new(PubkyCompanionRelay::new(
+                pubky::PubkyHttpClient::new().unwrap(),
+            )),
+            creators.clone(),
+            sessions.clone(),
+            BitcoinNetwork::Testnet,
+        );
+        let service = SetupService::new(
+            vec!["https://app.example".into()],
+            Arc::new(completer),
+            Arc::new(SystemClock::default()),
+            SetupLimits {
+                max_polls_per_flow: 2,
+                max_polls: 20,
+                setup_per_ip_per_minute: 20,
+                max_pending_setup_flows: 10,
+            },
+        );
+        let route = StatusRoute {
+            signer: SigningKey::from_bytes(&[7; 32]),
+            creators: creators.clone(),
+            sessions: sessions.clone(),
+            usdt_enabled: true,
+        };
+        let without_usdt_config = StatusRoute {
+            signer: SigningKey::from_bytes(&[7; 32]),
+            creators,
+            sessions,
+            usdt_enabled: false,
+        };
+
+        let never_set_up = enroll(&bootstrap, &home).await;
+        // Seller A approved a Bitcoin account and a USDT address.
+        let both = enroll(&bootstrap, &home).await;
+        assert_eq!(
+            setup(&service, &bootstrap, &both, Some(USDT_ADDRESS)).await,
+            PollResult::Complete
+        );
+        // Seller B approved a Bitcoin account and declined the USDT address.
+        let bitcoin_only = enroll(&bootstrap, &home).await;
+        assert_eq!(
+            setup(&service, &bootstrap, &bitcoin_only, None).await,
+            PollResult::Complete
+        );
+
+        assert_eq!(route.accepted(&both.creator, "USDT").await, READY);
+        assert_eq!(route.accepted(&both.creator, "BTC").await, READY);
+        assert_eq!(
+            route.accepted(&bitcoin_only.creator, "USDT").await,
+            SETUP_REQUIRED
+        );
+        assert_eq!(route.accepted(&bitcoin_only.creator, "BTC").await, READY);
+        assert_eq!(
+            route.accepted(&never_set_up.creator, "USDT").await,
+            SETUP_REQUIRED
+        );
+        assert_eq!(
+            route.accepted(&never_set_up.creator, "BTC").await,
+            SETUP_REQUIRED
+        );
+        // `[usdt]` not configured: even a seller with a USDT address is not ready.
+        assert_eq!(
+            without_usdt_config.accepted(&both.creator, "USDT").await,
+            SETUP_REQUIRED
+        );
+        assert_eq!(
+            without_usdt_config.accepted(&both.creator, "BTC").await,
+            READY
+        );
+
+        // The denomination semantics are untouched: the same Bitcoin-only seller
+        // is ready for every denomination, exactly as before `accepted_asset`.
+        for asset in ["BTC", "USD", "USDT"] {
+            assert_eq!(
+                route.denomination(&bitcoin_only.creator, asset).await,
+                READY
+            );
+            assert_eq!(route.denomination(&both.creator, asset).await, READY);
+            assert_eq!(
+                route.denomination(&never_set_up.creator, asset).await,
+                SETUP_REQUIRED
+            );
+        }
+        assert_eq!(
+            without_usdt_config
+                .denomination(&both.creator, "USDT")
+                .await,
+            SETUP_REQUIRED
+        );
+        assert_eq!(
+            without_usdt_config.denomination(&both.creator, "USD").await,
+            READY
+        );
+
+        // Both fields together.
+        let (status, body) = route
+            .ask(format!(
+                r#"{{"accepted_asset":"USDT","asset":"USDT","creator":"{}"}}"#,
+                bitcoin_only.creator
+            ))
+            .await;
+        assert_eq!((status, body.as_str()), (StatusCode::OK, SETUP_REQUIRED));
+        let (status, body) = route
+            .ask(format!(
+                r#"{{"accepted_asset":"BTC","asset":"USDT","creator":"{}"}}"#,
+                bitcoin_only.creator
+            ))
+            .await;
+        assert_eq!((status, body.as_str()), (StatusCode::OK, READY));
+        let (status, body) = route
+            .ask(format!(
+                r#"{{"accepted_asset":"USDT","asset":"USD","creator":"{}"}}"#,
+                both.creator
+            ))
+            .await;
+        assert_eq!((status, body.as_str()), (StatusCode::OK, READY));
+
+        // A reconnect that does not add the address leaves USDT unavailable.
+        assert_eq!(
+            reconnect_with_usdt(&service, &bootstrap, &bitcoin_only, None).await,
+            PollResult::Complete
+        );
+        assert_eq!(
+            route.accepted(&bitcoin_only.creator, "USDT").await,
+            SETUP_REQUIRED
+        );
+        // A reconnect that adds the address makes the seller USDT-ready.
+        assert_eq!(
+            reconnect_with_usdt(&service, &bootstrap, &bitcoin_only, Some(USDT_ADDRESS)).await,
+            PollResult::Complete
+        );
+        assert_eq!(route.accepted(&bitcoin_only.creator, "USDT").await, READY);
+        assert_eq!(route.accepted(&bitcoin_only.creator, "BTC").await, READY);
+        assert_eq!(
+            without_usdt_config
+                .accepted(&bitcoin_only.creator, "USDT")
+                .await,
+            SETUP_REQUIRED
+        );
+        database.cleanup().await;
+    }
 }

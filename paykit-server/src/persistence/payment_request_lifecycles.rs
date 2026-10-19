@@ -51,7 +51,8 @@ impl RequiredReceiveTarget {
 
 #[derive(sqlx::FromRow)]
 struct LifecycleRow {
-    invoice_id: Uuid,
+    invoice_id: Option<Uuid>,
+    marketplace_preparation_id: Option<Uuid>,
     sdk_payment_request_id: String,
     request_state: String,
     state_event_id: Option<String>,
@@ -63,9 +64,16 @@ struct LifecycleRow {
 #[derive(sqlx::FromRow)]
 struct IntentRow {
     id: Uuid,
-    invoice_id: Uuid,
+    invoice_id: Option<Uuid>,
+    marketplace_preparation_id: Option<Uuid>,
     creator_lookup_hash: Vec<u8>,
     intent_envelope: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LifecycleOwner {
+    Invoice(Uuid),
+    Marketplace(Uuid),
 }
 
 #[derive(sqlx::FromRow)]
@@ -81,6 +89,131 @@ impl PaymentRequestLifecycleStore {
             pool: pool.clone(),
             crypto,
         }
+    }
+
+    /// Counterparties whose Bitcoin-bearing requests may affect one Creator-wide
+    /// account-rotation snapshot.
+    pub async fn required_receive_targets_for_creator_rotation(
+        &self,
+        creator: &CreatorPubky,
+    ) -> Result<Vec<RequiredReceiveTarget>, PersistenceError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        let creator_hash = self.crypto.lookup_hash(creator.to_string().as_bytes());
+        let creator_id: Uuid =
+            sqlx::query_scalar("SELECT id FROM creators WHERE creator_lookup_hash = $1")
+                .bind(creator_hash.as_bytes().as_slice())
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(|_| PersistenceError::Unavailable)?
+                .ok_or(PersistenceError::CorruptOrMissing)?;
+        let targets = self
+            .required_receive_targets_for_creator_rotation_in_transaction(
+                &mut transaction,
+                creator_id,
+            )
+            .await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        Ok(targets)
+    }
+
+    pub(crate) async fn required_receive_targets_for_creator_rotation_in_transaction(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        creator_id: Uuid,
+    ) -> Result<Vec<RequiredReceiveTarget>, PersistenceError> {
+        self.backfill_legacy_marketplace_bitcoin_generation(transaction, creator_id)
+            .await?;
+        let rows = sqlx::query_as::<_, RequiredReceiveTargetRow>(
+            "SELECT DISTINCT ON (proposal.id)
+                    proposal.id, creator.creator_lookup_hash, proposal.intent_envelope
+             FROM outbox proposal
+             JOIN creators creator ON creator.id = proposal.creator_id
+             LEFT JOIN invoices invoice ON invoice.id = proposal.invoice_id
+             LEFT JOIN marketplace_payment_preparations preparation
+               ON preparation.id = proposal.marketplace_preparation_id
+             WHERE proposal.creator_id = $1
+               AND proposal.intent_kind = 'payment_request_proposal'
+               AND (
+                   invoice.bitcoin_account_generation = creator.bitcoin_account_generation
+                   OR preparation.bitcoin_account_generation = creator.bitcoin_account_generation
+               )
+               AND (
+                   (proposal.status IN ('handed_off', 'delivered') AND NOT EXISTS (
+                       SELECT 1 FROM payment_request_lifecycles lifecycle
+                       WHERE lifecycle.invoice_id = invoice.id
+                          OR lifecycle.marketplace_preparation_id = preparation.id
+                   ))
+                   OR EXISTS (
+                       SELECT 1 FROM payment_request_lifecycles lifecycle
+                       WHERE (lifecycle.invoice_id = invoice.id
+                              OR lifecycle.marketplace_preparation_id = preparation.id)
+                         AND lifecycle.request_state = 'proposed'
+                   )
+               )
+             ORDER BY proposal.id",
+        )
+        .bind(creator_id)
+        .fetch_all(&mut **transaction)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        self.decode_required_receive_targets(rows)
+    }
+
+    async fn backfill_legacy_marketplace_bitcoin_generation(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        creator_id: Uuid,
+    ) -> Result<(), PersistenceError> {
+        let (creator_lookup_hash, generation): (Vec<u8>, i64) = sqlx::query_as(
+            "SELECT creator_lookup_hash, bitcoin_account_generation
+             FROM creators WHERE id = $1 FOR UPDATE",
+        )
+        .bind(creator_id)
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?
+        .ok_or(PersistenceError::CorruptOrMissing)?;
+        let creator_lookup_hash = lookup_hash(&creator_lookup_hash)?;
+        let legacy: Vec<(Uuid, Vec<u8>)> = sqlx::query_as(
+            "SELECT id, preparation_envelope FROM marketplace_payment_preparations
+             WHERE creator_id = $1 AND bitcoin_account_generation IS NULL
+             ORDER BY id FOR UPDATE",
+        )
+        .bind(creator_id)
+        .fetch_all(&mut **transaction)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        for (preparation_id, envelope) in legacy {
+            let plaintext = self
+                .crypto
+                .decrypt(
+                    &EnvelopeContext::marketplace_preparation(creator_lookup_hash, preparation_id),
+                    &EncryptedEnvelope::from_bytes(envelope),
+                )
+                .map_err(|_| PersistenceError::CorruptOrMissing)?;
+            if super::marketplace_preparations::PreparationEnvelope::decode(&plaintext)?
+                .has_bitcoin()
+            {
+                sqlx::query(
+                    "UPDATE marketplace_payment_preparations
+                     SET bitcoin_account_generation = $2
+                     WHERE id = $1 AND bitcoin_account_generation IS NULL",
+                )
+                .bind(preparation_id)
+                .bind(generation)
+                .execute(&mut **transaction)
+                .await
+                .map_err(|_| PersistenceError::Unavailable)?;
+            }
+        }
+        Ok(())
     }
 
     pub async fn required_receive_targets_for_lock(
@@ -106,10 +239,10 @@ impl PaymentRequestLifecycleStore {
              WHERE invoice.creator_id = $1
                AND invoice.lock_resource_lookup_hash = $2
                AND (
-                   NOT EXISTS (
+                   (proposal.status <> 'permanently_failed' AND NOT EXISTS (
                        SELECT 1 FROM payment_request_lifecycles AS lifecycle
                        WHERE lifecycle.invoice_id = invoice.id
-                   )
+                   ))
                    OR EXISTS (
                        SELECT 1 FROM payment_request_lifecycles AS lifecycle
                        WHERE lifecycle.invoice_id = invoice.id
@@ -149,10 +282,10 @@ impl PaymentRequestLifecycleStore {
              WHERE invoice.creator_id = $1
                AND invoice.bundle_lookup_hash = $2
                AND (
-                   NOT EXISTS (
+                   (proposal.status <> 'permanently_failed' AND NOT EXISTS (
                        SELECT 1 FROM payment_request_lifecycles AS lifecycle
                        WHERE lifecycle.invoice_id = invoice.id
-                   )
+                   ))
                    OR EXISTS (
                        SELECT 1 FROM payment_request_lifecycles AS lifecycle
                        WHERE lifecycle.invoice_id = invoice.id
@@ -192,10 +325,10 @@ impl PaymentRequestLifecycleStore {
              WHERE invoice.creator_id = $1
                AND invoice.lock_resource_lookup_hash = $2
                AND (
-                   NOT EXISTS (
+                   (proposal.status <> 'permanently_failed' AND NOT EXISTS (
                        SELECT 1 FROM payment_request_lifecycles AS lifecycle
                        WHERE lifecycle.invoice_id = invoice.id
-                   )
+                   ))
                    OR EXISTS (
                        SELECT 1 FROM payment_request_lifecycles AS lifecycle
                        WHERE lifecycle.invoice_id = invoice.id
@@ -235,10 +368,10 @@ impl PaymentRequestLifecycleStore {
              WHERE invoice.creator_id = $1
                AND invoice.bundle_lookup_hash = $2
                AND (
-                   NOT EXISTS (
+                   (proposal.status <> 'permanently_failed' AND NOT EXISTS (
                        SELECT 1 FROM payment_request_lifecycles AS lifecycle
                        WHERE lifecycle.invoice_id = invoice.id
-                   )
+                   ))
                    OR EXISTS (
                        SELECT 1 FROM payment_request_lifecycles AS lifecycle
                        WHERE lifecycle.invoice_id = invoice.id
@@ -313,17 +446,24 @@ impl PaymentRequestLifecycleStore {
             .await
             .map_err(|_| PersistenceError::Unavailable)?;
 
-        let direct_invoice_ids: Vec<Uuid> = sqlx::query_scalar(
-            "SELECT DISTINCT invoice_id
+        let direct_owner_rows: Vec<(Option<Uuid>, Option<Uuid>)> = sqlx::query_as(
+            "SELECT DISTINCT invoice_id, marketplace_preparation_id
              FROM outbox
-             WHERE creator_id = $1 AND sdk_payment_request_id = $2 AND invoice_id IS NOT NULL",
+             WHERE creator_id = $1 AND sdk_payment_request_id = $2
+               AND num_nonnulls(invoice_id, marketplace_preparation_id) = 1",
         )
         .bind(creator_id)
         .bind(&projection.payment_request_id)
         .fetch_all(&mut *transaction)
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
-        if direct_invoice_ids.len() > 1 {
+        let direct_owners = direct_owner_rows
+            .into_iter()
+            .map(|(invoice_id, marketplace_preparation_id)| {
+                lifecycle_owner(invoice_id, marketplace_preparation_id)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if direct_owners.len() > 1 {
             return Err(PersistenceError::CorruptOrMissing);
         }
 
@@ -335,8 +475,8 @@ impl PaymentRequestLifecycleStore {
             projection.proposal.terms.payment_reference.as_bytes(),
         );
         let intent_rows = sqlx::query_as::<_, IntentRow>(
-            "SELECT outbox.id, outbox.invoice_id, creators.creator_lookup_hash,
-                    outbox.intent_envelope
+            "SELECT outbox.id, outbox.invoice_id, outbox.marketplace_preparation_id,
+                    creators.creator_lookup_hash, outbox.intent_envelope
              FROM outbox
              JOIN creators ON creators.id = outbox.creator_id
              WHERE outbox.creator_id = $1
@@ -348,7 +488,7 @@ impl PaymentRequestLifecycleStore {
         .fetch_all(&mut *transaction)
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
-        let mut semantic_invoice_ids = Vec::new();
+        let mut semantic_owners = Vec::new();
         for row in intent_rows {
             let creator_hash = lookup_hash(&row.creator_lookup_hash)?;
             let plaintext = self
@@ -364,42 +504,27 @@ impl PaymentRequestLifecycleStore {
                 &projection.proposal.reader_pubky,
                 &projection.proposal.proposal_app_id,
                 &projection.proposal.terms,
-            ) && !semantic_invoice_ids.contains(&row.invoice_id)
-            {
-                semantic_invoice_ids.push(row.invoice_id);
+            ) {
+                let owner = lifecycle_owner(row.invoice_id, row.marketplace_preparation_id)?;
+                if !semantic_owners.contains(&owner) {
+                    semantic_owners.push(owner);
+                }
             }
         }
-        let invoice_id = match semantic_invoice_ids.as_slice() {
-            [] if direct_invoice_ids.is_empty() => {
+        let owner = match semantic_owners.as_slice() {
+            [] if direct_owners.is_empty() => {
                 return Ok(PaymentRequestLifecycleApply::NotAttributable);
             }
-            [invoice_id]
-                if direct_invoice_ids.is_empty()
-                    || direct_invoice_ids.first() == Some(invoice_id) =>
-            {
-                *invoice_id
-            }
+            [owner] if direct_owners.is_empty() || direct_owners.first() == Some(owner) => *owner,
             _ => return Err(PersistenceError::CorruptOrMissing),
         };
 
-        let locked_invoice: Option<Uuid> = sqlx::query_scalar(
-            "SELECT id
-             FROM invoices
-             WHERE id = $1 AND creator_id = $2
-             FOR UPDATE",
-        )
-        .bind(invoice_id)
-        .bind(creator_id)
-        .fetch_optional(&mut *transaction)
-        .await
-        .map_err(|_| PersistenceError::Unavailable)?;
-        if locked_invoice.is_none() {
-            return Err(PersistenceError::CorruptOrMissing);
-        }
+        lock_owner(&mut transaction, creator_id, owner).await?;
 
         let existing = sqlx::query_as::<_, LifecycleRow>(
-            "SELECT invoice_id, sdk_payment_request_id, request_state, state_event_id,
-                    last_stream_item_id, last_outbound_message_id, last_event_at
+            "SELECT invoice_id, marketplace_preparation_id, sdk_payment_request_id,
+                    request_state, state_event_id, last_stream_item_id,
+                    last_outbound_message_id, last_event_at
              FROM payment_request_lifecycles
              WHERE sdk_payment_request_id = $1
              FOR UPDATE",
@@ -430,7 +555,7 @@ impl PaymentRequestLifecycleStore {
             let equal_cursor_update_allowed = existing.state_event_id == projection.state_event_id
                 && (existing_state == projection.request_state
                     || cursor_stable_transition_allowed(existing_state, projection.request_state));
-            if existing.invoice_id != invoice_id
+            if lifecycle_owner(existing.invoice_id, existing.marketplace_preparation_id)? != owner
                 || existing.sdk_payment_request_id != projection.payment_request_id
                 || (existing_state == PaymentRequestLifecycleState::ProposalExpired
                     && projection.request_state == PaymentRequestLifecycleState::Proposed)
@@ -458,31 +583,59 @@ impl PaymentRequestLifecycleStore {
             .await
             .map_err(|_| PersistenceError::Unavailable)?;
         } else {
-            let inserted = sqlx::query(
-                "INSERT INTO payment_request_lifecycles (
-                     invoice_id, sdk_payment_request_id, request_state, state_event_id,
-                     last_stream_item_id, last_outbound_message_id, last_event_at
-                 )
-                 SELECT $1, $2, $3, $4, $5, $6, $7
-                 WHERE EXISTS (
-                     SELECT 1
-                     FROM invoices invoice
-                     JOIN lock_payment_generations generation
-                       ON generation.creator_id = invoice.creator_id
-                      AND generation.lock_resource_lookup_hash = invoice.lock_resource_lookup_hash
-                      AND generation.current_generation = invoice.lock_resource_generation
-                     WHERE invoice.id = $1 AND generation.active_drain_id IS NULL
-                 )",
-            )
-            .bind(invoice_id)
-            .bind(&projection.payment_request_id)
-            .bind(projection.request_state.as_str())
-            .bind(&projection.state_event_id)
-            .bind(stream_cursor)
-            .bind(outbound_cursor)
-            .bind(last_event_at)
-            .execute(&mut *transaction)
-            .await
+            let inserted = match owner {
+                LifecycleOwner::Invoice(invoice_id) => sqlx::query(
+                    "INSERT INTO payment_request_lifecycles (
+                         invoice_id, sdk_payment_request_id, request_state, state_event_id,
+                         last_stream_item_id, last_outbound_message_id, last_event_at
+                     )
+                     SELECT $1, $2, $3, $4, $5, $6, $7
+                     WHERE EXISTS (
+                         SELECT 1
+                         FROM invoices invoice
+                         JOIN lock_payment_generations generation
+                           ON generation.creator_id = invoice.creator_id
+                          AND generation.lock_resource_lookup_hash = invoice.lock_resource_lookup_hash
+                          AND generation.current_generation = invoice.lock_resource_generation
+                         WHERE invoice.id = $1 AND generation.active_drain_id IS NULL
+                     )",
+                )
+                .bind(invoice_id)
+                .bind(&projection.payment_request_id)
+                .bind(projection.request_state.as_str())
+                .bind(&projection.state_event_id)
+                .bind(stream_cursor)
+                .bind(outbound_cursor)
+                .bind(last_event_at)
+                .execute(&mut *transaction)
+                .await,
+                LifecycleOwner::Marketplace(preparation_id) => sqlx::query(
+                    "INSERT INTO payment_request_lifecycles (
+                         marketplace_preparation_id, sdk_payment_request_id,
+                         request_state, state_event_id, last_stream_item_id,
+                         last_outbound_message_id, last_event_at
+                     )
+                     SELECT $1, $2, $3, $4, $5, $6, $7
+                     WHERE EXISTS (
+                         SELECT 1
+                         FROM marketplace_settlements settlement
+                         JOIN marketplace_payment_preparations preparation
+                           ON preparation.id = settlement.preparation_id
+                          AND preparation.creator_id = settlement.creator_id
+                         WHERE settlement.preparation_id = $1
+                           AND preparation.state = 'active'
+                     )",
+                )
+                .bind(preparation_id)
+                .bind(&projection.payment_request_id)
+                .bind(projection.request_state.as_str())
+                .bind(&projection.state_event_id)
+                .bind(stream_cursor)
+                .bind(outbound_cursor)
+                .bind(last_event_at)
+                .execute(&mut *transaction)
+                .await,
+            }
             .map_err(|_| PersistenceError::Unavailable)?;
             if inserted.rows_affected() != 1 {
                 return Err(PersistenceError::Conflict);
@@ -526,18 +679,103 @@ impl PaymentRequestLifecycleStore {
         Ok(aggregate_lifecycle(attempts))
     }
 
+    /// Loads canonical lifecycle state for one activated Marketplace preparation.
+    pub async fn load_marketplace(
+        &self,
+        creator: &CreatorPubky,
+        preparation_id: Uuid,
+    ) -> Result<Option<PersistedPaymentRequestLifecycle>, PersistenceError> {
+        let creator_hash = self.crypto.lookup_hash(creator.to_string().as_bytes());
+        let rows: Vec<(String, time::OffsetDateTime)> = sqlx::query_as(
+            "SELECT lifecycle.request_state, lifecycle.last_event_at
+             FROM payment_request_lifecycles AS lifecycle
+             JOIN marketplace_settlements AS settlement
+               ON settlement.preparation_id = lifecycle.marketplace_preparation_id
+             JOIN creators ON creators.id = settlement.creator_id
+             WHERE creators.creator_lookup_hash = $1
+               AND settlement.preparation_id = $2",
+        )
+        .bind(creator_hash.as_bytes().as_slice())
+        .bind(preparation_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        let attempts = rows
+            .into_iter()
+            .map(|(request_state, last_event_at)| {
+                PaymentRequestLifecycleState::parse(&request_state)
+                    .map(|state| (state, last_event_at))
+                    .ok_or(PersistenceError::CorruptOrMissing)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(aggregate_lifecycle(attempts))
+    }
+
     /// Creator rows that currently have attributable SDK Payment Requests.
     pub async fn creator_ids(&self) -> Result<Vec<Uuid>, PersistenceError> {
         sqlx::query_scalar(
             "SELECT DISTINCT creator_id
              FROM outbox
-             WHERE invoice_id IS NOT NULL
+             WHERE invoice_id IS NOT NULL OR marketplace_preparation_id IS NOT NULL
              ORDER BY creator_id",
         )
         .fetch_all(&self.pool)
         .await
         .map_err(|_| PersistenceError::Unavailable)
     }
+}
+
+fn lifecycle_owner(
+    invoice_id: Option<Uuid>,
+    marketplace_preparation_id: Option<Uuid>,
+) -> Result<LifecycleOwner, PersistenceError> {
+    match (invoice_id, marketplace_preparation_id) {
+        (Some(invoice_id), None) => Ok(LifecycleOwner::Invoice(invoice_id)),
+        (None, Some(preparation_id)) => Ok(LifecycleOwner::Marketplace(preparation_id)),
+        _ => Err(PersistenceError::CorruptOrMissing),
+    }
+}
+
+async fn lock_owner(
+    transaction: &mut Transaction<'_, Postgres>,
+    creator_id: Uuid,
+    owner: LifecycleOwner,
+) -> Result<(), PersistenceError> {
+    let locked: Option<Uuid> = match owner {
+        LifecycleOwner::Invoice(invoice_id) => {
+            sqlx::query_scalar(
+                "SELECT id FROM invoices
+             WHERE id = $1 AND creator_id = $2
+             FOR UPDATE",
+            )
+            .bind(invoice_id)
+            .bind(creator_id)
+            .fetch_optional(&mut **transaction)
+            .await
+        }
+        LifecycleOwner::Marketplace(preparation_id) => {
+            sqlx::query_scalar(
+                "SELECT settlement.preparation_id
+             FROM marketplace_settlements AS settlement
+             JOIN marketplace_payment_preparations AS preparation
+               ON preparation.id = settlement.preparation_id
+              AND preparation.creator_id = settlement.creator_id
+             WHERE settlement.preparation_id = $1
+               AND settlement.creator_id = $2
+               AND preparation.state = 'active'
+             FOR UPDATE OF settlement",
+            )
+            .bind(preparation_id)
+            .bind(creator_id)
+            .fetch_optional(&mut **transaction)
+            .await
+        }
+    }
+    .map_err(|_| PersistenceError::Unavailable)?;
+    if locked.is_none() {
+        return Err(PersistenceError::CorruptOrMissing);
+    }
+    Ok(())
 }
 
 fn lookup_hash(bytes: &[u8]) -> Result<LookupHash, PersistenceError> {

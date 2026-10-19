@@ -4,8 +4,11 @@
 //! repository persists those complete SDK inputs inside Creator-bound AEAD
 //! envelopes before reporting invoice success.
 
+mod buyer_contacts;
 mod settlement;
 mod usdt;
+
+pub use buyer_contacts::PendingBuyerContact;
 
 use std::sync::Arc;
 
@@ -52,6 +55,7 @@ pub struct AtomicInvoiceInput<'a> {
     pub lock_resource_binding: &'a [u8],
     /// Exact payment-request binding for idempotent replay detection.
     pub payment_request_binding: &'a [u8],
+
     /// Derives the address and complete request only after this
     /// transaction has selected the permanent child index.
     pub invoice_payloads: &'a dyn InvoicePayloadFactory,
@@ -66,22 +70,25 @@ pub struct InvoicePayloads {
     pub payment_request_intent: DeliveryIntentV1,
 }
 
-#[derive(Serialize, Deserialize)]
-struct InvoicePaymentRecordV1 {
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct InvoicePaymentRecordV1 {
     version: u8,
     derivation_index: i64,
     bitcoin: Option<PaymentDestination>,
     usdt: Option<PaymentDestination>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
 struct PaymentDestination {
     address: String,
     required_amount: u64,
 }
 
 impl InvoicePaymentRecordV1 {
-    fn from_intent(index: i64, intent: &DeliveryIntentV1) -> Result<Self, PersistenceError> {
+    pub(crate) fn from_intent(
+        index: i64,
+        intent: &DeliveryIntentV1,
+    ) -> Result<Self, PersistenceError> {
         let terms = intent
             .terms()
             .map_err(|_| PersistenceError::CorruptOrMissing)?;
@@ -136,6 +143,56 @@ impl InvoicePaymentRecordV1 {
         }
         Ok(record)
     }
+
+    pub(crate) fn derivation_index(&self) -> i64 {
+        self.derivation_index
+    }
+
+    /// The shared USDT receiving address this record offered, if any.
+    pub(crate) fn usdt_address(&self) -> Result<Option<UsdtAddress>, PersistenceError> {
+        self.usdt
+            .as_ref()
+            .map(|destination| {
+                UsdtAddress::try_from(destination.address.clone())
+                    .map_err(|_| PersistenceError::CorruptOrMissing)
+            })
+            .transpose()
+    }
+
+    pub(crate) fn has_bitcoin(&self) -> bool {
+        self.bitcoin.is_some()
+    }
+
+    pub(crate) fn has_usdt(&self) -> bool {
+        self.usdt.is_some()
+    }
+
+    pub(crate) fn usdt_required_amount(&self) -> Result<u64, PersistenceError> {
+        if self.version != 1 {
+            return Err(PersistenceError::CorruptOrMissing);
+        }
+        self.usdt
+            .as_ref()
+            .map(|destination| destination.required_amount)
+            .ok_or(PersistenceError::InvalidInput)
+    }
+
+    pub(crate) fn bitcoin_address(&self) -> Result<&str, PersistenceError> {
+        self.bitcoin
+            .as_ref()
+            .map(|destination| destination.address.as_str())
+            .ok_or(PersistenceError::InvalidInput)
+    }
+
+    pub(crate) fn bitcoin_required_amount(&self) -> Result<u64, PersistenceError> {
+        if self.version != 1 {
+            return Err(PersistenceError::CorruptOrMissing);
+        }
+        self.bitcoin
+            .as_ref()
+            .map(|destination| destination.required_amount)
+            .ok_or(PersistenceError::InvalidInput)
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -153,8 +210,28 @@ pub(crate) struct BitcoinObservationInput {
     pub present: bool,
 }
 
+impl BitcoinObservationInput {
+    /// Groups address work, clears tracked absences before replacements, and
+    /// gives all remaining fields a provider-order-independent tie break.
+    pub(crate) fn cmp_for_batch(&self, other: &Self) -> std::cmp::Ordering {
+        self.address
+            .cmp(&other.address)
+            .then_with(|| self.present.cmp(&other.present))
+            .then_with(|| self.outpoint.txid().cmp(other.outpoint.txid()))
+            .then_with(|| self.outpoint.vout().cmp(&other.outpoint.vout()))
+            .then_with(|| self.observed_sats.cmp(&other.observed_sats))
+            .then_with(|| self.confirmations.cmp(&other.confirmations))
+    }
+}
+
 /// Produces payloads after the creator-row lock determines the child index.
 pub trait InvoicePayloadFactory: Send + Sync {
+    /// Generation observed with the Bitcoin account used by this factory.
+    /// Test and non-Bitcoin factories default to no generation fence.
+    fn expected_bitcoin_account_generation(&self) -> Option<i64> {
+        None
+    }
+
     fn for_child_index(&self, child_index: i64) -> Result<InvoicePayloads, PersistenceError>;
 }
 
@@ -239,6 +316,7 @@ impl AtomicInvoiceResult {
 pub struct InvoiceStore {
     pool: PgPool,
     crypto: Arc<Crypto>,
+    admitted: Arc<tokio::sync::Notify>,
 }
 
 impl InvoiceStore {
@@ -246,7 +324,14 @@ impl InvoiceStore {
         Self {
             pool: pool.clone(),
             crypto,
+            admitted: Arc::new(tokio::sync::Notify::new()),
         }
+    }
+
+    /// Waits for a coalesced hint that this store committed new outbox work.
+    /// Clones share the hint; periodic polling remains necessary after restart.
+    pub async fn wait_for_admission(&self) {
+        self.admitted.notified().await;
     }
 
     /// Authenticates encrypted payment records and observations against their keyed lookup hashes.
@@ -580,7 +665,7 @@ impl InvoiceStore {
             .await
             .map_err(|_| PersistenceError::Unavailable)?;
         let creator = sqlx::query_as::<_, CreatorRow>(
-            "SELECT id, creator_lookup_hash, next_child_index FROM creators \
+            "SELECT id, creator_lookup_hash, next_child_index, bitcoin_account_generation FROM creators \
              WHERE creator_lookup_hash = $1 FOR UPDATE",
         )
         .bind(creator_hash.as_bytes().as_slice())
@@ -803,7 +888,24 @@ impl InvoiceStore {
         invoice_id: Uuid,
     ) -> Result<Option<PaymentRequestStatusSummary>, PersistenceError> {
         let row = sqlx::query_as::<_, PaymentRequestStatusRow>(
-            "SELECT lifecycle.request_state, invoices.payment_status,
+            "SELECT COALESCE(
+                        lifecycle.request_state,
+                        CASE WHEN EXISTS (
+                            SELECT 1
+                            FROM creator_bitcoin_account_rotation_items rotation_item
+                            WHERE rotation_item.invoice_id = invoices.id
+                              AND rotation_item.classification = 'proposal_suppressed'
+                        ) THEN 'canceled'
+                        WHEN EXISTS (
+                            SELECT 1
+                            FROM outbox proposal
+                            WHERE proposal.invoice_id = invoices.id
+                              AND proposal.intent_kind = 'payment_request_proposal'
+                              AND proposal.status = 'permanently_failed'
+                              AND proposal.error_class = 'proposal_expired'
+                        ) THEN 'proposal_expired' END
+                    ) AS request_state,
+                    invoices.payment_status,
                     invoices.confirmation_count, invoices.amount_matched,
                     invoices.invoice_created_at, invoices.payment_deadline,
                     invoices.payment_expired_at,
@@ -1073,7 +1175,8 @@ impl InvoiceStore {
             .crypto
             .bitcoin_outpoint_lookup_hash(outpoint.as_bytes());
         let existing_outpoint = sqlx::query_as::<_, BitcoinObservationRow>(
-            "SELECT id, invoice_id, observation_envelope, outpoint_lookup_hash,
+            "SELECT id, invoice_id, marketplace_preparation_id,
+                    observation_envelope, outpoint_lookup_hash,
                     confirmations, present
              FROM bitcoin_observations WHERE outpoint_lookup_hash = $1 FOR UPDATE",
         )
@@ -1081,22 +1184,23 @@ impl InvoiceStore {
         .fetch_optional(&mut **tx)
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
-        if existing_outpoint
-            .as_ref()
-            .is_some_and(|row| row.invoice_id != invoice.id)
-        {
+        if existing_outpoint.as_ref().is_some_and(|row| {
+            row.invoice_id != Some(invoice.id) || row.marketplace_preparation_id.is_some()
+        }) {
             return Err(PersistenceError::Conflict);
         }
         if let Some(row) = existing_outpoint.as_ref() {
             let record = self.decrypt_observation(creator_hash, row)?;
             if record.outpoint != outpoint
+                || record.observed_sats != observed_sats
                 || row.outpoint_lookup_hash != outpoint_lookup_hash.as_bytes()
             {
-                return Err(PersistenceError::CorruptOrMissing);
+                return Err(PersistenceError::Conflict);
             }
         }
         let active = sqlx::query_as::<_, BitcoinObservationRow>(
-            "SELECT id, invoice_id, observation_envelope, outpoint_lookup_hash,
+            "SELECT id, invoice_id, marketplace_preparation_id,
+                    observation_envelope, outpoint_lookup_hash,
                     confirmations, present
              FROM bitcoin_observations WHERE invoice_id = $1 AND active FOR UPDATE",
         )
@@ -1190,10 +1294,9 @@ impl InvoiceStore {
         let observation_write = sqlx::query(
             "INSERT INTO bitcoin_observations \
             (id, invoice_id, observation_envelope, outpoint_lookup_hash,
-            confirmations, present, active) \
-            VALUES ($1, $2, $3, $4, $5, $6, TRUE) \
+            confirmations, present, active, first_observed_at) \
+            VALUES ($1, $2, $3, $4, $5, $6, TRUE, $7) \
             ON CONFLICT (outpoint_lookup_hash) DO UPDATE SET
-            observation_envelope = EXCLUDED.observation_envelope,
             confirmations = EXCLUDED.confirmations, present = EXCLUDED.present, active = TRUE, \
             updated_at = NOW() WHERE bitcoin_observations.invoice_id = EXCLUDED.invoice_id",
         )
@@ -1203,6 +1306,7 @@ impl InvoiceStore {
         .bind(outpoint_lookup_hash.as_bytes().as_slice())
         .bind(confirmations)
         .bind(present)
+        .bind(observed_at)
         .execute(&mut **tx)
         .await
         .map_err(|_| PersistenceError::Conflict)?;
@@ -1285,7 +1389,7 @@ impl InvoiceStore {
             .await
             .map_err(|_| PersistenceError::Unavailable)?;
         let creator = sqlx::query_as::<_, CreatorRow>(
-            "SELECT id, creator_lookup_hash, next_child_index \
+            "SELECT id, creator_lookup_hash, next_child_index, bitcoin_account_generation \
              FROM creators WHERE creator_lookup_hash = $1 FOR UPDATE",
         )
         .bind(creator_hash.as_bytes().as_slice())
@@ -1353,6 +1457,14 @@ impl InvoiceStore {
                 payment_deadline: existing.payment_deadline,
                 replayed: true,
             });
+        }
+
+        if input
+            .invoice_payloads
+            .expected_bitcoin_account_generation()
+            .is_some_and(|expected| expected != creator.bitcoin_account_generation)
+        {
+            return Err(PersistenceError::Conflict);
         }
 
         sqlx::query(
@@ -1494,9 +1606,9 @@ impl InvoiceStore {
               payment_record_envelope, bitcoin_address_lookup_hash,
               derivation_index_lookup_hash, payment_status, invoice_created_at,
               proposal_expires_at, payment_deadline, proposal_acceptance_seconds,
-              payment_window_seconds) \
+              payment_window_seconds, bitcoin_account_generation) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'undetected',
-                     $12, $13, $14, $15, $16)",
+                     $12, $13, $14, $15, $16, $17)",
         )
         .bind(invoice_id)
         .bind(creator.id)
@@ -1518,6 +1630,12 @@ impl InvoiceStore {
         .bind(payment_deadline)
         .bind(proposal_acceptance_seconds)
         .bind(payment_window_seconds)
+        .bind(
+            input
+                .invoice_payloads
+                .expected_bitcoin_account_generation()
+                .map(|_| creator.bitcoin_account_generation),
+        )
         .execute(&mut *tx)
         .await
         .map_err(|_| PersistenceError::Conflict)?;
@@ -1546,6 +1664,7 @@ impl InvoiceStore {
         tx.commit()
             .await
             .map_err(|_| PersistenceError::Unavailable)?;
+        self.admitted.notify_one();
         Ok(AtomicInvoiceResult {
             invoice_id,
             payment_request_outbox_id,
@@ -1582,14 +1701,14 @@ impl InvoiceStore {
         creator_hash: LookupHash,
         row: &BitcoinObservationRow,
     ) -> Result<BitcoinObservationV1, PersistenceError> {
+        let invoice_id = match (row.invoice_id, row.marketplace_preparation_id) {
+            (Some(invoice_id), None) => invoice_id,
+            _ => return Err(PersistenceError::CorruptOrMissing),
+        };
         let plaintext = self
             .crypto
             .decrypt(
-                &EnvelopeContext::bitcoin_observation_for_invoice(
-                    creator_hash,
-                    row.id,
-                    row.invoice_id,
-                ),
+                &EnvelopeContext::bitcoin_observation_for_invoice(creator_hash, row.id, invoice_id),
                 &EncryptedEnvelope::from_bytes(row.observation_envelope.clone()),
             )
             .map_err(|_| PersistenceError::CorruptOrMissing)?;
@@ -1710,6 +1829,7 @@ struct CreatorRow {
     id: Uuid,
     creator_lookup_hash: Vec<u8>,
     next_child_index: i64,
+    bitcoin_account_generation: i64,
 }
 
 fn parse_canonical_bitcoin_outpoint(value: &str) -> Result<BitcoinOutpoint, PersistenceError> {
@@ -1735,7 +1855,8 @@ struct BitcoinInvoiceRow {
 #[derive(sqlx::FromRow)]
 struct BitcoinObservationRow {
     id: Uuid,
-    invoice_id: Uuid,
+    invoice_id: Option<Uuid>,
+    marketplace_preparation_id: Option<Uuid>,
     observation_envelope: Vec<u8>,
     outpoint_lookup_hash: Vec<u8>,
     confirmations: i32,

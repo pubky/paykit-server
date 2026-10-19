@@ -27,11 +27,11 @@ ed25519-dalek = "2"
 hkdf = "0.13"
 hmac = "0.13"
 humantime-serde = "1"
-locks-core = { git = "https://github.com/pubky/locks.git", tag = "v0.1.0-rc9" }
-paykit-lib = { git = "https://github.com/pubky/paykit-rs.git", tag = "v0.1.0-rc71" }
-paykit-sdk = { git = "https://github.com/pubky/paykit-rs.git", tag = "v0.1.0-rc71" }
-pubky = "=0.15.0"
-pubky-testnet = "=0.15.0"
+locks-core = "=0.1.0"
+paykit-lib = "=0.1.0"
+paykit-sdk = "=0.1.0"
+pubky = "=0.16.2"
+pubky-testnet = "=0.16.2"
 prometheus-client = "0.25"
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 postcard = { version = "1.1", features = ["use-std"] }

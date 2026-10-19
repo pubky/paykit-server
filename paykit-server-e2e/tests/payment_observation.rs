@@ -87,6 +87,95 @@ async fn invoice(store: &InvoiceStore) -> (uuid::Uuid, String) {
     invoice_for(store, b"bundle", b"request", "bitcoin-address-0").await
 }
 
+#[tokio::test]
+async fn verified_timely_payment_queues_one_contact_attempt_per_buyer() {
+    let database = TestDatabase::create().await;
+    let store = store(&database).await;
+    let (id, address) = invoice(&store).await;
+    assert!(store.claim_buyer_contact().await.unwrap().is_none());
+    let underpayment = persisted_outpoint("buyer-contact-underpayment");
+    for present in [true, false] {
+        store
+            .apply_bitcoin_observation(&address, &underpayment, 99, 1, present)
+            .await
+            .unwrap();
+        assert!(store.claim_buyer_contact().await.unwrap().is_none());
+    }
+    store
+        .apply_bitcoin_observation(
+            &address,
+            &persisted_outpoint("buyer-contact-payment"),
+            100,
+            0,
+            true,
+        )
+        .await
+        .unwrap();
+    let pending = store.claim_buyer_contact().await.unwrap().unwrap();
+    assert_eq!(pending.invoice_id, id);
+    assert_eq!(pending.reader, reader());
+    assert!(store.claim_buyer_contact().await.unwrap().is_none());
+
+    // An interrupted save is retryable after restart, without another chain observation.
+    sqlx::query("UPDATE buyer_contacts SET next_attempt_at = NOW() WHERE invoice_id = $1")
+        .bind(id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    let restarted = InvoiceStore::new(database.pool(), crypto());
+    let retried = restarted.claim_buyer_contact().await.unwrap().unwrap();
+    assert_eq!(retried.invoice_id, id);
+    restarted.complete_buyer_contact(&retried).await.unwrap();
+    let (_, second_address) = invoice_for(
+        &store,
+        b"second-bundle",
+        b"second-request",
+        "bitcoin-address-1",
+    )
+    .await;
+    store
+        .apply_bitcoin_observation(
+            &second_address,
+            &persisted_outpoint("second-payment"),
+            100,
+            1,
+            true,
+        )
+        .await
+        .unwrap();
+    assert!(
+        store.claim_buyer_contact().await.unwrap().is_none(),
+        "repeat purchases must not recreate a deleted contact"
+    );
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn late_payment_does_not_queue_a_buyer_contact() {
+    let database = TestDatabase::create().await;
+    let store = store(&database).await;
+    let (id, address) = invoice(&store).await;
+    let deadline: OffsetDateTime =
+        sqlx::query_scalar("SELECT payment_deadline FROM invoices WHERE id = $1")
+            .bind(id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    store
+        .apply_bitcoin_observation_at(
+            &address,
+            &persisted_outpoint("late-payment"),
+            100,
+            1,
+            true,
+            deadline + time::Duration::seconds(1),
+        )
+        .await
+        .unwrap();
+    assert!(store.claim_buyer_contact().await.unwrap().is_none());
+    database.cleanup().await;
+}
+
 async fn invoice_for(
     store: &InvoiceStore,
     bundle: &[u8],
@@ -261,6 +350,96 @@ async fn set_invoice_deadline(
     .execute(database.pool())
     .await
     .unwrap();
+}
+
+async fn assert_reorg_batch_preserves_replacement_for_invoice(
+    original: OutPoint,
+    replacement: OutPoint,
+) {
+    let database = TestDatabase::create().await;
+    let (store, invoice_id) = batch_invoice(&database).await;
+    let deadline = timestamp("2030-01-02T00:00:00Z");
+    set_invoice_deadline(&database, invoice_id, deadline).await;
+    let original_at = deadline - time::Duration::seconds(1);
+
+    assert_eq!(
+        observe_once_at(
+            &FixedBatch(vec![ObservedOutput {
+                network: BitcoinNetwork::Regtest,
+                address: REGTEST_ADDRESS.into(),
+                outpoint: original,
+                sats: 100,
+                confirmations: 1,
+                present: true,
+            }]),
+            &store,
+            &BitcoinNetwork::Regtest,
+            &[invoice_target()],
+            original_at,
+        )
+        .await,
+        Ok(1)
+    );
+    assert_eq!(
+        observe_once_at(
+            &FixedBatch(vec![
+                ObservedOutput {
+                    network: BitcoinNetwork::Regtest,
+                    address: REGTEST_ADDRESS.into(),
+                    outpoint: replacement,
+                    sats: 100,
+                    confirmations: 0,
+                    present: true,
+                },
+                ObservedOutput {
+                    network: BitcoinNetwork::Regtest,
+                    address: REGTEST_ADDRESS.into(),
+                    outpoint: original,
+                    sats: 100,
+                    confirmations: 0,
+                    present: false,
+                },
+            ]),
+            &store,
+            &BitcoinNetwork::Regtest,
+            &[tracked_invoice_target(original, 100)],
+            deadline,
+        )
+        .await,
+        Ok(2)
+    );
+
+    let active: (i32, bool, OffsetDateTime) = sqlx::query_as(
+        "SELECT confirmations, present, first_observed_at
+         FROM bitcoin_observations WHERE invoice_id = $1 AND active",
+    )
+    .bind(invoice_id)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(active, (0, true, deadline));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM bitcoin_observations WHERE invoice_id = $1",
+        )
+        .bind(invoice_id)
+        .fetch_one(database.pool())
+        .await
+        .unwrap(),
+        2
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM invoice_timely_amount_matched_outpoints WHERE invoice_id = $1",
+        )
+        .bind(invoice_id)
+        .fetch_one(database.pool())
+        .await
+        .unwrap(),
+        2
+    );
+
+    database.cleanup().await;
 }
 
 async fn install_decision_clock_audit(database: &TestDatabase) {
@@ -785,6 +964,20 @@ async fn matching_output_later_in_exact_deadline_batch_wins_before_expiry() {
     );
 
     database.cleanup().await;
+}
+
+#[tokio::test]
+async fn reorg_batch_preserves_invoice_replacement_for_both_outpoint_orders() {
+    assert_reorg_batch_preserves_replacement_for_invoice(
+        provider_outpoint(2),
+        provider_outpoint(1),
+    )
+    .await;
+    assert_reorg_batch_preserves_replacement_for_invoice(
+        provider_outpoint(1),
+        provider_outpoint(2),
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -1397,10 +1590,12 @@ async fn underpayment_is_nonfinal_replaceable_and_outpoints_stay_globally_unique
         facts(&database, invoice_id).await,
         ("confirmed".into(), 20, false)
     );
-    store
-        .apply_bitcoin_observation(&address, &persisted_outpoint("underpaid"), 100, 0, true)
-        .await
-        .unwrap();
+    assert_eq!(
+        store
+            .apply_bitcoin_observation(&address, &persisted_outpoint("underpaid"), 100, 0, true)
+            .await,
+        Err(PersistenceError::Conflict)
+    );
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM bitcoin_observations WHERE invoice_id = $1",
@@ -1660,22 +1855,13 @@ async fn payment_record_integrity_rejects_row_and_type_envelope_swaps() {
     .fetch_one(database.pool())
     .await
     .unwrap();
-    sqlx::query("UPDATE bitcoin_observations SET invoice_id = $1 WHERE id = $2")
-        .bind(other_invoice_id)
-        .bind(first_observation.0)
-        .execute(database.pool())
-        .await
-        .unwrap();
-    assert_eq!(
-        store.scan_payment_record_integrity().await,
-        Err(PersistenceError::CorruptOrMissing)
-    );
-    sqlx::query("UPDATE bitcoin_observations SET invoice_id = $1 WHERE id = $2")
-        .bind(first_id)
-        .bind(first_observation.0)
-        .execute(database.pool())
-        .await
-        .unwrap();
+    let cross_creator_rewrite =
+        sqlx::query("UPDATE bitcoin_observations SET invoice_id = $1 WHERE id = $2")
+            .bind(other_invoice_id)
+            .bind(first_observation.0)
+            .execute(database.pool())
+            .await;
+    assert!(cross_creator_rewrite.is_err());
     store.scan_payment_record_integrity().await.unwrap();
 
     let (same_creator_parent_id, _) = invoice_for(
@@ -1685,40 +1871,22 @@ async fn payment_record_integrity_rejects_row_and_type_envelope_swaps() {
         "bitcoin-address-2",
     )
     .await;
-    sqlx::query("UPDATE bitcoin_observations SET invoice_id = $1 WHERE id = $2")
-        .bind(same_creator_parent_id)
-        .bind(first_observation.0)
-        .execute(database.pool())
-        .await
-        .unwrap();
-    assert_eq!(
-        store.scan_payment_record_integrity().await,
-        Err(PersistenceError::CorruptOrMissing)
-    );
-    sqlx::query("UPDATE bitcoin_observations SET invoice_id = $1 WHERE id = $2")
-        .bind(first_id)
-        .bind(first_observation.0)
-        .execute(database.pool())
-        .await
-        .unwrap();
+    let same_creator_rewrite =
+        sqlx::query("UPDATE bitcoin_observations SET invoice_id = $1 WHERE id = $2")
+            .bind(same_creator_parent_id)
+            .bind(first_observation.0)
+            .execute(database.pool())
+            .await;
+    assert!(same_creator_rewrite.is_err());
     store.scan_payment_record_integrity().await.unwrap();
 
-    sqlx::query("UPDATE bitcoin_observations SET observation_envelope = $1 WHERE id = $2")
-        .bind(&second_observation.1)
-        .bind(first_observation.0)
-        .execute(database.pool())
-        .await
-        .unwrap();
-    assert_eq!(
-        store.scan_payment_record_integrity().await,
-        Err(PersistenceError::CorruptOrMissing)
-    );
-    sqlx::query("UPDATE bitcoin_observations SET observation_envelope = $1 WHERE id = $2")
-        .bind(&first_observation.1)
-        .bind(first_observation.0)
-        .execute(database.pool())
-        .await
-        .unwrap();
+    let envelope_rewrite =
+        sqlx::query("UPDATE bitcoin_observations SET observation_envelope = $1 WHERE id = $2")
+            .bind(&second_observation.1)
+            .bind(first_observation.0)
+            .execute(database.pool())
+            .await;
+    assert!(envelope_rewrite.is_err());
 
     sqlx::query("UPDATE invoices SET payment_record_envelope = $1 WHERE id = $2")
         .bind(&first_observation.1)

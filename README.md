@@ -34,9 +34,14 @@ Before submitting changes, read [`CONTRIBUTING.md`](CONTRIBUTING.md). Report sec
 
 The [architecture contract](docs/architecture.md) describes shared identity,
 credential ownership, and immutable invoice attribution. Rust dependencies pin
-the Paykit `v0.1.0-rc71` release tag in `Cargo.toml`; `Cargo.lock` fixes its
-resolved commit at `e4e58d3ee6c6aa19d6262d4cd96a58890a65b6fa`.
-Direct `pubky` and `pubky-testnet` dependencies are pinned to `0.15.0`.
+the published `paykit-lib` and `paykit-sdk` crates to `0.1.0` in `Cargo.toml` and
+`Cargo.lock`. Direct `pubky` and `pubky-testnet` dependencies are pinned to `0.16.2`.
+
+Shared-state recovery requires Homeserver `0.16.2` or newer with the required GCS
+behavior on every serving instance. Drain older writes and coordinate all
+writers before adopting this release; updating the dependency does not deploy
+Homeservers or establish operational readiness. See the
+[Paykit 0.1.0 integration requirements](https://github.com/pubky/paykit-rs/releases/tag/v0.1.0).
 
 ## Executable boundary
 
@@ -54,6 +59,11 @@ Business routes:
 - `GET /setup/reconnect`
 - `POST /setup/{flow_id}/complete`
 - signed `POST /invoices`
+- signed `POST /marketplace/payment-requests/prepare`
+- signed `POST /marketplace/payment-requests/activate`
+- signed `POST /marketplace/payment-requests/void`
+- signed `POST /marketplace/payment-requests/resolve`
+- signed `POST /marketplace/payment-requests/status`
 - signed `POST /connections/status`
 - signed `POST /transactions/status`
 - signed `POST /setup/status`
@@ -62,7 +72,11 @@ Business routes:
 - signed `POST /payment-request-drain-lookups`
 - signed `POST /payment-request-drain-cleanups`
 
-Business-route signatures use the configured trusted Locks Ed25519 key. Setup uses the Bitkit Pubky Auth companion-claim flow and an exact configured browser origin.
+Business-route signatures use one shared `signed_services.trusted_public_keys`
+authority domain. Every listed Locks or Marketplace Ed25519 key may call every
+signed route; there is no route-specific authorization. Shop/browser code must
+never receive a service signing secret. Setup uses the Bitkit Pubky Auth
+companion-claim flow and an exact configured browser origin.
 
 Successful invoice creation and exact replay return `200 OK` with only RFC 3339
 `invoice_created_at` and `payment_deadline` timestamps; they do not expose Noise
@@ -73,8 +87,124 @@ the exact Reader identity from persisted invoice state, then returns
 invoices return `404`; authentication, storage, malformed-state, and dependency
 failures remain typed errors. `connected` is the identity's shared Noise state,
 not payment or verification completion.
+Shared-state lock contention returns `503 dependency_unavailable`; callers can
+retry the read. Other storage or state-validation failures remain errors, not
+connection-state responses.
 
-`POST /setup/status` is the Locks-only readiness check for an authenticated Creator. Its closed body is `{"creator":"pubky..."}` with optional `asset: "BTC"`, `"USD"`, or `"USDT"` to check whether approved receiving details can accept that denomination. Every signed route verifies Ed25519 over `b"paykit-http-signature-v1\0" + uppercase_method + b"\0" + exact_query_free_path + b"\0" + exact_raw_body`; there is no body-only fallback. It returns exactly one coarse state: `ready` when the persisted session, delegated key, App Registry entry, and hosted state are usable; `setup_required` when authority is absent or confirmed invalid; and `unavailable` for validation timeouts and storage, rate-limit, server, DNS, or transport failures. Untyped Pubky 401 responses are also `unavailable`: they cannot distinguish revoked grants from recoverable PoP failures. A revoked grant reported this way requires explicit reconnect. Callers must not convert `unavailable` into a new authorization flow.
+Overlapping polls in one Server process for the same Creator and persisted Reader
+share an in-flight SDK read. Each
+request still authenticates and loads its invoice binding; completed observations
+and errors are not cached. Payment authorization, handoff, and verification keep
+their own fresh checks.
+
+Marketplace prepare and activate carry one request for every asset the buyer may pay
+with, derived from the seller's Paykit setup exactly as Locks invoices are.
+`POST /marketplace/payment-requests/prepare` takes a closed body of `creator`, `reader`,
+`reference`, `operation_id`, `payment_window_seconds`, optional `description`, `amount`
+(a base-unit integer string: sats, cents or millionths, the Locks criterion format) and
+`asset` (the denomination: `BTC`, `USD` or `USDT`). The optional `accepted_assets` (a
+non-empty, unique subset of `BTC` and `USDT`; order is not significant; `null` and `[]`
+are invalid) only narrows. When it is omitted the request offers every asset the seller
+has set up: a Bitcoin address from the seller's xpub, and the seller's shared USDT address
+when this deployment has `[usdt]`. When present it never adds a rail, and a requested rail
+the seller has not set up is absent rather than a refusal. Every combination is supported,
+including both assets in one request. USD and USDT are fixed parity (rate `"1"`). Any
+pairing that crosses BTC reads the Blocktank BTC/USD feed once at prepare (ten-minute
+freshness, as Locks invoices do) and stores it as a fixed conversion in the preparation;
+activation never refetches it. The preparation's whole life is fixed on the database clock
+when that quote is accepted: `prepare_expires_at` is the acceptance time plus the
+preparation TTL (15 minutes by default), whatever happens afterwards. A wait for the
+Creator row that outlasts it, including one that also crosses the 15-second request
+deadline, commits nothing and answers `503 dependency_timeout`; the exact retry reads the
+feed again, so a stale rate is never given a new TTL. A quote is therefore at most the
+feed's ten-minute freshness plus the TTL old when it can last be activated. Exact replay of
+an already committed preparation still returns it, with its original rate and expiry.
+Each payable amount is rounded up to its own endpoint
+unit. The `200` response echoes `amount`, `asset`, the offered `accepted_assets`,
+`payment_amounts` (per offered asset, in that asset's base units), the fixed `rates`
+(payment-asset units per one requested-asset unit; `{}` when none) and
+`prepare_expires_at`. Typed refusals: `503 seller_setup_pending` when nothing can be
+offered (the message names the rail: Bitcoin, USDT, or both, never a rail this deployment
+cannot offer; an omitted filter on a seller with no rail names Bitcoin), `409 asset_unsupported` (the filter asks only for USDT and this
+deployment has no `[usdt]` configuration), `400 payment_window_exceeds_cap` (the window is
+over `min(payment_window, conversion_payment_window)` when what is offered crosses BTC,
+else over `payment_window`; never clamped) and, when the feed is unavailable or stale,
+`503 dependency_unavailable`. Changing the amount, asset, window, description or the
+filter (omitted counts as different from any list) under the same `operation_id` is
+`409 operation_conflict`. `POST /marketplace/payment-requests/activate` takes a closed
+`{creator, invoice_id, amount, asset}`; a different amount or asset is `409 total_mismatch`;
+the response echoes `amount`, `asset`, `accepted_assets` and `payment_amounts`. The
+proposal accept-by stays `min(proposal_acceptance_window, payment_window / 2)`, so a
+1,800 second window gives a 15 minute accept-by and a 30 minute payment deadline. A request
+that offers only USDT has no Bitcoin address: its settlement is never an Electrum target.
+Fixtures captured from the real services over PostgreSQL are under
+`docs/fixtures/marketplace-payment-request-prepare-activate/`.
+
+Marketplace preparation reserves invoice identity and private payment material but
+does not create an active invoice or enqueue publication. Its Creator-scoped
+`operation_id` exactly replays the stored preparation when the closed request is
+unchanged, conflicts on changed binding, and remains replayable after the
+preparation TTL. Activation, void, and business resolution are separate lifecycle
+operations. Signed activation starts the bound payment window from the database
+clock and atomically enqueues one proposal; exact replay returns its stored result.
+Signed void wins only while prepared, never publishes, and never invokes SDK
+cancellation. Activate and void serialize on the preparation row. Signed resolution
+records one immutable `paid_manually`, `refunded`, or `abandoned` business outcome
+using database time. Exact outcome replay returns its stored timestamp; a different
+outcome conflicts. Resolution never changes payment-request or Bitcoin facts and
+never invokes SDK cancellation. Resolving a prepared invoice blocks activation but
+still permits void.
+
+Marketplace status uses closed `{"creator","invoice_id"}` input. Prepared and voided
+responses keep proposal and payment facts null; active responses project proposal
+delivery, canonical SDK request state, producer-owned payment state, business outcome,
+and active Bitcoin txid/amount/confirmations. A 0-confirmation replacement may change
+the active outpoint, while immutable per-outpoint amount and first-observation evidence
+continues to determine `amount_matched` and `paid_on_time`. When an active output is
+missing after a reorg, its Bitcoin object remains as evidence, but confirmations are
+zero and `amount_matched` and `paid_on_time` are false. `request_state: null` means no
+SDK lifecycle has been projected yet; `proposed` means proposal is projected but
+acceptance is not. Neither lag state means rejection or expiry. `payment_state` becomes
+`expired` after the inclusive payment deadline passes without the current active
+outpoint carrying durable timely amount-match evidence; a late match remains visible
+but does not restore eligibility. Exact route-emitted consumer and error fixtures live
+under `docs/fixtures/marketplace-payment-request-status/`. Unknown invoices and wrong
+Creators return the same `404`.
+
+Marketplace status also echoes `accepted_assets` and `payment_amounts` for every state,
+and reports USDT0 on Arbitrum One next to Bitcoin. Verified `erc20-transfer-eip712`
+proofs reach an active Marketplace request that offers USDT through the same attestation
+and Arbitrum receipt checks as Locks invoices, on the background reconciliation pass, keyed
+by the request's attributed SDK lifecycle record. `usdt_arbitrum` is `null` until a receipt
+is present, and again after a reorg removes it (the row is kept as evidence); otherwise it
+carries `tx_hash`, `observed_amount` (base-unit string), `confirmations`, `amount_matched`,
+`paid_on_time` (the receipt's block time is inside the window, which opens at the whole
+second of activation and closes at the deadline) and `finalized`. One receipt is chosen,
+never a sum of partial transfers, and a finalized receipt is never rewritten. A transfer
+belongs to one request for good. `paid_asset` is `"BTC"` or `"USDT"` for the rail whose
+receipt is `amount_matched` and `paid_on_time`, the earlier one if both qualify (Bitcoin by
+first observation, USDT by the block time of its earliest qualifying receipt, not of the
+receipt shown in `usdt_arbitrum`, which ranks by finality and confirmations), else `null`. The two times come from different
+clocks, this server's first sighting of the output and the chain's whole-second block
+time, so they order two qualifying payments only approximately: a close race can name
+either rail, and Bitcoin wins an exact tie. Consumers that must not depend on the order
+should read both rail objects, which stay populated. A second payment on the other rail
+leaves both rail objects populated for the consumer to flag; partial payments across rails
+are never combined. `payment_state` is `confirmed` when either rail has an included
+payment, `detected` when a receipt is present with no confirmations, and `expired` once the
+deadline has passed with no qualifying payment on either rail. Fixtures captured from the
+real services are under `docs/fixtures/marketplace-payment-request-status/`.
+
+Marketplace lifecycle conflicts use recovery-specific `409` codes. `prepare_expired`
+requires a new preparation attempt; `lifecycle_terminal` means activation lost to
+void or prepared-state resolution and must stop; `invoice_active` means void lost to
+activation, so the caller must keep observing the live invoice; `total_mismatch`
+means the caller amount or asset differs from Paykit Server's authoritative prepared
+terms and requires operator attention. Exact activation and void replay still return their
+stored `200` response. Persisted-state and database-integrity faults fail with
+non-retryable `500 internal_error`, not `503 dependency_unavailable`.
+
+`POST /setup/status` is the readiness check for an authenticated Creator. Its closed body is `{"creator":"pubky..."}` with optional `asset: "BTC"`, `"USD"`, or `"USDT"` to check whether approved receiving details can accept that denomination, and optional `accepted_asset: "BTC"` or `"USDT"` to check whether the Creator has approved receiving details for that payment asset (see [Direct USDT0 invoices](#direct-usdt0-invoices)). Every signed route verifies Ed25519 over `b"paykit-http-signature-v1\0" + uppercase_method + b"\0" + exact_query_free_path + b"\0" + exact_raw_body`; there is no body-only fallback. It returns exactly one coarse state: `ready` when the persisted session, delegated key, App Registry entry, and hosted state are usable; `setup_required` when authority is absent or confirmed invalid; and `unavailable` for validation timeouts and storage, rate-limit, server, DNS, or transport failures. Reading the hosted state takes the Creator's shared-state write lock, which Bitkit, the outbox workers and concurrent status checks also hold, including during uncertain-write reconciliation; when that lock is busy and this process read the Creator's hosted state within the last 10 minutes, that read stands and the other checks decide the answer, so a busy lock alone never turns a ready Creator `unavailable`. Untyped Pubky 401 responses are also `unavailable`: they cannot distinguish revoked grants from recoverable PoP failures. A revoked grant reported this way requires explicit reconnect. Callers must not convert `unavailable` into a new authorization flow.
 
 ### Setup iframe
 
@@ -109,8 +239,9 @@ capabilities. That owner-only scope includes
 The App Registry remains discovery metadata, not key authority.
 
 An existing Creator without signed key authorization is not ready until its
-authorizer publishes that record. Reconnect refreshes delegated credentials while
-preserving the account and invoices; signed authorization does not require a
+authorizer publishes that record. Reconnect refreshes delegated credentials and
+may explicitly rotate the Bitcoin account while preserving historical invoices;
+signed authorization does not require a
 database reset.
 
 Bitkit authorizes only `/pub/paykit/:rw` for Server. With USDT disabled, the server requests two independent
@@ -122,8 +253,10 @@ delegated key and generation against the Creator's signed Noise key authorizatio
 persists credentials, then
 publishes only the `paykit-server` app entry through the SDK. Other apps and
 shared history remain intact. Failed publication leaves setup incomplete and
-retryable. Reauthorization preserves the account/xpub and accepts only the same
-key or a newer generation. The server never receives the Pubky root secret or
+retryable. Reauthorization preserves an omitted or identical account. A different
+valid BIP84 account triggers atomic generation cutover and durable asynchronous
+cancellation of unaccepted old-account requests. The delegated Paykit key must be
+the same or a newer generation. The server never receives the Pubky root secret or
 Bitcoin spending keys.
 
 This Bitcoin setup requires both permissions. With `[usdt]` enabled, setup additionally requests optional `usdt-address-v1` and uses the JSON claim described below. The exact received list order binds the
@@ -131,16 +264,21 @@ SDK signature and relay channel; the 124-byte payload always puts watch-only
 account bytes before Paykit key material regardless of list order. Empty,
 duplicate, unknown, or one-only selections fail setup.
 Reconnect uses `GET /setup/reconnect?creator=pubky...&return_to=...&state=...`.
-The server requires an existing Creator and requests `paykit-access-v1`
-(41 unsigned bytes), adding optional `usdt-address-v1` when enabled. The AUTH identity must match that exact Creator; the xpub
-and account index come exclusively from stored credentials under the setup lock.
-No watch-only account is selected, allocated, or retransmitted on reconnect.
+The server requires an existing Creator and requests
+`paykit-access-v1.watch-only-account-v1`, adding optional `usdt-address-v1` when
+enabled. The AUTH identity must match that exact Creator. A signed 41-byte
+Paykit-only response omits Bitcoin rotation; a signed 124-byte response explicitly
+supplies the account. Changed account material must be valid BIP84 for the configured
+network; Bitcoin receiving cannot be removed.
 Initial setup cannot replace an existing binding; use reconnect even when retrying
 publication after credentials were stored. Client IDs and display names are never
 used to infer account bindings. Rejected
 or abandoned approval leaves existing credentials, pending invoices, assignments,
-and allocation indexes intact. Successful reauthorization can refresh the session
-or rotate the Paykit key without resetting that state. See the
+and allocation indexes intact. Successful reauthorization can refresh the session,
+rotate the Paykit key, or rotate the Bitcoin account. Rotation cancels each whole
+unaccepted mixed request, preserves accepted old-address monitoring under original
+deadline/finality rules, voids unpublished Bitcoin Marketplace preparations, and
+requires a new bundle/operation ID for replacement issuance. See the
 [companion contract](docs/bitkit-companion-claim.md) for exact wire bytes.
 
 The local Locks demo substitutes a Paykit-owned Cargo example for Bitkit. That
@@ -180,11 +318,14 @@ Different Creators may use the same numeric child index because their xpubs and 
 
 PostgreSQL stores server credentials, address allocation, invoices, and delivery intents. The Paykit SDK stores encrypted identity-wide state on the Creator's homeserver under WebDAV locks; it is not cached as an authoritative PostgreSQL SDK blob. Other authorized apps can advance the same links and delivery queue. A background worker receives private messages and processes outbound work without executing wallet payments.
 
-Shared hosted-state deployments require Pubky Homeserver **0.15 or newer**.
+Shared hosted-state deployments require Pubky Homeserver **0.16.2 or newer**
+with the required GCS behavior on every serving instance.
 Upgrade the deployed homeserver separately; updating Server's client dependencies
 does not upgrade that service. The SDK still requires commit-time fencing of
-expired lock holders and durable publication of complete files. Its five-minute
-uncertain-write cooldown remains in place and does not replace those requirements.
+expired lock holders and durable publication of complete files. It reconciles
+uncertain writes using exact ciphertext and per-attempt markers. Drain older
+writes and coordinate all writers before adoption; recovery does not replace
+those storage guarantees.
 
 Startup holds a session advisory lock while applying the single schema baseline. Before binding HTTP it verifies immutable deployment metadata and authenticates every persisted Creator credential, invoice payment record, and payment observation. Missing, corrupt, swapped, conflicting, or wrong-key database state aborts startup with a secret-free error. Hosted Paykit state is checked during SDK operations and setup readiness; failures do not create a replacement local state.
 
@@ -192,10 +333,15 @@ Immutable deployment values are:
 
 - Bitcoin network;
 - Paykit Pubky client ID;
-- Paykit app ID (`paykit-server`);
-- trusted Locks public-key fingerprint.
+- Paykit app ID (`paykit-server`).
 
 Changing any of them after database initialization requires resetting the database.
+Trusted service keys are credentials rather than immutable deployment identity.
+Adding, removing, or replacing allowlisted keys does not alter persisted replay
+identity and does not require database reset. During rotation, deploy overlapping
+old and new public keys before removing old key. The allowlist is read at startup,
+so restart the server after each rotation step: add the new key, switch the signer,
+then remove the old key.
 
 Persisted application and schema compatibility across releases is intentionally unsupported during this pre-production phase. The `0.1.0-rc6` Paykit Server and `0.1.0-rc6` Locks rollout is coordinated: stop both services, deploy both versions, then start each service and let its one-time SQLx reset migration clear only its dedicated disposable prototype database while preserving `_sqlx_migrations`. Verify both migrations and services before allowing new invoice or verification work, then reacquire any required prototype state. Do not manually drop/recreate either database. Never run these reset migrations against production, staging, an unidentified database, or a database shared with unrelated applications.
 
@@ -203,7 +349,19 @@ The cryptographic envelope version, domain-separated KDF/AAD labels, and private
 
 ## Configuration and secrets
 
-Copy [`config/paykit-server.example.toml`](config/paykit-server.example.toml) to an operator-controlled path. The TOML schema is closed: unknown sections and keys are rejected. Durations are strings such as `"10s"` and `"5m"`.
+Copy [`config/paykit-server.example.toml`](config/paykit-server.example.toml) to an operator-controlled path. The TOML schema is closed: unknown sections and keys are rejected. Durations are strings such as `"10s"` and `"5m"`. The exception is `outbox.rapid_link_retry_interval_ms`, an integer millisecond count so operators can configure subsecond Encrypted Link retries.
+
+`outbox.rapid_link_retry_attempts` defaults to `120` and accepts integers from
+`1` through `2147483647`. `outbox.rapid_link_retry_interval_ms` defaults to
+`1000` and accepts integers from `1` through `4294967295`; `500` selects a
+half-second rapid interval. Omitting both keys preserves these defaults. General
+`outbox.retry_initial` and `outbox.retry_max` remain duration strings and still
+control later capped backoff and all non-link retry classes.
+
+Configuration rollout is explicit: replace legacy
+`locks.trusted_public_key = "pubky..."` with non-empty
+`signed_services.trusted_public_keys = ["pubky..."]`. Legacy key is rejected;
+there is no compatibility alias that could create two authorities.
 
 Required environment variables:
 
@@ -318,6 +476,7 @@ Build command, image contract, source-rewrite behavior, and generated config con
 - `GET /health/live` returns `200` with `{ "status": "live" }` while the process serves; it performs no dependency check.
 - `GET /health/ready` reports `postgres`, `electrum`, `paykit_delivery`, and `outbox` states. Overall `ready` and `degraded` return `200`; `not_ready` returns `503`.
 - PostgreSQL loss is `not_ready`. Electrum or Paykit delivery trouble is `degraded`.
+- Individual Reader setup/link progress, handed-off queue progress, expired proposals, and retained terminal delivery failures do not degrade global `paykit_delivery`; systemic adapter, dependency-read, SDK execution, link dependency, reconciliation, and transport failures do.
 - Shared transport contention retries on the next poll and preserves prior transport health. Actual failures still degrade health, and outstanding undelivered invoices remain unavailable; only a clean pass clears transport failures.
 - `GET /metrics` exports identifier-free Prometheus/OpenMetrics data.
 
@@ -345,17 +504,19 @@ On SIGTERM or SIGINT, readiness changes first, normal admission and new worker c
 
 A successful new invoice transaction atomically allocates an address and persists the Creator/reader assignment, invoice, and complete Payment Request intent. Its terms bind that invoice's address in `payment_endpoints` and require the `paykit-server` app. The request is immediately eligible for handoff without publishing a Private Payment List. Exact replay preserves the address and complete terms; conflicting replay is rejected. Concurrent invoices for the same Reader receive distinct addresses.
 
-The later SDK handoff is not exactly once. Server delivery is at least once:
+Payment Request proposal creation is idempotent; transport delivery remains at least once:
 
-- a crash before SDK-generated identifiers are durably associated is retried by first looking up the request the SDK already queued for the intent's Payment Reference and reusing its identifiers, so a retry does not enqueue a second Payment Request. The lookup reads the server's own stored outbound messages, never a record derived from the reader's messages, so a reader cannot hide the queued request from it;
-- the lookup runs under the Creator mutation lock and sees only requests in this Creator's SDK state, so a second server process sharing that state is not covered;
-- retries preserve the invoice's bound address and terms;
+- the durable outbox row UUID is the Payment Request ID, bound by the SDK to the Creator identity, app, Reader, and exact original terms;
+- a crash after SDK commit but before PostgreSQL association retries that ID and recovers the original Event and outbound-message IDs without enqueueing another proposal;
+- conflicting reuse of the ID is rejected; retries preserve the invoice's bound address and complete terms and still require current authorization and link readiness;
 - marking server work delivered means the exact SDK outbound record reached SDK `Sent`, not that the remote application acknowledged it.
 
 The invoice API returns after durable intent commit. It does not wait for Encrypted Link establishment or remote delivery.
 
 Requests address the Reader identity, not a receiver folder. The Reader's App
-Registry must advertise a private-payment app capable of paying requests. New
+Registry must advertise a Noise key and at least one app with `payment_requests`
+and `outgoing_payments` enabled. Private Payment List sharing (`private_payments`)
+is not required: the invoice includes its payment destination. New
 invoice admission reads a cleanly missing registry at most three times, using
 full-jitter delays whose combined maximum is one second inside the existing
 15-second request deadline. Exhausted clean absence returns `503`
@@ -366,6 +527,13 @@ no `Retry-After` header; a present but incapable registry returns terminal `409`
 `502` `reader_registry_malformed`, and request-wide exhaustion remains `503`
 `dependency_timeout`. Invalid Reader identifiers return `400` `invalid_request`
 before discovery; malformed remote registry data remains a distinct `502`.
+A capable registry is not enough on its own: admission then reads the Reader's
+identity-signed Paykit Noise Key Authorization once. A missing record returns
+`503` `reader_setup_pending` (no `Retry-After`), and a record that fails
+verification (bad signature, another owner, unreadable) returns `409`
+`reader_not_payable`. A read failure returns `503` `reader_registry_unavailable`.
+Link setup still verifies the authorization before any delivery, because it can
+change after admission.
 These failures occur before xpub loading, address allocation, invoice
 persistence, or outbox insertion. Exact replay is checked first and returns its
 existing invoice without live registry discovery.
@@ -418,10 +586,15 @@ finality. When both assets are paid, both observations remain available.
 
 Deploy this contract together with the matching Locks consumer.
 
-Before returning status, the server performs linked-peer
-receive, exact required-target freshness checks, Creator-local SDK mutation
-serialization, and transactional target revalidation. Missing, partial,
-unrelated, or failed required-peer intake returns unavailable. Exact terminal
+Before returning status, the server receives from the bundle's required
+counterparties, with exact required-target freshness checks, Creator-local SDK
+mutation serialization, and transactional target revalidation. Overlapping
+lookups for the same Creator, App, and bundle share receive work;
+each caller still projects current SDK state, looks up status, and revalidates its targets. Neither
+completed receive evidence nor payment status is cached. Missing or failed required-peer intake returns
+unavailable. Transport maintenance gives foreground work a turn between complete
+peer operations without interrupting admitted SDK work. Background lifecycle
+refresh retains bulk intake with bounded parallel inbox probes. Exact terminal
 response fixtures for Locks are published under
 `docs/fixtures/payment-request-status/`.
 
@@ -481,7 +654,8 @@ other authorized apps through the SDK's recovery flow.
 - One Electrum endpoint; no failover pool.
 - `tcp://` Electrum has no transport authentication; use a CA-valid `ssl://` endpoint for production.
 - No configured Creator-count bound or runtime eviction.
-- One xpub/account index per Creator; no xpub, account, master-key, or immutable-invariant rotation.
+- One current xpub/account index per Creator. Explicit reconnect can rotate that Bitcoin
+  account after lifecycle reconciliation; no master-key or immutable-invariant rotation.
 - BTC and optional direct USDT0 on Arbitrum One, with fixed denomination conversion; no bridging or asset swaps.
 - No public payer inbox or proof-submission API, and no receipt issuance.
 - No spending custody, refunds, credits, or change.
@@ -502,11 +676,32 @@ the server. A standard Arbitrum JSON-RPC endpoint must support `eth_chainId`,
 
 Setup requests the existing Bitcoin account plus `usdt-address-v1`. The user can
 skip USDT without blocking Bitcoin. Reconnect can add a previously omitted USDT
-address but cannot change an already-approved address or Bitcoin account.
-Signed `POST /setup/status` accepts optional `asset: "BTC"`, `"USD"`, or `"USDT"`
-and returns the existing `{status}` response for that denomination. Omitting `asset`
-checks Pubky/Paykit authority only. Locks should check the selected asset before
-publishing a priced lock.
+address but cannot change an already-approved USDT address. An explicit full companion
+claim may rotate the Bitcoin account through the reconciliation and cutover flow above.
+Signed `POST /setup/status` accepts two optional fields that answer different
+questions and return the same `{status}` response:
+
+- `asset: "BTC"`, `"USD"`, or `"USDT"` is the price denomination. It is `ready`
+  when the Creator has any usable receiving detail (a Bitcoin account, or a USDT
+  address on a deployment with `[usdt]`), because Locks can convert the
+  denomination to whatever rail the Creator approved. `asset: "USDT"` additionally
+  requires `[usdt]` to be configured. Locks should check the selected asset
+  before publishing a priced lock.
+- `accepted_asset: "BTC"` or `"USDT"` is the payment asset. It is `ready` only when
+  the Creator has approved receiving details for that asset: `BTC` needs the
+  Bitcoin account and `USDT` needs the `usdt-address-v1` address, on a deployment
+  with `[usdt]` configured. A Bitcoin-only Creator who declined the USDT address
+  gets `setup_required` for `accepted_asset: "USDT"`, and a reconnect that adds
+  the address makes it `ready`. `USD` is a denomination, not a payment asset, and
+  any other value is `400 invalid_request`. An explicit `"accepted_asset": null`
+  is not an omission: it is also `400 invalid_request`, answered before any
+  authority or receiving check.
+
+When both fields are sent, the answer is `ready` only if both checks pass, and
+`setup_required` otherwise. A receiving-detail read that times out or fails is
+`unavailable`. Omitting both checks Pubky/Paykit
+authority only. Authority is always checked first, so a Creator whose authority is
+`setup_required` or `unavailable` gets that answer whatever the assets.
 
 Payment criteria use integer units: satoshis for `BTC`, cents for `USD`, and
 millionths for `USDT`. For example, `asset: "USD", amount: "500"` requests $5.

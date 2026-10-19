@@ -11,18 +11,117 @@ rewrite SDK state, acquire the worker mutation lock, mutate outbox state, or wai
 for delivery. Missing invoices and storage, authentication, malformed-state, or
 dependency failures remain typed errors rather than synthetic connection states.
 
-At request time the server checks the Reader's App Registry for an app supporting private payments, Payment Requests, and outgoing payments. It retries only a cleanly missing registry, with at most three total reads and at most one second of full-jitter delay inside the request deadline. Exhausted absence is typed setup-pending without `Retry-After`; a present incapable registry is terminal for the new request; transport and malformed-data failures remain distinct dependency outcomes. Locks may retry setup-pending and malformed registry data only inside its original fixed 10-minute admission deadline, while Marketplace must immediately show `Reader wallet setup needed` for setup-pending and offer an explicit wallet-setup or user retry action. Marketplace must not collapse all `503` responses into a generic outage or automatic retry loop. That UI and orchestration work belongs in the Marketplace repository and is not implemented here. Every failed new admission returns before xpub loading, address allocation, invoice persistence, or outbox insertion. It persists the Reader identity in the encrypted, Creator- and row-bound delivery intent only after admission succeeds. The Reader resolves the request by ID using the SDK request-aware resolver with no consumed Payment List version. The bound destination cannot fall back to mutable private or public endpoints. Exact replay bypasses discovery because it returns the already authenticated intent.
+At request time the server checks the Reader's App Registry for a Noise key and an app supporting both Payment Requests and outgoing payments. Private Payment List sharing is not required because the invoice binds its payment destination. It retries only a cleanly missing registry, with at most three total reads and at most one second of full-jitter delay inside the request deadline. Exhausted absence is typed setup-pending without `Retry-After`; a present incapable registry is terminal for the new request; transport and malformed-data failures remain distinct dependency outcomes. Locks may retry setup-pending and malformed registry data only inside its original fixed 10-minute admission deadline, while Marketplace must immediately show `Reader wallet setup needed` for setup-pending and offer an explicit wallet-setup or user retry action. Marketplace must not collapse all `503` responses into a generic outage or automatic retry loop. That UI and orchestration work belongs in the Marketplace repository and is not implemented here. Every failed new admission returns before xpub loading, address allocation, invoice persistence, or outbox insertion. It persists the Reader identity in the encrypted, Creator- and row-bound delivery intent only after admission succeeds. The Reader resolves the request by ID using the SDK request-aware resolver with no consumed Payment List version. The bound destination cannot fall back to mutable private or public endpoints. Exact replay bypasses discovery because it returns the already authenticated intent.
 
-Workers claim fenced rows, decrypt and revalidate the complete intent, and recheck Reader capabilities before handoff. Production handoff uses public Paykit SDK APIs backed by encrypted identity-wide homeserver state. PostgreSQL retains server business state and delivery intents, not a second authoritative SDK state.
+Admission also requires the Reader's identity-signed Noise Key Authorization: missing is setup-pending, and failing verification is `reader_not_payable`. Workers claim fenced rows, decrypt and revalidate the complete intent, and recheck Reader capabilities and the authorization before handoff. A missing or invalid authorization keeps an admitted row retryable (`reader_authorization_missing`, `reader_authorization_invalid`, or `reader_authorization_fetch` on a read failure), because the Reader can still publish or fix it. Link setup verifies the authorization again before any send. Production handoff uses public Paykit SDK APIs backed by encrypted identity-wide homeserver state. PostgreSQL retains server business state and delivery intents, not a second authoritative SDK state.
 
-Before link establishment or enqueue, the worker asks the SDK to observe the Reader's recovery marker under the Creator mutation lock. Confirmed absence continues normally. A fresh marker abandons the old link generation and starts recovery; lookup or prerequisite failures keep the exact outbox row retryable without SDK handoff identifiers. The server does not publish a marker on the Reader's behalf. This check covers handoffs beginning after marker publication, not SDK records already durably `Sent` before it.
+Link establishment checks the Reader's recovery marker under the SDK's identity
+and lease guards; the Server does not perform a separate observation first.
+Confirmed absence continues normally. A fresh marker starts recovery from the
+current generation. Invalid recovery or key metadata returns `LinkObservation`,
+keeping the exact outbox row retryable without SDK handoff identifiers. Protocol
+errors returned by the SDK remain permanent; SDK-managed handshake recovery can
+instead report pending, which is not permission to enqueue. Preparation, publication and
+completion each retain their SDK validation boundaries. The Server never
+publishes a marker on the Reader's behalf, and these checks cannot recall a
+message already durably `Sent`.
 
-A successful proposal stores the returned SDK outbound, Event, and Payment Request IDs under the same live fence as `handed_off`. If the SDK transaction commits before this server transition, reclaimed work first looks for the request the SDK already queued for the intent's Payment Reference, and reuses its IDs instead of proposing again. The lookup reads the server's stored outbound `paykit.payment_request` messages for that reader and App (skipping `Invalid` and `Superseded`), not the SDK's derived Payment Request record: that record also folds in the reader's inbound messages, and a message that names the request and fails validation, or reuses the proposal's Event ID, makes the derivation drop the server's own proposal. The Payment Reference is generated once per intent, so a crash in that window does not create a second Payment Request. A reader that admits requests automatically, such as one with an accepted Allowance, would otherwise pay the duplicate.
+A successful proposal stores the returned SDK outbound, Event, and Payment Request IDs under the same live fence as `handed_off`. The existing outbox row UUID supplies the stable UUID-v4 Payment Request ID. If the SDK transaction commits before this server transition, reclaimed work calls `propose_payment_request_with_id` with that ID and the exact persisted terms and Reader. The SDK atomically returns the original proposal and message IDs without enqueueing another proposal. A different App, Reader, or canonical payload under the same identity-scoped ID is a conflict. No additional intent field or index is required.
+
+This idempotency binding uses the retained SDK proposal Event Message history,
+including expired and terminal proposals. It does not survive deletion of that
+history or restoration of a backup from before proposal creation. Every retry
+still requires current session, App capability, and link readiness. Cancellation
+and transport retries retain their existing semantics; this is not exactly-once
+remote delivery.
+
+An admitted enqueue task renews its database claim every third of the configured
+lease duration while work is active. Renewal requires the same unexpired claim
+token and an eligible proposal generation with no active drain. An expired or
+replaced claim cannot be revived. Renewal failure does not cancel an in-flight
+SDK operation: it finishes, while subsequent SDK effects and the final database
+transition revalidate ownership. Shutdown drains admitted work within the existing
+server deadline. Renewal reduces expiry during slow work. Stable proposal IDs
+make retry after SDK persistence safe without a cross-system transaction, while
+the live claim fence still controls the database association.
+
+Normal handshake progress or waiting uses the bounded link retry schedule and
+resets the consecutive failure counter. Actual dependency failures, including
+failed link operations, use exponential backoff from that counter instead of the
+total claim count. Failures at different stages do not reset one another's
+backoff. A first failure after repeated pending-link attempts therefore starts at
+the configured initial delay, while a continuing outage still reaches the cap.
+
+Before every claimed handoff and again before each external proposal effect, the
+worker compares the intent's immutable `proposal_expires_at` with PostgreSQL
+`clock_timestamp()`. Equality is expired. An expired proposal is retained as
+`permanently_failed` with the closed `proposal_expired` diagnostic; it is never
+claimed again and no Reader or SDK operation is retried. This check also runs
+after restart, so a retry deadline cannot be extended by downtime or process
+clock drift. Cancellation intents remain durable and retry after the canceled
+request's immutable payment deadline. They can still clean up old-address work,
+but a stale reader-scoped cancellation no longer counts as a systemic delivery
+outage once that deadline has passed.
 
 `handed_off` means durable shared SDK queue association, not remote delivery. A separately fenced reconciliation claim runs the SDK outbound processor and checks the exact stored outbound ID and app ownership in durable Creator SDK state. Only `OutboundPrivateMessageStatus::Sent` advances the row to `delivered`, meaning successful Encrypted Link send, not payer application acknowledgement. SDK `Pending`, `Sending`, and retry-backoff `Failed` records remain retryable. Missing records, `Invalid`, `RecoveryRequired`, and `Superseded` records are retained as `permanently_failed`; they never imply delivery or trigger a new proposal. Transport/storage errors remain retryable, and permanent errors retain only a non-secret error class.
+
+Normal pending Encrypted Links use a rapid retry phase configured by
+`outbox.rapid_link_retry_attempts` (default `120`, range `1..=2147483647`) and
+`outbox.rapid_link_retry_interval_ms` (default `1000` milliseconds, range
+`1..=4294967295`; use `500` for half a second). After exactly that many outbox
+attempts, pending-link retries resume the general `outbox.retry_initial`
+to `outbox.retry_max` exponential schedule, still capped at five seconds. Other
+retry classes always use the general schedule. `outbox.poll_interval`,
+`outbox.retry_initial`, and `outbox.retry_max` remain duration strings; their
+units and behavior are unchanged.
 
 Payment Requests are retained Event Messages. The server neither publishes nor waits on invoice-specific Private Payment Lists, so their latest-state compaction cannot block request delivery or change an invoice's destination.
 
 The schema requires `handed_off` and `delivered` rows to carry a canonical numeric SDK outbound ID. See the [upgrade policy](../README.md#persistence-startup-and-upgrades) before replacing a database or binary.
 
 No part of this design claims exactly-once remote delivery.
+
+New invoice admissions wake the enqueue worker only after their database commit.
+A committed, fenced SDK handoff separately wakes transport and reconciliation
+for that Creator only. These process-local hints coalesce by Creator during work
+and do not bypass persisted due times or lease fences. Periodic full scans take
+precedence over hints and remain the recovery path for restarts, missed hints,
+and work admitted through other stores. A successful targeted pass cannot clear
+aggregate health failures for unrelated Creators. Hints reduce idle polling waits
+without changing the meaning of Linked, handed-off, or delivered state.
+
+Global `paykit_delivery` readiness reports worker and systemic dependency health,
+not one Reader's progress. Pending/missing Reader setup, link establishment or
+waiting, normal handed-off reconciliation, proposal expiry, and retained permanent
+failure stay visible in durable row state without degrading every Creator.
+Adapter construction, dependency reads, SDK proposal/cancellation execution,
+systemic link storage/identity/transport failures, and reconciliation failures
+for still-actionable work degrade delivery readiness. Post-deadline cancellation
+retries remain visible in durable row state without degrading global readiness.
+Proposal reconciliation continues after its acceptance deadline so a later durable `Sent` state can
+still promote the row to `delivered`, but one buyer's post-deadline retry does
+not degrade global readiness. PostgreSQL worker failures independently degrade
+`outbox` readiness.
+
+Enqueue scheduling admits at most `outbox.batch_size` concurrent Creators, with
+one task per Creator. Completion frees a slot without waiting for unrelated tasks.
+Discovery does not lease rows: each task takes the existing Creator mutation lock
+before claiming one due row, then rechecks its live fence before SDK effects.
+Shutdown stops new claims and drains admitted effects within the server deadline.
+Transport and reconciliation retain their own periodic worker scheduling.
+
+After a successful handoff, the enqueue task attempts the associated Reader's
+queue while it still owns the Creator mutation lock. It reads the committed
+server association before sending. It does not receive from unrelated Readers
+or enqueue another proposal. The peer's FIFO order and SDK recovery checks still
+apply; the SDK may drain that peer's queue, including earlier messages.
+
+Each handoff gets one awaited peer send pass, not a fixed message-count limit,
+with no additional retry loop or operation deadline. It runs after enqueue lease
+renewal has finished and the association has committed, unless shutdown has begun.
+Admitted SDK operations run to completion under the Creator lock, preserving cancellation safety and
+existing SDK lease/retry waits. Releasing the guard after that pass lets queued
+lock waiters proceed in FIFO order. Failure leaves the server row `handed_off`,
+with no retry schedule or delivery-state mutation. Ordinary transport maintenance
+and fenced reconciliation remain responsible for eventual progress and `Sent`
+acknowledgement.

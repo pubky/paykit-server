@@ -8,9 +8,13 @@ published Paykit SDK. Domain terminology follows the dependency's `THESAURUS.md`
 ## Authority and setup
 
 Bitkit grants Pubky access to `/pub/paykit/:rw` and delegates a generation-bound
-Paykit Identity Secret. Initial setup also requests a BIP84 account xpub; reconnect
-preserves the Bitcoin account for an existing Creator. When USDT is enabled, setup and reconnect also request an optional Arbitrum receiving address. The server never receives
-Bitcoin spending keys or the Pubky identity secret. Receiving details cannot change through reauthorization; a previously omitted USDT address may be added.
+Paykit Identity Secret. Initial setup also requests a BIP84 account xpub. Reconnect
+preserves it when the companion response omits account material; an explicit changed
+account is reconciled, generation-fenced, and rotated while historical accepted payments
+remain monitored. When USDT is enabled, setup and reconnect also request an optional
+Arbitrum receiving address. The server never receives Bitcoin spending keys or the Pubky
+identity secret. A previously omitted USDT address may be added, but an approved USDT
+address cannot change through reauthorization.
 
 The companion claim is bound to the AUTH identity, secret, and exact permission
 list. Before delegation or private app publication, the identity owner uses
@@ -56,10 +60,12 @@ time. Proposals left behind the limit are accepted by the next read.
 The local reader demo likewise uses hosted SDK state; its encrypted local file
 retains only the app/Creator binding and a process ownership lock.
 
-Deployed Pubky Homeserver instances must run 0.15 or newer. Shared-state safety
-requires commit-time fencing of expired lock holders and durable publication of
-complete files; the SDK's five-minute uncertain-write cooldown remains in place
-and is not a substitute for those storage guarantees.
+Every serving Pubky Homeserver instance must run 0.16.2 or newer with the required
+GCS behavior. Shared-state safety requires commit-time fencing of expired lock
+holders and durable publication of complete files. The SDK reconciles uncertain
+writes using exact ciphertext and per-attempt markers; older writes must be
+drained and all writers coordinated before adoption. Recovery is not a substitute
+for those storage guarantees.
 
 ## Invoice and settlement invariants
 
@@ -67,17 +73,50 @@ A database transaction allocates one fresh BIP84 address per invoice and persist
 the complete Payment Request with that address in `payment_endpoints` and
 `required_app_id = "paykit-server"`. Exact replay returns the same invoice,
 assignment, terms, and outbox row. Invoices accepting Bitcoin cannot reuse its address. Invoices accepting USDT share the approved address and attribute individual transfers through verified request proofs. Both options may belong to one invoice; fixed conversion rates and per-option amounts are persisted with its immutable terms.
-Reader discovery checks that at least one registered app supports private payments,
-Payment Requests, and outgoing payments; it does not select a receiver path.
+Reader discovery requires a Noise key and at least one registered app supporting
+both Payment Requests and outgoing payments; Private Payment List sharing is not
+required. Discovery does not select a receiver path.
 
-SDK handoff is at least once. Reconciliation identifies the exact outbound ID and
-app; only SDK `Sent` means delivered, not payer acknowledgement. See
+SDK proposal handoff uses the durable outbox UUID as its Payment Request ID, so
+retries recover one proposal and the same Event and outbound IDs. Transport
+remains at least once. Reconciliation identifies the exact outbound ID and app;
+only SDK `Sent` means delivered, not payer acknowledgement. See
 [outbox recovery](outbox-recovery.md) for leases and retry behavior.
 
 Bitcoin attribution uses direct observation of the invoice-specific address. USDT attribution combines an authenticated, request-bound ERC-20 account signature with independent Arbitrum receipt verification. Neither SDK lifecycle state nor a transaction hash alone proves settlement. One amount-matched output is required; split outputs are not aggregated.
 A Bitcoin amount-matched output freezes at one confirmation and becomes final at six. USDT observations remain reorg-sensitive until the RPC finalized block covers the receipt; their unique transfer identity cannot settle another invoice.
-USDT verification shares a bounded five-second chain-tip snapshot across Creator adapters. Each receipt and canonical block is read afresh. Persisted observation check times limit background refreshes of present transfers to once per minute; explicit status reads bypass this delay, and missing transfers remain eligible on every receive cycle.
+USDT verification shares a bounded five-second chain-tip snapshot across Creator adapters. Each receipt and canonical block is read afresh. Persisted observation check times reserve background refreshes before RPC, limiting present transfers to one attempt per minute even during provider outages or after restart. Explicit invoice status reads bypass this delay; unchanged unmatched proof sets retry after 15 seconds. Verification accepts at most 128 proof records per request, checking this limit before parsing or signature recovery.
+
+Larger histories skip new evidence, but still refresh up to eight owned, nonfinal receipts per pass. Explicit invoice status prioritizes the receipt selected for payment status, followed by other owned receipts and then new evidence, with no more than eight distinct candidates per pass. A nonfinal receipt may support the response only if it was successfully refreshed in that call. If a batch removes receipts but leaves an unrefreshed receipt selected, status returns retryable unavailable until the next pass refreshes it. Finalized receipts do not require RPC; provider and persistence failures remain unavailable. Encrypted receipt facts retain the originally attested sender so refreshes preserve account ownership checks without reparsing the proof history. Present receipts keep the one-minute background interval; removed receipts retry after 15 seconds, and explicit invoice status refreshes take priority even while new-proof discovery is deferred. Owned-only refreshes do not reset the discovery cooldown. Existing envelopes without a sender remain readable and gain that anchor on normal verification; if their history exceeds the supported limit, their nonfinal credit is withdrawn until it can be reattested. Finalized receipts are unchanged. Provider outages retain last-known facts; missing or invalid canonical receipts remove payment credit.
+
+Within the proof-count bound, each pass checks at most eight distinct receipt events, rotating through larger candidate sets. Changed proof sets for retained contexts are eligible immediately; discovery of unchanged sets in cooldown skips signature recovery. Multiple account attestations for one event share a receipt read. A scan containing unmatched or unavailable evidence retains its retry delay even when other receipts are present; a truncated discovery batch cannot be marked fully observed.
+
+Retry scheduling retains at most 1,024 request contexts and does not create database observations for missing transfers. Active retry delays are never evicted: new contexts wait when every slot is cooling down. Partially scanned contexts revisited within five minutes keep their cursor until a full proof sweep completes; inactive cursors may be reclaimed and restart on their next visit. The request currently being scanned keeps its slot. One additional deferred context is remembered in circular key order and reserves the next eligible slot so later requests can progress in a stable reconciliation order. Unused reservations expire after 15 seconds.
 No spending, refunds, receipt issuance, or horizontal replicas are supported.
+
+### Buyer contacts
+
+A verified, full payment received within the invoice's payment window queues a
+private buyer-contact save. This uses Bitcoin output or USDT receipt verification,
+not a submitted Payment Proof or an Encrypted Link. It does not change Locks'
+confirmation/finality policy or grant access to content.
+
+A separate worker resolves the buyer's Paykit profile first, then Pubky.app when
+the Paykit profile is absent. If neither exists, it skips the contact. The worker
+inserts into the Creator's encrypted shared SDK contacts, visible to Bitkit on its
+next contact refresh. It never publishes a Public Contact Marker, edits an existing
+contact, or unblocks a peer. The existing Encrypted Link is unchanged.
+
+Contact work is recorded atomically with payment observation and retried after
+transient failures or worker restart, independently of payment delivery and status
+responses. Completed or skipped attempts are retained per Creator/buyer so later
+purchases do not recreate a contact the Creator removed. Profile resolution runs
+outside the shared-state lock. The worker rechecks completion under that lock and
+holds it through the contact write and database completion, fencing expired
+claims before they can modify shared contacts. These are two durable writes: a
+crash after the contact write but before database completion leaves a retryable
+attempt, not a completed one. Profile data stays in
+encrypted shared state; the queue reuses the encrypted invoice and keyed lookups.
 
 Upgrade policy and operational limits are in the [README](../README.md);
 validation commands are in [CONTRIBUTING](../CONTRIBUTING.md).

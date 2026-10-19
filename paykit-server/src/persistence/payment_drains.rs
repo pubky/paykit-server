@@ -99,6 +99,7 @@ struct ExistingDrainRow {
 struct InvoiceLifecycleRow {
     invoice_id: Uuid,
     request_state: Option<String>,
+    terminal_fallback: Option<String>,
     sdk_payment_request_id: Option<String>,
     last_event_at: Option<OffsetDateTime>,
 }
@@ -108,6 +109,7 @@ struct PreparedCancellation {
     payment_request_id: String,
     outbox_id: Uuid,
     envelope: EncryptedEnvelope,
+    insert: bool,
 }
 
 impl PaymentDrainStore {
@@ -559,6 +561,20 @@ impl PaymentDrainStore {
 
         let rows = sqlx::query_as::<_, InvoiceLifecycleRow>(
             "SELECT invoices.id AS invoice_id, lifecycle.request_state,
+                    CASE WHEN EXISTS (
+                        SELECT 1
+                        FROM creator_bitcoin_account_rotation_items rotation_item
+                        WHERE rotation_item.invoice_id = invoices.id
+                          AND rotation_item.classification = 'proposal_suppressed'
+                    ) THEN 'canceled'
+                    WHEN EXISTS (
+                        SELECT 1
+                        FROM outbox proposal
+                        WHERE proposal.invoice_id = invoices.id
+                          AND proposal.intent_kind = 'payment_request_proposal'
+                          AND proposal.status = 'permanently_failed'
+                          AND proposal.error_class = 'proposal_expired'
+                    ) THEN 'proposal_expired' END AS terminal_fallback,
                     lifecycle.sdk_payment_request_id, lifecycle.last_event_at
              FROM invoices
              LEFT JOIN payment_request_lifecycles AS lifecycle
@@ -592,19 +608,25 @@ impl PaymentDrainStore {
             let parsed = attempts
                 .iter()
                 .map(|attempt| {
-                    let state = attempt
-                        .request_state
-                        .as_deref()
-                        .and_then(PaymentRequestLifecycleState::parse)
-                        .ok_or(PersistenceError::CorruptOrMissing)?;
-                    let payment_request_id = attempt
-                        .sdk_payment_request_id
-                        .as_deref()
-                        .ok_or(PersistenceError::CorruptOrMissing)?;
-                    let last_event_at = attempt
-                        .last_event_at
-                        .ok_or(PersistenceError::CorruptOrMissing)?;
-                    Ok((state, payment_request_id, last_event_at))
+                    if let Some(request_state) = attempt.request_state.as_deref() {
+                        let state = PaymentRequestLifecycleState::parse(request_state)
+                            .ok_or(PersistenceError::CorruptOrMissing)?;
+                        let payment_request_id = attempt
+                            .sdk_payment_request_id
+                            .as_deref()
+                            .ok_or(PersistenceError::CorruptOrMissing)?;
+                        let last_event_at = attempt
+                            .last_event_at
+                            .ok_or(PersistenceError::CorruptOrMissing)?;
+                        Ok((state, Some(payment_request_id), Some(last_event_at)))
+                    } else {
+                        let state = attempt
+                            .terminal_fallback
+                            .as_deref()
+                            .and_then(PaymentRequestLifecycleState::parse)
+                            .ok_or(PersistenceError::CorruptOrMissing)?;
+                        Ok((state, None, None))
+                    }
                 })
                 .collect::<Result<Vec<_>, PersistenceError>>()?;
 
@@ -688,26 +710,82 @@ impl PaymentDrainStore {
                     return Err(PersistenceError::CorruptOrMissing);
                 };
                 for (_, payment_request_id, _) in proposed_attempts {
+                    let payment_request_id =
+                        payment_request_id.ok_or(PersistenceError::CorruptOrMissing)?;
                     let cancellation = DeliveryIntentV1::payment_request_cancellation(
                         proposal,
-                        (*payment_request_id).to_owned(),
+                        payment_request_id.to_owned(),
                     )
                     .map_err(|_| PersistenceError::CorruptOrMissing)?;
-                    let outbox_id = Uuid::new_v4();
-                    let plaintext = postcard::to_allocvec(&cancellation)
-                        .map_err(|_| PersistenceError::CorruptOrMissing)?;
-                    let envelope = self
-                        .crypto
-                        .encrypt(
-                            &EnvelopeContext::outbox_semantic_intent(creator_hash, outbox_id),
-                            &plaintext,
-                        )
-                        .map_err(|_| PersistenceError::CorruptOrMissing)?;
+                    let existing: Option<(Uuid, Vec<u8>, String, bool)> = sqlx::query_as(
+                        "SELECT cancellation.id, cancellation.intent_envelope,
+                                cancellation.status,
+                                EXISTS (
+                                    SELECT 1
+                                    FROM creator_bitcoin_account_rotation_items rotation_item
+                                    WHERE rotation_item.invoice_id = $2
+                                      AND rotation_item.sdk_payment_request_id = $3
+                                      AND rotation_item.classification = 'cancellation_pending'
+                                      AND rotation_item.cancellation_outbox_id = cancellation.id
+                                ) AS rotation_owned
+                         FROM outbox cancellation
+                         WHERE cancellation.creator_id = $1
+                           AND cancellation.invoice_id = $2
+                           AND cancellation.marketplace_preparation_id IS NULL
+                           AND cancellation.intent_kind = 'payment_request_cancellation'
+                           AND cancellation.cancellation_target_payment_request_id = $3
+                         FOR UPDATE",
+                    )
+                    .bind(creator.id)
+                    .bind(invoice_id)
+                    .bind(payment_request_id)
+                    .fetch_optional(&mut *transaction)
+                    .await
+                    .map_err(|_| PersistenceError::Unavailable)?;
+                    let (outbox_id, envelope, insert) =
+                        if let Some((outbox_id, envelope, status, rotation_owned)) = existing {
+                            if !rotation_owned || status == "permanently_failed" {
+                                return Err(PersistenceError::Conflict);
+                            }
+                            let envelope = EncryptedEnvelope::from_bytes(envelope);
+                            let plaintext = self
+                                .crypto
+                                .decrypt(
+                                    &EnvelopeContext::outbox_semantic_intent(
+                                        creator_hash,
+                                        outbox_id,
+                                    ),
+                                    &envelope,
+                                )
+                                .map_err(|_| PersistenceError::CorruptOrMissing)?;
+                            let existing_intent = DeliveryIntentV1::decode(&plaintext)
+                                .map_err(|_| PersistenceError::CorruptOrMissing)?;
+                            if existing_intent != cancellation {
+                                return Err(PersistenceError::Conflict);
+                            }
+                            (outbox_id, envelope, false)
+                        } else {
+                            let outbox_id = Uuid::new_v4();
+                            let plaintext = postcard::to_allocvec(&cancellation)
+                                .map_err(|_| PersistenceError::CorruptOrMissing)?;
+                            let envelope = self
+                                .crypto
+                                .encrypt(
+                                    &EnvelopeContext::outbox_semantic_intent(
+                                        creator_hash,
+                                        outbox_id,
+                                    ),
+                                    &plaintext,
+                                )
+                                .map_err(|_| PersistenceError::CorruptOrMissing)?;
+                            (outbox_id, envelope, true)
+                        };
                     cancellations.push(PreparedCancellation {
                         invoice_id,
-                        payment_request_id: (*payment_request_id).to_owned(),
+                        payment_request_id: payment_request_id.to_owned(),
                         outbox_id,
                         envelope,
+                        insert,
                     });
                 }
             }
@@ -794,20 +872,45 @@ impl PaymentDrainStore {
         }
 
         for cancellation in &cancellations {
-            sqlx::query(
-                "INSERT INTO outbox (
-                     id, creator_id, invoice_id, intent_envelope, intent_kind,
-                     cancellation_target_payment_request_id, status
-                 ) VALUES ($1, $2, $3, $4, 'payment_request_cancellation', $5, 'queued')",
-            )
-            .bind(cancellation.outbox_id)
-            .bind(creator.id)
-            .bind(cancellation.invoice_id)
-            .bind(cancellation.envelope.as_bytes())
-            .bind(&cancellation.payment_request_id)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|_| PersistenceError::Unavailable)?;
+            if cancellation.insert {
+                sqlx::query(
+                    "INSERT INTO outbox (
+                         id, creator_id, invoice_id, intent_envelope, intent_kind,
+                         cancellation_target_payment_request_id, status,
+                         cancellation_drain_required
+                     ) VALUES ($1, $2, $3, $4, 'payment_request_cancellation', $5,
+                               'queued', TRUE)",
+                )
+                .bind(cancellation.outbox_id)
+                .bind(creator.id)
+                .bind(cancellation.invoice_id)
+                .bind(cancellation.envelope.as_bytes())
+                .bind(&cancellation.payment_request_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|_| PersistenceError::Unavailable)?;
+            } else {
+                let marked = sqlx::query(
+                    "UPDATE outbox
+                     SET cancellation_drain_required = TRUE,
+                         updated_at = clock_timestamp()
+                     WHERE id = $1 AND creator_id = $2 AND invoice_id = $3
+                       AND marketplace_preparation_id IS NULL
+                       AND intent_kind = 'payment_request_cancellation'
+                       AND cancellation_target_payment_request_id = $4
+                       AND status <> 'permanently_failed'",
+                )
+                .bind(cancellation.outbox_id)
+                .bind(creator.id)
+                .bind(cancellation.invoice_id)
+                .bind(&cancellation.payment_request_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|_| PersistenceError::Unavailable)?;
+                if marked.rows_affected() != 1 {
+                    return Err(PersistenceError::Conflict);
+                }
+            }
         }
         for (invoice_id, classification) in classifications {
             sqlx::query(
@@ -864,6 +967,7 @@ impl PaymentDrainStore {
              FROM payment_drain_cancellations AS cancellation
              JOIN outbox ON outbox.id = cancellation.cancellation_outbox_id
              WHERE cancellation.drain_id = $1
+               AND outbox.cancellation_drain_required
              ORDER BY cancellation.invoice_id, cancellation.sdk_payment_request_id,
                       cancellation.cancellation_outbox_id",
         )

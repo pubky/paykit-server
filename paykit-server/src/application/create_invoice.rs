@@ -35,9 +35,9 @@ use crate::{
     },
 };
 
-const REQUEST_DEADLINE: Duration = Duration::from_secs(15);
-const REGISTRY_READ_ATTEMPTS: usize = 3;
-const REGISTRY_RETRY_DELAY_CAPS_MS: [u64; REGISTRY_READ_ATTEMPTS - 1] = [333, 667];
+pub(crate) const REQUEST_DEADLINE: Duration = Duration::from_secs(15);
+pub(crate) const REGISTRY_READ_ATTEMPTS: usize = 3;
+pub(crate) const REGISTRY_RETRY_DELAY_CAPS_MS: [u64; REGISTRY_READ_ATTEMPTS - 1] = [333, 667];
 
 #[derive(Clone, Debug)]
 pub struct CreateInvoiceRequest {
@@ -115,6 +115,25 @@ pub trait AppRegistryDiscovery: Send + Sync {
         &self,
         reader: &ReaderPubky,
     ) -> Result<Option<PaykitAppRegistry>, RegistryDiscoveryError>;
+
+    /// Reads the Reader's identity-signed Paykit Noise Key Authorization.
+    /// Admission only: link setup verifies it again before any delivery,
+    /// because the record can change in between.
+    async fn authorization(
+        &self,
+        reader: &ReaderPubky,
+    ) -> Result<ReaderAuthorization, RegistryDiscoveryError>;
+}
+
+/// Admission-time state of a Reader's signed Noise Key Authorization.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReaderAuthorization {
+    /// Present, signed by the Reader's identity key and owned by the Reader.
+    Verified,
+    /// Cleanly not found: the Reader's wallet has not published one yet.
+    Missing,
+    /// Present but unreadable, wrongly signed, or owned by another identity.
+    Invalid,
 }
 
 #[async_trait]
@@ -123,7 +142,7 @@ pub trait RegistryRetryDelay: Send + Sync {
 }
 
 #[derive(Default)]
-struct FullJitterRegistryRetryDelay;
+pub(crate) struct FullJitterRegistryRetryDelay;
 
 #[async_trait]
 impl RegistryRetryDelay for FullJitterRegistryRetryDelay {
@@ -143,10 +162,12 @@ impl CreatorReceivingProvider for CreatorStore {
         &self,
         creator: &CreatorPubky,
     ) -> Result<ReceivingDetails, PersistenceError> {
-        let credentials = self.load(creator).await?;
+        let (credentials, bitcoin_account_generation) =
+            self.load_with_bitcoin_account_generation(creator).await?;
         Ok(ReceivingDetails {
             bitcoin: credentials.bitcoin_account().cloned(),
             usdt: credentials.usdt_address().cloned(),
+            bitcoin_account_generation,
         })
     }
 }
@@ -211,6 +232,8 @@ pub trait IntentBuilder: Send + Sync {
 pub struct ReceivingDetails {
     pub bitcoin: Option<crate::domain::receiving::BitcoinAccount>,
     pub usdt: Option<crate::domain::receiving::UsdtAddress>,
+    /// Durable generation paired with `bitcoin`; zero is the migrated legacy generation.
+    pub bitcoin_account_generation: i64,
 }
 
 pub struct ReceivingAddresses {
@@ -337,6 +360,13 @@ struct DerivedInvoicePayloads<'a> {
     app_id: PaykitAppId,
 }
 impl InvoicePayloadFactory for DerivedInvoicePayloads<'_> {
+    fn expected_bitcoin_account_generation(&self) -> Option<i64> {
+        self.receiving
+            .bitcoin
+            .as_ref()
+            .map(|_| self.receiving.bitcoin_account_generation)
+    }
+
     fn for_child_index(&self, child_index: i64) -> Result<InvoicePayloads, PersistenceError> {
         let addresses = ReceivingAddresses {
             bitcoin: self
@@ -740,6 +770,52 @@ impl CreateInvoiceService {
             );
             return Err(CreateInvoiceError::ReaderNotPayable);
         }
+        let authorization_remaining =
+            remaining_at(started, self.clock.now(), "reader_authorization")?;
+        let authorization = tokio::time::timeout(
+            authorization_remaining,
+            self.registries.authorization(&request.reader),
+        )
+        .await
+        .map_err(|_| deadline("reader_authorization"))?;
+        match authorization {
+            Ok(ReaderAuthorization::Verified) => {}
+            Ok(ReaderAuthorization::Missing) => {
+                diagnose(
+                    "reader_authorization_check",
+                    CreateInvoiceError::ReaderSetupPending,
+                );
+                return Err(CreateInvoiceError::ReaderSetupPending);
+            }
+            Ok(ReaderAuthorization::Invalid) => {
+                diagnose(
+                    "reader_authorization_check",
+                    CreateInvoiceError::ReaderNotPayable,
+                );
+                return Err(CreateInvoiceError::ReaderNotPayable);
+            }
+            Err(RegistryDiscoveryError::InvalidRequest) => {
+                diagnose(
+                    "reader_authorization_identity",
+                    CreateInvoiceError::InvalidRequest,
+                );
+                return Err(CreateInvoiceError::InvalidRequest);
+            }
+            Err(RegistryDiscoveryError::Unavailable) => {
+                diagnose(
+                    "reader_authorization_fetch",
+                    CreateInvoiceError::ReaderRegistryUnavailable,
+                );
+                return Err(CreateInvoiceError::ReaderRegistryUnavailable);
+            }
+            Err(RegistryDiscoveryError::Malformed) => {
+                diagnose(
+                    "reader_authorization_parse",
+                    CreateInvoiceError::ReaderRegistryMalformed,
+                );
+                return Err(CreateInvoiceError::ReaderRegistryMalformed);
+            }
+        }
         let credentials_remaining =
             remaining_at(started, self.clock.now(), "creator_receiving_details")?;
         let (asset, _) = extract_terms(&lock)?;
@@ -878,6 +954,13 @@ fn validate_lock(
         .iter()
         .find(|criterion| criterion.verifier_type == VerifierType::PaykitPayment)
         .ok_or(CreateInvoiceError::InvalidRequest)?;
+    let params = criterion
+        .paykit_payment_params()
+        .map_err(|_| CreateInvoiceError::InvalidRequest)?
+        .ok_or(CreateInvoiceError::InvalidRequest)?;
+    if params.payment_in() != request.payment_in.get() {
+        return Err(CreateInvoiceError::InvalidRequest);
+    }
     CriterionAsset::parse(
         criterion
             .params

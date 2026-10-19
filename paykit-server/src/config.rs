@@ -6,7 +6,6 @@ use paykit_lib::PaykitAppId;
 use pubky::{ClientId, PublicKey};
 use rustls_pki_types::ServerName;
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 use sqlx::postgres::PgConnectOptions;
 use thiserror::Error;
 use url::Url;
@@ -24,7 +23,7 @@ pub const MAX_TRUSTED_PROXY_HOPS: u8 = 8;
 #[derive(Debug)]
 pub struct Config {
     pub http: HttpConfig,
-    pub locks: LocksConfig,
+    pub signed_services: SignedServicesConfig,
     pub setup: SetupConfig,
     pub paykit: PaykitConfig,
     pub electrum: ElectrumConfig,
@@ -43,11 +42,18 @@ impl Config {
         toml_source: &str,
         environment: ConfigEnvironment,
     ) -> Result<Self, ConfigError> {
-        let raw: RawConfig = toml::from_str(toml_source).map_err(|_| ConfigError::Toml)?;
+        let value: toml::Value = toml::from_str(toml_source).map_err(|_| ConfigError::Toml)?;
+        if value
+            .get("locks")
+            .and_then(toml::Value::as_table)
+            .is_some_and(|locks| locks.contains_key("trusted_public_key"))
+        {
+            return Err(ConfigError::LegacyLocksTrustedPublicKey);
+        }
+        let raw: RawConfig = value.try_into().map_err(|_| ConfigError::Toml)?;
         let database_url = DatabaseUrl::parse(environment.database_url)?;
         let master_key = MasterKey::parse(environment.master_key)?;
-        let trusted_public_key = TrustedLocksPublicKey::parse(raw.locks.trusted_public_key)?;
-        let trusted_locks_key_fingerprint = trusted_public_key.fingerprint();
+        let signed_services = SignedServicesConfig::parse(raw.signed_services)?;
         let app_id = PaykitAppId::new(raw.paykit.app_id).map_err(|_| ConfigError::InvalidAppId)?;
         if app_id.as_str() != PAYKIT_APP_ID {
             return Err(ConfigError::InvalidAppId);
@@ -76,7 +82,7 @@ impl Config {
                 listen_addr,
                 trusted_proxy_hops: raw.http.trusted_proxy_hops,
             },
-            locks: LocksConfig { trusted_public_key },
+            signed_services,
             setup: SetupConfig {
                 allowed_origins,
                 log_authorization_url: raw.setup.log_authorization_url,
@@ -88,6 +94,7 @@ impl Config {
                 proposal_acceptance_window: raw.paykit.proposal_acceptance_window,
                 payment_window: raw.paykit.payment_window,
                 conversion_payment_window: raw.paykit.conversion_payment_window,
+                marketplace_prepare_ttl: raw.paykit.marketplace_prepare_ttl,
             },
             electrum: ElectrumConfig {
                 endpoint: electrum_endpoint,
@@ -106,7 +113,6 @@ impl Config {
                 bitcoin_network,
                 paykit_client_id: client_id,
                 app_id,
-                trusted_locks_key_fingerprint,
             },
         };
         config.validate_operational_values()?;
@@ -137,6 +143,10 @@ impl Config {
             ("outbox.lease_duration", self.outbox.lease_duration),
             ("outbox.retry_initial", self.outbox.retry_initial),
             ("outbox.retry_max", self.outbox.retry_max),
+            (
+                "outbox.rapid_link_retry_interval_ms",
+                self.outbox.rapid_link_retry_interval,
+            ),
             ("limits.lock_fetch_timeout", self.limits.lock_fetch_timeout),
             ("shutdown.drain_timeout", self.shutdown.drain_timeout),
         ] {
@@ -146,6 +156,10 @@ impl Config {
         }
         for (name, value) in [
             ("outbox.batch_size", u64::from(self.outbox.batch_size)),
+            (
+                "outbox.rapid_link_retry_attempts",
+                u64::from(self.outbox.rapid_link_retry_attempts),
+            ),
             ("limits.request_body_bytes", self.limits.request_body_bytes),
             (
                 "limits.lock_resource_bytes",
@@ -189,11 +203,18 @@ impl Config {
         if self.outbox.retry_initial > self.outbox.retry_max {
             return Err(ConfigError::InconsistentRetries("outbox"));
         }
+        if self.outbox.rapid_link_retry_attempts > i32::MAX as u32 {
+            return Err(ConfigError::ValueTooLarge(
+                "outbox.rapid_link_retry_attempts",
+            ));
+        }
         if self.paykit.conversion_payment_window.as_secs() < 2
             || self.paykit.conversion_payment_window.subsec_nanos() != 0
             || self.paykit.proposal_acceptance_window.is_zero()
             || self.paykit.proposal_acceptance_window.subsec_nanos() != 0
             || self.paykit.payment_window.subsec_nanos() != 0
+            || self.paykit.marketplace_prepare_ttl.is_zero()
+            || self.paykit.marketplace_prepare_ttl.subsec_nanos() != 0
             || self.paykit.proposal_acceptance_window >= self.paykit.payment_window
         {
             return Err(ConfigError::InvalidInvoiceWindows);
@@ -231,7 +252,6 @@ pub struct DeploymentInvariants {
     pub bitcoin_network: BitcoinNetwork,
     pub paykit_client_id: ClientId,
     pub app_id: PaykitAppId,
-    pub trusted_locks_key_fingerprint: TrustedLocksKeyFingerprint,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -273,41 +293,32 @@ impl BitcoinNetwork {
 }
 
 #[derive(Clone, PartialEq, Eq)]
-pub struct TrustedLocksPublicKey([u8; 32]);
+pub struct TrustedServicePublicKey([u8; 32]);
 
-impl TrustedLocksPublicKey {
+impl TrustedServicePublicKey {
     fn parse(value: String) -> Result<Self, ConfigError> {
         let public_key = PublicKey::try_from(value.as_str())
-            .map_err(|_| ConfigError::InvalidTrustedLocksPublicKey)?;
+            .map_err(|_| ConfigError::InvalidTrustedServicePublicKey)?;
         if public_key.to_string() != value {
-            return Err(ConfigError::InvalidTrustedLocksPublicKey);
+            return Err(ConfigError::InvalidTrustedServicePublicKey);
         }
         let bytes = public_key.to_bytes();
-        VerifyingKey::from_bytes(&bytes).map_err(|_| ConfigError::InvalidTrustedLocksPublicKey)?;
+        let verifying_key = VerifyingKey::from_bytes(&bytes)
+            .map_err(|_| ConfigError::InvalidTrustedServicePublicKey)?;
+        if verifying_key.is_weak() {
+            return Err(ConfigError::InvalidTrustedServicePublicKey);
+        }
         Ok(Self(bytes))
     }
 
-    fn fingerprint(&self) -> TrustedLocksKeyFingerprint {
-        TrustedLocksKeyFingerprint(Sha256::digest(self.0).into())
-    }
-
     pub(crate) fn verifying_key(&self) -> VerifyingKey {
-        VerifyingKey::from_bytes(&self.0).expect("validated trusted Locks public key")
+        VerifyingKey::from_bytes(&self.0).expect("validated trusted service public key")
     }
 }
 
-impl fmt::Debug for TrustedLocksPublicKey {
+impl fmt::Debug for TrustedServicePublicKey {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("<redacted>")
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TrustedLocksKeyFingerprint([u8; 32]);
-
-impl TrustedLocksKeyFingerprint {
-    pub fn as_bytes(&self) -> &[u8; 32] {
-        &self.0
     }
 }
 
@@ -353,8 +364,28 @@ impl HttpConfig {
 }
 
 #[derive(Debug)]
-pub struct LocksConfig {
-    pub trusted_public_key: TrustedLocksPublicKey,
+pub struct SignedServicesConfig {
+    pub trusted_public_keys: Vec<TrustedServicePublicKey>,
+}
+
+impl SignedServicesConfig {
+    fn parse(raw: RawSignedServicesConfig) -> Result<Self, ConfigError> {
+        if raw.trusted_public_keys.is_empty() {
+            return Err(ConfigError::EmptyTrustedServicePublicKeys);
+        }
+        let trusted_public_keys = raw
+            .trusted_public_keys
+            .into_iter()
+            .map(TrustedServicePublicKey::parse)
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut unique = std::collections::HashSet::with_capacity(trusted_public_keys.len());
+        if trusted_public_keys.iter().any(|key| !unique.insert(key.0)) {
+            return Err(ConfigError::DuplicateTrustedServicePublicKey);
+        }
+        Ok(Self {
+            trusted_public_keys,
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -411,6 +442,7 @@ pub struct PaykitConfig {
     pub proposal_acceptance_window: Duration,
     pub payment_window: Duration,
     pub conversion_payment_window: Duration,
+    pub marketplace_prepare_ttl: Duration,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -450,6 +482,8 @@ pub struct OutboxConfig {
     pub lease_duration: Duration,
     pub retry_initial: Duration,
     pub retry_max: Duration,
+    pub rapid_link_retry_attempts: u32,
+    pub rapid_link_retry_interval: Duration,
 }
 
 #[derive(Debug)]
@@ -558,12 +592,14 @@ impl fmt::Debug for ElectrumEndpoint {
     }
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq, Eq)]
 pub enum ConfigError {
     #[error("invalid Arbitrum RPC configuration")]
     InvalidUsdtRpc,
     #[error("configuration TOML is invalid")]
     Toml,
+    #[error("[locks] trusted_public_key was replaced by [signed_services] trusted_public_keys")]
+    LegacyLocksTrustedPublicKey,
     #[error("PAYKIT_DATABASE_URL is required")]
     MissingDatabaseUrl,
     #[error("PAYKIT_MASTER_KEY is required")]
@@ -574,8 +610,14 @@ pub enum ConfigError {
     InvalidDatabaseUrl,
     #[error("PAYKIT_MASTER_KEY must be unpadded base64url encoding of exactly 32 bytes")]
     InvalidMasterKey,
-    #[error("locks.trusted_public_key must be a canonical pubky-prefixed public key")]
-    InvalidTrustedLocksPublicKey,
+    #[error(
+        "signed_services.trusted_public_keys entries must be valid canonical pubky-prefixed public keys"
+    )]
+    InvalidTrustedServicePublicKey,
+    #[error("signed_services.trusted_public_keys must contain at least one key")]
+    EmptyTrustedServicePublicKeys,
+    #[error("signed_services.trusted_public_keys must not contain duplicates")]
+    DuplicateTrustedServicePublicKey,
     #[error("bitcoin.network must be mainnet, testnet, signet, or regtest")]
     InvalidNetwork,
     #[error("{0} must be a valid absolute URL")]
@@ -607,7 +649,7 @@ pub enum ConfigError {
     #[error("paykit.receiver_path_priority must not contain duplicates")]
     DuplicateReceiverPathPriority,
     #[error(
-        "paykit windows must use whole seconds; acceptance must be positive and shorter than payment, and conversion must be at least two seconds"
+        "paykit windows must use whole seconds; acceptance and Marketplace prepare TTL must be positive, acceptance must be shorter than payment, and conversion must be at least two seconds"
     )]
     InvalidInvoiceWindows,
     #[error("{0} must be greater than zero")]
@@ -694,7 +736,7 @@ fn validate_allowed_origins(values: Vec<String>) -> Result<Vec<String>, ConfigEr
 #[serde(deny_unknown_fields)]
 struct RawConfig {
     http: RawHttpConfig,
-    locks: RawLocksConfig,
+    signed_services: RawSignedServicesConfig,
     setup: RawSetupConfig,
     paykit: RawPaykitConfig,
     bitcoin: RawBitcoinConfig,
@@ -719,8 +761,8 @@ struct RawHttpConfig {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawLocksConfig {
-    trusted_public_key: String,
+struct RawSignedServicesConfig {
+    trusted_public_keys: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -749,6 +791,8 @@ struct RawPaykitConfig {
         with = "humantime_serde"
     )]
     conversion_payment_window: Duration,
+    #[serde(default = "default_marketplace_prepare_ttl", with = "humantime_serde")]
+    marketplace_prepare_ttl: Duration,
 }
 
 const fn default_proposal_acceptance_window() -> Duration {
@@ -757,6 +801,10 @@ const fn default_proposal_acceptance_window() -> Duration {
 
 const fn default_payment_window() -> Duration {
     Duration::from_secs(24 * 60 * 60)
+}
+
+const fn default_marketplace_prepare_ttl() -> Duration {
+    Duration::from_secs(15 * 60)
 }
 
 #[derive(Deserialize)]
@@ -802,6 +850,10 @@ struct RawOutboxConfig {
     retry_initial: Duration,
     #[serde(default = "default_outbox_retry_max", with = "humantime_serde")]
     retry_max: Duration,
+    #[serde(default = "default_rapid_link_retry_attempts")]
+    rapid_link_retry_attempts: u32,
+    #[serde(default = "default_rapid_link_retry_interval_ms")]
+    rapid_link_retry_interval_ms: u32,
 }
 
 #[derive(Deserialize)]
@@ -878,6 +930,10 @@ impl From<RawOutboxConfig> for OutboxConfig {
             lease_duration: value.lease_duration,
             retry_initial: value.retry_initial,
             retry_max: value.retry_max,
+            rapid_link_retry_attempts: value.rapid_link_retry_attempts,
+            rapid_link_retry_interval: Duration::from_millis(u64::from(
+                value.rapid_link_retry_interval_ms,
+            )),
         }
     }
 }
@@ -924,6 +980,12 @@ const fn default_retry_initial() -> Duration {
 }
 const fn default_outbox_retry_max() -> Duration {
     Duration::from_secs(5 * 60)
+}
+const fn default_rapid_link_retry_attempts() -> u32 {
+    120
+}
+const fn default_rapid_link_retry_interval_ms() -> u32 {
+    1_000
 }
 
 const fn default_request_body_bytes() -> u64 {

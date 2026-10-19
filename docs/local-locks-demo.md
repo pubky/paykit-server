@@ -10,18 +10,17 @@ Private Payment List as the invoice destination.
 ## Build from public release sources
 
 From a fresh anonymous clone of this repository, build with the Paykit release
-and exact Locks release selected in `Cargo.toml`:
+contexts. `locks-core` resolves from the exact crates.io version in `Cargo.toml`:
 
 ```bash
 docker buildx build --load \
-  --build-context paykit-lib='https://github.com/pubky/paykit-rs.git#v0.1.0-rc71:paykit-lib' \
-  --build-context paykit-sdk='https://github.com/pubky/paykit-rs.git#v0.1.0-rc71:paykit-sdk' \
-  --build-context locks='https://github.com/pubky/locks.git#v0.1.0-rc9' \
+  --build-context paykit-lib='https://github.com/pubky/paykit-rs.git#dd8e75e5588cf7a0b3b45cacbab9125576ee90df:paykit-lib' \
+  --build-context paykit-sdk='https://github.com/pubky/paykit-rs.git#dd8e75e5588cf7a0b3b45cacbab9125576ee90df:paykit-sdk' \
   -f Dockerfile.local \
   -t paykit-server:local .
 ```
 
-The Paykit contexts use the `v0.1.0-rc71` release tag.
+The Paykit contexts use the immutable `v0.1.0` release revision matching the crate versions in `Cargo.toml`.
 These contexts are anonymously reachable and reproducible. Update the URLs
 together with the corresponding `Cargo.toml` pins; exact dependency-pin matches
 make source drift fail closed.
@@ -35,16 +34,15 @@ trees. This mode intentionally includes uncommitted source edits:
 docker buildx build --load \
   --build-context paykit-lib=../paykit-rs/paykit-lib \
   --build-context paykit-sdk=../paykit-rs/paykit-sdk \
-  --build-context locks=../../Pubky/locks \
   -f Dockerfile.local \
   -t paykit-server:local .
 ```
 
 Crate-level `paykit-lib` and `paykit-sdk` contexts avoid transferring the Paykit
 Rust workspace target directory and require no Docker-owned files in that
-repository. The Locks context applies its existing source-tree exclusions.
+repository.
 
-Builder runs [`scripts/prepare-local-docker-sources.sh`](../scripts/prepare-local-docker-sources.sh) against copied manifests to resolve `paykit-lib`, `paykit-sdk`, and `locks-core` from named contexts. Committed Git dependency declarations and lockfile remain unchanged. No SSH agent or Cargo credentials are mounted. Exact dependency-pin matches make source drift fail closed.
+Builder runs [`scripts/prepare-local-docker-sources.sh`](../scripts/prepare-local-docker-sources.sh) against copied manifests to resolve `paykit-lib` and `paykit-sdk` from named contexts. `locks-core` remains pinned to crates.io. Cargo reconciles the copied lockfile with the local Paykit sources. Committed dependency declarations and lockfile remain unchanged. No SSH agent or Cargo credentials are mounted. Exact dependency-pin matches make source drift fail closed.
 
 ## Runtime image
 
@@ -63,9 +61,9 @@ Final pinned Debian image:
 
 Supply `PAYKIT_CONFIG`, `PAYKIT_DATABASE_URL`, and `PAYKIT_MASTER_KEY` at runtime. Mount generated ignored local config. The calling Compose definition owns mounts, environment values, infrastructure image pins, and helper command overrides.
 
-The deployed Pubky Homeserver must run 0.15 or newer. Rebuilding this image does
-not upgrade the homeserver managed by the calling Compose stack. The SDK's
-five-minute uncertain-write cooldown remains in place; see the
+Every serving Pubky Homeserver must run 0.16.2 or newer with the required GCS
+behavior. Rebuilding this image does not upgrade the homeserver managed by the
+calling Compose stack or drain older writes. Coordinate all writers; see the
 [shared-state deployment requirements](../README.md#persistence-startup-and-upgrades).
 
 ## Generated local config contract
@@ -76,8 +74,8 @@ Locks must generate `.local/paykit-config/config.toml` only after the local Lock
 [http]
 listen_addr = "0.0.0.0:3001"
 
-[locks]
-trusted_public_key = "<ACTUAL_CANONICAL_LOCK_SERVER_PUBKY>"
+[signed_services]
+trusted_public_keys = ["<ACTUAL_CANONICAL_LOCK_SERVER_PUBKY>"]
 
 [setup]
 allowed_origins = ["http://localhost:8080"]

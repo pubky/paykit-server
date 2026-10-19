@@ -41,9 +41,14 @@ impl InvoiceStore {
         };
         if let Some(destination) = &payment.bitcoin {
             let observation: Option<BitcoinObservationRow> = sqlx::query_as(
-                "SELECT id, invoice_id, observation_envelope, outpoint_lookup_hash, confirmations, present
-                 FROM bitcoin_observations WHERE invoice_id = $1 AND active")
-                .bind(invoice).fetch_optional(&mut **tx).await.map_err(|_| PersistenceError::Unavailable)?;
+                "SELECT id, invoice_id, marketplace_preparation_id,
+                        observation_envelope, outpoint_lookup_hash, confirmations, present
+                 FROM bitcoin_observations WHERE invoice_id = $1 AND active",
+            )
+            .bind(invoice)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
             if let Some(observation) = observation {
                 let facts = self.decrypt_observation(creator_hash, &observation)?;
                 let matched =
@@ -69,6 +74,7 @@ impl InvoiceStore {
         let usdt = if let Some(destination) = &payment.usdt {
             self.usdt_payment(tx, &row, creator_hash, destination.required_amount)
                 .await?
+                .map(|(_, payment)| payment)
         } else {
             None
         };
@@ -92,6 +98,17 @@ impl InvoiceStore {
             .bind(invoice).bind(status).bind(bitcoin.confirmations).bind(bitcoin.matched)
             .bind(received_at).bind(eligible).bind(now)
             .execute(&mut **tx).await.map_err(|_| PersistenceError::Unavailable)?;
+        if eligible {
+            sqlx::query(
+                "INSERT INTO buyer_contacts (invoice_id, creator_id, reader_lookup_hash)
+                 SELECT id, creator_id, reader_lookup_hash FROM invoices WHERE id = $1
+                 ON CONFLICT (creator_id, reader_lookup_hash) DO NOTHING",
+            )
+            .bind(invoice)
+            .execute(&mut **tx)
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        }
         Ok(())
     }
 }

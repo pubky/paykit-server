@@ -16,6 +16,14 @@ pub enum ApiError {
     DependencyUnavailable,
     DependencyTimeout,
     Conflict,
+    OperationConflict,
+    PrepareExpired,
+    LifecycleTerminal,
+    InvoiceActive,
+    TotalMismatch,
+    ResolutionConflict,
+    RecoveryRequired,
+    InvalidConflict,
     Unavailable,
     InvoiceConflict,
     InvoiceNotFound,
@@ -26,6 +34,11 @@ pub enum ApiError {
     ReaderNotPayable,
     ReaderRegistryUnavailable,
     ReaderRegistryMalformed,
+    SellerSetupPending,
+    SellerUsdtSetupPending,
+    SellerBitcoinAndUsdtSetupPending,
+    AssetUnsupported,
+    PaymentWindowExceedsCap,
 }
 
 #[derive(Serialize)]
@@ -91,6 +104,46 @@ impl ApiError {
                 "conflict",
                 "request conflicts with persisted payment state",
             ),
+            Self::OperationConflict => (
+                StatusCode::CONFLICT,
+                "operation_conflict",
+                "operation binding conflicts with persisted payment state",
+            ),
+            Self::PrepareExpired => (
+                StatusCode::CONFLICT,
+                "prepare_expired",
+                "payment preparation expired",
+            ),
+            Self::LifecycleTerminal => (
+                StatusCode::CONFLICT,
+                "lifecycle_terminal",
+                "payment lifecycle is already terminal",
+            ),
+            Self::InvoiceActive => (
+                StatusCode::CONFLICT,
+                "invoice_active",
+                "invoice is already active",
+            ),
+            Self::TotalMismatch => (
+                StatusCode::CONFLICT,
+                "total_mismatch",
+                "total does not match prepared payment",
+            ),
+            Self::ResolutionConflict => (
+                StatusCode::CONFLICT,
+                "resolution_conflict",
+                "business resolution conflicts with persisted outcome",
+            ),
+            Self::RecoveryRequired => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "recovery_required",
+                "payment request requires recovery",
+            ),
+            Self::InvalidConflict => (
+                StatusCode::CONFLICT,
+                "invalid_conflict",
+                "payment request lifecycle is inconsistent",
+            ),
             Self::Unavailable => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "unavailable",
@@ -140,6 +193,31 @@ impl ApiError {
                 StatusCode::BAD_GATEWAY,
                 "reader_registry_malformed",
                 "reader registry is malformed",
+            ),
+            Self::SellerSetupPending => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "seller_setup_pending",
+                "seller Bitcoin receiving setup is needed",
+            ),
+            Self::SellerUsdtSetupPending => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "seller_setup_pending",
+                "seller USDT receiving setup is needed",
+            ),
+            Self::SellerBitcoinAndUsdtSetupPending => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "seller_setup_pending",
+                "seller Bitcoin and USDT receiving setup is needed",
+            ),
+            Self::AssetUnsupported => (
+                StatusCode::CONFLICT,
+                "asset_unsupported",
+                "requested payment asset is not supported by this deployment",
+            ),
+            Self::PaymentWindowExceedsCap => (
+                StatusCode::BAD_REQUEST,
+                "payment_window_exceeds_cap",
+                "payment window exceeds the cap for this request",
             ),
         }
     }

@@ -12,7 +12,8 @@ use paykit_server::{
     crypto::Crypto,
     domain::locks::parse_creator,
     persistence::{
-        CreatorCredentials, CreatorStore, DeploymentStore, PersistenceError, run_migrations,
+        CreatorCredentials, CreatorStore, DeploymentStore, PaymentRequestLifecycleStore,
+        PersistenceError, run_migrations,
     },
     startup::initialize_database,
 };
@@ -31,13 +32,22 @@ const OTHER_SESSION: &str = "other-session";
 const OTHER_XPUB: &str = "other-xpub";
 
 fn config_with_secrets(network: &str, database_url: &str, master_key: &str) -> Config {
+    config_with_keys_and_secrets(network, database_url, master_key, &format!("\"{KEY}\""))
+}
+
+fn config_with_keys_and_secrets(
+    network: &str,
+    database_url: &str,
+    master_key: &str,
+    trusted_public_keys: &str,
+) -> Config {
     Config::from_toml_and_environment(
         &format!(
             r#"
 [http]
 listen_addr = "127.0.0.1:8080"
-[locks]
-trusted_public_key = "{KEY}"
+[signed_services]
+trusted_public_keys = [{trusted_public_keys}]
 [setup]
 allowed_origins = ["https://app.example"]
 [paykit]
@@ -469,6 +479,47 @@ async fn deployment_initialization_is_restart_safe_and_rejects_mismatches() {
 }
 
 #[tokio::test]
+async fn trusted_service_key_rotation_preserves_persisted_deployment_startup() {
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let store = DeploymentStore::new(database.pool());
+    let original = config_with_keys_and_secrets(
+        "testnet",
+        database.database_url(),
+        MASTER_KEY,
+        &format!("\"{KEY}\""),
+    );
+    store
+        .initialize(original.deployment_invariants())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE deployment_metadata SET locks_key_fingerprint = $1")
+        .bind(vec![7_u8; 32])
+        .execute(database.pool())
+        .await
+        .unwrap();
+
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&[4; 32]);
+    let rotated_key = pubky::PublicKey::from(
+        pubky::pkarr::PublicKey::try_from(signing_key.verifying_key().as_bytes()).unwrap(),
+    )
+    .to_string();
+    let rotated = config_with_keys_and_secrets(
+        "testnet",
+        database.database_url(),
+        MASTER_KEY,
+        &format!("\"{rotated_key}\""),
+    );
+
+    store
+        .initialize(rotated.deployment_invariants())
+        .await
+        .unwrap();
+
+    database.cleanup().await;
+}
+
+#[tokio::test]
 async fn creator_authority_round_trips_only_through_ciphertext() {
     let database = TestDatabase::create().await;
     let creators = stores(&database).await;
@@ -655,5 +706,51 @@ async fn reauthentication_can_add_but_cannot_replace_approved_usdt_details() {
         creators.load(&creator()).await.unwrap().usdt_address(),
         Some(&address)
     );
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn bitcoin_account_rotation_atomically_advances_generation_and_preserves_ready_semantics() {
+    let database = TestDatabase::create().await;
+    let creators = stores(&database).await;
+    creators
+        .create(&credentials(SESSION, XPUB, 7, [9; 32]))
+        .await
+        .unwrap();
+    creators.mark_setup_complete(&creator()).await.unwrap();
+    let replacement = credentials("rotated-session", OTHER_XPUB, 19, [9; 32]);
+    let lifecycles = PaymentRequestLifecycleStore::new(database.pool(), crypto());
+
+    let rotation = creators
+        .rotate_bitcoin_account_after_receive(&lifecycles, &replacement, &[])
+        .await
+        .unwrap();
+    assert_eq!(rotation.generation, 1);
+    assert_eq!(rotation.cancellation_pending_count, 0);
+    assert_eq!(rotation.voided_preparation_count, 0);
+    let (stored, generation) = creators
+        .load_with_bitcoin_account_generation(&creator())
+        .await
+        .unwrap();
+    assert_eq!(generation, 1);
+    assert_eq!(stored.session_secret(), "rotated-session");
+    assert_eq!(stored.bitcoin_account().unwrap().xpub.as_str(), OTHER_XPUB);
+    assert_eq!(stored.bitcoin_account().unwrap().account_index, 19);
+    assert!(!creators.setup_complete(&creator()).await.unwrap());
+    creators.mark_setup_complete(&creator()).await.unwrap();
+    assert!(creators.setup_complete(&creator()).await.unwrap());
+    assert!(
+        creators
+            .rotate_bitcoin_account_after_receive(&lifecycles, &replacement, &[])
+            .await
+            .is_err(),
+        "exact reconnect replay must not create a second rotation"
+    );
+    let rotation_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM creator_bitcoin_account_rotations")
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(rotation_count, 1);
     database.cleanup().await;
 }

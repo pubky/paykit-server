@@ -5,7 +5,7 @@ use paykit_server_e2e::postgres::TestDatabase;
 use sqlx::{Connection, PgConnection, PgPool, Row, postgres::PgConnectOptions};
 use uuid::Uuid;
 
-const REQUIRED_TABLES: [&str; 7] = [
+const REQUIRED_TABLES: [&str; 11] = [
     "deployment_metadata",
     "creators",
     "reader_assignments",
@@ -13,7 +13,45 @@ const REQUIRED_TABLES: [&str; 7] = [
     "outbox",
     "bitcoin_observations",
     "usdt_observations",
+    "buyer_contacts",
+    "marketplace_payment_preparations",
+    "marketplace_settlements",
+    "bitcoin_address_owners",
 ];
+
+const PRE_SETTLEMENT_MIGRATIONS: [&str; 13] = [
+    include_str!("../../paykit-server/migrations/0001_initial.sql"),
+    include_str!("../../paykit-server/migrations/0002_invoice_deadlines.sql"),
+    include_str!("../../paykit-server/migrations/0003_invoice_observation_deadlines.sql"),
+    include_str!("../../paykit-server/migrations/0004_payment_request_lifecycles.sql"),
+    include_str!("../../paykit-server/migrations/0005_payment_drains.sql"),
+    include_str!("../../paykit-server/migrations/0006_payment_drain_cleanup_receipts.sql"),
+    include_str!("../../paykit-server/migrations/0007_payment_request_deadline_terms.sql"),
+    include_str!("../../paykit-server/migrations/0008_outbox_invoice_cardinality.sql"),
+    include_str!("../../paykit-server/migrations/0009_usdt_observations.sql"),
+    include_str!("../../paykit-server/migrations/0010_buyer_contacts.sql"),
+    include_str!("../../paykit-server/migrations/0011_outbox_failure_count.sql"),
+    include_str!("../../paykit-server/migrations/0012_marketplace_payment_preparations.sql"),
+    include_str!("../../paykit-server/migrations/0013_marketplace_activation_void.sql"),
+];
+const SETTLEMENT_MIGRATION: &str =
+    include_str!("../../paykit-server/migrations/0014_marketplace_settlements.sql");
+const MARKETPLACE_OBSERVATION_MIGRATION: &str =
+    include_str!("../../paykit-server/migrations/0015_marketplace_bitcoin_observations.sql");
+const RESOLUTION_MIGRATION: &str =
+    include_str!("../../paykit-server/migrations/0016_marketplace_resolution_immutability.sql");
+const OPTIONAL_RAIL_MIGRATION: &str =
+    include_str!("../../paykit-server/migrations/0017_marketplace_optional_bitcoin_rail.sql");
+const USDT_OBSERVATION_MIGRATION: &str =
+    include_str!("../../paykit-server/migrations/0018_marketplace_usdt_observations.sql");
+const USDT_VALIDATION_MIGRATION: &str =
+    include_str!("../../paykit-server/migrations/0019_validate_marketplace_usdt_constraints.sql");
+const USDT_INDEX_MIGRATION: &str =
+    include_str!("../../paykit-server/migrations/0020_marketplace_usdt_observation_index.sql");
+const CREATOR_ROTATION_MIGRATION: &str =
+    include_str!("../../paykit-server/migrations/0021_creator_bitcoin_account_rotation.sql");
+const DRAIN_CANCELLATION_OWNERSHIP_MIGRATION: &str =
+    include_str!("../../paykit-server/migrations/0022_payment_drain_cancellation_ownership.sql");
 
 /// PostgreSQL advisory locks are server-wide, not database-scoped. These
 /// migration tests deliberately use the production migration lock key, so
@@ -55,7 +93,69 @@ async fn migrations_create_the_required_schema_and_are_restart_safe() {
             .fetch_all(pool)
             .await
             .unwrap();
-    assert_eq!(applied_versions, (1..=9).collect::<Vec<_>>());
+    assert_eq!(applied_versions, (1..=22).collect::<Vec<_>>());
+
+    let rotation_columns: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM information_schema.columns
+         WHERE table_schema = 'public'
+           AND (table_name, column_name) IN
+               (('creators', 'bitcoin_account_generation'),
+                ('invoices', 'bitcoin_account_generation'),
+                ('marketplace_payment_preparations', 'bitcoin_account_generation'))",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(rotation_columns, 3);
+
+    let settlement_address_nullable: String = sqlx::query_scalar(
+        "SELECT is_nullable FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = 'marketplace_settlements'
+           AND column_name = 'bitcoin_address_lookup_hash'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(settlement_address_nullable, "YES");
+    let usdt_owner_nullable: String = sqlx::query_scalar(
+        "SELECT is_nullable FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = 'usdt_observations'
+           AND column_name = 'invoice_id'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(usdt_owner_nullable, "YES");
+    let usdt_owner_guards: i64 = sqlx::query_scalar(
+        "SELECT (SELECT count(*) FROM pg_constraint
+                 WHERE conname = 'usdt_observation_exactly_one_owner')
+              + (SELECT count(*) FROM pg_trigger
+                 WHERE tgname = 'usdt_observation_owner_immutable')",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(usdt_owner_guards, 2);
+    assert_usdt_constraints_validated(pool, true).await;
+    let index_valid: bool = sqlx::query_scalar(
+        "SELECT indisvalid FROM pg_index
+         WHERE indexrelid = 'usdt_observations_marketplace_settlement_index'::regclass",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert!(index_valid);
+    let claim_trigger: String = sqlx::query_scalar(
+        "SELECT pg_get_triggerdef(oid) FROM pg_trigger
+         WHERE tgname = 'marketplace_settlements_claim_global_bitcoin_address'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert!(
+        claim_trigger.contains("WHEN ((new.bitcoin_address_lookup_hash IS NOT NULL))"),
+        "{claim_trigger}"
+    );
 
     let plaintext_creator_pubky_columns: Vec<String> = sqlx::query_scalar(
         "SELECT table_name \
@@ -112,6 +212,371 @@ async fn migrations_create_the_required_schema_and_are_restart_safe() {
     .unwrap();
     assert_ne!(creator_id, Uuid::nil());
 
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn drain_ownership_migration_preserves_cleaned_cancellation() {
+    let _migration_test_guard = migration_test_lock().lock().await;
+    let database = TestDatabase::create().await;
+    let pool = database.pool();
+    apply_migrations_through_creator_rotation(pool).await;
+    let (cancellation_id, _, _) = seed_cleaned_drain_cancellation(pool).await;
+
+    sqlx::raw_sql(DRAIN_CANCELLATION_OWNERSHIP_MIGRATION)
+        .execute(pool)
+        .await
+        .unwrap();
+    let drain_required: bool =
+        sqlx::query_scalar("SELECT cancellation_drain_required FROM outbox WHERE id = $1")
+            .bind(cancellation_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert!(drain_required);
+
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn drain_ownership_migration_preserves_cleaned_cancellation_adopted_by_rotation() {
+    let _migration_test_guard = migration_test_lock().lock().await;
+    let database = TestDatabase::create().await;
+    let pool = database.pool();
+    apply_migrations_through_creator_rotation(pool).await;
+    let (cancellation_id, creator_id, invoice_id) = seed_cleaned_drain_cancellation(pool).await;
+
+    let rotation_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO creator_bitcoin_account_rotations (
+             id, creator_id, from_generation, to_generation, cancellation_count
+         ) VALUES ($1, $2, 0, 1, 1)",
+    )
+    .bind(rotation_id)
+    .bind(creator_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO creator_bitcoin_account_rotation_items (
+             rotation_id, invoice_id, sdk_payment_request_id, classification,
+             cancellation_outbox_id, created_at
+         ) SELECT $1, $2, cancellation_target_payment_request_id,
+                  'cancellation_pending', id, created_at + INTERVAL '1 second'
+           FROM outbox WHERE id = $3",
+    )
+    .bind(rotation_id)
+    .bind(invoice_id)
+    .bind(cancellation_id)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    sqlx::raw_sql(DRAIN_CANCELLATION_OWNERSHIP_MIGRATION)
+        .execute(pool)
+        .await
+        .unwrap();
+    let drain_required: bool =
+        sqlx::query_scalar("SELECT cancellation_drain_required FROM outbox WHERE id = $1")
+            .bind(cancellation_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert!(drain_required);
+
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn drain_ownership_migration_rejects_ambiguous_cleaned_rotation_cancellation() {
+    let _migration_test_guard = migration_test_lock().lock().await;
+    let database = TestDatabase::create().await;
+    let pool = database.pool();
+    apply_migrations_through_creator_rotation(pool).await;
+    let (cancellation_id, creator_id, invoice_id) = seed_cleaned_drain_cancellation(pool).await;
+
+    let rotation_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO creator_bitcoin_account_rotations (
+             id, creator_id, from_generation, to_generation, cancellation_count
+         ) VALUES ($1, $2, 0, 1, 1)",
+    )
+    .bind(rotation_id)
+    .bind(creator_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO creator_bitcoin_account_rotation_items (
+             rotation_id, invoice_id, sdk_payment_request_id, classification,
+             cancellation_outbox_id, created_at
+         ) SELECT $1, $2, cancellation_target_payment_request_id,
+                  'cancellation_pending', id, created_at
+           FROM outbox WHERE id = $3",
+    )
+    .bind(rotation_id)
+    .bind(invoice_id)
+    .bind(cancellation_id)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let error = sqlx::raw_sql(DRAIN_CANCELLATION_OWNERSHIP_MIGRATION)
+        .execute(pool)
+        .await
+        .expect_err("ambiguous cleaned cancellation must block the upgrade");
+    assert!(
+        error
+            .to_string()
+            .contains("ambiguous cleaned cancellation ownership"),
+        "unexpected migration error: {error}"
+    );
+
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn drain_ownership_migration_keeps_post_cleanup_rotation_cancellation_rotation_only() {
+    let _migration_test_guard = migration_test_lock().lock().await;
+    let database = TestDatabase::create().await;
+    let pool = database.pool();
+    apply_migrations_through_creator_rotation(pool).await;
+
+    let creator_id = insert_creator(pool).await;
+    insert_invoice(
+        pool,
+        creator_id,
+        b"rotation-only-bundle",
+        b"rotation-only-request",
+    )
+    .await;
+    let (invoice_id, lock_hash): (Uuid, Vec<u8>) =
+        sqlx::query_as("SELECT id, lock_resource_lookup_hash FROM invoices WHERE creator_id = $1")
+            .bind(creator_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    sqlx::query(
+        "INSERT INTO lock_payment_generations (
+             creator_id, lock_resource_lookup_hash, current_generation,
+             last_cleanup_token, updated_at
+         ) VALUES ($1, $2, 1, $3, clock_timestamp())",
+    )
+    .bind(creator_id)
+    .bind(&lock_hash)
+    .bind(vec![7_u8; 32])
+    .execute(pool)
+    .await
+    .unwrap();
+    let rotation_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO creator_bitcoin_account_rotations (
+             id, creator_id, from_generation, to_generation, cancellation_count
+         ) VALUES ($1, $2, 0, 1, 1)",
+    )
+    .bind(rotation_id)
+    .bind(creator_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    let cancellation_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO outbox (
+             id, creator_id, invoice_id, intent_envelope, status, intent_kind,
+             cancellation_target_payment_request_id, created_at
+         ) SELECT $1, $2, $3, $4, 'queued', 'payment_request_cancellation', $5,
+                  updated_at + INTERVAL '1 second'
+           FROM lock_payment_generations
+           WHERE creator_id = $2 AND lock_resource_lookup_hash = $6",
+    )
+    .bind(cancellation_id)
+    .bind(creator_id)
+    .bind(invoice_id)
+    .bind(b"encrypted-rotation-cancellation".as_slice())
+    .bind("rotation-only-payment-request")
+    .bind(&lock_hash)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO creator_bitcoin_account_rotation_items (
+             rotation_id, invoice_id, sdk_payment_request_id, classification,
+             cancellation_outbox_id, created_at
+         ) SELECT $1, $2, cancellation_target_payment_request_id,
+                  'cancellation_pending', id, created_at
+           FROM outbox WHERE id = $3",
+    )
+    .bind(rotation_id)
+    .bind(invoice_id)
+    .bind(cancellation_id)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    sqlx::raw_sql(DRAIN_CANCELLATION_OWNERSHIP_MIGRATION)
+        .execute(pool)
+        .await
+        .unwrap();
+    let drain_required: bool =
+        sqlx::query_scalar("SELECT cancellation_drain_required FROM outbox WHERE id = $1")
+            .bind(cancellation_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert!(!drain_required);
+
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn settlement_migration_backfills_invoice_owners_and_rejects_unbackfillable_active_rows() {
+    let _migration_test_guard = migration_test_lock().lock().await;
+    let database = TestDatabase::create().await;
+    apply_pre_settlement_migrations(database.pool()).await;
+    let creator_id = insert_creator(database.pool()).await;
+    insert_invoice(
+        database.pool(),
+        creator_id,
+        b"upgrade-bundle",
+        b"upgrade-request",
+    )
+    .await;
+    let expected_owner: (Vec<u8>, Uuid) = sqlx::query_as(
+        "SELECT bitcoin_address_lookup_hash, id FROM invoices WHERE creator_id = $1",
+    )
+    .bind(creator_id)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+
+    let mut migration = database.pool().begin().await.unwrap();
+    sqlx::raw_sql(SETTLEMENT_MIGRATION)
+        .execute(&mut *migration)
+        .await
+        .unwrap();
+    migration.commit().await.unwrap();
+    let actual_owner: (Vec<u8>, Uuid) = sqlx::query_as(
+        "SELECT bitcoin_address_lookup_hash, invoice_id
+         FROM bitcoin_address_owners WHERE invoice_id = $1",
+    )
+    .bind(expected_owner.1)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(actual_owner, expected_owner);
+    database.cleanup().await;
+
+    let database = TestDatabase::create().await;
+    apply_pre_settlement_migrations(database.pool()).await;
+    let creator_id = insert_creator(database.pool()).await;
+    sqlx::query(
+        "INSERT INTO marketplace_payment_preparations (
+             id, creator_id, operation_lookup_hash, request_lookup_hash,
+             reader_lookup_hash, preparation_envelope, state, prepared_at,
+             prepare_expires_at, activated_at, payment_deadline
+         ) VALUES ($1, $2, $3, $4, $5, $6, 'active', NOW(),
+                   NOW() + INTERVAL '1 hour', NOW(), NOW() + INTERVAL '24 hours')",
+    )
+    .bind(Uuid::new_v4())
+    .bind(creator_id)
+    .bind(vec![1_u8; 32])
+    .bind(vec![2_u8; 32])
+    .bind(vec![3_u8; 32])
+    .bind(b"encrypted-preparation".as_slice())
+    .execute(database.pool())
+    .await
+    .unwrap();
+    let mut migration = database.pool().begin().await.unwrap();
+    let error = sqlx::raw_sql(SETTLEMENT_MIGRATION)
+        .execute(&mut *migration)
+        .await
+        .expect_err("active preparation without an application-owned record must block upgrade");
+    assert_eq!(
+        error.as_database_error().unwrap().code().as_deref(),
+        Some("P0001")
+    );
+    migration.rollback().await.unwrap();
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn resolution_migration_upgrades_settlement_schema_and_enforces_immutability() {
+    let _migration_test_guard = migration_test_lock().lock().await;
+    let database = TestDatabase::create().await;
+    let pool = database.pool();
+    apply_pre_settlement_migrations(pool).await;
+    let creator_id = insert_creator(pool).await;
+
+    let mut settlement = pool.begin().await.unwrap();
+    sqlx::raw_sql(SETTLEMENT_MIGRATION)
+        .execute(&mut *settlement)
+        .await
+        .unwrap();
+    settlement.commit().await.unwrap();
+
+    sqlx::raw_sql(MARKETPLACE_OBSERVATION_MIGRATION)
+        .execute(pool)
+        .await
+        .unwrap();
+
+    let preparation_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO marketplace_payment_preparations (
+             id, creator_id, operation_lookup_hash, request_lookup_hash,
+             reader_lookup_hash, preparation_envelope, state, prepared_at,
+             prepare_expires_at
+         ) VALUES ($1, $2, $3, $4, $5, $6, 'prepared', NOW(), NOW() + INTERVAL '1 hour')",
+    )
+    .bind(preparation_id)
+    .bind(creator_id)
+    .bind(vec![1_u8; 32])
+    .bind(vec![2_u8; 32])
+    .bind(vec![3_u8; 32])
+    .bind(b"encrypted-preparation".as_slice())
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let mut resolution = pool.begin().await.unwrap();
+    sqlx::raw_sql(RESOLUTION_MIGRATION)
+        .execute(&mut *resolution)
+        .await
+        .unwrap();
+    resolution.commit().await.unwrap();
+
+    sqlx::query(
+        "UPDATE marketplace_payment_preparations
+         SET business_outcome = 'refunded', resolved_at = clock_timestamp()
+         WHERE id = $1",
+    )
+    .bind(preparation_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    assert_check_violation(
+        sqlx::query(
+            "UPDATE marketplace_payment_preparations
+             SET business_outcome = 'abandoned', resolved_at = clock_timestamp()
+             WHERE id = $1",
+        )
+        .bind(preparation_id)
+        .execute(pool)
+        .await,
+    );
+
+    let settlement_indexes: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_indexes
+         WHERE schemaname = 'public'
+           AND indexname IN (
+               'marketplace_settlements_pkey',
+               'marketplace_settlements_bitcoin_address_lookup_hash_key',
+               'payment_request_lifecycles_marketplace_index'
+           )",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(settlement_indexes, 3);
     database.cleanup().await;
 }
 
@@ -361,8 +826,8 @@ async fn schema_uniqueness_constraints_reject_duplicate_lookup_keys() {
     sqlx::query(
         "INSERT INTO bitcoin_observations
          (invoice_id, observation_envelope, outpoint_lookup_hash, active,
-          confirmations, present)
-         VALUES ($1, $2, $3, TRUE, 0, TRUE)",
+          confirmations, present, first_observed_at)
+         VALUES ($1, $2, $3, TRUE, 0, TRUE, clock_timestamp())",
     )
     .bind(first_invoice)
     .bind(b"encrypted-observation-a".as_slice())
@@ -374,14 +839,76 @@ async fn schema_uniqueness_constraints_reject_duplicate_lookup_keys() {
         sqlx::query(
             "INSERT INTO bitcoin_observations
              (invoice_id, observation_envelope, outpoint_lookup_hash, active,
-              confirmations, present)
-             VALUES ($1, $2, $3, TRUE, 0, TRUE)",
+              confirmations, present, first_observed_at)
+             VALUES ($1, $2, $3, TRUE, 0, TRUE, clock_timestamp())",
         )
         .bind(second_invoice)
         .bind(b"encrypted-observation-b".as_slice())
         .bind(outpoint_hash.as_bytes().as_slice())
         .execute(pool)
         .await,
+    );
+
+    let invoice_address_hash: Vec<u8> =
+        sqlx::query_scalar("SELECT bitcoin_address_lookup_hash FROM invoices WHERE id = $1")
+            .bind(first_invoice)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    let marketplace_preparation_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO marketplace_payment_preparations (
+             id, creator_id, operation_lookup_hash, request_lookup_hash,
+             reader_lookup_hash, preparation_envelope, state, prepared_at,
+             prepare_expires_at, activated_at, payment_deadline
+         ) VALUES ($1, $2, $3, $4, $5, $6, 'active', NOW(),
+                   NOW() + INTERVAL '1 hour', NOW(), NOW() + INTERVAL '24 hours')",
+    )
+    .bind(marketplace_preparation_id)
+    .bind(creator_id)
+    .bind(vec![41_u8; 32])
+    .bind(vec![42_u8; 32])
+    .bind(vec![43_u8; 32])
+    .bind(b"encrypted-preparation".as_slice())
+    .execute(pool)
+    .await
+    .unwrap();
+    assert_unique_violation(
+        sqlx::query(
+            "INSERT INTO marketplace_settlements (
+                 preparation_id, creator_id, payment_record_envelope,
+                 bitcoin_address_lookup_hash, derivation_index_lookup_hash
+             ) VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(marketplace_preparation_id)
+        .bind(creator_id)
+        .bind(b"encrypted-marketplace-payment".as_slice())
+        .bind(&invoice_address_hash)
+        .bind(vec![44_u8; 32])
+        .execute(pool)
+        .await,
+    );
+    let marketplace_address_hash = vec![45_u8; 32];
+    sqlx::query(
+        "INSERT INTO marketplace_settlements (
+             preparation_id, creator_id, payment_record_envelope,
+             bitcoin_address_lookup_hash, derivation_index_lookup_hash
+         ) VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(marketplace_preparation_id)
+    .bind(creator_id)
+    .bind(b"encrypted-marketplace-payment".as_slice())
+    .bind(&marketplace_address_hash)
+    .bind(vec![44_u8; 32])
+    .execute(pool)
+    .await
+    .unwrap();
+    assert_unique_violation(
+        sqlx::query("UPDATE invoices SET bitcoin_address_lookup_hash = $1 WHERE id = $2")
+            .bind(marketplace_address_hash)
+            .bind(second_invoice)
+            .execute(pool)
+            .await,
     );
 
     database.cleanup().await;
@@ -458,6 +985,491 @@ async fn enum_like_status_columns_allow_unexpected_text_for_read_time_validation
     database.cleanup().await;
 }
 
+#[tokio::test]
+async fn observation_migration_upgrades_existing_locks_evidence_without_rewriting_it() {
+    let _migration_test_guard = migration_test_lock().lock().await;
+    let database = TestDatabase::create().await;
+    let pool = database.pool();
+    apply_pre_settlement_migrations(pool).await;
+    sqlx::raw_sql(SETTLEMENT_MIGRATION)
+        .execute(pool)
+        .await
+        .unwrap();
+    let creator_id = insert_creator(pool).await;
+    insert_invoice(pool, creator_id, b"upgrade-bundle", b"upgrade-request").await;
+    let invoice_id: Uuid =
+        sqlx::query_scalar("SELECT id FROM invoices WHERE payment_request_lookup_hash = $1")
+            .bind(b"upgrade-request".as_slice())
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    let outpoint_hash = vec![71_u8; 32];
+    let created_at: time::OffsetDateTime = sqlx::query_scalar(
+        "INSERT INTO bitcoin_observations
+         (invoice_id, observation_envelope, outpoint_lookup_hash, active,
+          confirmations, present)
+         VALUES ($1, $2, $3, TRUE, 0, TRUE)
+         RETURNING created_at",
+    )
+    .bind(invoice_id)
+    .bind(b"encrypted-upgrade-observation".as_slice())
+    .bind(&outpoint_hash)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+
+    sqlx::raw_sql(MARKETPLACE_OBSERVATION_MIGRATION)
+        .execute(pool)
+        .await
+        .unwrap();
+    let upgraded: (Option<Uuid>, Option<Uuid>, time::OffsetDateTime, Vec<u8>) = sqlx::query_as(
+        "SELECT invoice_id, marketplace_preparation_id, first_observed_at,
+                observation_envelope
+         FROM bitcoin_observations WHERE outpoint_lookup_hash = $1",
+    )
+    .bind(&outpoint_hash)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        upgraded,
+        (
+            Some(invoice_id),
+            None,
+            created_at,
+            b"encrypted-upgrade-observation".to_vec(),
+        )
+    );
+    assert_check_violation(
+        sqlx::query(
+            "UPDATE bitcoin_observations SET invoice_id = NULL
+             WHERE outpoint_lookup_hash = $1",
+        )
+        .bind(&outpoint_hash)
+        .execute(pool)
+        .await,
+    );
+    assert_check_violation(
+        sqlx::query(
+            "UPDATE bitcoin_observations SET first_observed_at = first_observed_at + INTERVAL '1 second'
+             WHERE outpoint_lookup_hash = $1",
+        )
+        .bind(&outpoint_hash)
+        .execute(pool)
+        .await,
+    );
+    assert_check_violation(
+        sqlx::query("DELETE FROM bitcoin_observations WHERE outpoint_lookup_hash = $1")
+            .bind(&outpoint_hash)
+            .execute(pool)
+            .await,
+    );
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn usdt_migration_keeps_locks_receipts_and_pins_one_immutable_owner() {
+    let _migration_test_guard = migration_test_lock().lock().await;
+    let database = TestDatabase::create().await;
+    let pool = database.pool();
+    apply_pre_settlement_migrations(pool).await;
+    for migration in [
+        SETTLEMENT_MIGRATION,
+        MARKETPLACE_OBSERVATION_MIGRATION,
+        RESOLUTION_MIGRATION,
+        OPTIONAL_RAIL_MIGRATION,
+    ] {
+        sqlx::raw_sql(migration).execute(pool).await.unwrap();
+    }
+    let creator_id = insert_creator(pool).await;
+    insert_invoice(pool, creator_id, b"usdt-bundle", b"usdt-request").await;
+    let invoice_id: Uuid =
+        sqlx::query_scalar("SELECT id FROM invoices WHERE payment_request_lookup_hash = $1")
+            .bind(b"usdt-request".as_slice())
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    let transfer_hash = vec![81_u8; 32];
+    sqlx::query(
+        "INSERT INTO usdt_observations
+         (id, invoice_id, transfer_lookup_hash, observation_envelope, confirmations,
+          present, finalized)
+         VALUES ($1, $2, $3, $4, 3, TRUE, FALSE)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(invoice_id)
+    .bind(&transfer_hash)
+    .bind(b"encrypted-usdt-observation".as_slice())
+    .execute(pool)
+    .await
+    .unwrap();
+
+    sqlx::raw_sql(USDT_OBSERVATION_MIGRATION)
+        .execute(pool)
+        .await
+        .unwrap();
+    // The live table is only touched briefly: constraints start NOT VALID but are
+    // already enforced for every new or changed row.
+    assert_usdt_constraints_validated(pool, false).await;
+    let upgraded: (Option<Uuid>, Option<Uuid>, Vec<u8>, i32) = sqlx::query_as(
+        "SELECT invoice_id, marketplace_preparation_id, observation_envelope, confirmations
+         FROM usdt_observations WHERE transfer_lookup_hash = $1",
+    )
+    .bind(&transfer_hash)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        upgraded,
+        (
+            Some(invoice_id),
+            None,
+            b"encrypted-usdt-observation".to_vec(),
+            3
+        )
+    );
+    assert_check_violation(
+        sqlx::query(
+            "UPDATE usdt_observations SET invoice_id = NULL WHERE transfer_lookup_hash = $1",
+        )
+        .bind(&transfer_hash)
+        .execute(pool)
+        .await,
+    );
+    assert_check_violation(
+        sqlx::query(
+            "UPDATE usdt_observations SET transfer_lookup_hash = $2 WHERE transfer_lookup_hash = $1",
+        )
+        .bind(&transfer_hash)
+        .bind(vec![82_u8; 32])
+        .execute(pool)
+        .await,
+    );
+    assert_check_violation(
+        sqlx::query(
+            "INSERT INTO usdt_observations
+             (id, transfer_lookup_hash, observation_envelope, confirmations, present, finalized)
+             VALUES ($1, $2, $3, 0, TRUE, FALSE)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(vec![83_u8; 32])
+        .bind(b"ownerless".as_slice())
+        .execute(pool)
+        .await,
+    );
+    sqlx::query("UPDATE usdt_observations SET confirmations = 9 WHERE transfer_lookup_hash = $1")
+        .bind(&transfer_hash)
+        .execute(pool)
+        .await
+        .unwrap();
+
+    sqlx::raw_sql(USDT_VALIDATION_MIGRATION)
+        .execute(pool)
+        .await
+        .unwrap();
+    assert_usdt_constraints_validated(pool, true).await;
+    sqlx::raw_sql(USDT_INDEX_MIGRATION)
+        .execute(pool)
+        .await
+        .unwrap();
+    let index: (bool, String) = sqlx::query_as(
+        "SELECT index.indisvalid, pg_get_indexdef(index.indexrelid)
+         FROM pg_index index
+         WHERE index.indexrelid = 'usdt_observations_marketplace_settlement_index'::regclass",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert!(index.0);
+    assert!(
+        index
+            .1
+            .contains("WHERE (marketplace_preparation_id IS NOT NULL)")
+    );
+    database.cleanup().await;
+}
+
+async fn assert_usdt_constraints_validated(pool: &PgPool, validated: bool) {
+    let states: Vec<(String, bool)> = sqlx::query_as(
+        "SELECT conname::text, convalidated FROM pg_constraint
+         WHERE conrelid = 'usdt_observations'::regclass
+           AND conname IN ('usdt_observations_marketplace_preparation_id_fkey',
+                           'usdt_observation_exactly_one_owner')
+         ORDER BY conname",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        states,
+        vec![
+            ("usdt_observation_exactly_one_owner".to_owned(), validated),
+            (
+                "usdt_observations_marketplace_preparation_id_fkey".to_owned(),
+                validated
+            ),
+        ]
+    );
+}
+
+async fn insert_usdt_receipt(
+    executor: impl sqlx::PgExecutor<'_>,
+    invoice_id: Uuid,
+    transfer_byte: u8,
+) -> Result<sqlx::postgres::PgQueryResult, sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO usdt_observations
+         (id, invoice_id, transfer_lookup_hash, observation_envelope, confirmations,
+          present, finalized)
+         VALUES ($1, $2, $3, $4, 1, TRUE, FALSE)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(invoice_id)
+    .bind(vec![transfer_byte; 32])
+    .bind(b"encrypted-usdt-observation".as_slice())
+    .execute(executor)
+    .await
+}
+
+/// A live Locks table: everything through `0018` applied, one receipt present.
+async fn live_usdt_table_through_0018(pool: &PgPool) -> Uuid {
+    apply_pre_settlement_migrations(pool).await;
+    for migration in [
+        SETTLEMENT_MIGRATION,
+        MARKETPLACE_OBSERVATION_MIGRATION,
+        RESOLUTION_MIGRATION,
+        OPTIONAL_RAIL_MIGRATION,
+        USDT_OBSERVATION_MIGRATION,
+    ] {
+        sqlx::raw_sql(migration).execute(pool).await.unwrap();
+    }
+    let creator_id = insert_creator(pool).await;
+    insert_invoice(pool, creator_id, b"live-bundle", b"live-request").await;
+    let invoice_id: Uuid =
+        sqlx::query_scalar("SELECT id FROM invoices WHERE payment_request_lookup_hash = $1")
+            .bind(b"live-request".as_slice())
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    insert_usdt_receipt(pool, invoice_id, 1).await.unwrap();
+    invoice_id
+}
+
+/// The index build waits for older transactions but must never stall Locks, and the
+/// validation must not wait for them at all.
+#[tokio::test]
+async fn usdt_validation_and_index_migrations_do_not_block_locks_writers() {
+    let _migration_test_guard = migration_test_lock().lock().await;
+    let database = TestDatabase::create().await;
+    let pool = database.pool();
+    let invoice_id = live_usdt_table_through_0018(pool).await;
+
+    // A Locks writer is mid-transaction while the migrations run.
+    let mut open_writer = pool.begin().await.unwrap();
+    insert_usdt_receipt(&mut *open_writer, invoice_id, 2)
+        .await
+        .unwrap();
+
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        sqlx::raw_sql(USDT_VALIDATION_MIGRATION).execute(pool),
+    )
+    .await
+    .expect("validation must not wait for an open writer")
+    .unwrap();
+    assert_usdt_constraints_validated(pool, true).await;
+
+    let index_pool = pool.clone();
+    let index = tokio::spawn(async move {
+        sqlx::raw_sql(USDT_INDEX_MIGRATION)
+            .execute(&index_pool)
+            .await
+            .unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !index.is_finished(),
+        "a concurrent build waits for the older writer"
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        insert_usdt_receipt(pool, invoice_id, 3).await.unwrap();
+        sqlx::query(
+            "UPDATE usdt_observations SET confirmations = 5 WHERE transfer_lookup_hash = $1",
+        )
+        .bind(vec![1_u8; 32])
+        .execute(pool)
+        .await
+        .unwrap();
+    })
+    .await
+    .expect("Locks writes must not be blocked by the index build");
+
+    open_writer.commit().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(20), index)
+        .await
+        .expect("index build finishes once the older writer commits")
+        .unwrap();
+    let valid: bool = sqlx::query_scalar(
+        "SELECT indisvalid FROM pg_index
+         WHERE indexrelid = 'usdt_observations_marketplace_settlement_index'::regclass",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert!(valid);
+    database.cleanup().await;
+}
+
+async fn apply_pre_settlement_migrations(pool: &PgPool) {
+    let mut transaction = pool.begin().await.unwrap();
+    for migration in PRE_SETTLEMENT_MIGRATIONS {
+        sqlx::raw_sql(migration)
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+    }
+    transaction.commit().await.unwrap();
+}
+
+async fn apply_migrations_through_creator_rotation(pool: &PgPool) {
+    apply_pre_settlement_migrations(pool).await;
+    for migration in [
+        SETTLEMENT_MIGRATION,
+        MARKETPLACE_OBSERVATION_MIGRATION,
+        RESOLUTION_MIGRATION,
+        OPTIONAL_RAIL_MIGRATION,
+        USDT_OBSERVATION_MIGRATION,
+        USDT_VALIDATION_MIGRATION,
+        USDT_INDEX_MIGRATION,
+        CREATOR_ROTATION_MIGRATION,
+    ] {
+        sqlx::raw_sql(migration).execute(pool).await.unwrap();
+    }
+}
+
+async fn seed_cleaned_drain_cancellation(pool: &PgPool) -> (Uuid, Uuid, Uuid) {
+    let creator_id = insert_creator(pool).await;
+    insert_invoice(
+        pool,
+        creator_id,
+        b"cleaned-drain-bundle",
+        b"cleaned-drain-request",
+    )
+    .await;
+    let (invoice_id, lock_hash): (Uuid, Vec<u8>) =
+        sqlx::query_as("SELECT id, lock_resource_lookup_hash FROM invoices WHERE creator_id = $1")
+            .bind(creator_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    let request_id = "cleaned-drain-payment-request";
+    sqlx::query(
+        "INSERT INTO payment_request_lifecycles (
+             sdk_payment_request_id, invoice_id, request_state,
+             last_outbound_message_id, last_event_at
+         ) VALUES ($1, $2, 'proposed', 1, clock_timestamp())",
+    )
+    .bind(request_id)
+    .bind(invoice_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    let cancellation_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO outbox (
+             id, creator_id, invoice_id, intent_envelope, status, intent_kind,
+             cancellation_target_payment_request_id
+         ) VALUES ($1, $2, $3, $4, 'queued',
+                   'payment_request_cancellation', $5)",
+    )
+    .bind(cancellation_id)
+    .bind(creator_id)
+    .bind(invoice_id)
+    .bind(b"encrypted-cancellation".as_slice())
+    .bind(request_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO lock_payment_generations (
+             creator_id, lock_resource_lookup_hash, last_cleanup_token
+         ) VALUES ($1, $2, $3)",
+    )
+    .bind(creator_id)
+    .bind(&lock_hash)
+    .bind(vec![7_u8; 32])
+    .execute(pool)
+    .await
+    .unwrap();
+    let drain_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO payment_drains (
+             id, creator_id, lock_resource_lookup_hash, lock_resource_generation,
+             lock_resource_envelope, status, accepted_count, terminal_count,
+             cancellation_enqueued_count, cancellation_set_hash, item_set_hash,
+             completed_at
+         ) VALUES ($1, $2, $3, 0, $4, 'completed', 0, 0, 1, $5, $6,
+                   clock_timestamp())",
+    )
+    .bind(drain_id)
+    .bind(creator_id)
+    .bind(&lock_hash)
+    .bind(b"encrypted-lock".as_slice())
+    .bind(vec![8_u8; 32])
+    .bind(vec![9_u8; 32])
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE lock_payment_generations SET active_drain_id = $1
+         WHERE creator_id = $2 AND lock_resource_lookup_hash = $3",
+    )
+    .bind(drain_id)
+    .bind(creator_id)
+    .bind(&lock_hash)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO payment_drain_items (drain_id, invoice_id, classification)
+         VALUES ($1, $2, 'cancellation_enqueued')",
+    )
+    .bind(drain_id)
+    .bind(invoice_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO payment_drain_cancellations (
+             drain_id, invoice_id, sdk_payment_request_id, cancellation_outbox_id
+         ) VALUES ($1, $2, $3, $4)",
+    )
+    .bind(drain_id)
+    .bind(invoice_id)
+    .bind(request_id)
+    .bind(cancellation_id)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    sqlx::query("DELETE FROM payment_drains WHERE id = $1")
+        .bind(drain_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    let retained_before_upgrade: (bool, i64) = sqlx::query_as(
+        "SELECT EXISTS(SELECT 1 FROM outbox WHERE id = $1),
+                (SELECT count(*) FROM payment_drain_cancellations
+                 WHERE cancellation_outbox_id = $1)",
+    )
+    .bind(cancellation_id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(retained_before_upgrade, (true, 0));
+    (cancellation_id, creator_id, invoice_id)
+}
+
 async fn insert_creator(pool: &PgPool) -> Uuid {
     sqlx::query_scalar(
         "INSERT INTO creators (creator_lookup_hash, credential_envelope) VALUES ($1, $2) RETURNING id",
@@ -491,8 +1503,10 @@ async fn insert_invoice_result_with_reader(
     bundle_hash: &[u8],
     request_hash: &[u8],
 ) -> Result<sqlx::postgres::PgQueryResult, sqlx::Error> {
-    let address_hash = Uuid::new_v4();
-    let derivation_index_hash = Uuid::new_v4();
+    let mut address_hash = Uuid::new_v4().as_bytes().to_vec();
+    address_hash.extend_from_slice(Uuid::new_v4().as_bytes());
+    let mut derivation_index_hash = Uuid::new_v4().as_bytes().to_vec();
+    derivation_index_hash.extend_from_slice(Uuid::new_v4().as_bytes());
     let lock_resource_hash = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO invoices \
@@ -510,8 +1524,8 @@ async fn insert_invoice_result_with_reader(
     .bind(request_hash)
     .bind(b"encrypted-invoice".as_slice())
     .bind(b"encrypted-payment-record".as_slice())
-    .bind(address_hash.as_bytes().as_slice())
-    .bind(derivation_index_hash.as_bytes().as_slice())
+    .bind(address_hash)
+    .bind(derivation_index_hash)
     .bind("undetected")
     .bind(lock_resource_hash.as_bytes().as_slice())
     .execute(pool)
@@ -578,4 +1592,70 @@ async fn acquire_and_release_advisory_lock(connection: &mut PgConnection) {
     })
     .await
     .expect("cancelled migration left the advisory lock held");
+}
+
+/// An interrupted concurrent build leaves the named index invalid. The rerun must fail
+/// visibly rather than accept the unusable relation and record the migration.
+#[tokio::test]
+async fn interrupted_index_build_makes_the_rerun_fail_visibly() {
+    let _migration_test_guard = migration_test_lock().lock().await;
+    let database = TestDatabase::create().await;
+    let pool = database.pool();
+    let invoice_id = live_usdt_table_through_0018(pool).await;
+    sqlx::raw_sql(USDT_VALIDATION_MIGRATION)
+        .execute(pool)
+        .await
+        .unwrap();
+
+    // The build waits for the open writer, and is cancelled while it waits.
+    let mut open_writer = pool.begin().await.unwrap();
+    insert_usdt_receipt(&mut *open_writer, invoice_id, 2)
+        .await
+        .unwrap();
+    let mut interrupted = database.acquire_connection().await;
+    sqlx::query("SET statement_timeout = '500ms'")
+        .execute(&mut *interrupted)
+        .await
+        .unwrap();
+    sqlx::raw_sql(USDT_INDEX_MIGRATION)
+        .execute(&mut *interrupted)
+        .await
+        .expect_err("the build is cancelled while it waits for the older writer");
+    sqlx::query("RESET statement_timeout")
+        .execute(&mut *interrupted)
+        .await
+        .unwrap();
+    drop(interrupted);
+    open_writer.commit().await.unwrap();
+
+    let index_valid = || async {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT indisvalid FROM pg_index
+             WHERE indexrelid = 'usdt_observations_marketplace_settlement_index'::regclass",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    };
+    assert!(!index_valid().await, "the cancelled build left it invalid");
+
+    let rerun = sqlx::raw_sql(USDT_INDEX_MIGRATION).execute(pool).await;
+    let error = rerun.expect_err("the rerun must not accept the invalid index");
+    assert!(
+        error.to_string().contains("already exists"),
+        "unexpected error: {error}"
+    );
+    assert!(!index_valid().await);
+
+    // The documented recovery: drop it concurrently, then rerun.
+    sqlx::raw_sql("DROP INDEX CONCURRENTLY usdt_observations_marketplace_settlement_index")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql(USDT_INDEX_MIGRATION)
+        .execute(pool)
+        .await
+        .unwrap();
+    assert!(index_valid().await);
+    database.cleanup().await;
 }

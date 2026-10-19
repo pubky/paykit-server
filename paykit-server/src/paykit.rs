@@ -1,36 +1,34 @@
 //! Concrete per-Creator Paykit SDK boundary used by durable outbox workers.
 
+mod buyer_contacts;
+mod payment_status;
+
 use std::{
     collections::HashMap,
     future::Future,
     sync::{Arc, Mutex as StdMutex, OnceLock, Weak},
-    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
-use paykit_lib::{
-    AllowanceId, PaykitAppId, PaymentRequestEvent, PaymentRequestId, PrivateApplicationMessage,
-    parse_payment_request_event_message,
-};
+use paykit_lib::{PaykitAppId, PaymentRequestId};
 use paykit_sdk::{
-    AllowanceFilter, AllowanceHistoryStatus, AllowanceLifecycleState, AllowanceLocalRole,
-    AllowanceRecord, LinkedPeerState, OutboundPrivateMessageStatus, OutboundPrivateSendReport,
+    LinkedPeerState, OutboundPrivateMessageStatus, OutboundPrivateSendReport,
     PAYKIT_SESSION_CAPABILITIES, PaykitSdk, PaykitSdkConfig, PaykitSdkError, PaymentAdapter,
     PaymentRequestLifecycleState as SdkPaymentRequestLifecycleState, PaymentRequestLocalRole,
     PaymentRequestRecord, PrivateStreamCounterpartyIntakeReport, PubkyPublicKey,
     PubkySessionAccess, PubkySessionBootstrap, PubkySessionProvider, PubkySharedStateStorage,
-    StorageAdapter, storage::OutboundPrivateMessageRecord,
+    StorageAdapter,
 };
 use pubky::Pubky;
 use tokio::sync::Mutex as TokioMutex;
-use tracing::{info, warn};
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
     application::{
         payment_drain::{PaymentDrainError, PaymentDrainResult},
         payment_request_status::{PaymentRequestStatusError, PaymentRequestStatusSummary},
-        semantic_intent::{DeliveryIntentV1, PaymentTermsV1},
+        semantic_intent::{DeliveryIntentV1, DeliveryOperationV1, PaymentTermsV1},
     },
     config::PaykitConfig,
     domain::{
@@ -42,12 +40,12 @@ use crate::{
         },
     },
     persistence::{
-        ClaimedOutbox, CreatorStore, InvoiceStore, OutboxStore, PaymentDrainStore,
-        PaymentRequestLifecycleStore, PersistenceError, RequiredReceiveTarget,
+        ClaimedOutbox, CreatorStore, InvoiceStore, MarketplacePreparationStore, OutboxStore,
+        PaymentDrainStore, PaymentRequestLifecycleStore, PersistenceError, RequiredReceiveTarget,
     },
     workers::outbox::{
         Adapter, HandoffError, HandoffFailure, HandoffResult, RetryableHandoffCause,
-        RetryableHandoffStage, handoff_steps,
+        RetryableHandoffStage, claimed_handoff_steps, handoff_steps,
     },
 };
 
@@ -59,6 +57,8 @@ pub struct CreatorSessionProvider {
     public_client: Pubky,
     client_id: String,
     cache: Arc<TokioMutex<Option<CachedSession>>>,
+    payment_request_refreshes: Arc<payment_status::PaymentRequestRefreshes>,
+    verified_reconnect: bool,
 }
 
 impl CreatorSessionProvider {
@@ -87,6 +87,8 @@ impl CreatorSessionProvider {
             public_client,
             client_id: config.client_id.to_string(),
             cache: Arc::new(TokioMutex::new(None)),
+            payment_request_refreshes: Arc::new(payment_status::PaymentRequestRefreshes::default()),
+            verified_reconnect: false,
         }
     }
 }
@@ -95,6 +97,9 @@ impl CreatorSessionProvider {
 impl PubkySessionProvider for CreatorSessionProvider {
     async fn load_session_access(&self) -> paykit_sdk::Result<Option<PubkySessionAccess>> {
         let mut cache = self.cache.lock().await;
+        if self.verified_reconnect {
+            return Ok(cache.as_ref().map(|cached| cached.access.clone()));
+        }
         let credentials = self
             .creators
             .load(&self.creator)
@@ -198,6 +203,28 @@ impl CreatorSessions {
             })
             .clone()
     }
+
+    /// Isolated provider for reconciliation before changed-account credentials
+    /// commit. Caller has already verified identity, session, and Paykit key.
+    pub(crate) fn verified_reconnect_provider(
+        &self,
+        creator: &CreatorPubky,
+        session_secret: &str,
+        access: PubkySessionAccess,
+    ) -> CreatorSessionProvider {
+        CreatorSessionProvider {
+            creators: self.creators.clone(),
+            creator: creator.clone(),
+            public_client: self.pubky.clone(),
+            client_id: self.config.client_id.to_string(),
+            cache: Arc::new(TokioMutex::new(Some(CachedSession {
+                session_secret: zeroize::Zeroizing::new(session_secret.to_owned()),
+                access,
+            }))),
+            payment_request_refreshes: Arc::new(payment_status::PaymentRequestRefreshes::default()),
+            verified_reconnect: true,
+        }
+    }
 }
 
 #[async_trait]
@@ -208,12 +235,11 @@ impl crate::application::connection_status::PeerConnectionStateRepository for Cr
         binding: &crate::application::connection_status::ConnectionBinding,
     ) -> Result<
         crate::application::connection_status::PaykitConnectionState,
-        crate::persistence::PersistenceError,
+        crate::application::connection_status::ConnectionStatusError,
     > {
-        use crate::application::connection_status::PaykitConnectionState;
-        use crate::persistence::PersistenceError;
+        use crate::application::connection_status::{ConnectionStatusError, PaykitConnectionState};
         let reader = PubkyPublicKey::from_raw_or_app_key(binding.reader().to_string())
-            .map_err(|_| PersistenceError::CorruptOrMissing)?;
+            .map_err(|_| ConnectionStatusError::Unavailable)?;
         let storage = PubkySharedStateStorage::new(self.provider(creator));
         storage
             .transaction(move |tx| {
@@ -237,7 +263,22 @@ impl crate::application::connection_status::PeerConnectionStateRepository for Cr
                 )
             })
             .await
-            .map_err(|_| PersistenceError::Unavailable)
+            .map_err(|error| {
+                let (category, mapped) = match error {
+                    PaykitSdkError::SharedStateBusy { .. } => {
+                        ("shared_state_busy", ConnectionStatusError::Busy)
+                    }
+                    PaykitSdkError::ConcurrentUpdate { .. } => {
+                        ("concurrent_update", ConnectionStatusError::Unavailable)
+                    }
+                    error => (
+                        classify(error).diagnostic_label(),
+                        ConnectionStatusError::Unavailable,
+                    ),
+                };
+                crate::diagnostics::failure("connection_status", "peer_state_load", category);
+                mapped
+            })
     }
 }
 
@@ -272,7 +313,10 @@ pub struct PaykitAdapter {
     creator: CreatorPubky,
     app_id: PaykitAppId,
     mutation_lock: Arc<TokioMutex<()>>,
+    payment_request_refreshes: Arc<payment_status::PaymentRequestRefreshes>,
     usdt: Option<(InvoiceStore, crate::usdt::ArbitrumVerifier)>,
+    marketplace: Option<Arc<MarketplacePreparationStore>>,
+    lifecycles: Option<PaymentRequestLifecycleStore>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -284,6 +328,18 @@ pub enum LifecycleSyncError {
     PartialReceive,
 }
 
+impl LifecycleSyncError {
+    pub(crate) const fn diagnostic_label(self) -> &'static str {
+        match self {
+            Self::Sdk => "sdk",
+            Self::Persistence => "persistence",
+            Self::Conflict => "conflict",
+            Self::InvalidProjection => "invalid_projection",
+            Self::PartialReceive => "partial_receive",
+        }
+    }
+}
+
 impl std::fmt::Debug for PaykitAdapter {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("PaykitAdapter { .. }")
@@ -291,131 +347,132 @@ impl std::fmt::Debug for PaykitAdapter {
 }
 
 impl PaykitAdapter {
+    pub(crate) async fn execute_claimed_handoff_with_guard(
+        &self,
+        guard: &tokio::sync::OwnedMutexGuard<()>,
+        store: &OutboxStore,
+        claim: &ClaimedOutbox,
+        intent: &DeliveryIntentV1,
+    ) -> Result<HandoffResult, HandoffFailure> {
+        assert!(Arc::ptr_eq(
+            &self.mutation_lock,
+            tokio::sync::OwnedMutexGuard::mutex(guard)
+        ));
+        if matches!(
+            intent.operation(),
+            DeliveryOperationV1::PaymentRequestCancellation { .. }
+        ) {
+            let lifecycles = self.lifecycles.as_ref().ok_or(HandoffFailure::Retryable(
+                RetryableHandoffStage::AdapterUnavailable,
+            ))?;
+            let target =
+                parse_peer(intent.reader_pubky()).map_err(|_| HandoffFailure::Permanent)?;
+            self.refresh_payment_requests_locked(
+                lifecycles,
+                &[ReceiveTarget {
+                    counterparty: target,
+                }],
+            )
+            .await
+            .map_err(|_| HandoffFailure::Retryable(RetryableHandoffStage::AdapterUnavailable))?;
+            if store
+                .rotation_cancellation_target_is_accepted(claim)
+                .await
+                .map_err(|_| HandoffFailure::Retryable(RetryableHandoffStage::AdapterUnavailable))?
+            {
+                return Err(HandoffFailure::CancellationObsolete);
+            }
+        }
+        claimed_handoff_steps(self, intent, store, claim).await
+    }
+
+    /// Attempts one peer's queued sends after a durable server handoff.
+    /// Reconciliation still owns delivery acknowledgement; failures never enqueue
+    /// another proposal. SDK recovery and retry waits remain unchanged.
+    pub async fn send_handed_off(
+        &self,
+        store: &OutboxStore,
+        claim: &ClaimedOutbox,
+    ) -> Result<(), HandoffError> {
+        let guard = self.mutation_lock.clone().lock_owned().await;
+        self.send_handed_off_with_guard(&guard, store, claim).await
+    }
+
+    pub(crate) async fn send_handed_off_with_guard(
+        &self,
+        guard: &tokio::sync::OwnedMutexGuard<()>,
+        store: &OutboxStore,
+        claim: &ClaimedOutbox,
+    ) -> Result<(), HandoffError> {
+        assert!(Arc::ptr_eq(
+            &self.mutation_lock,
+            tokio::sync::OwnedMutexGuard::mutex(guard)
+        ));
+        if claim.creator_id() != self.creator_id {
+            return Err(HandoffError::Permanent);
+        }
+        if !store
+            .handoff_is_committed(claim)
+            .await
+            .map_err(|_| HandoffError::Retryable(RetryableHandoffCause::Storage))?
+        {
+            return Ok(());
+        }
+        let intent = store
+            .delivery_intent(claim)
+            .map_err(|_| HandoffError::Permanent)?;
+        // One peer pass preserves FIFO and SDK retry/recovery checks. Let admitted
+        // sends finish; cancellation can strand a prepared send until lease expiry.
+        self.sdk
+            .process_outbound_private_messages(parse_peer(intent.reader_pubky())?)
+            .await
+            .and_then(check_send_report)
+            .map_err(classify)
+    }
+
     /// Persists the mixed private stream before the SDK sends confirmations.
     /// No request is claimed, accepted, or executed by the server.
     /// Lock or revision contention is deferred to the next poll; other failures take precedence.
-    ///
-    /// Afterwards, outside the Creator mutation lock, it reads the Allowance
-    /// proposals of linked readers whose link received new items.
-    pub async fn maintain_transport(&self, intake: &AllowanceIntake) -> paykit_sdk::Result<()> {
-        let mut linked = Vec::new();
+    pub async fn maintain_transport(&self) -> paykit_sdk::Result<()> {
+        let peers = {
+            let _guard = self.mutation_lock.lock().await;
+            self.sdk.linked_peers().await?
+        };
         let mut results = Vec::new();
+        for peer in peers
+            .into_iter()
+            .filter(|peer| peer.state == LinkedPeerState::Linked)
         {
             let _guard = self.mutation_lock.lock().await;
-            let peers = self.sdk.linked_peers().await?;
-            for peer in peers
-                .into_iter()
-                .filter(|peer| peer.state == LinkedPeerState::Linked)
-            {
-                linked.push(peer.counterparty.clone());
-                results.push(
-                    self.sdk
-                        .receive_private_messages(peer.counterparty)
-                        .await
-                        .map(|_| ()),
-                );
-            }
-            // A peer's receive failure must not prevent other peers' queued sends.
-            match self.sdk.pending_outbound_private_counterparties().await {
-                Ok(peers) => {
-                    for peer in peers {
-                        results.push(
-                            self.sdk
-                                .process_outbound_private_messages(peer)
-                                .await
-                                .and_then(check_send_report),
-                        );
-                    }
-                }
-                Err(error) => results.push(Err(error)),
-            }
-        }
-        let result = check_transport_results(&results);
-        self.read_allowances(intake, &linked).await;
-        result
-    }
-
-    /// Accepts the Allowance proposals of readers whose link received items
-    /// the last read did not cover. A reader controls how much Allowance
-    /// history its link holds, and the SDK derives the whole history on every
-    /// read and every acceptance, so this stays off the outbox handoff and
-    /// takes the Creator mutation lock only around one acceptance at a time.
-    /// Failures are logged and retried after the cooldown; they never affect
-    /// transport health.
-    async fn read_allowances(&self, intake: &AllowanceIntake, linked: &[PubkyPublicKey]) {
-        if linked.is_empty() {
-            return;
-        }
-        let Ok(newest) = self.newest_stream_items(linked).await else {
-            return;
-        };
-        for reader in linked {
-            let Some(ticket) = intake.begin(
-                self.creator_id,
-                reader,
-                newest.get(reader).copied(),
-                Instant::now(),
-            ) else {
-                continue;
-            };
-            match accept_proposals(self, &self.mutation_lock, reader).await {
-                Ok(outcome) => {
-                    if outcome.accepted > 0 {
-                        info!(
-                            accepted = outcome.accepted,
-                            "accepted Paykit Allowance proposals"
-                        );
-                        self.send_queued_messages(reader).await;
-                    }
-                    intake.finish(ticket, outcome.drained);
-                }
-                Err(error) => warn!(
-                    stage = "allowance_intake",
-                    cause = error.diagnostic_label(),
-                    "Paykit Allowance intake failed; retried after the cooldown"
-                ),
-            }
-        }
-    }
-
-    async fn newest_stream_items(
-        &self,
-        linked: &[PubkyPublicKey],
-    ) -> Result<HashMap<PubkyPublicKey, u64>, PaykitSdkError> {
-        let linked = linked.to_vec();
-        self.storage
-            .transaction(move |transaction| {
-                Ok(linked
-                    .into_iter()
-                    .filter_map(|reader| {
-                        let newest = transaction
-                            .private_stream_items(&reader)
-                            .iter()
-                            .map(|item| item.stream_item_id)
-                            .max()?;
-                        Some((reader, newest))
-                    })
-                    .collect())
-            })
-            .await
-    }
-
-    /// Sends what the intake queued now, rather than on the next poll. A
-    /// failure is left to the next poll, which sends every queued message.
-    async fn send_queued_messages(&self, reader: &PubkyPublicKey) {
-        let _guard = self.mutation_lock.lock().await;
-        if self
-            .sdk
-            .process_outbound_private_messages(reader.clone())
-            .await
-            .and_then(check_send_report)
-            .is_err()
-        {
-            warn!(
-                stage = "allowance_intake",
-                "Paykit Allowance acceptances stay queued for the next poll"
+            results.push(
+                self.sdk
+                    .receive_private_messages(peer.counterparty)
+                    .await
+                    .map(|_| ()),
             );
         }
+        // A peer's receive failure must not prevent other peers' queued sends.
+        let pending = {
+            let _guard = self.mutation_lock.lock().await;
+            self.sdk.pending_outbound_private_counterparties().await
+        };
+        match pending {
+            Ok(peers) => {
+                for peer in peers {
+                    // Finish an admitted peer operation before giving foreground
+                    // work the next turn on the Creator-local mutation fence.
+                    let _guard = self.mutation_lock.lock().await;
+                    results.push(
+                        self.sdk
+                            .process_outbound_private_messages(peer)
+                            .await
+                            .and_then(check_send_report),
+                    );
+                }
+            }
+            Err(error) => results.push(Err(error)),
+        }
+        check_transport_results(&results)
     }
 
     pub fn new(
@@ -424,6 +481,7 @@ impl PaykitAdapter {
         config: &PaykitConfig,
     ) -> Result<Self, PaykitSdkError> {
         let creator = sessions.creator.clone();
+        let payment_request_refreshes = sessions.payment_request_refreshes.clone();
         let storage = PubkySharedStateStorage::new(sessions.clone());
         let sdk = PaykitSdk::new(
             storage.clone(),
@@ -434,12 +492,20 @@ impl PaykitAdapter {
         Ok(Self {
             sdk,
             mutation_lock: creator_mutation_lock(creator_id),
+            payment_request_refreshes,
             storage,
             creator_id,
             creator,
             app_id: config.app_id.clone(),
             usdt: None,
+            marketplace: None,
+            lifecycles: None,
         })
+    }
+
+    pub fn with_lifecycles(mut self, lifecycles: PaymentRequestLifecycleStore) -> Self {
+        self.lifecycles = Some(lifecycles);
+        self
     }
 
     pub fn with_usdt(
@@ -451,6 +517,13 @@ impl PaykitAdapter {
         self
     }
 
+    /// Also attributes verified USDT evidence to active Marketplace settlements during
+    /// background reconciliation.
+    pub fn with_marketplace_usdt(mut self, store: Arc<MarketplacePreparationStore>) -> Self {
+        self.marketplace = Some(store);
+        self
+    }
+
     /// Receives linked-peer messages and durably projects the SDK's canonical
     /// lifecycle view while serializing Creator-local SDK mutations.
     pub async fn receive_and_project_payment_requests(
@@ -458,19 +531,58 @@ impl PaykitAdapter {
         lifecycles: &PaymentRequestLifecycleStore,
     ) -> Result<(), LifecycleSyncError> {
         let _guard = self.mutation_lock.lock().await;
-        self.refresh_payment_requests_locked(lifecycles, None)
+        let reports = self.sdk.receive_private_messages_from_linked_peers().await;
+        let health = match reports {
+            Ok(reports) if reports.iter().all(|report| report.error.is_none()) => {
+                ReceiveHealth::Available
+            }
+            _ => ReceiveHealth::Unavailable,
+        };
+        self.project_payment_requests_locked(lifecycles, health)
             .await?;
         self.observe_usdt_requests(None).await
+    }
+
+    /// Reconciles every counterparty that can affect Bitcoin account rotation,
+    /// returning evidence for the subsequent serializable persistence snapshot.
+    pub async fn reconcile_for_bitcoin_account_rotation(
+        &self,
+        guard: &tokio::sync::OwnedMutexGuard<()>,
+        lifecycles: &PaymentRequestLifecycleStore,
+    ) -> Result<Vec<RequiredReceiveTarget>, LifecycleSyncError> {
+        assert!(Arc::ptr_eq(
+            &self.mutation_lock,
+            tokio::sync::OwnedMutexGuard::mutex(guard)
+        ));
+        let required_targets = lifecycles
+            .required_receive_targets_for_creator_rotation(&self.creator)
+            .await
+            .map_err(map_projection_persistence_error)?;
+        let parsed_targets = parse_receive_targets(&required_targets)?;
+        self.refresh_payment_requests_locked(lifecycles, &parsed_targets)
+            .await?;
+        Ok(required_targets)
     }
 
     async fn refresh_payment_requests_locked(
         &self,
         lifecycles: &PaymentRequestLifecycleStore,
-        required_targets: Option<&[ReceiveTarget]>,
+        required_targets: &[ReceiveTarget],
     ) -> Result<(), LifecycleSyncError> {
-        let reports = self.sdk.receive_private_messages_from_linked_peers().await;
-        let receive_health =
-            receive_health_from_reports(reports.as_deref().map_err(|_| ()), required_targets);
+        let reports = receive_from_targets(required_targets, |peer| {
+            self.sdk.receive_private_messages(peer)
+        })
+        .await;
+        let receive_health = receive_health_for_required_targets(&reports, required_targets);
+        self.project_payment_requests_locked(lifecycles, receive_health)
+            .await
+    }
+
+    async fn project_payment_requests_locked(
+        &self,
+        lifecycles: &PaymentRequestLifecycleStore,
+        receive_health: ReceiveHealth,
+    ) -> Result<(), LifecycleSyncError> {
         let records = self
             .sdk
             .payment_requests()
@@ -509,19 +621,79 @@ impl PaykitAdapter {
             {
                 result = Err(map_projection_persistence_error(error));
             }
+            // Marketplace requests have no per-bundle status read; only the background
+            // reconciliation attributes their receipts.
+            if bundle.is_none()
+                && let Some(marketplace) = &self.marketplace
+                && let Err(error) = marketplace
+                    .observe_usdt_request(self.creator_id, &self.creator, record, verifier)
+                    .await
+            {
+                result = Err(map_projection_persistence_error(error));
+            }
         }
         result
     }
 
-    /// Receives and projects fresh canonical state before returning status, all
-    /// under the same Creator-local mutation fence.
+    /// Coalesces overlapping receive for the same App and bundle.
+    /// Every caller projects current SDK state and transactionally revalidates targets
+    /// under the Creator-local mutation fence; payment status is never cached.
     pub async fn reconcile_and_lookup_payment_request_status(
         &self,
         lifecycles: &PaymentRequestLifecycleStore,
         statuses: &InvoiceStore,
         bundle_id: &BundleId,
     ) -> Result<Option<PaymentRequestStatusSummary>, PaymentRequestStatusError> {
+        let (required_targets, receive_health) = self
+            .payment_request_refreshes
+            .receive(
+                &self.app_id,
+                bundle_id,
+                Box::pin(async {
+                    let _guard = self.mutation_lock.lock().await;
+                    self.receive_payment_request_targets_locked(lifecycles, bundle_id)
+                        .await
+                }),
+            )
+            .await?;
         let _guard = self.mutation_lock.lock().await;
+        self.project_payment_requests_locked(lifecycles, receive_health)
+            .await
+            .map_err(|error| {
+                let mapped = map_lifecycle_status_error(error);
+                crate::diagnostics::failure(
+                    "payment_request_status",
+                    "paykit_reconciliation",
+                    mapped.diagnostic_label(),
+                );
+                mapped
+            })?;
+        self.observe_usdt_requests(Some(bundle_id))
+            .await
+            .map_err(map_lifecycle_status_error)?;
+        statuses
+            .payment_request_status_after_receive(
+                lifecycles,
+                &self.creator,
+                bundle_id,
+                &required_targets,
+            )
+            .await
+            .map_err(|error| {
+                crate::diagnostics::failure(
+                    "payment_request_status",
+                    "status_projection_load",
+                    error.diagnostic_label(),
+                );
+                PaymentRequestStatusError::Unavailable
+            })
+    }
+
+    async fn receive_payment_request_targets_locked(
+        &self,
+        lifecycles: &PaymentRequestLifecycleStore,
+        bundle_id: &BundleId,
+    ) -> Result<(Vec<RequiredReceiveTarget>, ReceiveHealth), PaymentRequestStatusError> {
         let required_targets = lifecycles
             .required_receive_targets_for_bundle(self.creator_id, bundle_id)
             .await
@@ -542,43 +714,12 @@ impl PaykitAdapter {
             );
             mapped
         })?;
-        refresh_then(
-            || async {
-                self.refresh_payment_requests_locked(lifecycles, Some(&parsed_targets))
-                    .await
-                    .map_err(|error| {
-                        let mapped = map_lifecycle_status_error(error);
-                        crate::diagnostics::failure(
-                            "payment_request_status",
-                            "paykit_reconciliation",
-                            mapped.diagnostic_label(),
-                        );
-                        mapped
-                    })
-            },
-            || async {
-                self.observe_usdt_requests(Some(bundle_id))
-                    .await
-                    .map_err(map_lifecycle_status_error)?;
-                statuses
-                    .payment_request_status_after_receive(
-                        lifecycles,
-                        &self.creator,
-                        bundle_id,
-                        &required_targets,
-                    )
-                    .await
-                    .map_err(|error| {
-                        crate::diagnostics::failure(
-                            "payment_request_status",
-                            "status_projection_load",
-                            error.diagnostic_label(),
-                        );
-                        PaymentRequestStatusError::Unavailable
-                    })
-            },
-        )
-        .await
+        let reports = receive_from_targets(&parsed_targets, |peer| {
+            self.sdk.receive_private_messages(peer)
+        })
+        .await;
+        let health = receive_health_for_required_targets(&reports, &parsed_targets);
+        Ok((required_targets, health))
     }
 
     /// Reconciles receive and the canonical SDK reducer before atomically
@@ -607,7 +748,7 @@ impl PaykitAdapter {
             .map_err(map_lifecycle_drain_error)?;
         let parsed_targets =
             parse_receive_targets(&required_targets).map_err(map_lifecycle_drain_error)?;
-        self.refresh_payment_requests_locked(lifecycles, Some(&parsed_targets))
+        self.refresh_payment_requests_locked(lifecycles, &parsed_targets)
             .await
             .map_err(map_lifecycle_drain_error)?;
         drains
@@ -661,23 +802,35 @@ fn receive_health_for_required_targets(
     }
 }
 
-fn receive_health_from_reports<E>(
-    reports: Result<&[PrivateStreamCounterpartyIntakeReport], E>,
-    required_targets: Option<&[ReceiveTarget]>,
-) -> ReceiveHealth {
-    match required_targets {
-        Some([]) => ReceiveHealth::Available,
-        Some(required) => reports.map_or(ReceiveHealth::Unavailable, |reports| {
-            receive_health_for_required_targets(reports, required)
-        }),
-        None => reports.map_or(ReceiveHealth::Unavailable, |reports| {
-            if reports.iter().all(|report| report.error.is_none()) {
-                ReceiveHealth::Available
-            } else {
-                ReceiveHealth::Unavailable
+async fn receive_from_targets<F, Fut>(
+    targets: &[ReceiveTarget],
+    mut receive: F,
+) -> Vec<PrivateStreamCounterpartyIntakeReport>
+where
+    F: FnMut(PubkyPublicKey) -> Fut,
+    Fut: Future<Output = paykit_sdk::Result<paykit_sdk::PrivateStreamIntakeReport>>,
+{
+    let mut reports = Vec::with_capacity(targets.len());
+    for target in targets {
+        let (report, error) = match receive(target.counterparty.clone()).await {
+            Ok(report) => (Some(report), None),
+            Err(error) => {
+                let text = error.to_string();
+                crate::diagnostics::failure(
+                    "payment_request_reconciliation",
+                    "peer_receive",
+                    classify(error).diagnostic_label(),
+                );
+                (None, Some(text))
             }
-        }),
+        };
+        reports.push(PrivateStreamCounterpartyIntakeReport {
+            counterparty: target.counterparty.clone(),
+            error,
+            report,
+        });
     }
+    reports
 }
 
 async fn project_lifecycles_after_receive<F, Fut>(
@@ -740,6 +893,7 @@ where
     refresh_then(refresh, operation).await
 }
 
+#[cfg(test)]
 async fn refresh_then<T, E, Refresh, RefreshFuture, Operation, OperationFuture>(
     refresh: Refresh,
     operation: Operation,
@@ -994,7 +1148,7 @@ fn check_transport_results(results: &[paykit_sdk::Result<()>]) -> paykit_sdk::Re
 
 type CreatorMutationLock = TokioMutex<()>;
 
-fn creator_mutation_lock(creator_id: Uuid) -> Arc<CreatorMutationLock> {
+pub(crate) fn creator_mutation_lock(creator_id: Uuid) -> Arc<CreatorMutationLock> {
     static LOCKS: OnceLock<StdMutex<HashMap<Uuid, Weak<CreatorMutationLock>>>> = OnceLock::new();
     let registry = LOCKS.get_or_init(|| StdMutex::new(HashMap::new()));
     let mut registry = registry
@@ -1013,9 +1167,30 @@ fn parse_peer(reader: &str) -> Result<PubkyPublicKey, HandoffError> {
     PubkyPublicKey::from_raw_or_app_key(reader).map_err(|_| HandoffError::Permanent)
 }
 
+/// Closed, identifier-free label for an SDK failure; never includes error text.
+pub(crate) const fn sdk_error_label(error: &PaykitSdkError) -> &'static str {
+    match error {
+        PaykitSdkError::ConcurrentUpdate { .. } => "concurrent_update",
+        PaykitSdkError::SharedStateBusy { .. } => "shared_state_busy",
+        PaykitSdkError::Storage { .. } => "storage",
+        PaykitSdkError::Identity { .. } => "identity",
+        PaykitSdkError::Transport { .. } => "transport",
+        PaykitSdkError::NotFound { .. } => "not_found",
+        PaykitSdkError::Protocol { .. } => "protocol",
+        PaykitSdkError::LinkObservation { .. } => "link_observation",
+        PaykitSdkError::Policy { .. } => "policy",
+        PaykitSdkError::PaymentAdapter { .. } => "payment_adapter",
+        PaykitSdkError::RecoveryRequired { .. } => "recovery_required",
+        _ => "other",
+    }
+}
+
 fn classify(error: PaykitSdkError) -> HandoffError {
     match error {
         PaykitSdkError::Protocol { .. } => HandoffError::Permanent,
+        PaykitSdkError::LinkObservation { .. } => {
+            HandoffError::Retryable(RetryableHandoffCause::LinkObservation)
+        }
         PaykitSdkError::Policy { .. } => HandoffError::Retryable(RetryableHandoffCause::Policy),
         PaykitSdkError::Storage { .. } => HandoffError::Retryable(RetryableHandoffCause::Storage),
         PaykitSdkError::Identity { .. } => HandoffError::Retryable(RetryableHandoffCause::Identity),
@@ -1033,244 +1208,17 @@ fn classify(error: PaykitSdkError) -> HandoffError {
     }
 }
 
-/// Acceptances queued per intake. Each one is a durable outbound message, so
-/// a reader that floods the link cannot turn one intake into unbounded
-/// output; a later intake accepts the rest.
-const MAX_ALLOWANCE_ACCEPTANCES_PER_INTAKE: usize = 4;
-
-/// Least time between two reads of one reader's Allowances.
-pub const ALLOWANCE_INTAKE_COOLDOWN: Duration = Duration::from_secs(10);
-
-/// Decides when a reader's Allowances are read. The read is worth doing only
-/// when the reader's link holds stream items an earlier read did not cover,
-/// and at most once per cooldown per reader, so a reader cannot make the
-/// server derive its history faster than that.
-#[derive(Debug)]
-pub struct AllowanceIntake {
-    cooldown: Duration,
-    readers: StdMutex<HashMap<(Uuid, PubkyPublicKey), ReaderIntake>>,
-}
-
-#[derive(Debug, Default)]
-struct ReaderIntake {
-    /// Newest stream item an earlier read covered completely.
-    covered_through: Option<u64>,
-    last_started: Option<Instant>,
-}
-
-/// A read that is due, to be reported back with [`AllowanceIntake::finish`].
-struct IntakeTicket {
-    creator_id: Uuid,
-    reader: PubkyPublicKey,
-    newest_stream_item_id: u64,
-}
-
-impl AllowanceIntake {
-    pub fn new(cooldown: Duration) -> Self {
-        Self {
-            cooldown,
-            readers: StdMutex::new(HashMap::new()),
-        }
-    }
-
-    /// Whether the reader's link, whose newest stream item is `newest`, is due
-    /// for a read at `now`. A due read counts against the cooldown at once, so
-    /// a failed read is not retried sooner.
-    fn begin(
-        &self,
-        creator_id: Uuid,
-        reader: &PubkyPublicKey,
-        newest: Option<u64>,
-        now: Instant,
-    ) -> Option<IntakeTicket> {
-        let newest = newest?;
-        let mut readers = self
-            .readers
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let state = readers.entry((creator_id, reader.clone())).or_default();
-        if state
-            .covered_through
-            .is_some_and(|covered| newest <= covered)
-            || state
-                .last_started
-                .is_some_and(|started| now.saturating_duration_since(started) < self.cooldown)
-        {
-            return None;
-        }
-        state.last_started = Some(now);
-        Some(IntakeTicket {
-            creator_id,
-            reader: reader.clone(),
-            newest_stream_item_id: newest,
-        })
-    }
-
-    /// Records a finished read. When it left proposals unaccepted, the same
-    /// items stay due for the next read.
-    fn finish(&self, ticket: IntakeTicket, drained: bool) {
-        if !drained {
-            return;
-        }
-        let mut readers = self
-            .readers
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        readers
-            .entry((ticket.creator_id, ticket.reader))
-            .or_default()
-            .covered_through = Some(ticket.newest_stream_item_id);
-    }
-}
-
-/// What the intake does on one reader's link.
-#[async_trait]
-trait AllowanceLink: Send + Sync {
-    /// Proposals awaiting acceptance, at most one more than an intake accepts.
-    /// The SDK derives the link's whole history for this, so it must not run
-    /// under the Creator mutation lock.
-    async fn pending_proposals(
-        &self,
-        reader: &PubkyPublicKey,
-    ) -> Result<Vec<AllowanceId>, HandoffError>;
-
-    /// Queues one acceptance. The SDK derives the link's history again, and
-    /// the caller serializes it with the Creator's other mutations.
-    async fn accept(&self, reader: &PubkyPublicKey, id: &AllowanceId) -> Result<(), HandoffError>;
-}
-
-struct IntakeOutcome {
-    accepted: usize,
-    /// No proposal is left waiting behind the per-intake limit.
-    drained: bool,
-}
-
-/// Accepts up to [`MAX_ALLOWANCE_ACCEPTANCES_PER_INTAKE`] pending proposals.
-/// The Creator mutation lock is held for one acceptance at a time, never for
-/// the scan, so other Creator work interleaves with a reader's large history.
-async fn accept_proposals<L: AllowanceLink + ?Sized>(
-    link: &L,
-    mutation_lock: &TokioMutex<()>,
-    reader: &PubkyPublicKey,
-) -> Result<IntakeOutcome, HandoffError> {
-    let pending = link.pending_proposals(reader).await?;
-    let mut accepted = 0;
-    for id in pending.iter().take(MAX_ALLOWANCE_ACCEPTANCES_PER_INTAKE) {
-        let _guard = mutation_lock.lock().await;
-        link.accept(reader, id).await?;
-        accepted += 1;
-    }
-    Ok(IntakeOutcome {
-        accepted,
-        drained: pending.len() <= MAX_ALLOWANCE_ACCEPTANCES_PER_INTAKE,
-    })
-}
-
-#[async_trait]
-impl AllowanceLink for PaykitAdapter {
-    async fn pending_proposals(
-        &self,
-        reader: &PubkyPublicKey,
-    ) -> Result<Vec<AllowanceId>, HandoffError> {
-        self.sdk
-            .list_allowances(AllowanceFilter {
-                counterparty: Some(reader.clone()),
-                local_role: Some(AllowanceLocalRole::Allowee),
-                states: vec![AllowanceLifecycleState::Proposed],
-            })
-            .await
-            .map_err(classify)?
-            .iter()
-            .filter(|record| awaits_allowee_acceptance(record))
-            .take(MAX_ALLOWANCE_ACCEPTANCES_PER_INTAKE + 1)
-            .map(|record| {
-                AllowanceId::new(record.allowance_id.clone()).map_err(|_| HandoffError::Permanent)
-            })
-            .collect()
-    }
-
-    async fn accept(&self, reader: &PubkyPublicKey, id: &AllowanceId) -> Result<(), HandoffError> {
-        self.sdk
-            .accept_allowance(reader.clone(), id)
-            .await
-            .map(|_| ())
-            .map_err(classify)
-    }
-}
-
-/// An Allowance proposal the reader sent, naming this identity as the Allowee,
-/// with consistent history and no response yet.
-fn awaits_allowee_acceptance(record: &AllowanceRecord) -> bool {
-    record.local_role == Some(AllowanceLocalRole::Allowee)
-        && record.state == AllowanceLifecycleState::Proposed
-        && record.history_status == AllowanceHistoryStatus::Consistent
-        && record.proposal_stream_item_id.is_some()
-        && record.proposal_outbound_message_id.is_none()
-}
-
-/// A Payment Request proposal this server already queued for the reader.
-struct QueuedProposal {
-    outbound_message_id: u64,
-    event_id: String,
-    payment_request_id: String,
-}
-
-/// The Payment Request this server already queued for a Payment Reference.
-///
-/// This reads only the server's own stored outbound messages, never the SDK's
-/// derived Payment Request record. The derivation also folds in what the
-/// reader sent: a reader message that names the request and fails validation,
-/// or that reuses the Event ID of the proposal, makes it drop the proposal
-/// (`derivation/stored_events.rs`, `pre_invalid_request_ids`). A lookup through
-/// the derived record would then miss the queued request and propose a second
-/// one for the same Payment Reference.
-///
-/// A proposal whose outbound message the SDK marked `Invalid` or `Superseded`
-/// never reaches the reader, so it does not count as queued. The oldest
-/// match wins.
-fn queued_proposal(
-    messages: &[OutboundPrivateMessageRecord],
-    app_id: &PaykitAppId,
-    payment_reference: &str,
-) -> Option<QueuedProposal> {
-    messages
-        .iter()
-        .filter(|message| {
-            message.kind == PAYMENT_REQUEST_KIND
-                && &message.app_id == app_id
-                && !matches!(
-                    message.status,
-                    OutboundPrivateMessageStatus::Invalid
-                        | OutboundPrivateMessageStatus::Superseded
-                )
-        })
-        .filter_map(|message| {
-            let parsed = parse_payment_request_event_message(&PrivateApplicationMessage {
-                version: Some(1),
-                kind: Some(message.kind.clone()),
-                app_id: Some(message.app_id.to_string()),
-                raw_json: message.raw_json.clone(),
-            })?;
-            let PaymentRequestEvent::Request(request) = parsed.parsed_event()? else {
-                return None;
-            };
-            (request.request().payment_reference().as_str() == payment_reference).then(|| {
-                QueuedProposal {
-                    outbound_message_id: message.outbound_message_id,
-                    event_id: request.event_id().as_str().to_owned(),
-                    payment_request_id: request.payment_request_id().as_str().to_owned(),
-                }
-            })
-        })
-        .min_by_key(|proposal| proposal.outbound_message_id)
-}
-
-const PAYMENT_REQUEST_KIND: &str = "paykit.payment_request";
-
-fn retryable_recovery_observation(error: HandoffError) -> HandoffError {
-    match error {
-        HandoffError::Retryable(cause) => HandoffError::Retryable(cause),
-        HandoffError::Permanent => HandoffError::Retryable(RetryableHandoffCause::Other),
+/// `Protocol` here only comes from a bad signature, another owner or an
+/// unreadable record; storage loading for the server's own SDK is infallible.
+fn handoff_reader_authorization<T>(
+    fetched: paykit_sdk::Result<T>,
+) -> Result<crate::application::create_invoice::ReaderAuthorization, HandoffError> {
+    use crate::application::create_invoice::ReaderAuthorization;
+    match fetched {
+        Ok(_) => Ok(ReaderAuthorization::Verified),
+        Err(PaykitSdkError::NotFound { .. }) => Ok(ReaderAuthorization::Missing),
+        Err(PaykitSdkError::Protocol { .. }) => Ok(ReaderAuthorization::Invalid),
+        Err(error) => Err(classify(error)),
     }
 }
 
@@ -1282,22 +1230,18 @@ impl Adapter for PaykitAdapter {
         claim: &ClaimedOutbox,
         intent: &DeliveryIntentV1,
     ) -> Result<HandoffResult, HandoffFailure> {
-        let _guard = self.mutation_lock.lock().await;
-        match store.claim_handoff_eligible(claim).await {
-            Ok(true) => handoff_steps(self, intent).await,
-            Ok(false) => Err(HandoffFailure::Permanent),
-            Err(_) => Err(HandoffFailure::Retryable(
-                RetryableHandoffStage::AdapterUnavailable,
-            )),
-        }
+        let guard = self.mutation_lock.clone().lock_owned().await;
+        self.execute_claimed_handoff_with_guard(&guard, store, claim, intent)
+            .await
     }
 
     async fn execute_handoff(
         &self,
+        outbox_id: uuid::Uuid,
         intent: &DeliveryIntentV1,
     ) -> Result<HandoffResult, HandoffFailure> {
         let _guard = self.mutation_lock.lock().await;
-        handoff_steps(self, intent).await
+        handoff_steps(self, outbox_id, intent).await
     }
 
     async fn fetch_registry(
@@ -1308,14 +1252,12 @@ impl Adapter for PaykitAdapter {
         self.sdk.paykit_app_registry(reader).await.map_err(classify)
     }
 
-    async fn observe_recovery_marker(&self, reader: &str) -> Result<(), HandoffError> {
+    async fn fetch_authorization(
+        &self,
+        reader: &str,
+    ) -> Result<crate::application::create_invoice::ReaderAuthorization, HandoffError> {
         let reader = parse_peer(reader)?;
-        self.sdk
-            .observe_encrypted_link_recovery_marker(reader)
-            .await
-            .map(|_| ())
-            .map_err(classify)
-            .map_err(retryable_recovery_observation)
+        handoff_reader_authorization(self.sdk.paykit_noise_key_authorization(reader).await)
     }
 
     async fn ensure_link_with_peer(&self, reader: &str) -> Result<(), HandoffError> {
@@ -1339,34 +1281,17 @@ impl Adapter for PaykitAdapter {
     async fn propose_payment_request(
         &self,
         reader: &str,
+        payment_request_id: PaymentRequestId,
         terms: &PaymentTermsV1,
     ) -> Result<HandoffResult, HandoffError> {
         let reader = parse_peer(reader)?;
-        let payment_terms = terms.to_sdk().map_err(|_| HandoffError::Permanent)?;
-        // The outbox hands a proposal off at least once, and the SDK mints a new
-        // Payment Request ID for every proposal. A retry after an ambiguous
-        // attempt would reach the reader as a second request for the same
-        // invoice, and an accepted Allowance would pay it again. The Payment
-        // Reference is generated once per intent, so a request already queued
-        // for it is this intent's request: reuse it. Callers hold the creator
-        // mutation lock, so the lookup and the enqueue below cannot interleave.
-        let queued = {
-            let reader = reader.clone();
-            self.storage
-                .transaction(move |transaction| Ok(transaction.outbound_private_messages(&reader)))
-                .await
-                .map_err(classify)?
-        };
-        if let Some(proposal) = queued_proposal(&queued, &self.app_id, &terms.payment_reference) {
-            return Ok(HandoffResult::PaymentRequestProposal {
-                outbound_message_id: proposal.outbound_message_id,
-                event_id: proposal.event_id,
-                payment_request_id: proposal.payment_request_id,
-            });
-        }
         let record = self
             .sdk
-            .propose_payment_request(reader, payment_terms)
+            .propose_payment_request_with_id(
+                reader,
+                payment_request_id,
+                terms.to_sdk().map_err(|_| HandoffError::Permanent)?,
+            )
             .await
             .map_err(classify)?;
         Ok(HandoffResult::PaymentRequestProposal {
@@ -1487,6 +1412,43 @@ mod tests {
     use serde_json::Map;
 
     const CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
+
+    #[test]
+    fn handoff_reader_authorization_is_verified_only_for_a_fetched_record() {
+        use crate::application::create_invoice::ReaderAuthorization;
+        assert_eq!(
+            handoff_reader_authorization(Ok(())),
+            Ok(ReaderAuthorization::Verified)
+        );
+        assert_eq!(
+            handoff_reader_authorization::<()>(Err(PaykitSdkError::NotFound {
+                context: "no record".into(),
+                source: None,
+            })),
+            Ok(ReaderAuthorization::Missing)
+        );
+        assert_eq!(
+            handoff_reader_authorization::<()>(Err(PaykitSdkError::Protocol {
+                context: "bad signature".into(),
+                source: None,
+            })),
+            Ok(ReaderAuthorization::Invalid)
+        );
+        assert_eq!(
+            handoff_reader_authorization::<()>(Err(PaykitSdkError::Transport {
+                context: "read failed".into(),
+                source: None,
+            })),
+            Err(HandoffError::Retryable(RetryableHandoffCause::Transport))
+        );
+        assert_eq!(
+            handoff_reader_authorization::<()>(Err(PaykitSdkError::Identity {
+                context: "no storage".into(),
+                source: None,
+            })),
+            Err(HandoffError::Retryable(RetryableHandoffCause::Identity))
+        );
+    }
 
     fn server_app_id() -> PaykitAppId {
         PaykitAppId::new("paykit-server").unwrap()
@@ -1671,6 +1633,37 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn targeted_receive_contacts_only_required_peers_and_preserves_failures() {
+        let required = [receive_target(CREATOR)];
+        for failed in [false, true] {
+            let mut calls = Vec::new();
+            let reports = receive_from_targets(&required, |peer| {
+                calls.push(peer.clone());
+                async move {
+                    if failed {
+                        Err(PaykitSdkError::Transport {
+                            context: "offline".into(),
+                            source: None,
+                        })
+                    } else {
+                        Ok(intake_report(CREATOR, None).report.unwrap())
+                    }
+                }
+            })
+            .await;
+            assert_eq!(calls, [required[0].counterparty.clone()]);
+            assert_eq!(
+                receive_health_for_required_targets(&reports, &required),
+                if failed {
+                    ReceiveHealth::Unavailable
+                } else {
+                    ReceiveHealth::Available
+                }
+            );
+        }
+    }
+
     #[test]
     fn no_required_receive_targets_ignore_unrelated_failures() {
         assert_eq!(
@@ -1679,10 +1672,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn no_required_receive_targets_ignore_top_level_receive_failure() {
+    #[tokio::test]
+    async fn no_required_receive_targets_do_not_receive() {
+        let reports = receive_from_targets(&[], |_| async {
+            panic!("empty targets must not contact peers")
+        })
+        .await;
         assert_eq!(
-            receive_health_from_reports(Err(()), Some(&[])),
+            receive_health_for_required_targets(&reports, &[]),
             ReceiveHealth::Available
         );
     }
@@ -1865,10 +1862,12 @@ mod tests {
     }
 
     #[test]
-    fn recovery_marker_observation_normalizes_permanent_sdk_errors_to_retryable() {
+    fn invalid_link_observation_is_retryable() {
         assert_eq!(
-            retryable_recovery_observation(HandoffError::Permanent),
-            HandoffError::Retryable(RetryableHandoffCause::Other)
+            classify(PaykitSdkError::LinkObservation {
+                context: "invalid recovery marker".into()
+            }),
+            HandoffError::Retryable(RetryableHandoffCause::LinkObservation)
         );
     }
 
@@ -2171,413 +2170,5 @@ mod tests {
 
         assert_eq!(result, Err(PaymentDrainError::Unavailable));
         assert_eq!(*calls.lock().unwrap(), vec!["replay", "refresh"]);
-    }
-
-    #[tokio::test]
-    async fn unavailable_required_intake_prevents_payment_request_status_lookup() {
-        let calls = Arc::new(StdMutex::new(Vec::new()));
-        let refresh_calls = calls.clone();
-        let lookup_calls = calls.clone();
-
-        let result = refresh_then(
-            move || {
-                refresh_calls.lock().unwrap().push("refresh");
-                std::future::ready(Err(PaymentRequestStatusError::Unavailable))
-            },
-            move || {
-                lookup_calls.lock().unwrap().push("lookup");
-                std::future::ready(Ok::<_, PaymentRequestStatusError>(Some(7_u8)))
-            },
-        )
-        .await;
-
-        assert_eq!(result, Err(PaymentRequestStatusError::Unavailable));
-        assert_eq!(*calls.lock().unwrap(), vec!["refresh"]);
-    }
-
-    fn received_allowee_proposal() -> AllowanceRecord {
-        AllowanceRecord {
-            counterparty: PubkyPublicKey::from_raw_or_app_key(CREATOR).unwrap(),
-            allowance_id: "b7f9c2a1-6d43-4b0e-a8d4-0fe2c712ab44".into(),
-            local_role: Some(AllowanceLocalRole::Allowee),
-            state: AllowanceLifecycleState::Proposed,
-            history_status: AllowanceHistoryStatus::Consistent,
-            proposal_event_id: Some("8a0d8b4c-913f-4e31-9f2c-2a6f5bb4d201".into()),
-            terms: None,
-            proposal_stream_item_id: Some(7),
-            proposal_outbound_message_id: None,
-            proposal_outbound_status: None,
-            acceptance_event_id: None,
-            acceptance_outbound_status: None,
-            rejection_event_id: None,
-            rejection_outbound_status: None,
-            end_event_id: None,
-            end_outbound_status: None,
-            pending_causal_event_ids: Vec::new(),
-            conflict_event_ids: Vec::new(),
-            last_stream_item_id: Some(7),
-            last_outbound_message_id: None,
-            last_outbound_status: None,
-            last_event_at: None,
-            invalid_reason: None,
-        }
-    }
-
-    fn proposal_terms(reference: &str) -> PaymentTermsV1 {
-        PaymentTermsV1 {
-            amount: "1".into(),
-            asset: "btc".into(),
-            rates: Vec::new(),
-            payment_reference: reference.into(),
-            proposal_expires_at: None,
-            payment_deadline: None,
-            accepted_endpoint_identifiers: vec!["btc-bitcoin-p2wpkh".into()],
-            payment_endpoints: [("btc-bitcoin-p2wpkh".into(), "bc1qexample".into())]
-                .into_iter()
-                .collect(),
-            metadata: serde_json::Map::new(),
-        }
-    }
-
-    /// An outbound `paykit.payment_request` the way the SDK stores a proposal.
-    fn outbound_proposal(
-        id: u64,
-        app_id: &PaykitAppId,
-        reference: &str,
-    ) -> OutboundPrivateMessageRecord {
-        let request = paykit_lib::PaymentRequest::new(
-            paykit_lib::EventId::new_v4(),
-            PaymentRequestId::new_v4(),
-            proposal_terms(reference).to_sdk().unwrap(),
-        );
-        let raw_json = paykit_lib::serialize_payment_request_event(
-            app_id,
-            &PaymentRequestEvent::Request(request),
-        )
-        .unwrap();
-        let at = (std::time::SystemTime::UNIX_EPOCH
-            + std::time::Duration::from_secs(1_800_000_000))
-        .into();
-        OutboundPrivateMessageRecord {
-            outbound_message_id: id,
-            counterparty: PubkyPublicKey::from_raw_or_app_key(CREATOR).unwrap(),
-            app_id: app_id.clone(),
-            kind: PAYMENT_REQUEST_KIND.into(),
-            raw_json,
-            status: OutboundPrivateMessageStatus::Pending,
-            attempt_count: 0,
-            created_at: at,
-            updated_at: at,
-            last_attempt_at: None,
-            sent_at: None,
-            confirmed_at: None,
-            last_error: None,
-            prepared_send: None,
-        }
-    }
-
-    #[test]
-    fn a_proposal_queued_for_the_payment_reference_is_reused() {
-        let reference = Uuid::new_v4().to_string();
-        let queued = outbound_proposal(7, &server_app_id(), &reference);
-        let other = outbound_proposal(6, &server_app_id(), &Uuid::new_v4().to_string());
-
-        for status in [
-            OutboundPrivateMessageStatus::Pending,
-            OutboundPrivateMessageStatus::Sending,
-            OutboundPrivateMessageStatus::Failed,
-            OutboundPrivateMessageStatus::Sent,
-        ] {
-            let mut queued = queued.clone();
-            queued.status = status;
-            let found = queued_proposal(
-                &[other.clone(), queued.clone()],
-                &server_app_id(),
-                &reference,
-            )
-            .expect("the queued proposal");
-            assert_eq!(found.outbound_message_id, 7);
-            let json: serde_json::Value = serde_json::from_str(&queued.raw_json).unwrap();
-            assert_eq!(json["event_id"], found.event_id);
-            assert_eq!(json["payment_request_id"], found.payment_request_id);
-        }
-        assert!(queued_proposal(&[other], &server_app_id(), &reference).is_none());
-    }
-
-    #[test]
-    fn the_oldest_proposal_for_a_payment_reference_wins() {
-        let reference = Uuid::new_v4().to_string();
-        let first = outbound_proposal(3, &server_app_id(), &reference);
-        let second = outbound_proposal(9, &server_app_id(), &reference);
-
-        let found = queued_proposal(&[second, first], &server_app_id(), &reference).unwrap();
-
-        assert_eq!(found.outbound_message_id, 3);
-    }
-
-    #[test]
-    fn only_this_servers_deliverable_proposals_count_as_queued() {
-        let reference = Uuid::new_v4().to_string();
-        let rejected: [fn(&mut OutboundPrivateMessageRecord); 5] = [
-            // Another Paykit App on the same identity proposed it.
-            |record| record.app_id = PaykitAppId::new("bitkit").unwrap(),
-            // The SDK will never deliver it.
-            |record| record.status = OutboundPrivateMessageStatus::Invalid,
-            |record| record.status = OutboundPrivateMessageStatus::Superseded,
-            // Not a Payment Request proposal.
-            |record| record.kind = "paykit.payment_request_cancellation".into(),
-            // Not a readable Payment Request.
-            |record| record.raw_json = "{}".into(),
-        ];
-        for change in rejected {
-            let mut record = outbound_proposal(3, &server_app_id(), &reference);
-            change(&mut record);
-            assert!(queued_proposal(&[record], &server_app_id(), &reference).is_none());
-        }
-    }
-
-    fn reader() -> PubkyPublicKey {
-        PubkyPublicKey::from_raw_or_app_key(CREATOR).unwrap()
-    }
-
-    #[test]
-    fn allowances_are_read_only_when_the_link_received_new_items() {
-        let intake = AllowanceIntake::new(Duration::from_secs(10));
-        let creator = Uuid::new_v4();
-        let start = Instant::now();
-
-        // Nothing received on the link: nothing to read.
-        assert!(intake.begin(creator, &reader(), None, start).is_none());
-
-        let ticket = intake.begin(creator, &reader(), Some(5), start).unwrap();
-        intake.finish(ticket, true);
-
-        // The same items again, long after the cooldown: still nothing to read.
-        let later = start + Duration::from_secs(3_600);
-        assert!(intake.begin(creator, &reader(), Some(5), later).is_none());
-        assert!(intake.begin(creator, &reader(), Some(6), later).is_some());
-    }
-
-    #[test]
-    fn a_reader_is_read_at_most_once_per_cooldown() {
-        let intake = AllowanceIntake::new(Duration::from_secs(10));
-        let creator = Uuid::new_v4();
-        let start = Instant::now();
-
-        let ticket = intake.begin(creator, &reader(), Some(1), start).unwrap();
-        intake.finish(ticket, true);
-
-        // A flood of new items does not make the next read come sooner.
-        for (seconds, newest) in [(1, 10), (5, 500), (9, 90_000)] {
-            let now = start + Duration::from_secs(seconds);
-            assert!(
-                intake
-                    .begin(creator, &reader(), Some(newest), now)
-                    .is_none()
-            );
-        }
-        let after = start + Duration::from_secs(10);
-        assert!(
-            intake
-                .begin(creator, &reader(), Some(90_000), after)
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn a_failed_or_unfinished_read_is_retried_after_the_cooldown() {
-        let intake = AllowanceIntake::new(Duration::from_secs(10));
-        let creator = Uuid::new_v4();
-        let start = Instant::now();
-        let after = start + Duration::from_secs(10);
-
-        // A read that failed never reports back, and counted against the cooldown.
-        assert!(intake.begin(creator, &reader(), Some(4), start).is_some());
-        assert!(intake.begin(creator, &reader(), Some(4), start).is_none());
-        let ticket = intake.begin(creator, &reader(), Some(4), after).unwrap();
-
-        // A read that left proposals behind the per-intake limit keeps the items due.
-        intake.finish(ticket, false);
-        let again = after + Duration::from_secs(10);
-        let ticket = intake.begin(creator, &reader(), Some(4), again).unwrap();
-        intake.finish(ticket, true);
-        let last = again + Duration::from_secs(10);
-        assert!(intake.begin(creator, &reader(), Some(4), last).is_none());
-    }
-
-    #[test]
-    fn readers_and_creators_are_scheduled_independently() {
-        let intake = AllowanceIntake::new(Duration::from_secs(10));
-        let (creator, other_creator) = (Uuid::new_v4(), Uuid::new_v4());
-        let other_reader = PubkyPublicKey::from_raw_or_app_key(
-            "pubky8pinxxgqs41n4aididenw5apqp1urfmzdztr8jt4abrkdn435ewo",
-        )
-        .unwrap();
-        let now = Instant::now();
-
-        assert!(intake.begin(creator, &reader(), Some(1), now).is_some());
-        assert!(intake.begin(creator, &other_reader, Some(1), now).is_some());
-        assert!(
-            intake
-                .begin(other_creator, &reader(), Some(1), now)
-                .is_some()
-        );
-    }
-
-    /// A link whose scan can be held in flight, like the derivation of a
-    /// large Allowance history, and that reports whether the Creator mutation
-    /// lock was held at each step.
-    struct SlowLink {
-        lock: Arc<TokioMutex<()>>,
-        pending: usize,
-        scan_entered: tokio::sync::Notify,
-        scan_release: tokio::sync::Notify,
-        lock_held_during_accepts: StdMutex<Vec<bool>>,
-        lock_held_during_scan: StdMutex<Option<bool>>,
-        fail_accept: bool,
-    }
-
-    impl SlowLink {
-        fn new(lock: &Arc<TokioMutex<()>>, pending: usize) -> Self {
-            Self {
-                lock: lock.clone(),
-                pending,
-                scan_entered: tokio::sync::Notify::new(),
-                scan_release: tokio::sync::Notify::new(),
-                lock_held_during_accepts: StdMutex::new(Vec::new()),
-                lock_held_during_scan: StdMutex::new(None),
-                fail_accept: false,
-            }
-        }
-    }
-
-    #[async_trait]
-    impl AllowanceLink for SlowLink {
-        async fn pending_proposals(
-            &self,
-            _reader: &PubkyPublicKey,
-        ) -> Result<Vec<AllowanceId>, HandoffError> {
-            *self.lock_held_during_scan.lock().unwrap() = Some(self.lock.try_lock().is_err());
-            self.scan_entered.notify_one();
-            self.scan_release.notified().await;
-            Ok((0..self.pending)
-                .map(|_| AllowanceId::new(Uuid::new_v4().to_string()).unwrap())
-                .collect())
-        }
-
-        async fn accept(
-            &self,
-            _reader: &PubkyPublicKey,
-            _id: &AllowanceId,
-        ) -> Result<(), HandoffError> {
-            self.lock_held_during_accepts
-                .lock()
-                .unwrap()
-                .push(self.lock.try_lock().is_err());
-            if self.fail_accept {
-                return Err(HandoffError::Retryable(RetryableHandoffCause::Transport));
-            }
-            Ok(())
-        }
-    }
-
-    #[tokio::test]
-    async fn a_large_allowance_history_does_not_hold_the_creator_lock_while_it_is_read() {
-        let lock = Arc::new(TokioMutex::new(()));
-        let link = Arc::new(SlowLink::new(&lock, 1_000));
-        let intake = tokio::spawn({
-            let (link, lock) = (link.clone(), lock.clone());
-            async move { accept_proposals(link.as_ref(), &lock, &reader()).await }
-        });
-
-        // The scan is in flight, as for a reader with a very large history.
-        // Every other Creator operation takes this lock, and none waits for it.
-        link.scan_entered.notified().await;
-        let other_creator_work = tokio::time::timeout(Duration::from_secs(5), lock.lock()).await;
-        assert!(
-            other_creator_work.is_ok(),
-            "another operation waited for the reader's scan"
-        );
-        drop(other_creator_work);
-
-        link.scan_release.notify_one();
-        let outcome = intake.await.unwrap().unwrap();
-
-        assert_eq!(*link.lock_held_during_scan.lock().unwrap(), Some(false));
-        // Each acceptance runs under the lock, and the lock is free between them.
-        assert_eq!(
-            *link.lock_held_during_accepts.lock().unwrap(),
-            [true; MAX_ALLOWANCE_ACCEPTANCES_PER_INTAKE]
-        );
-        assert_eq!(outcome.accepted, MAX_ALLOWANCE_ACCEPTANCES_PER_INTAKE);
-        assert!(!outcome.drained);
-        assert!(lock.try_lock().is_ok());
-    }
-
-    #[tokio::test]
-    async fn the_intake_accepts_everything_pending_up_to_its_limit() {
-        for (pending, accepted, drained) in [
-            (0, 0, true),
-            (1, 1, true),
-            (
-                MAX_ALLOWANCE_ACCEPTANCES_PER_INTAKE,
-                MAX_ALLOWANCE_ACCEPTANCES_PER_INTAKE,
-                true,
-            ),
-            (
-                MAX_ALLOWANCE_ACCEPTANCES_PER_INTAKE + 1,
-                MAX_ALLOWANCE_ACCEPTANCES_PER_INTAKE,
-                false,
-            ),
-        ] {
-            let lock = Arc::new(TokioMutex::new(()));
-            let link = SlowLink::new(&lock, pending);
-            link.scan_release.notify_one();
-
-            let outcome = accept_proposals(&link, &lock, &reader()).await.unwrap();
-
-            assert_eq!((outcome.accepted, outcome.drained), (accepted, drained));
-        }
-    }
-
-    #[tokio::test]
-    async fn a_failed_acceptance_ends_the_intake_and_frees_the_lock() {
-        let lock = Arc::new(TokioMutex::new(()));
-        let mut link = SlowLink::new(&lock, 3);
-        link.fail_accept = true;
-        link.scan_release.notify_one();
-
-        let result = accept_proposals(&link, &lock, &reader()).await;
-
-        assert!(matches!(result, Err(HandoffError::Retryable(_))));
-        assert_eq!(link.lock_held_during_accepts.lock().unwrap().len(), 1);
-        assert!(lock.try_lock().is_ok());
-    }
-
-    #[test]
-    fn only_received_consistent_allowee_proposals_are_accepted() {
-        assert!(awaits_allowee_acceptance(&received_allowee_proposal()));
-
-        let rejected: [fn(&mut AllowanceRecord); 7] = [
-            // The receiver would be the payer.
-            |record| record.local_role = Some(AllowanceLocalRole::Allower),
-            |record| record.local_role = None,
-            // Already answered, ended or colliding.
-            |record| record.state = AllowanceLifecycleState::Accepted,
-            |record| record.state = AllowanceLifecycleState::Conflicted,
-            // Evidence that needs review or recovery first.
-            |record| record.history_status = AllowanceHistoryStatus::Invalid,
-            |record| record.history_status = AllowanceHistoryStatus::UnresolvedReferences,
-            // A proposal this receiver sent is not its to accept.
-            |record| {
-                record.proposal_stream_item_id = None;
-                record.proposal_outbound_message_id = Some(3);
-            },
-        ];
-        for change in rejected {
-            let mut record = received_allowee_proposal();
-            change(&mut record);
-            assert!(!awaits_allowee_acceptance(&record));
-        }
     }
 }

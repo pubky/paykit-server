@@ -7,8 +7,12 @@ use crate::{
         connection_status::ConnectionStatusService,
         create_invoice::{
             AppRegistryDiscovery, CreateInvoiceService, LockFetchError, LockFetcher,
-            PaykitIntentBuilder, RegistryDiscoveryError, SessionValidationError, SessionValidator,
+            PaykitIntentBuilder, ReaderAuthorization, RegistryDiscoveryError,
+            SessionValidationError, SessionValidator,
         },
+        marketplace_lifecycle::MarketplaceLifecycleService,
+        marketplace_preparation::PrepareMarketplaceService,
+        marketplace_status::MarketplaceStatusService,
         payment_drain::{
             PaymentDrainCleanupToken, PaymentDrainError, PaymentDrainOperations,
             PaymentDrainSummary,
@@ -23,28 +27,33 @@ use crate::{
     config::{Config, OutboxConfig, PaykitConfig, PaykitNetwork},
     crypto::Crypto,
     domain::locks::{BundleId, CreatorPubky, PubkyLockResource, ReaderPubky},
-    http::{self, auth::SignedLocksAuth},
-    paykit::{ALLOWANCE_INTAKE_COOLDOWN, AllowanceIntake, CreatorSessions, PaykitAdapter},
+    http::{self, auth::SignedServiceAuth},
+    paykit::{CreatorSessions, PaykitAdapter, creator_mutation_lock, sdk_error_label},
     persistence::{
-        CreatorStore, InvoiceStore, OutboxRetryClass, OutboxStore, PaymentDrainStore,
-        PaymentRequestLifecycleStore, PersistenceError,
+        CreatorStore, InvoiceStore, MarketplacePreparationStore, OutboxRetryClass, OutboxStore,
+        PaymentDrainStore, PaymentRequestLifecycleStore, PersistenceError,
     },
     real_setup::RealSetupCompleter,
     runtime::{PostgresDependency, Runtime, operational_router},
     setup::{SetupLimits, SetupService, SystemClock},
     setup_orchestration::PubkyCompanionRelay,
     workers::{
-        observer::{ElectrumAdapter, ElectrumPort, ObserverError, observe_once},
+        creator_tasks::CreatorTasks,
+        observer::{
+            ElectrumAdapter, ElectrumPort, ObserverError, observe_marketplace_once, observe_once,
+        },
         outbox::{
-            ProcessingHealth, RetrySchedule, process_claim_with_health,
-            process_reconciliation_with_health,
+            ProcessingHealth, RetrySchedule, process_claim_with,
+            process_reconciliation_with_health, with_claim_renewal,
         },
     },
 };
 use async_trait::async_trait;
 use axum::{Extension, Router};
 use locks_core::lock_policy::ContentLock;
-use paykit_lib::{PaykitAppRegistry, PaykitError, get_paykit_app_registry};
+use paykit_lib::{
+    PaykitAppRegistry, PaykitError, get_paykit_app_registry, get_paykit_noise_key_authorization,
+};
 use paykit_sdk::{PaykitSdkError, PubkyPublicKey, PubkySessionBootstrap, PubkySessionProvider};
 use pubky::{Pubky, errors::RequestError};
 use sqlx::PgPool;
@@ -95,6 +104,7 @@ struct WorkerComponents {
     sessions: CreatorSessions,
     outbox: OutboxStore,
     invoices: InvoiceStore,
+    marketplace_preparations: Arc<MarketplacePreparationStore>,
     payment_request_lifecycles: PaymentRequestLifecycleStore,
     electrum: Arc<dyn ElectrumPort>,
     usdt: Option<crate::usdt::ArbitrumVerifier>,
@@ -105,6 +115,8 @@ struct WorkerComponents {
     outbox_lease_duration: Duration,
     outbox_retry_initial: Duration,
     outbox_retry_max: Duration,
+    rapid_link_retry_attempts: u32,
+    rapid_link_retry_interval: Duration,
     electrum_poll_interval: Duration,
 }
 
@@ -168,6 +180,8 @@ impl Server {
         let outbox = OutboxStore::new(&pool, crypto.clone());
         let payment_request_lifecycles = PaymentRequestLifecycleStore::new(&pool, crypto.clone());
         let payment_drains = PaymentDrainStore::new(&pool, crypto.clone());
+        let marketplace_preparations =
+            Arc::new(MarketplacePreparationStore::new(&pool, crypto.clone()));
 
         let bootstrap = setup_bootstrap(
             pubky.clone(),
@@ -186,13 +200,16 @@ impl Server {
         if config.usdt.is_some() {
             auth_starter = auth_starter.with_usdt();
         }
-        let setup_completer = Arc::new(RealSetupCompleter::new(
-            auth_starter,
-            relay,
-            creators.clone(),
-            sessions.clone(),
-            config.deployment_invariants().bitcoin_network.clone(),
-        ));
+        let setup_completer = Arc::new(
+            RealSetupCompleter::new(
+                auth_starter,
+                relay,
+                creators.clone(),
+                sessions.clone(),
+                config.deployment_invariants().bitcoin_network.clone(),
+            )
+            .with_bitcoin_rotation(payment_request_lifecycles.clone(), config.paykit.clone()),
+        );
         let setup = SetupService::new_with_authorization_url_logging(
             config.setup.allowed_origins.clone(),
             setup_completer,
@@ -217,6 +234,7 @@ impl Server {
         let session_validator = Arc::new(CreatorSessionValidator {
             creators: creators.clone(),
             sessions: sessions.clone(),
+            identity_states: IdentityStateReads::default(),
         });
         let invoice_service = Arc::new(
             CreateInvoiceService::with_invoice_windows(
@@ -246,6 +264,33 @@ impl Server {
                     .map_err(|_| ServerBuildError::ExchangeRates)?,
             )),
         );
+        let marketplace_preparation_service = Arc::new(
+            PrepareMarketplaceService::new(
+                session_validator.clone(),
+                Arc::new(PubkyAppRegistryDiscovery {
+                    storage: pubky.public_storage(),
+                }),
+                Arc::new(creators.clone()),
+                marketplace_preparations.clone(),
+                config.paykit.app_id.clone(),
+                config.deployment_invariants().bitcoin_network.clone(),
+                config.paykit.payment_window,
+                config.paykit.marketplace_prepare_ttl,
+            )
+            .with_usdt(usdt.is_some())
+            .with_conversion_payment_window(config.paykit.conversion_payment_window)
+            .with_exchange_rates(Arc::new(
+                crate::application::invoice_pricing::BlocktankRates::new()
+                    .map_err(|_| ServerBuildError::ExchangeRates)?,
+            )),
+        );
+        let marketplace_lifecycle_service = Arc::new(MarketplaceLifecycleService::new(
+            marketplace_preparations.clone(),
+            config.paykit.proposal_acceptance_window,
+        ));
+        let marketplace_status_service = Arc::new(MarketplaceStatusService::new(
+            marketplace_preparations.clone(),
+        ));
         let connection_status_service = Arc::new(ConnectionStatusService::new(
             Arc::new(invoices.clone()),
             Arc::new(sessions.clone()),
@@ -275,7 +320,7 @@ impl Server {
             SetupStatusService::new(session_validator)
                 .with_receiving(Arc::new(creators.clone()), usdt.is_some()),
         );
-        let signed_auth = Arc::new(SignedLocksAuth::from_config(&config));
+        let signed_auth = Arc::new(SignedServiceAuth::from_config(&config));
         let business_routes = http::setup::setup_router_with_trusted_proxy_hops(
             setup,
             config.http.trusted_proxy_hops(),
@@ -284,6 +329,17 @@ impl Server {
             http::invoices::invoices_router(invoice_service)
                 .merge(http::connection_status::connection_status_router(
                     connection_status_service,
+                ))
+                .merge(
+                    http::marketplace_preparation::marketplace_preparation_router(
+                        marketplace_preparation_service,
+                    ),
+                )
+                .merge(http::marketplace_lifecycle::marketplace_lifecycle_router(
+                    marketplace_lifecycle_service,
+                ))
+                .merge(http::marketplace_status::marketplace_status_router(
+                    marketplace_status_service,
                 ))
                 .merge(http::status::status_router(status_service))
                 .merge(http::payment_drains::payment_drains_router(
@@ -308,6 +364,7 @@ impl Server {
             sessions,
             outbox,
             invoices,
+            marketplace_preparations,
             payment_request_lifecycles,
             electrum,
             usdt,
@@ -318,6 +375,8 @@ impl Server {
             outbox_lease_duration: config.outbox.lease_duration,
             outbox_retry_initial: config.outbox.retry_initial,
             outbox_retry_max: config.outbox.retry_max,
+            rapid_link_retry_attempts: config.outbox.rapid_link_retry_attempts,
+            rapid_link_retry_interval: config.outbox.rapid_link_retry_interval,
             electrum_poll_interval: config.electrum.poll_interval,
         };
 
@@ -419,12 +478,12 @@ fn spawn_owned_workers(workers: WorkerComponents, runtime: Arc<Runtime>) -> Join
     tasks.spawn(outbox_enqueue_loop(workers.clone(), runtime.clone()));
     tasks.spawn(outbox_reconciliation_loop(workers.clone(), runtime.clone()));
     tasks.spawn(shared_transport_loop(workers.clone(), runtime.clone()));
+    tasks.spawn(buyer_contacts_loop(workers.clone(), runtime.clone()));
     tasks.spawn(observer_loop(workers, runtime));
     tasks
 }
 
-async fn shared_transport_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtime>) {
-    let intake = AllowanceIntake::new(ALLOWANCE_INTAKE_COOLDOWN);
+async fn buyer_contacts_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtime>) {
     let mut interval = tokio::time::interval(workers.outbox_poll_interval);
     interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
@@ -432,41 +491,95 @@ async fn shared_transport_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runt
             _ = runtime.cancelled() => break,
             _ = interval.tick() => {}
         }
-        let Ok(creators) = workers.creators.ready_ids().await else {
-            runtime.set_paykit_transport_available(false);
-            continue;
+        for _ in 0..workers.outbox_batch_size {
+            if !runtime.may_start_worker_claim() {
+                return;
+            }
+            let pending = match workers.invoices.claim_buyer_contact().await {
+                Ok(Some(pending)) => pending,
+                Ok(None) => break,
+                Err(_) => {
+                    tracing::warn!(
+                        stage = "buyer_contact_claim",
+                        "Buyer contact work unavailable"
+                    );
+                    break;
+                }
+            };
+            let saved = match creator_adapter(&workers, pending.creator_id).await {
+                Ok(adapter) => adapter
+                    .save_buyer_contact(&workers.invoices, &pending)
+                    .await
+                    .is_ok(),
+                Err(_) => false,
+            };
+            if !saved {
+                tracing::warn!(stage = "buyer_contact_save", "Buyer contact save deferred");
+            }
+        }
+    }
+}
+
+async fn shared_transport_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtime>) {
+    let mut interval = tokio::time::interval(workers.outbox_poll_interval);
+    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    loop {
+        let hinted_creators = tokio::select! {
+            biased;
+            _ = runtime.cancelled() => break,
+            _ = interval.tick() => None,
+            creators = workers.outbox.wait_for_transport() => Some(creators),
         };
-        let mut available = true;
+        let full_scan = hinted_creators.is_none();
+        let creators = match hinted_creators {
+            Some(creators) => creators,
+            None => match workers.creators.ready_ids().await {
+                Ok(creators) => creators,
+                Err(error) => {
+                    tracing::warn!(
+                        stage = "shared_transport",
+                        step = "creator_ids_load",
+                        category = error.diagnostic_label(),
+                        "Paykit transport maintenance unavailable"
+                    );
+                    runtime.set_paykit_transport_available(false);
+                    continue;
+                }
+            },
+        };
         let mut deferred = false;
         for creator in creators {
             if !runtime.may_start_worker_claim() {
                 return;
             }
-            let maintained = match creator_adapter(&workers, creator).await {
-                Ok(adapter) => match adapter.maintain_transport(&intake).await {
-                    Ok(()) => true,
+            // One Creator's session or peer failure is retried on the next pass and
+            // must not withdraw every Creator's rail.
+            let failure = match creator_adapter(&workers, creator).await {
+                Ok(adapter) => match adapter.maintain_transport().await {
+                    Ok(()) => None,
                     Err(
                         PaykitSdkError::ConcurrentUpdate { .. }
                         | PaykitSdkError::SharedStateBusy { .. },
                     ) => {
                         deferred = true;
-                        true
+                        None
                     }
-                    Err(_) => false,
+                    Err(error) => Some(("maintain_transport", sdk_error_label(&error))),
                 },
-                Err(_) => false,
+                Err(error) => Some(("adapter_build", error.diagnostic_label())),
             };
-            if !maintained {
-                available = false;
+            if let Some((step, category)) = failure {
                 tracing::warn!(
                     stage = "shared_transport",
+                    step,
+                    category,
                     "Paykit transport maintenance failed"
                 );
             }
         }
-        // Contention is retried by the next poll, not evidence of recovery or failure.
-        if !available || !deferred {
-            runtime.set_paykit_transport_available(available);
+        // A targeted pass cannot clear a failed Creator enumeration or deferred work.
+        if full_scan && !deferred {
+            runtime.set_paykit_transport_available(true);
         }
     }
 }
@@ -479,6 +592,15 @@ fn outbox_batch_size(config: &OutboxConfig) -> i64 {
 enum AdapterBuildError {
     Permanent,
     Unavailable,
+}
+
+impl AdapterBuildError {
+    const fn diagnostic_label(self) -> &'static str {
+        match self {
+            Self::Permanent => "adapter_permanent",
+            Self::Unavailable => "adapter_unavailable",
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -647,7 +769,12 @@ async fn creator_adapter(
     let creator = credentials.creator().clone();
     let sessions = workers.sessions.provider(&creator);
     PaykitAdapter::new(creator_id, sessions, &workers.paykit)
-        .map(|adapter| adapter.with_usdt(workers.invoices.clone(), workers.usdt.clone()))
+        .map(|adapter| {
+            adapter
+                .with_lifecycles(workers.payment_request_lifecycles.clone())
+                .with_usdt(workers.invoices.clone(), workers.usdt.clone())
+                .with_marketplace_usdt(workers.marketplace_preparations.clone())
+        })
         .map_err(|_| AdapterBuildError::Permanent)
 }
 
@@ -658,123 +785,223 @@ fn retry_delay(initial: Duration, maximum: Duration, attempt_count: i32) -> Dura
     initial.saturating_mul(1_u32 << exponent).min(maximum)
 }
 
-const RAPID_LINK_ESTABLISHMENT_RETRY_ATTEMPTS: i32 = 20;
-const RAPID_LINK_ESTABLISHMENT_RETRY_DELAY: Duration = Duration::from_secs(1);
 const MAX_LINK_ESTABLISHMENT_RETRY_DELAY: Duration = Duration::from_secs(5);
 
 fn outbox_retry_schedule(
     initial: Duration,
     maximum: Duration,
+    rapid_link_retry_attempts: u32,
+    rapid_link_retry_interval: Duration,
     attempt_count: i32,
+    failure_count: i32,
 ) -> RetrySchedule {
-    let default = retry_delay(initial, maximum, attempt_count);
-    let link_establishment = if attempt_count <= RAPID_LINK_ESTABLISHMENT_RETRY_ATTEMPTS {
-        RAPID_LINK_ESTABLISHMENT_RETRY_DELAY
+    let default = retry_delay(initial, maximum, failure_count.saturating_add(1));
+    let rapid_link_retry_attempts = i32::try_from(rapid_link_retry_attempts)
+        .expect("validated rapid link retry attempts fit i32");
+    let link_establishment = if attempt_count <= rapid_link_retry_attempts {
+        rapid_link_retry_interval
     } else {
-        retry_delay(
-            initial,
-            maximum,
-            attempt_count - RAPID_LINK_ESTABLISHMENT_RETRY_ATTEMPTS,
-        )
-        .min(MAX_LINK_ESTABLISHMENT_RETRY_DELAY)
+        retry_delay(initial, maximum, attempt_count - rapid_link_retry_attempts)
+            .min(MAX_LINK_ESTABLISHMENT_RETRY_DELAY)
     };
     RetrySchedule::new(default, link_establishment)
 }
 
 async fn outbox_enqueue_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtime>) {
     let owner = Uuid::new_v4();
-    let mut next_poll_delay = Duration::ZERO;
+    let limit = usize::try_from(workers.outbox_batch_size).expect("validated outbox batch size");
+    let mut tasks = CreatorTasks::new(limit, runtime.clone());
+    let mut next_poll = tokio::time::Instant::now();
     loop {
-        tokio::select! {
+        let completed = tokio::select! {
             _ = runtime.cancelled() => break,
-            _ = tokio::time::sleep(next_poll_delay) => {}
-        }
+            result = tasks.join_next(), if !tasks.is_empty() => result,
+            _ = workers.invoices.wait_for_admission() => None,
+            _ = tokio::time::sleep_until(next_poll) => None,
+        };
         if !runtime.may_start_worker_claim() {
             break;
         }
-        let claims = match workers
-            .outbox
-            .claim(
-                owner,
-                workers.outbox_batch_size,
-                workers.outbox_lease_duration,
-            )
-            .await
-        {
-            Ok(claims) => {
-                runtime.set_outbox_enqueue_available(true);
-                claims
-            }
-            Err(_) => {
-                runtime.set_outbox_enqueue_available(false);
-                next_poll_delay = workers.outbox_poll_interval;
-                continue;
-            }
-        };
-        let mut batch = JoinSet::new();
-        for claim in claims {
-            let workers = workers.clone();
-            batch.spawn(async move {
-                let retry_schedule = outbox_retry_schedule(
-                    workers.outbox_retry_initial,
-                    workers.outbox_retry_max,
-                    claim.attempt_count(),
-                );
-                match creator_adapter(&workers, claim.creator_id()).await {
-                    Ok(adapter) => {
-                        process_claim_with_health(&workers.outbox, &adapter, &claim, retry_schedule)
-                            .await
-                    }
-                    Err(AdapterBuildError::Permanent) => workers
-                        .outbox
-                        .mark_permanently_failed(&claim)
-                        .await
-                        .map(|transitioned| (transitioned, ProcessingHealth::PermanentFailure)),
-                    Err(AdapterBuildError::Unavailable) => workers
-                        .outbox
-                        .mark_retryable(
-                            &claim,
-                            retry_schedule.default_delay(),
-                            OutboxRetryClass::AdapterUnavailable,
-                        )
-                        .await
-                        .map(|transitioned| {
-                            (
-                                transitioned,
-                                ProcessingHealth::Retryable(retry_schedule.default_delay()),
-                            )
-                        }),
-                }
-            });
+        let now = tokio::time::Instant::now();
+        if next_poll <= now {
+            next_poll = now + workers.outbox_poll_interval;
         }
-        let mut delivery_available = true;
         let mut outbox_available = true;
-        next_poll_delay = workers.outbox_poll_interval;
-        while let Some(result) = batch.join_next().await {
+        if let Some((_, result)) = completed {
             match result {
-                Ok(Ok((_, ProcessingHealth::Available))) => {}
-                Ok(Ok((_, ProcessingHealth::Retryable(delay)))) => {
-                    delivery_available = false;
-                    next_poll_delay = next_poll_delay.min(delay);
+                Ok(Some((true, ProcessingHealth::Retryable(delay)))) => {
+                    next_poll = next_poll.min(now + delay);
                 }
-                Ok(Ok((_, ProcessingHealth::PermanentFailure))) => {
-                    delivery_available = false;
+                Ok(_) => {}
+                Err(_) => {
+                    outbox_available = false;
                 }
-                Ok(Err(_)) => outbox_available = false,
-                Err(_) => panic!("owned outbox claim task exited unexpectedly"),
+            }
+        }
+        if outbox_available && tasks.available_slots() > 0 {
+            match workers
+                .outbox
+                .due_creator_ids(
+                    &tasks.active_creators(),
+                    i64::try_from(tasks.available_slots()).expect("bounded Creator task capacity"),
+                )
+                .await
+            {
+                Ok(creators) => {
+                    for creator in creators {
+                        tasks.try_spawn(
+                            creator,
+                            process_creator_outbox(
+                                workers.clone(),
+                                runtime.clone(),
+                                owner,
+                                creator,
+                            ),
+                        );
+                    }
+                }
+                Err(_) => outbox_available = false,
             }
         }
         match workers.outbox.delivery_available().await {
             Ok(persisted_available) => {
-                delivery_available &= persisted_available;
+                runtime.set_paykit_enqueue_available(persisted_available);
+                runtime.set_outbox_enqueue_available(outbox_available);
             }
             Err(_) => {
-                delivery_available = false;
-                outbox_available = false;
+                runtime.set_paykit_enqueue_available(false);
+                runtime.set_outbox_enqueue_available(false);
             }
         }
-        runtime.set_paykit_enqueue_available(delivery_available);
-        runtime.set_outbox_enqueue_available(outbox_available);
+    }
+    // Finish admitted effects. The server's drain deadline still bounds shutdown.
+    while tasks.join_next().await.is_some() {}
+}
+
+async fn process_creator_outbox(
+    workers: Arc<WorkerComponents>,
+    runtime: Arc<Runtime>,
+    owner: Uuid,
+    creator: Uuid,
+) -> Result<Option<(bool, ProcessingHealth)>, PersistenceError> {
+    // Setup/rotation takes this PostgreSQL fence before the process-local SDK
+    // mutex. Keep the same ordering here to serialize external SDK effects with
+    // durable cutover across processes without lock inversion.
+    let mutation_fence = tokio::select! {
+        _ = runtime.cancelled() => return Ok(None),
+        fence = workers.creators.acquire_setup_lock_for_creator_id(creator) => fence?,
+    };
+    let guard = tokio::select! {
+        _ = runtime.cancelled() => return Ok(None),
+        guard = creator_mutation_lock(creator).lock_owned() => guard,
+    };
+    if !runtime.may_start_worker_claim() {
+        return Ok(None);
+    }
+    // No row is leased while waiting for a scheduler slot or Creator ownership.
+    let Some(claim) = workers
+        .outbox
+        .claim_for_creator(owner, creator, workers.outbox_lease_duration)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let retry_schedule = outbox_retry_schedule(
+        workers.outbox_retry_initial,
+        workers.outbox_retry_max,
+        workers.rapid_link_retry_attempts,
+        workers.rapid_link_retry_interval,
+        claim.attempt_count(),
+        claim.failure_count(),
+    );
+    let mut ready_adapter = None;
+    let result = with_claim_renewal(
+        &workers.outbox,
+        &claim,
+        workers.outbox_lease_duration,
+        async {
+            let intent =
+                match workers.outbox.delivery_intent(&claim) {
+                    Ok(intent) => intent,
+                    Err(_) => {
+                        return workers.outbox.mark_permanently_failed(&claim).await.map(
+                            |transitioned| (transitioned, ProcessingHealth::PermanentFailure),
+                        );
+                    }
+                };
+            if let Some(deadline) = intent
+                .proposal_expires_at()
+                .map_err(|_| PersistenceError::CorruptOrMissing)?
+                && workers.outbox.proposal_expired(deadline).await?
+            {
+                return workers
+                    .outbox
+                    .mark_proposal_expired(&claim)
+                    .await
+                    .map(|transitioned| (transitioned, ProcessingHealth::Available));
+            }
+            match creator_adapter(&workers, creator).await {
+                Ok(adapter) => {
+                    let adapter = ready_adapter.insert(adapter);
+                    process_claim_with(&workers.outbox, &claim, retry_schedule, |intent| {
+                        let adapter = &*adapter;
+                        let guard = &guard;
+                        let store = &workers.outbox;
+                        let claim = &claim;
+                        async move {
+                            adapter
+                                .execute_claimed_handoff_with_guard(guard, store, claim, &intent)
+                                .await
+                        }
+                    })
+                    .await
+                }
+                Err(AdapterBuildError::Permanent) => workers
+                    .outbox
+                    .mark_permanently_failed(&claim)
+                    .await
+                    .map(|transitioned| (transitioned, ProcessingHealth::PermanentFailure)),
+                Err(AdapterBuildError::Unavailable) => workers
+                    .outbox
+                    .mark_retryable(
+                        &claim,
+                        retry_schedule.default_delay(),
+                        OutboxRetryClass::AdapterUnavailable,
+                    )
+                    .await
+                    .map(|transitioned| {
+                        (
+                            transitioned,
+                            ProcessingHealth::Retryable(retry_schedule.default_delay()),
+                        )
+                    }),
+            }
+        },
+    )
+    .await;
+    if matches!(result, Ok((false, _))) {
+        tracing::warn!("outbox handoff finished without a live claim transition");
+    }
+    if matches!(result, Ok((true, ProcessingHealth::Available)))
+        && runtime.may_start_worker_claim()
+        && let Some(adapter) = ready_adapter
+        && let Err(error) = adapter
+            .send_handed_off_with_guard(&guard, &workers.outbox, &claim)
+            .await
+    {
+        tracing::warn!(
+            ?error,
+            "handed-off delivery deferred to transport maintenance"
+        );
+    }
+    let result = result.map(Some);
+    let unlocked = mutation_fence.release().await;
+    match result {
+        Err(error) => Err(error),
+        Ok(result) => {
+            unlocked?;
+            Ok(result)
+        }
     }
 }
 
@@ -783,24 +1010,29 @@ async fn outbox_reconciliation_loop(workers: Arc<WorkerComponents>, runtime: Arc
     let mut interval = tokio::time::interval(workers.outbox_poll_interval);
     interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
-        tokio::select! {
+        let hinted_creators = tokio::select! {
+            biased;
             _ = runtime.cancelled() => break,
-            _ = interval.tick() => {}
-        }
+            _ = interval.tick() => None,
+            creators = workers.outbox.wait_for_reconciliation() => Some(creators),
+        };
         if !runtime.may_start_worker_claim() {
             break;
         }
         let claims = match workers
             .outbox
-            .claim_reconciliation(
+            .claim_reconciliation_for_creators(
                 owner,
                 workers.outbox_batch_size,
                 workers.outbox_lease_duration,
+                hinted_creators.as_deref(),
             )
             .await
         {
             Ok(claims) => {
-                runtime.set_outbox_reconciliation_available(true);
+                if hinted_creators.is_none() {
+                    runtime.set_outbox_reconciliation_available(true);
+                }
                 claims
             }
             Err(_) => {
@@ -839,14 +1071,11 @@ async fn outbox_reconciliation_loop(workers: Arc<WorkerComponents>, runtime: Arc
         let mut outbox_available = true;
         while let Some(result) = batch.join_next().await {
             match result {
-                Ok(Ok((_, ProcessingHealth::Available))) => {}
-                Ok(Ok((
-                    _,
-                    ProcessingHealth::Retryable(_) | ProcessingHealth::PermanentFailure,
-                ))) => {
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) => {
                     delivery_available = false;
+                    outbox_available = false;
                 }
-                Ok(Err(_)) => outbox_available = false,
                 Err(_) => panic!("owned outbox reconciliation task exited unexpectedly"),
             }
         }
@@ -859,16 +1088,39 @@ async fn outbox_reconciliation_loop(workers: Arc<WorkerComponents>, runtime: Arc
                 outbox_available = false;
             }
         }
-        delivery_available &= reconcile_payment_request_lifecycles(workers.clone()).await;
-        runtime.set_paykit_reconciliation_available(delivery_available);
-        runtime.set_outbox_reconciliation_available(outbox_available);
+        delivery_available &=
+            reconcile_payment_request_lifecycles(workers.clone(), hinted_creators.as_deref()).await;
+        if !delivery_available || hinted_creators.is_none() {
+            runtime.set_paykit_reconciliation_available(delivery_available);
+        }
+        if !outbox_available || hinted_creators.is_none() {
+            runtime.set_outbox_reconciliation_available(outbox_available);
+        }
     }
 }
 
-async fn reconcile_payment_request_lifecycles(workers: Arc<WorkerComponents>) -> bool {
-    let creator_ids = match workers.payment_request_lifecycles.creator_ids().await {
-        Ok(creator_ids) => creator_ids,
-        Err(_) => return false,
+/// Only failing to enumerate Creators is systemic here. One Creator's receive or
+/// projection failure (often one Reader's homeserver) is retried on the next pass
+/// and must not withdraw every Creator's rail; durable delivery failures still
+/// degrade readiness through `delivery_available`.
+async fn reconcile_payment_request_lifecycles(
+    workers: Arc<WorkerComponents>,
+    hinted_creators: Option<&[Uuid]>,
+) -> bool {
+    let creator_ids = match hinted_creators {
+        Some(creators) => creators.to_vec(),
+        None => match workers.payment_request_lifecycles.creator_ids().await {
+            Ok(creator_ids) => creator_ids,
+            Err(error) => {
+                tracing::warn!(
+                    stage = "lifecycle_reconciliation",
+                    step = "creator_ids_load",
+                    category = error.diagnostic_label(),
+                    "Payment request lifecycle reconciliation unavailable"
+                );
+                return false;
+            }
+        },
     };
     let mut batch = JoinSet::new();
     for creator_id in creator_ids {
@@ -876,25 +1128,89 @@ async fn reconcile_payment_request_lifecycles(workers: Arc<WorkerComponents>) ->
         batch.spawn(async move {
             let adapter = creator_adapter(&workers, creator_id)
                 .await
-                .map_err(|_| ())?;
+                .map_err(|error| ("adapter_build", error.diagnostic_label()))?;
             adapter
                 .receive_and_project_payment_requests(&workers.payment_request_lifecycles)
                 .await
-                .map_err(|_| ())
+                .map_err(|error| ("receive_and_project", error.diagnostic_label()))
         });
     }
     let mut available = true;
     while let Some(result) = batch.join_next().await {
-        if !matches!(result, Ok(Ok(()))) {
-            available = false;
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err((step, category))) => {
+                tracing::warn!(
+                    stage = "lifecycle_reconciliation",
+                    step,
+                    category,
+                    "Creator payment request reconciliation deferred"
+                );
+            }
+            Err(_) => {
+                tracing::warn!(
+                    stage = "lifecycle_reconciliation",
+                    step = "task_join",
+                    "Payment request lifecycle reconciliation task failed"
+                );
+                available = false;
+            }
         }
     }
     available
 }
 
+/// A single failed tick is routine for a remote Electrum server. Readiness turns
+/// degraded only once failures persist for both a tick count and a wall-clock
+/// span, so a short `poll_interval` cannot turn a blip into a withdrawn rail.
+const ELECTRUM_DEGRADED_AFTER_FAILURES: u32 = 3;
+const ELECTRUM_DEGRADED_AFTER: Duration = Duration::from_secs(30);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ElectrumTick {
+    /// No observation target, so Electrum was not called.
+    Idle,
+    Succeeded,
+    Failed,
+}
+
+#[derive(Debug, Default)]
+struct ElectrumReadiness {
+    last_success: Option<tokio::time::Instant>,
+    consecutive_failures: u32,
+}
+
+impl ElectrumReadiness {
+    /// Records one observer tick and returns whether Electrum counts as available.
+    /// Only a completed observation is evidence of Electrum success; an idle tick
+    /// keeps the no-work readiness without establishing any. Before any success a
+    /// failure is reported immediately.
+    fn record(&mut self, tick: ElectrumTick, now: tokio::time::Instant) -> bool {
+        match tick {
+            ElectrumTick::Idle => true,
+            ElectrumTick::Succeeded => {
+                self.last_success = Some(now);
+                self.consecutive_failures = 0;
+                true
+            }
+            ElectrumTick::Failed => {
+                self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+                match self.last_success {
+                    None => false,
+                    Some(last_success) => {
+                        self.consecutive_failures < ELECTRUM_DEGRADED_AFTER_FAILURES
+                            || now.saturating_duration_since(last_success) < ELECTRUM_DEGRADED_AFTER
+                    }
+                }
+            }
+        }
+    }
+}
+
 async fn observer_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtime>) {
     let mut interval = tokio::time::interval(workers.electrum_poll_interval);
     interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut readiness = ElectrumReadiness::default();
     loop {
         tokio::select! {
             _ = runtime.cancelled() => break,
@@ -903,27 +1219,67 @@ async fn observer_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtime>) {
         if !runtime.may_start_worker_claim() {
             break;
         }
-        let targets = match workers.invoices.observation_targets().await {
-            Ok(targets) => targets,
-            Err(_) => {
-                runtime.set_electrum_available(false);
-                continue;
+        let mut failure: Option<(&'static str, &'static str)> = None;
+        let mut observed = false;
+        match workers.invoices.observation_targets().await {
+            Ok(targets) if !targets.is_empty() => {
+                observed = true;
+                if let Err(error) = observe_once(
+                    workers.electrum.as_ref(),
+                    &workers.invoices,
+                    &workers.bitcoin_network,
+                    &targets,
+                )
+                .await
+                {
+                    failure.get_or_insert(("invoice_observation", error.diagnostic_label()));
+                }
             }
-        };
-        if targets.is_empty() {
-            runtime.set_electrum_available(true);
-            continue;
+            Ok(_) => {}
+            Err(error) => {
+                failure.get_or_insert(("invoice_targets_load", error.diagnostic_label()));
+            }
         }
-        runtime.set_electrum_available(
-            observe_once(
-                workers.electrum.as_ref(),
-                &workers.invoices,
-                &workers.bitcoin_network,
-                &targets,
-            )
-            .await
-            .is_ok(),
-        );
+        match workers.marketplace_preparations.observation_targets().await {
+            Ok(targets) if !targets.is_empty() => {
+                observed = true;
+                if let Err(error) = observe_marketplace_once(
+                    workers.electrum.as_ref(),
+                    workers.marketplace_preparations.as_ref(),
+                    &workers.bitcoin_network,
+                    &targets,
+                )
+                .await
+                {
+                    failure.get_or_insert(("marketplace_observation", error.diagnostic_label()));
+                }
+            }
+            Ok(_) => {}
+            Err(error) => {
+                failure.get_or_insert(("marketplace_targets_load", error.diagnostic_label()));
+            }
+        }
+        let tick = match (failure, observed) {
+            (Some(_), _) => ElectrumTick::Failed,
+            (None, true) => ElectrumTick::Succeeded,
+            (None, false) => ElectrumTick::Idle,
+        };
+        let now = tokio::time::Instant::now();
+        let available = readiness.record(tick, now);
+        if let Some((step, category)) = failure {
+            tracing::warn!(
+                stage = "electrum_observation",
+                step,
+                category,
+                consecutive_failures = readiness.consecutive_failures,
+                degraded = !available,
+                "Electrum observation tick failed"
+            );
+        }
+        if tick == ElectrumTick::Succeeded {
+            runtime.metrics().record_electrum_success(now.into_std());
+        }
+        runtime.set_electrum_available(available);
     }
 }
 
@@ -943,6 +1299,60 @@ fn map_electrum_error(_: ObserverError) -> ServerBuildError {
 struct CreatorSessionValidator {
     creators: CreatorStore,
     sessions: CreatorSessions,
+    identity_states: IdentityStateReads,
+}
+
+/// How long a Creator's last identity state read stands in for one that lost
+/// the shared-state lock. It outlasts the SDK's 5-minute uncertain-write
+/// cooldown, during which another holder keeps the lock.
+const IDENTITY_STATE_BUSY_GRACE: Duration = Duration::from_secs(10 * 60);
+
+/// When each Creator's identity state was last read. Reading it takes the
+/// Creator's shared-state write lock, which Bitkit, the outbox workers and
+/// concurrent readiness checks also take, so a busy lock says nothing about
+/// whether the state is there.
+#[derive(Clone, Default)]
+struct IdentityStateReads {
+    read_at: Arc<std::sync::Mutex<std::collections::HashMap<String, tokio::time::Instant>>>,
+}
+
+impl IdentityStateReads {
+    /// The outcome of the identity state step: a read state is recorded, and a
+    /// read that lost the lock passes when the state was read within
+    /// [`IDENTITY_STATE_BUSY_GRACE`]. Every other failure is unchanged.
+    fn outcome(
+        &self,
+        creator: &CreatorPubky,
+        loaded: Result<bool, PaykitSdkError>,
+        now: tokio::time::Instant,
+    ) -> Result<(), SessionValidationError> {
+        let mut read_at = self
+            .read_at
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        match loaded {
+            Ok(true) => {
+                read_at.retain(|_, at| now.duration_since(*at) < IDENTITY_STATE_BUSY_GRACE);
+                read_at.insert(creator.to_string(), now);
+                Ok(())
+            }
+            Ok(false) => {
+                read_at.remove(&creator.to_string());
+                Err(SessionValidationError::Invalid)
+            }
+            Err(PaykitSdkError::SharedStateBusy { .. })
+                if read_at
+                    .get(&creator.to_string())
+                    .is_some_and(|at| now.duration_since(*at) < IDENTITY_STATE_BUSY_GRACE) =>
+            {
+                Ok(())
+            }
+            Err(error) => {
+                let mapped = map_session_validation_error(error);
+                Err(session_failure("identity_state_load", mapped))
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -1023,15 +1433,12 @@ impl SessionValidator for CreatorSessionValidator {
             return Err(SessionValidationError::Invalid);
         }
         use paykit_sdk::StorageAdapter;
-        paykit_sdk::PubkySharedStateStorage::new(provider)
+        let loaded = paykit_sdk::PubkySharedStateStorage::new(provider)
             .transaction(|tx| Ok(tx.load_identity_state()))
             .await
-            .map_err(|error| {
-                let mapped = map_session_validation_error(error);
-                session_failure("identity_state_load", mapped)
-            })?
-            .ok_or(SessionValidationError::Invalid)?;
-        Ok(())
+            .map(|state| state.is_some());
+        self.identity_states
+            .outcome(creator, loaded, tokio::time::Instant::now())
     }
 }
 
@@ -1168,11 +1575,124 @@ impl AppRegistryDiscovery for PubkyAppRegistryDiscovery {
                 }
             })
     }
+
+    async fn authorization(
+        &self,
+        reader: &ReaderPubky,
+    ) -> Result<ReaderAuthorization, RegistryDiscoveryError> {
+        let reader = PubkyPublicKey::from_raw_or_app_key(reader.to_string())
+            .and_then(|key| key.to_public_key())
+            .map_err(|_| RegistryDiscoveryError::InvalidRequest)?;
+        reader_authorization(get_paykit_noise_key_authorization(&self.storage, &reader).await)
+    }
+}
+
+/// Deserializing the record verifies the identity signature and pins the owner,
+/// so only `Ok(Some(_))` is verified.
+fn reader_authorization<T>(
+    fetched: Result<Option<T>, PaykitError>,
+) -> Result<ReaderAuthorization, RegistryDiscoveryError> {
+    match fetched {
+        Ok(Some(_)) => Ok(ReaderAuthorization::Verified),
+        Ok(None) | Err(PaykitError::NotFound(_)) => Ok(ReaderAuthorization::Missing),
+        Err(PaykitError::InvalidData { .. } | PaykitError::Validation(_)) => {
+            Ok(ReaderAuthorization::Invalid)
+        }
+        Err(PaykitError::Transport { .. }) => Err(RegistryDiscoveryError::Unavailable),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn busy() -> Result<bool, PaykitSdkError> {
+        Err(PaykitSdkError::SharedStateBusy {
+            context: "Pubky shared state remains locked; retry later".into(),
+            source: None,
+        })
+    }
+
+    #[test]
+    fn a_busy_shared_state_lock_keeps_a_recently_read_identity_state() {
+        let reads = IdentityStateReads::default();
+        let creator = crate::domain::locks::parse_creator(
+            "pubky3f4khszd4gzg38bsazw88dmcfws36js9ct19s9dikb3a9ht3r84y",
+        )
+        .expect("creator");
+        let start = tokio::time::Instant::now();
+
+        assert_eq!(
+            reads.outcome(&creator, busy(), start),
+            Err(SessionValidationError::Unavailable),
+            "a busy lock with no earlier read cannot say"
+        );
+        assert_eq!(reads.outcome(&creator, Ok(true), start), Ok(()));
+        assert_eq!(
+            reads.outcome(&creator, busy(), start + Duration::from_secs(5 * 60)),
+            Ok(()),
+            "a busy lock within the grace keeps the earlier read"
+        );
+        assert_eq!(
+            reads.outcome(&creator, busy(), start + IDENTITY_STATE_BUSY_GRACE),
+            Err(SessionValidationError::Unavailable),
+            "the grace runs from the last read, not the last busy answer"
+        );
+        assert_eq!(
+            reads.outcome(
+                &creator,
+                Err(PaykitSdkError::Transport {
+                    context: "read encrypted Pubky shared state".into(),
+                    source: None,
+                }),
+                start + Duration::from_secs(1),
+            ),
+            Err(SessionValidationError::Unavailable),
+            "only a busy lock is covered"
+        );
+        assert_eq!(
+            reads.outcome(&creator, Ok(false), start + Duration::from_secs(2)),
+            Err(SessionValidationError::Invalid)
+        );
+        assert_eq!(
+            reads.outcome(&creator, busy(), start + Duration::from_secs(3)),
+            Err(SessionValidationError::Unavailable),
+            "missing identity state forgets the earlier read"
+        );
+    }
+
+    #[test]
+    fn reader_authorization_is_verified_only_for_a_fetched_record() {
+        let cases = [
+            (Ok(Some(())), Ok(ReaderAuthorization::Verified)),
+            (Ok(None), Ok(ReaderAuthorization::Missing)),
+            (
+                Err(PaykitError::NotFound("gone".into())),
+                Ok(ReaderAuthorization::Missing),
+            ),
+            (
+                Err(PaykitError::InvalidData {
+                    context: "bad signature".into(),
+                    source: None,
+                }),
+                Ok(ReaderAuthorization::Invalid),
+            ),
+            (
+                Err(PaykitError::Validation("other owner".into())),
+                Ok(ReaderAuthorization::Invalid),
+            ),
+            (
+                Err(PaykitError::Transport {
+                    context: "read failed".into(),
+                    source: anyhow::anyhow!("connection reset"),
+                }),
+                Err(RegistryDiscoveryError::Unavailable),
+            ),
+        ];
+        for (fetched, expected) in cases {
+            assert_eq!(reader_authorization(fetched), expected);
+        }
+    }
 
     #[tokio::test]
     async fn setup_auth_relay_matches_the_configured_pubky_network() {
@@ -1292,48 +1812,142 @@ mod tests {
     }
 
     #[test]
-    fn link_establishment_retry_delay_is_capped_below_general_backoff() {
+    fn pending_links_do_not_inflate_failure_backoff() {
         let initial = Duration::from_secs(1);
         let maximum = Duration::from_secs(300);
+        let rapid_attempts = 3;
+        let rapid_interval = Duration::from_millis(500);
 
-        for attempt in 1..=RAPID_LINK_ESTABLISHMENT_RETRY_ATTEMPTS {
-            let schedule = outbox_retry_schedule(initial, maximum, attempt);
+        for attempt in 1_i32..=3 {
+            let schedule =
+                outbox_retry_schedule(initial, maximum, rapid_attempts, rapid_interval, attempt, 0);
             assert_eq!(
-                schedule.delay_for(OutboxRetryClass::LinkEstablishment),
-                Duration::from_secs(1)
+                schedule.delay_for(OutboxRetryClass::LinkPending),
+                rapid_interval
             );
         }
 
         assert_eq!(
-            outbox_retry_schedule(initial, maximum, 21)
-                .delay_for(OutboxRetryClass::LinkEstablishment),
+            outbox_retry_schedule(initial, maximum, rapid_attempts, rapid_interval, 4, 0)
+                .delay_for(OutboxRetryClass::LinkPending),
             Duration::from_secs(1)
         );
         assert_eq!(
-            outbox_retry_schedule(initial, maximum, 22)
+            outbox_retry_schedule(initial, maximum, rapid_attempts, rapid_interval, 5, 0)
+                .delay_for(OutboxRetryClass::LinkPending),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            outbox_retry_schedule(initial, maximum, rapid_attempts, rapid_interval, 30, 0)
+                .delay_for(OutboxRetryClass::LinkPending),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            outbox_retry_schedule(initial, maximum, rapid_attempts, rapid_interval, 30, 0)
+                .default_delay(),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            outbox_retry_schedule(initial, maximum, rapid_attempts, rapid_interval, 30, 1)
                 .delay_for(OutboxRetryClass::LinkEstablishment),
             Duration::from_secs(2)
         );
         assert_eq!(
-            outbox_retry_schedule(initial, maximum, 30)
-                .delay_for(OutboxRetryClass::LinkEstablishment),
-            Duration::from_secs(5)
-        );
-        assert_eq!(
-            outbox_retry_schedule(initial, maximum, 30).default_delay(),
+            outbox_retry_schedule(initial, maximum, rapid_attempts, rapid_interval, 30, 30)
+                .default_delay(),
             Duration::from_secs(300)
         );
     }
 
+    #[test]
+    fn electrum_blips_do_not_degrade_until_failures_persist() {
+        use ElectrumTick::{Failed, Succeeded};
+        let start = tokio::time::Instant::now();
+        let mut readiness = ElectrumReadiness::default();
+        assert!(readiness.record(Succeeded, start));
+
+        // Second-scale bursts as seen on a 1 s poll interval stay available.
+        for second in 1..=5 {
+            assert!(readiness.record(Failed, start + Duration::from_secs(second)));
+        }
+        assert!(readiness.record(Succeeded, start + Duration::from_secs(6)));
+        assert_eq!(readiness.consecutive_failures, 0);
+
+        // Long-interval polling needs the tick count as well as the span.
+        let last_success = start + Duration::from_secs(6);
+        assert!(readiness.record(Failed, last_success + Duration::from_secs(40)));
+        assert!(readiness.record(Failed, last_success + Duration::from_secs(80)));
+        assert!(!readiness.record(Failed, last_success + Duration::from_secs(120)));
+
+        // A sustained outage on a short interval degrades once the span elapses.
+        let mut readiness = ElectrumReadiness::default();
+        assert!(readiness.record(Succeeded, start));
+        for second in 1..30 {
+            assert!(readiness.record(Failed, start + Duration::from_secs(second)));
+        }
+        assert!(!readiness.record(Failed, start + Duration::from_secs(30)));
+        assert!(readiness.record(Succeeded, start + Duration::from_secs(31)));
+    }
+
+    #[test]
+    fn electrum_failure_before_any_success_is_reported_immediately() {
+        let start = tokio::time::Instant::now();
+        let mut readiness = ElectrumReadiness::default();
+        assert!(!readiness.record(ElectrumTick::Failed, start));
+        assert!(readiness.record(ElectrumTick::Succeeded, start + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn idle_electrum_ticks_never_establish_success() {
+        let start = tokio::time::Instant::now();
+        let mut readiness = ElectrumReadiness::default();
+        for second in 0..60 {
+            assert!(readiness.record(ElectrumTick::Idle, start + Duration::from_secs(second)));
+        }
+        assert_eq!(readiness.last_success, None);
+        assert!(!readiness.record(ElectrumTick::Failed, start + Duration::from_secs(60)));
+    }
+
     #[tokio::test]
-    async fn production_spawn_path_owns_all_four_workers() {
+    async fn production_spawn_path_owns_all_workers() {
+        let server = test_server().await;
+        let mut tasks = spawn_owned_workers(server.workers, server.runtime);
+        assert_eq!(tasks.len(), 5);
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_creator_lock_wait_before_claiming() {
+        let server = test_server().await;
+        let creator = Uuid::new_v4();
+        let guard = creator_mutation_lock(creator).lock_owned().await;
+        let work = process_creator_outbox(
+            Arc::new(server.workers),
+            server.runtime.clone(),
+            Uuid::new_v4(),
+            creator,
+        );
+        tokio::pin!(work);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut work)
+                .await
+                .is_err()
+        );
+        server.runtime.begin_shutdown();
+        // The fixture's database is unreachable; a claim attempt would return an error.
+        assert_eq!(work.await.unwrap(), None);
+        drop(guard);
+    }
+
+    async fn test_server() -> Server {
         let config = Config::from_toml_and_environment(
             &format!(
                 r#"
 [http]
 listen_addr = "127.0.0.1:0"
-[locks]
-trusted_public_key = "{CONFIG_KEY}"
+[signed_services]
+trusted_public_keys = ["{CONFIG_KEY}"]
 [setup]
 allowed_origins = ["https://app.example"]
 [paykit]
@@ -1359,10 +1973,6 @@ poll_interval = "1s"
         let pool = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy("postgres://127.0.0.1:1/paykit")
             .unwrap();
-        let server = Server::build(config, pool).await.unwrap();
-        let mut tasks = spawn_owned_workers(server.workers, server.runtime);
-        assert_eq!(tasks.len(), 4);
-        tasks.abort_all();
-        while tasks.join_next().await.is_some() {}
+        Server::build(config, pool).await.unwrap()
     }
 }

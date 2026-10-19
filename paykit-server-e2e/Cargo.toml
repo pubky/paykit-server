@@ -1,6 +1,6 @@
 [package]
 name = "paykit-server-e2e"
-version = "0.1.0-rc9"
+version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -34,5 +34,6 @@ serde.workspace = true
 serde_json.workspace = true
 serde_json_canonicalizer.workspace = true
 time.workspace = true
+tracing-subscriber.workspace = true
 tower = { version = "0.5", features = ["util"] }
 http-relay = { version = "0.7", default-features = false, features = ["server"] }

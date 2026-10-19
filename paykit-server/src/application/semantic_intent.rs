@@ -170,6 +170,13 @@ impl DeliveryIntentV1 {
             .map_err(|_| DeliveryIntentError::Invalid)?;
         let payment = OffsetDateTime::parse(&payment_deadline, &Rfc3339)
             .map_err(|_| DeliveryIntentError::Invalid)?;
+        // The SDK reports a payment deadline in its own canonical form, and the
+        // delivered request is attributed to this intent by exact term equality.
+        let payment_deadline = PaymentDeadline::At {
+            timestamp: payment_deadline,
+        }
+        .at(None)
+        .map_err(|_| DeliveryIntentError::Invalid)?;
         if proposal >= payment {
             return Err(DeliveryIntentError::Invalid);
         }
@@ -230,6 +237,20 @@ impl DeliveryIntentV1 {
             DeliveryOperationV1::PaymentRequestCancellation { .. } => {
                 Err(DeliveryIntentError::Invalid)
             }
+        }
+    }
+
+    pub fn proposal_expires_at(&self) -> Result<Option<OffsetDateTime>, DeliveryIntentError> {
+        match &self.operation {
+            DeliveryOperationV1::PaymentRequestProposal { terms } => terms
+                .proposal_expires_at
+                .as_deref()
+                .map(|deadline| {
+                    OffsetDateTime::parse(deadline, &Rfc3339)
+                        .map_err(|_| DeliveryIntentError::Invalid)
+                })
+                .transpose(),
+            DeliveryOperationV1::PaymentRequestCancellation { .. } => Ok(None),
         }
     }
 
