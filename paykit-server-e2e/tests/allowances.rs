@@ -100,8 +100,8 @@ fn config(database_url: &str, signing_key: &SigningKey) -> Config {
             r#"
 [http]
 listen_addr = "127.0.0.1:0"
-[locks]
-trusted_public_key = "{trusted_key}"
+[signed_services]
+trusted_public_keys = ["{trusted_key}"]
 [setup]
 allowed_origins = ["https://app.example"]
 [paykit]
@@ -161,7 +161,8 @@ fn content_lock(creator: &CreatorPubky) -> ContentLock {
             params: serde_json::json!({
                 "recipient_pubky": creator.to_string(),
                 "amount": LOCK_SATS.to_string(),
-                "asset": "BTC"
+                "asset": "BTC",
+                "payment_in": 24
             }),
         }],
         lock_logic: LockLogic::All {
@@ -188,6 +189,8 @@ struct Stack {
     reader_key: PubkyPublicKey,
     reader_access: PubkySessionAccess,
     reader_sdk: ReaderSdk,
+    bootstrap: PubkySessionBootstrap,
+    homeserver: PubkyPublicKey,
     _testnet: EphemeralTestnet,
     database: TestDatabase,
     shutdown_tx: tokio::sync::oneshot::Sender<()>,
@@ -326,6 +329,8 @@ async fn boot(seed: u8) -> Stack {
         reader_key,
         reader_access,
         reader_sdk,
+        bootstrap,
+        homeserver,
         _testnet: testnet,
         database,
         shutdown_tx,
@@ -831,7 +836,7 @@ async fn allowance_proposed_on_the_server_link_covers_the_next_locks_invoice() {
     // The reader controls what it sends back. A message that reuses the Event
     // ID of the server's proposal (or one that names the request and fails
     // validation) makes the SDK's derived record drop the server's own
-    // outbound proposal. The retry below must not decide from that record.
+    // outbound proposal. The retry below must still find the first request.
     let outbound_proposals = outbound_proposal_events(&stack.creator_sdk).await;
     assert_eq!(outbound_proposals.len(), 2);
     for proposal in &outbound_proposals {
@@ -895,7 +900,8 @@ async fn allowance_proposed_on_the_server_link_covers_the_next_locks_invoice() {
     assert_eq!(queued_proposals(&stack.creator_sdk).await, queued);
 
     // The retry read the reader's messages, and the SDK's derived records no
-    // longer carry the server's proposals: a lookup through them finds nothing.
+    // longer carry the server's proposals, yet it kept each row's stable
+    // Payment Request ID.
     let derived =
         when_unlocked(|| stack.creator_sdk.payment_requests_with(&stack.reader_key)).await;
     for sent in &outbound_proposals {
@@ -990,6 +996,122 @@ async fn a_backlog_of_proposals_is_drained_without_holding_up_requests() {
         .filter(|record| record.kind == "paykit.allowance_acceptance")
         .count();
     assert_eq!(acceptances, BACKLOG);
+
+    stack.shutdown().await;
+}
+
+/// Another App on the Creator's identity can link a peer this server never
+/// invoiced. The server leaves that peer's Allowance proposals to that App.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_linked_peer_the_server_never_invoiced_gets_no_acceptance() {
+    let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
+    let stack = boot(73).await;
+
+    post_locks_invoice(&stack, BUNDLE_BEFORE_GRANT).await;
+    wait_for_request(&stack, BUNDLE_BEFORE_GRANT).await;
+
+    // A contact the Creator's wallet linked on the shared identity.
+    let stranger_account = stack
+        .bootstrap
+        .sign_up(
+            &PubkyLocalSecretKey::new(Keypair::random().secret_key()),
+            &stack.homeserver,
+            None,
+            PAYKIT_AUTHORIZER_SESSION_CAPABILITIES,
+        )
+        .await
+        .unwrap();
+    let stranger_key = stranger_account.public_key.clone();
+    let stranger = hosted_sdk(stranger_account.access, "bitkit", 0).await;
+    stranger
+        .initiate_link_with_peer(stack.creator_key.clone())
+        .await
+        .unwrap();
+    when_unlocked(|| {
+        stack
+            .creator_sdk
+            .accept_link_with_peer(stranger_key.clone())
+    })
+    .await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let creator_side = when_unlocked(|| {
+            stack
+                .creator_sdk
+                .advance_link_handshake(stranger_key.clone())
+        })
+        .await
+        .state;
+        let stranger_side = stranger
+            .advance_link_handshake(stack.creator_key.clone())
+            .await
+            .unwrap()
+            .state;
+        if creator_side == LinkedPeerState::Linked && stranger_side == LinkedPeerState::Linked {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "link timed out");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // The stranger proposes, and the server's transport stores the proposal.
+    let unscoped = stranger
+        .propose_allowance(
+            stack.creator_key.clone(),
+            AllowanceLocalRole::Allower,
+            allowance_terms("0.00005000"),
+        )
+        .await
+        .unwrap();
+    stranger
+        .process_outbound_private_messages(stack.creator_key.clone())
+        .await
+        .unwrap();
+    let creator_record = || async {
+        when_unlocked(|| {
+            stack.creator_sdk.list_allowances(AllowanceFilter {
+                counterparty: Some(stranger_key.clone()),
+                local_role: None,
+                states: Vec::new(),
+            })
+        })
+        .await
+        .into_iter()
+        .find(|record| record.allowance_id == unscoped.allowance_id)
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while creator_record().await.is_none() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the server never received the stranger's proposal"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // The reader proposes after it. The intake pass that accepts the reader's
+    // proposal also saw the stranger's.
+    let scoped = stack
+        .reader_sdk
+        .propose_allowance(
+            stack.creator_key.clone(),
+            AllowanceLocalRole::Allower,
+            allowance_terms("0.00005000"),
+        )
+        .await
+        .unwrap();
+    stack
+        .reader_sdk
+        .process_outbound_private_messages(stack.creator_key.clone())
+        .await
+        .unwrap();
+    let accepted = wait_for_acceptances(&stack, 1).await;
+    assert_eq!(accepted[0].allowance_id, scoped.allowance_id);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let record = creator_record().await.unwrap();
+    assert_eq!(record.state, AllowanceLifecycleState::Proposed);
+    assert_eq!(record.local_role, Some(AllowanceLocalRole::Allowee));
+    assert!(record.acceptance_event_id.is_none(), "{record:?}");
 
     stack.shutdown().await;
 }

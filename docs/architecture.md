@@ -49,14 +49,20 @@ The SDK owns encrypted identity-wide homeserver state under WebDAV locks. Apps
 share Encrypted Links and history; app IDs attribute requests and outbound records.
 The server does not maintain a PostgreSQL copy of SDK state. Its transport worker
 receives private events and processes queued delivery without executing payments.
-It also accepts, as the Allowee, the Allowance proposals a reader leaves on the
-server link, so the reader's wallet can pay later requests without a prompt.
-Acceptance never runs inside an outbox handoff: the SDK derives a link's whole
-history for each read and each acceptance, and the reader decides how large that
-history is. The worker reads a reader's Allowances only after that reader's link
-received new items, at most once per cooldown (10 seconds), accepts at most four
-proposals per read and takes the Creator mutation lock for one acceptance at a
-time. Proposals left behind the limit are accepted by the next read.
+A separate Allowance intake worker accepts, as the Allowee, the Allowance
+proposals a reader leaves on the server link, so the reader's wallet can pay
+later requests without a prompt. It answers only readers the Creator has
+invoiced (a Reader assignment exists); a peer another App on the shared
+identity linked is left to that App. The SDK derives a link's whole history for
+each read and each acceptance, and the reader decides how large that history
+is, so the intake never runs in an outbox handoff or the shared transport loop.
+It runs one task per Creator, reads a reader only after that reader's link
+received new items, no sooner than 10 seconds or ten times the last scan of
+its Allowances after the last read began, accepts at most four proposals per read and
+takes the Creator mutation lock for one acceptance at a time. A pass starts no
+new read after 5 seconds. During a derivation the Creator's other SDK
+operations are held back by its shared-state lock; only a bounded SDK operation
+removes that.
 The local reader demo likewise uses hosted SDK state; its encrypted local file
 retains only the app/Creator binding and a process ownership lock.
 

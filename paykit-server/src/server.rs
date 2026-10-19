@@ -28,7 +28,10 @@ use crate::{
     crypto::Crypto,
     domain::locks::{BundleId, CreatorPubky, PubkyLockResource, ReaderPubky},
     http::{self, auth::SignedServiceAuth},
-    paykit::{CreatorSessions, PaykitAdapter, creator_mutation_lock, sdk_error_label},
+    paykit::{
+        ALLOWANCE_INTAKE_COOLDOWN, AllowanceIntake, AllowanceIntakePasses, CreatorSessions,
+        PaykitAdapter, creator_mutation_lock, sdk_error_label,
+    },
     persistence::{
         CreatorStore, InvoiceStore, MarketplacePreparationStore, OutboxRetryClass, OutboxStore,
         PaymentDrainStore, PaymentRequestLifecycleStore, PersistenceError,
@@ -478,6 +481,7 @@ fn spawn_owned_workers(workers: WorkerComponents, runtime: Arc<Runtime>) -> Join
     tasks.spawn(outbox_enqueue_loop(workers.clone(), runtime.clone()));
     tasks.spawn(outbox_reconciliation_loop(workers.clone(), runtime.clone()));
     tasks.spawn(shared_transport_loop(workers.clone(), runtime.clone()));
+    tasks.spawn(allowance_intake_loop(workers.clone(), runtime.clone()));
     tasks.spawn(buyer_contacts_loop(workers.clone(), runtime.clone()));
     tasks.spawn(observer_loop(workers, runtime));
     tasks
@@ -582,6 +586,66 @@ async fn shared_transport_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runt
             runtime.set_paykit_transport_available(true);
         }
     }
+}
+
+/// Accepts the Allowance proposals invoiced readers leave on the server link.
+/// It runs apart from the shared transport loop, one task per Creator, because
+/// the SDK derives a reader's whole Allowance history on each read: a large
+/// history delays only that Creator's intake, never transport or another
+/// Creator.
+async fn allowance_intake_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtime>) {
+    let intake = Arc::new(AllowanceIntake::new(ALLOWANCE_INTAKE_COOLDOWN));
+    let mut passes = AllowanceIntakePasses::default();
+    let mut interval = tokio::time::interval(workers.outbox_poll_interval);
+    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = runtime.cancelled() => break,
+            _ = interval.tick() => {}
+        }
+        let creators = match workers.creators.ready_ids().await {
+            Ok(creators) => creators,
+            Err(error) => {
+                tracing::warn!(
+                    stage = "allowance_intake",
+                    step = "creator_ids_load",
+                    category = error.diagnostic_label(),
+                    "Paykit Allowance intake unavailable"
+                );
+                continue;
+            }
+        };
+        for creator in creators {
+            if !runtime.may_start_worker_claim() {
+                break;
+            }
+            let (workers, intake) = (workers.clone(), intake.clone());
+            passes.start(creator, async move {
+                let failure = match creator_adapter(&workers, creator).await {
+                    Ok(adapter) => {
+                        match adapter.take_in_allowances(&intake, &workers.invoices).await {
+                            Ok(())
+                            | Err(
+                                PaykitSdkError::ConcurrentUpdate { .. }
+                                | PaykitSdkError::SharedStateBusy { .. },
+                            ) => None,
+                            Err(error) => Some(("take_in_allowances", sdk_error_label(&error))),
+                        }
+                    }
+                    Err(error) => Some(("adapter_build", error.diagnostic_label())),
+                };
+                if let Some((step, category)) = failure {
+                    tracing::warn!(
+                        stage = "allowance_intake",
+                        step,
+                        category,
+                        "Paykit Allowance intake failed"
+                    );
+                }
+            });
+        }
+    }
+    passes.drain().await;
 }
 
 fn outbox_batch_size(config: &OutboxConfig) -> i64 {
@@ -1912,7 +1976,7 @@ mod tests {
     async fn production_spawn_path_owns_all_workers() {
         let server = test_server().await;
         let mut tasks = spawn_owned_workers(server.workers, server.runtime);
-        assert_eq!(tasks.len(), 5);
+        assert_eq!(tasks.len(), 6);
         tasks.abort_all();
         while tasks.join_next().await.is_some() {}
     }
