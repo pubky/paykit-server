@@ -591,6 +591,7 @@ async fn reauthentication_preserves_key_index_and_assignments_and_rejects_accoun
         .unwrap();
     let restored = creators.load(&creator()).await.unwrap();
     assert_eq!(restored.session_secret(), "new-session");
+    assert!(!creators.setup_complete(&creator()).await.unwrap());
     assert_eq!(restored.paykit_identity_secret().as_bytes(), &[9; 32]);
     assert_eq!(restored.bitcoin_account().unwrap().account_index, 7);
     assert_eq!(
@@ -620,7 +621,7 @@ async fn reauthentication_preserves_key_index_and_assignments_and_rejects_accoun
 }
 
 #[tokio::test]
-async fn reauthentication_requires_monotonic_key_generation_and_marks_setup_incomplete() {
+async fn reauthentication_requires_monotonic_key_generation_and_keeps_readiness() {
     let database = TestDatabase::create().await;
     let creators = stores(&database).await;
     creators
@@ -647,7 +648,8 @@ async fn reauthentication_requires_monotonic_key_generation_and_marks_setup_inco
         None,
     );
     creators.reauthenticate(&rotated).await.unwrap();
-    assert!(!creators.setup_complete(&creator()).await.unwrap());
+    // A reconnect that fails after this point must not take a ready Creator offline.
+    assert!(creators.setup_complete(&creator()).await.unwrap());
     assert_eq!(
         creators
             .load(&creator())

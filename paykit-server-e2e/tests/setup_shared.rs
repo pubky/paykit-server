@@ -155,7 +155,6 @@ impl AppPublisher for FailAfterPublication {
             Some(persisted.paykit_identity_secret()),
             access.paykit_identity_secret_key.as_ref()
         );
-        assert!(!self.creators.setup_complete(&self.creator).await.unwrap());
         // Workers can load persisted credentials before app publication completes.
         let provider = self.sessions.provider(&self.creator);
         let worker = provider.load_session_access().await.unwrap().unwrap();
@@ -528,6 +527,19 @@ async fn real_setup_reconnect_preserves_pending_invoices_and_hosted_state() {
         PollResult::Complete
     );
     assert!(creators.setup_complete(&creator).await.unwrap());
+
+    // A reconnect that fails after reauthentication keeps a ready Creator ready
+    // on the replacement session (pubky/paykit-server#105).
+    let ready_session = creators.load(&creator).await.unwrap();
+    publisher.fail.store(true, Ordering::SeqCst);
+    assert_eq!(
+        reconnect(&service, &bootstrap, &root, &key, &creator).await,
+        PollResult::Failed
+    );
+    assert!(creators.setup_complete(&creator).await.unwrap());
+    assert!(
+        creators.load(&creator).await.unwrap().session_secret() != ready_session.session_secret()
+    );
 
     let old_credentials = creators.load(&creator).await.unwrap();
     let old_access = sessions

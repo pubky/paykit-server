@@ -423,6 +423,8 @@ impl CreatorStore {
     }
 
     /// Replaces credentials after validating immutable account identity and key monotonicity.
+    /// Readiness is unchanged: a ready Creator keeps receiving if the rest of the
+    /// reconnect fails, and one that never finished setup stays not ready.
     pub async fn reauthenticate(
         &self,
         replacement: &CreatorCredentials,
@@ -451,7 +453,7 @@ impl CreatorStore {
             )
             .map_err(|_| PersistenceError::CorruptOrMissing)?;
         sqlx::query(
-            "UPDATE creators SET credential_envelope = $1, setup_complete = FALSE, updated_at = NOW() WHERE id = $2",
+            "UPDATE creators SET credential_envelope = $1, updated_at = NOW() WHERE id = $2",
         )
         .bind(envelope.as_bytes())
         .bind(row.id)
