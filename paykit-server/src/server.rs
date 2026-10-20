@@ -555,17 +555,25 @@ async fn shared_transport_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runt
             // One Creator's session or peer failure is retried on the next pass and
             // must not withdraw every Creator's rail.
             let failure = match creator_adapter(&workers, creator).await {
-                Ok(adapter) => match adapter.maintain_transport().await {
-                    Ok(()) => None,
-                    Err(
-                        PaykitSdkError::ConcurrentUpdate { .. }
-                        | PaykitSdkError::SharedStateBusy { .. },
-                    ) => {
-                        deferred = true;
-                        None
+                Ok(adapter) => {
+                    let result = if full_scan {
+                        adapter.maintain_transport().await
+                    } else {
+                        // Handoff hints concern work already queued in the SDK.
+                        adapter.maintain_outbound_transport().await
+                    };
+                    match result {
+                        Ok(()) => None,
+                        Err(
+                            PaykitSdkError::ConcurrentUpdate { .. }
+                            | PaykitSdkError::SharedStateBusy { .. },
+                        ) => {
+                            deferred = true;
+                            None
+                        }
+                        Err(error) => Some(("maintain_transport", sdk_error_label(&error))),
                     }
-                    Err(error) => Some(("maintain_transport", sdk_error_label(&error))),
-                },
+                }
                 Err(error) => Some(("adapter_build", error.diagnostic_label())),
             };
             if let Some((step, category)) = failure {
