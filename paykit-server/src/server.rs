@@ -611,7 +611,9 @@ async fn allowance_intake_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runt
 }
 
 /// Starts intake passes in the free slots, least recently started Creator
-/// first, skipping Creators whose pass is still running.
+/// first, skipping Creators whose pass is still running. A pass reads
+/// reader-supplied history, so it runs on its own task: a panic in it is
+/// logged and frees its slot instead of stopping the server.
 fn start_intake_passes<Pass, PassFuture>(
     tasks: &mut CreatorTasks<()>,
     turns: &mut IntakeTurns,
@@ -626,7 +628,21 @@ fn start_intake_passes<Pass, PassFuture>(
         if tasks.available_slots() == 0 {
             break;
         }
-        if !running.contains(&creator) && tasks.try_spawn(creator, pass(creator)) {
+        if running.contains(&creator) {
+            continue;
+        }
+        let pass = pass(creator);
+        let contained = async move {
+            if let Err(error) = tokio::spawn(pass).await
+                && error.is_panic()
+            {
+                tracing::error!(
+                    stage = "allowance_intake",
+                    "Paykit Allowance intake pass panicked"
+                );
+            }
+        };
+        if tasks.try_spawn(creator, contained) {
             turns.started(creator);
         }
     }
@@ -2100,6 +2116,13 @@ mod tests {
             });
             assert_eq!(tasks.active_creators().len(), 2);
             started.extend(tasks.active_creators());
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while active.load(Ordering::SeqCst) < 2 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
             // The longest-running pass finishes; its slot goes to a Creator
             // that has waited longer, not back to the first in the list.
             release.add_permits(1);
@@ -2112,6 +2135,37 @@ mod tests {
         release.add_permits(creators.len());
         while tasks.join_next().await.is_some() {}
         assert_eq!(peak.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_panicking_intake_pass_frees_its_slot() {
+        let runtime = test_server().await.runtime;
+        let mut tasks = CreatorTasks::new(1, runtime);
+        let mut turns = IntakeTurns::default();
+        let creator = Uuid::new_v4();
+
+        start_intake_passes(&mut tasks, &mut turns, vec![creator], |_| async {
+            panic!("malformed history");
+        });
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), tasks.join_next())
+                .await
+                .unwrap(),
+            Some((creator, ()))
+        );
+
+        // The slot is free and the Creator gets its next pass.
+        let (ran, done) = tokio::sync::oneshot::channel();
+        let mut ran = Some(ran);
+        start_intake_passes(&mut tasks, &mut turns, vec![creator], |_| {
+            let ran = ran.take().unwrap();
+            async move { ran.send(()).unwrap() }
+        });
+        tokio::time::timeout(Duration::from_secs(1), done)
+            .await
+            .unwrap()
+            .unwrap();
+        while tasks.join_next().await.is_some() {}
     }
 
     #[tokio::test]
