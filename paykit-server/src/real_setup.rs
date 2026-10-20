@@ -21,7 +21,7 @@ use crate::{
     domain::locks::{CreatorPubky, parse_creator},
     paykit::{CreatorSessions, ExplicitInputsPaymentAdapter, PaykitAdapter, creator_mutation_lock},
     persistence::{CreatorCredentials, CreatorStore, PaymentRequestLifecycleStore},
-    setup::{Completion, SetupAttempt, SetupCompleter, StartedSetup},
+    setup::{Completion, ReconnectScope, SetupAttempt, SetupCompleter, StartedSetup},
     setup_diagnostics::{
         SetupFailureClass, SetupOutcome, SetupStage, claim_failure_class, emit_setup_stage,
         persistence_failure_class, registry_failure_class, sdk_failure_class,
@@ -287,17 +287,24 @@ impl SetupCompleter for RealSetupCompleter {
         ))
     }
 
-    async fn start_reconnect(&self, creator: &CreatorPubky) -> Result<StartedSetup, Completion> {
+    async fn start_reconnect(
+        &self,
+        creator: &CreatorPubky,
+        scope: ReconnectScope,
+    ) -> Result<StartedSetup, Completion> {
+        if scope == ReconnectScope::UsdtOnly && !self.starter.usdt_enabled() {
+            return Err(Completion::DefinitiveFailure);
+        }
         self.creators
             .load_optional(creator)
             .await
             .map_err(|_| Completion::TransientUnavailable)?
             .ok_or(Completion::DefinitiveFailure)?;
-        let started = self
-            .starter
-            .start_reconnect()
-            .await
-            .map_err(|_| Completion::TransientUnavailable)?;
+        let started = match scope {
+            ReconnectScope::Full => self.starter.start_reconnect().await,
+            ReconnectScope::UsdtOnly => self.starter.start_usdt_reconnect().await,
+        }
+        .map_err(|_| Completion::TransientUnavailable)?;
         Ok(StartedSetup::new(
             started.authorization_url.clone(),
             Box::new(BitkitSetupAttempt {

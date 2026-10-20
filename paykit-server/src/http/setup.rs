@@ -14,7 +14,7 @@ use url::Url;
 use crate::config::BitcoinNetwork;
 use crate::domain::locks::{CreatorPubky, parse_creator};
 use crate::http::client_ip::client_ip;
-use crate::setup::{BeginError, PollResult, SetupService, StartedFlow};
+use crate::setup::{BeginError, PollResult, ReconnectScope, SetupService, StartedFlow};
 
 /// Setup routes keyed by the TCP peer, for a listener with no reverse proxy in front.
 pub fn setup_router(service: SetupService) -> Router {
@@ -52,7 +52,7 @@ async fn begin(
     headers: HeaderMap,
     RawQuery(query): RawQuery,
 ) -> Response<Body> {
-    let Some((return_to, state, None)) = parse_setup_query(query.as_deref(), false) else {
+    let Some((return_to, state, None, _)) = parse_setup_query(query.as_deref(), false) else {
         return invalid_request();
     };
     let client = client_ip(peer, &headers, trusted_proxy_hops);
@@ -71,13 +71,14 @@ async fn reconnect(
     headers: HeaderMap,
     RawQuery(query): RawQuery,
 ) -> Response<Body> {
-    let Some((return_to, state, Some(creator))) = parse_setup_query(query.as_deref(), true) else {
+    let Some((return_to, state, Some(creator), scope)) = parse_setup_query(query.as_deref(), true)
+    else {
         return invalid_request();
     };
     let client = client_ip(peer, &headers, trusted_proxy_hops);
     response_for_begin(
         service
-            .begin_reconnect(client, &return_to, &state, &creator)
+            .begin_scoped_reconnect(client, &return_to, &state, &creator, scope)
             .await,
         service.bitcoin_network(),
     )
@@ -113,10 +114,11 @@ async fn complete(
 fn parse_setup_query(
     query: Option<&str>,
     reconnect: bool,
-) -> Option<(String, String, Option<CreatorPubky>)> {
+) -> Option<(String, String, Option<CreatorPubky>, ReconnectScope)> {
     let mut return_to = None;
     let mut state = None;
     let mut creator = None;
+    let mut scope = None;
     for (key, value) in url::form_urlencoded::parse(query?.as_bytes()) {
         match key.as_ref() {
             "return_to" if return_to.is_none() => return_to = Some(value.into_owned()),
@@ -124,10 +126,14 @@ fn parse_setup_query(
             "creator" if reconnect && creator.is_none() => {
                 creator = Some(parse_creator(&value).ok()?)
             }
+            // `asset=USDT` asks Bitkit for the USDT address alone.
+            "asset" if reconnect && scope.is_none() && value == "USDT" => {
+                scope = Some(ReconnectScope::UsdtOnly)
+            }
             _ => return None,
         }
     }
-    Some((return_to?, state?, creator))
+    Some((return_to?, state?, creator, scope.unwrap_or_default()))
 }
 
 fn iframe_response(flow: StartedFlow, bitcoin_network: Option<&BitcoinNetwork>) -> Response<Body> {
