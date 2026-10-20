@@ -12,7 +12,8 @@ Paykit Identity Secret. Initial setup also requests a BIP84 account xpub. Reconn
 preserves it when the companion response omits account material; an explicit changed
 account is reconciled, generation-fenced, and rotated while historical accepted payments
 remain monitored. When USDT is enabled, setup and reconnect also request an optional
-Arbitrum receiving address. The server never receives Bitcoin spending keys or the Pubky
+Arbitrum receiving address; a reconnect with `asset=USDT` requests that address
+without account material. The server never receives Bitcoin spending keys or the Pubky
 identity secret. A previously omitted USDT address may be added, but an approved USDT
 address cannot change through reauthorization.
 

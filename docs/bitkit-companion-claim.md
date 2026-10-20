@@ -88,7 +88,10 @@ The canonical Creator must already exist before an AUTH request is created. It i
 retained in the in-memory flow and must exactly match the identity authenticated
 by Pubky AUTH; a different authorizer fails before credential writes or publication.
 Reconnect requests `paykit-access-v1.watch-only-account-v1`, plus
-`usdt-address-v1` when enabled. A 124-byte binary response explicitly supplies
+`usdt-address-v1` when enabled. `asset=USDT` requests
+`paykit-access-v1.usdt-address-v1` alone, so Bitkit prepares no account and the
+current one is retained; a reply carrying account material fails. It is refused
+when USDT is not enabled. A 124-byte binary response explicitly supplies
 the authenticated Bitcoin account; a 41-byte Paykit-only response is an
 authenticated omission and preserves the current account. Client IDs, display
 names, and relay URLs never select an account.
@@ -114,8 +117,9 @@ app, preserving invoices, reader assignments, old accepted-address observation,
 and the next address allocation index. Cancellation delivery is durable,
 asynchronous, and remains pending until canonical Paykit state confirms cancellation
 or prior acceptance. Publication failure retains retryable
-credentials with setup incomplete; it does not delete history or compensate by
-rewriting shared registry state.
+credentials. An initial or never-ready setup stays incomplete, while a failed
+reconnect keeps the Creator's prior readiness, including after a Bitcoin account
+rotation. Neither deletes history or compensates by rewriting shared registry state.
 
 ## Wire fixture
 

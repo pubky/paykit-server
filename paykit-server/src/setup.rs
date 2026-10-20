@@ -57,12 +57,26 @@ pub trait SetupCompleter: Send + Sync {
     /// Starts one normal Pubky AUTH request. The returned attempt is retained
     /// within one in-memory flow, not in a process-global completer.
     async fn start(&self) -> Result<StartedSetup, Completion>;
-    /// Starts Paykit-only reauthentication bound to an already configured creator.
-    async fn start_reconnect(&self, _creator: &CreatorPubky) -> Result<StartedSetup, Completion> {
+    /// Starts reauthentication bound to an already configured creator.
+    async fn start_reconnect(
+        &self,
+        _creator: &CreatorPubky,
+        _scope: ReconnectScope,
+    ) -> Result<StartedSetup, Completion> {
         Err(Completion::DefinitiveFailure)
     }
     /// Consumes the exact per-flow attempt after the iframe asks to complete.
     async fn complete(&self, attempt: Box<dyn SetupAttempt>) -> Completion;
+}
+
+/// What a reconnect asks Bitkit to share besides Paykit access.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ReconnectScope {
+    /// The Bitcoin account, plus the USDT address when USDT is enabled.
+    #[default]
+    Full,
+    /// The USDT address alone; the Bitcoin account is not requested and stays bound.
+    UsdtOnly,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -374,7 +388,7 @@ impl SetupService {
             .await
     }
 
-    /// Starts an explicit reconnect without requesting another watch-only account.
+    /// Starts an explicit reconnect bound to an existing creator.
     pub async fn begin_reconnect(
         &self,
         peer_ip: IpAddr,
@@ -382,7 +396,20 @@ impl SetupService {
         state: &str,
         creator: &CreatorPubky,
     ) -> Result<StartedFlow, BeginError> {
-        self.begin_for_creator(peer_ip, return_to, state, Some(creator))
+        self.begin_scoped_reconnect(peer_ip, return_to, state, creator, ReconnectScope::Full)
+            .await
+    }
+
+    /// Starts a reconnect that asks Bitkit only for what `scope` names.
+    pub async fn begin_scoped_reconnect(
+        &self,
+        peer_ip: IpAddr,
+        return_to: &str,
+        state: &str,
+        creator: &CreatorPubky,
+        scope: ReconnectScope,
+    ) -> Result<StartedFlow, BeginError> {
+        self.begin_for_creator(peer_ip, return_to, state, Some((creator, scope)))
             .await
     }
 
@@ -391,7 +418,7 @@ impl SetupService {
         peer_ip: IpAddr,
         return_to: &str,
         state: &str,
-        creator: Option<&CreatorPubky>,
+        creator: Option<(&CreatorPubky, ReconnectScope)>,
     ) -> Result<StartedFlow, BeginError> {
         let origin = validated_origin(return_to, &self.inner.allowed_origins)
             .ok_or(BeginError::InvalidRequest)?;
@@ -413,7 +440,7 @@ impl SetupService {
             .try_acquire_owned()
             .map_err(|_| BeginError::Unavailable)?;
         let started_setup = match creator {
-            Some(creator) => self.inner.completer.start_reconnect(creator).await,
+            Some((creator, scope)) => self.inner.completer.start_reconnect(creator, scope).await,
             None => self.inner.completer.start().await,
         }
         .map_err(|error| match error {

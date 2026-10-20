@@ -455,6 +455,14 @@ impl PaykitAdapter {
             );
         }
         // A peer's receive failure must not prevent other peers' queued sends.
+        results.push(self.maintain_outbound_transport().await);
+        check_transport_results(&results)
+    }
+
+    /// Processes durable outbound work without polling linked-peer inboxes.
+    /// Periodic transport maintenance still receives before discovering queued sends.
+    pub async fn maintain_outbound_transport(&self) -> paykit_sdk::Result<()> {
+        let mut results = Vec::new();
         let pending = {
             let _guard = self.mutation_lock.lock().await;
             self.sdk.pending_outbound_private_counterparties().await
@@ -541,9 +549,10 @@ impl PaykitAdapter {
             }
             _ => ReceiveHealth::Unavailable,
         };
-        self.project_payment_requests_locked(lifecycles, health)
+        let records = self
+            .project_payment_requests_locked(lifecycles, health)
             .await?;
-        self.observe_usdt_requests(None).await
+        self.observe_usdt_requests(&records, None).await
     }
 
     /// Reconciles every counterparty that can affect Bitcoin account rotation,
@@ -578,14 +587,15 @@ impl PaykitAdapter {
         .await;
         let receive_health = receive_health_for_required_targets(&reports, required_targets);
         self.project_payment_requests_locked(lifecycles, receive_health)
-            .await
+            .await?;
+        Ok(())
     }
 
     async fn project_payment_requests_locked(
         &self,
         lifecycles: &PaymentRequestLifecycleStore,
         receive_health: ReceiveHealth,
-    ) -> Result<(), LifecycleSyncError> {
+    ) -> Result<Vec<PaymentRequestRecord>, LifecycleSyncError> {
         let records = self
             .sdk
             .payment_requests()
@@ -601,23 +611,19 @@ impl PaykitAdapter {
             Ok(())
         })
         .await?;
-        Ok(())
+        Ok(records)
     }
 
     async fn observe_usdt_requests(
         &self,
+        records: &[PaymentRequestRecord],
         bundle: Option<&BundleId>,
     ) -> Result<(), LifecycleSyncError> {
         let Some((invoices, verifier)) = &self.usdt else {
             return Ok(());
         };
-        let records = self
-            .sdk
-            .payment_requests()
-            .await
-            .map_err(|_| LifecycleSyncError::Sdk)?;
         let mut result = Ok(());
-        for record in &records {
+        for record in records {
             if let Err(error) = invoices
                 .observe_usdt_request(self.creator_id, &self.creator, record, verifier, bundle)
                 .await
@@ -660,7 +666,8 @@ impl PaykitAdapter {
             )
             .await?;
         let _guard = self.mutation_lock.lock().await;
-        self.project_payment_requests_locked(lifecycles, receive_health)
+        let records = self
+            .project_payment_requests_locked(lifecycles, receive_health)
             .await
             .map_err(|error| {
                 let mapped = map_lifecycle_status_error(error);
@@ -671,7 +678,7 @@ impl PaykitAdapter {
                 );
                 mapped
             })?;
-        self.observe_usdt_requests(Some(bundle_id))
+        self.observe_usdt_requests(&records, Some(bundle_id))
             .await
             .map_err(map_lifecycle_status_error)?;
         statuses
@@ -1164,6 +1171,13 @@ pub(crate) fn creator_mutation_lock(creator_id: Uuid) -> Arc<CreatorMutationLock
     let lock = Arc::new(TokioMutex::new(()));
     registry.insert(creator_id, Arc::downgrade(&lock));
     lock
+}
+
+/// Acquires the Creator-local mutation fence for controlled transport fixtures.
+#[cfg(feature = "test-utils")]
+#[doc(hidden)]
+pub async fn acquire_creator_mutation_guard(creator_id: Uuid) -> tokio::sync::OwnedMutexGuard<()> {
+    creator_mutation_lock(creator_id).lock_owned().await
 }
 
 fn parse_peer(reader: &str) -> Result<PubkyPublicKey, HandoffError> {

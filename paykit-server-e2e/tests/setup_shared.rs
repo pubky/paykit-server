@@ -43,7 +43,7 @@ use paykit_server::{
         run_migrations,
     },
     real_setup::{AppPublisher, RealSetupCompleter, SharedAppPublisher},
-    setup::{PollResult, SetupLimits, SetupService, StartedFlow, SystemClock},
+    setup::{PollResult, ReconnectScope, SetupLimits, SetupService, StartedFlow, SystemClock},
     setup_orchestration::PubkyCompanionRelay,
 };
 use paykit_server_e2e::postgres::TestDatabase;
@@ -141,6 +141,7 @@ struct FailAfterPublication {
     sessions: CreatorSessions,
     creator: CreatorPubky,
     fail: AtomicBool,
+    fail_before_publication: AtomicBool,
     calls: AtomicUsize,
 }
 
@@ -155,7 +156,6 @@ impl AppPublisher for FailAfterPublication {
             Some(persisted.paykit_identity_secret()),
             access.paykit_identity_secret_key.as_ref()
         );
-        assert!(!self.creators.setup_complete(&self.creator).await.unwrap());
         // Workers can load persisted credentials before app publication completes.
         let provider = self.sessions.provider(&self.creator);
         let worker = provider.load_session_access().await.unwrap().unwrap();
@@ -172,6 +172,9 @@ impl AppPublisher for FailAfterPublication {
             "setup and workers must share one refreshed bearer"
         );
         self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.fail_before_publication.swap(false, Ordering::SeqCst) {
+            return Err(ClaimError::InvalidEnvelope);
+        }
         SharedAppPublisher.publish(access).await?;
         let registry = paykit_lib::get_paykit_app_registry(
             &worker.outbox_client.public_storage(),
@@ -414,6 +417,7 @@ async fn real_setup_reconnect_preserves_pending_invoices_and_hosted_state() {
         sessions: sessions.clone(),
         creator: creator.clone(),
         fail: AtomicBool::new(true),
+        fail_before_publication: AtomicBool::new(false),
         calls: AtomicUsize::new(0),
     });
     let completer = RealSetupCompleter::with_app_publisher(
@@ -437,7 +441,7 @@ async fn real_setup_reconnect_preserves_pending_invoices_and_hosted_state() {
         SetupLimits {
             max_polls_per_flow: 2,
             max_polls: 10,
-            setup_per_ip_per_minute: 20,
+            setup_per_ip_per_minute: 30,
             max_pending_setup_flows: 10,
         },
     );
@@ -528,6 +532,43 @@ async fn real_setup_reconnect_preserves_pending_invoices_and_hosted_state() {
         PollResult::Complete
     );
     assert!(creators.setup_complete(&creator).await.unwrap());
+
+    // A reconnect that fails after reauthentication keeps a ready Creator ready
+    // on the replacement session (pubky/paykit-server#105), whether publication
+    // fails before its write or after it.
+    let paykit_app = paykit_lib::PaykitAppId::new("paykit-server").unwrap();
+    for fail in [&publisher.fail_before_publication, &publisher.fail] {
+        let ready_session = creators.load(&creator).await.unwrap();
+        fail.store(true, Ordering::SeqCst);
+        assert_eq!(
+            reconnect(&service, &bootstrap, &root, &key, &creator).await,
+            PollResult::Failed
+        );
+        assert!(creators.setup_complete(&creator).await.unwrap());
+        let replacement = creators.load(&creator).await.unwrap();
+        assert!(replacement.session_secret() != ready_session.session_secret());
+        let worker = sessions
+            .provider(&creator)
+            .load_session_access()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            worker.paykit_identity_secret_key.as_ref(),
+            Some(replacement.paykit_identity_secret())
+        );
+        let registry = paykit_lib::get_paykit_app_registry(
+            &worker.outbox_client.public_storage(),
+            &worker.public_key().unwrap().to_public_key().unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            registry.apps().get(&paykit_app),
+            Some(&paykit_server::real_setup::server_app())
+        );
+    }
 
     let old_credentials = creators.load(&creator).await.unwrap();
     let old_access = sessions
@@ -922,6 +963,39 @@ poll_interval = "1s"
         server.contact_records().await.unwrap()[0].public_key,
         contact
     );
+
+    // Bitkit shares a new account on every reconnect, so a failed publication after
+    // the account cutover must also keep a ready Creator ready.
+    let generation = creators
+        .load_with_bitcoin_account_generation(&creator)
+        .await
+        .unwrap()
+        .1;
+    publisher
+        .fail_before_publication
+        .store(true, Ordering::SeqCst);
+    let new_account = encode_unsigned_payload(2, &account(2).encode(), &replacement);
+    assert_eq!(
+        reconnect_payload(
+            &service,
+            &bootstrap,
+            &root,
+            &creator,
+            new_account.as_slice()
+        )
+        .await,
+        PollResult::Failed
+    );
+    let (cut_over, cut_over_generation) = creators
+        .load_with_bitcoin_account_generation(&creator)
+        .await
+        .unwrap();
+    assert_eq!(cut_over_generation, generation + 1);
+    assert_eq!(
+        cut_over.bitcoin_account().unwrap().xpub.as_str(),
+        account(2).to_string()
+    );
+    assert!(creators.setup_complete(&creator).await.unwrap());
     database.cleanup().await;
 }
 
@@ -1191,7 +1265,8 @@ signed_burst = 200
             .unwrap();
         let home = PubkyPublicKey::from_public_key(&testnet.homeserver_app().public_key());
         let crypto = Arc::new(Crypto::from_master_key(&[1; 32]).unwrap());
-        let creators = CreatorStore::new(database.pool(), crypto);
+        let creators = CreatorStore::new(database.pool(), crypto.clone());
+        let invoices = InvoiceStore::new(database.pool(), crypto);
         let sessions = CreatorSessions::new(
             creators.clone(),
             client.clone(),
@@ -1233,7 +1308,7 @@ signed_burst = 200
         };
         let without_usdt_config = StatusRoute {
             signer: SigningKey::from_bytes(&[7; 32]),
-            creators,
+            creators: creators.clone(),
             sessions,
             usdt_enabled: false,
         };
@@ -1346,6 +1421,72 @@ signed_burst = 200
                 .await,
             SETUP_REQUIRED
         );
+
+        // "Add USDT" asks for the USDT address alone: the Bitcoin account, its
+        // generation and a pending request stay as they were.
+        let adds_usdt = enroll(&bootstrap, &home).await;
+        assert_eq!(
+            setup(&service, &bootstrap, &adds_usdt, None).await,
+            PollResult::Complete
+        );
+        let (bound, generation) = creators
+            .load_with_bitcoin_account_generation(&adds_usdt.creator)
+            .await
+            .unwrap();
+        let reader = parse_reader(&never_set_up.creator.to_string()).unwrap();
+        allocate_invoice(
+            &invoices,
+            &adds_usdt.creator,
+            &reader,
+            b"pending-before-usdt",
+            0,
+            generation,
+        )
+        .await;
+        let before = business_rows(&database).await;
+        // A Bitcoin account smuggled into the USDT-only reply is refused.
+        assert_eq!(
+            usdt_only_reconnect(&service, &bootstrap, &adds_usdt, true).await,
+            PollResult::Failed
+        );
+        assert_eq!(
+            usdt_only_reconnect(&service, &bootstrap, &adds_usdt, false).await,
+            PollResult::Complete
+        );
+        let (after, after_generation) = creators
+            .load_with_bitcoin_account_generation(&adds_usdt.creator)
+            .await
+            .unwrap();
+        assert_eq!(after.bitcoin_account(), bound.bitcoin_account());
+        assert_eq!(after_generation, generation);
+        assert_eq!(after.usdt_address().unwrap().as_str(), USDT_ADDRESS);
+        assert_eq!(business_rows(&database).await, before);
+        assert_eq!(route.accepted(&adds_usdt.creator, "BTC").await, READY);
+        assert_eq!(route.accepted(&adds_usdt.creator, "USDT").await, READY);
         database.cleanup().await;
+    }
+
+    async fn usdt_only_reconnect(
+        service: &SetupService,
+        bootstrap: &PubkySessionBootstrap,
+        seller: &Seller,
+        bitcoin: bool,
+    ) -> PollResult {
+        let flow = service
+            .begin_scoped_reconnect(
+                "127.0.0.1".parse().unwrap(),
+                "https://app.example",
+                "add-usdt",
+                &seller.creator,
+                ReconnectScope::UsdtOnly,
+            )
+            .await
+            .unwrap();
+        let request =
+            parse_reconnect_auth_request(&flow.authorization_url, PAYKIT_SESSION_CAPABILITIES)
+                .unwrap();
+        assert_eq!(request.claim_type(), "paykit-access-v1.usdt-address-v1");
+        let payload = payload(seller, bitcoin, Some(USDT_ADDRESS));
+        approve_payload(service, bootstrap, &seller.root, flow, &payload, true).await
     }
 }

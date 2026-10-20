@@ -551,35 +551,15 @@ async fn shared_transport_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runt
                 }
             },
         };
-        let mut deferred = false;
-        for creator in creators {
-            if !runtime.may_start_worker_claim() {
-                return;
-            }
-            // One Creator's session or peer failure is retried on the next pass and
-            // must not withdraw every Creator's rail.
-            let failure = match creator_adapter(&workers, creator).await {
-                Ok(adapter) => match adapter.maintain_transport().await {
-                    Ok(()) => None,
-                    Err(
-                        PaykitSdkError::ConcurrentUpdate { .. }
-                        | PaykitSdkError::SharedStateBusy { .. },
-                    ) => {
-                        deferred = true;
-                        None
-                    }
-                    Err(error) => Some(("maintain_transport", sdk_error_label(&error))),
-                },
-                Err(error) => Some(("adapter_build", error.diagnostic_label())),
-            };
-            if let Some((step, category)) = failure {
-                tracing::warn!(
-                    stage = "shared_transport",
-                    step,
-                    category,
-                    "Paykit transport maintenance failed"
-                );
-            }
+        let limit =
+            usize::try_from(workers.outbox_batch_size).expect("validated outbox batch size");
+        let deferred = maintain_transport_pass(creators, limit, runtime.clone(), |creator| {
+            let workers = workers.clone();
+            async move { maintain_creator_transport(&workers, creator, full_scan).await }
+        })
+        .await;
+        if !runtime.may_start_worker_claim() {
+            return;
         }
         // A targeted pass cannot clear a failed Creator enumeration or deferred work.
         if full_scan && !deferred {
@@ -646,6 +626,86 @@ async fn allowance_intake_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runt
         }
     }
     passes.drain().await;
+}
+
+enum TransportMaintenance {
+    Complete,
+    Deferred,
+    Failed {
+        step: &'static str,
+        category: &'static str,
+    },
+}
+
+async fn maintain_transport_pass<Work, WorkFuture>(
+    creators: Vec<Uuid>,
+    limit: usize,
+    runtime: Arc<Runtime>,
+    mut maintain: Work,
+) -> bool
+where
+    Work: FnMut(Uuid) -> WorkFuture,
+    WorkFuture: Future<Output = TransportMaintenance> + Send + 'static,
+{
+    let mut tasks = CreatorTasks::new(limit, runtime.clone());
+    let mut creators = creators.into_iter();
+    let mut deferred = false;
+    loop {
+        while tasks.available_slots() > 0 && runtime.may_start_worker_claim() {
+            let Some(creator) = creators.next() else {
+                break;
+            };
+            tasks.try_spawn(creator, maintain(creator));
+        }
+        // Drain admitted SDK work even after shutdown stops admission.
+        let Some((_, outcome)) = tasks.join_next().await else {
+            break;
+        };
+        match outcome {
+            TransportMaintenance::Complete => {}
+            TransportMaintenance::Deferred => deferred = true,
+            // One Creator's failure must not withdraw every Creator's rail.
+            TransportMaintenance::Failed { step, category } => tracing::warn!(
+                stage = "shared_transport",
+                step,
+                category,
+                "Paykit transport maintenance failed"
+            ),
+        }
+    }
+    deferred
+}
+
+async fn maintain_creator_transport(
+    workers: &WorkerComponents,
+    creator: Uuid,
+    full_scan: bool,
+) -> TransportMaintenance {
+    let adapter = match creator_adapter(workers, creator).await {
+        Ok(adapter) => adapter,
+        Err(error) => {
+            return TransportMaintenance::Failed {
+                step: "adapter_build",
+                category: error.diagnostic_label(),
+            };
+        }
+    };
+    let result = if full_scan {
+        adapter.maintain_transport().await
+    } else {
+        // Handoff hints concern work already queued in the SDK.
+        adapter.maintain_outbound_transport().await
+    };
+    match result {
+        Ok(()) => TransportMaintenance::Complete,
+        Err(PaykitSdkError::ConcurrentUpdate { .. } | PaykitSdkError::SharedStateBusy { .. }) => {
+            TransportMaintenance::Deferred
+        }
+        Err(error) => TransportMaintenance::Failed {
+            step: "maintain_transport",
+            category: sdk_error_label(&error),
+        },
+    }
 }
 
 fn outbox_batch_size(config: &OutboxConfig) -> i64 {
@@ -1979,6 +2039,171 @@ mod tests {
         assert_eq!(tasks.len(), 6);
         tasks.abort_all();
         while tasks.join_next().await.is_some() {}
+    }
+
+    #[tokio::test]
+    async fn transport_pass_refills_bounded_slots_while_a_creator_is_slow() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let runtime = test_server().await.runtime;
+        let creators = vec![
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        ];
+        let slow = creators[0];
+        let (release_slow, slow_wait) = tokio::sync::oneshot::channel();
+        let (release_fast, fast_wait) = tokio::sync::oneshot::channel();
+        let mut waits =
+            std::collections::HashMap::from([(slow, slow_wait), (creators[1], fast_wait)]);
+        let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
+        let (completed, mut completions) = tokio::sync::mpsc::unbounded_channel();
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let observed_peak = peak.clone();
+        let pass = tokio::spawn(maintain_transport_pass(
+            creators.clone(),
+            2,
+            runtime,
+            move |creator| {
+                let wait = waits.remove(&creator);
+                let started = started.clone();
+                let completed = completed.clone();
+                let active = active.clone();
+                let peak = peak.clone();
+                async move {
+                    peak.fetch_max(active.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+                    started.send(creator).unwrap();
+                    if let Some(wait) = wait {
+                        wait.await.unwrap();
+                    }
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    completed.send(creator).unwrap();
+                    TransportMaintenance::Complete
+                }
+            },
+        ));
+        let mut seen = tokio::time::timeout(Duration::from_secs(1), async {
+            vec![starts.recv().await.unwrap(), starts.recv().await.unwrap()]
+        })
+        .await
+        .unwrap();
+        assert!(
+            starts.try_recv().is_err(),
+            "the pass must respect its task limit"
+        );
+        release_fast.send(()).unwrap();
+        let fast = tokio::time::timeout(Duration::from_secs(1), async {
+            let mut fast = Vec::new();
+            for _ in 0..3 {
+                fast.push(completions.recv().await.unwrap());
+            }
+            fast
+        })
+        .await
+        .unwrap();
+        assert!(!fast.contains(&slow));
+        assert!(!pass.is_finished());
+        release_slow.send(()).unwrap();
+        assert!(
+            !tokio::time::timeout(Duration::from_secs(1), pass)
+                .await
+                .unwrap()
+                .unwrap()
+        );
+        assert_eq!(completions.recv().await, Some(slow));
+        assert_eq!(completions.recv().await, None);
+        while let Some(creator) = starts.recv().await {
+            seen.push(creator);
+        }
+        seen.sort();
+        let mut expected = creators;
+        expected.sort();
+        assert_eq!(seen, expected, "each Creator runs once per pass");
+        assert_eq!(observed_peak.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn transport_pass_shutdown_drains_admitted_creators_without_refilling() {
+        let runtime = test_server().await.runtime;
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let gate = release.clone();
+        let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
+        let (completed, mut completions) = tokio::sync::mpsc::unbounded_channel();
+        let creators = vec![Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+        let pass = tokio::spawn(maintain_transport_pass(
+            creators.clone(),
+            2,
+            runtime.clone(),
+            move |creator| {
+                let gate = gate.clone();
+                let started = started.clone();
+                let completed = completed.clone();
+                async move {
+                    started.send(creator).unwrap();
+                    let _permit = gate.acquire().await.unwrap();
+                    completed.send(creator).unwrap();
+                    TransportMaintenance::Complete
+                }
+            },
+        ));
+        let mut admitted = tokio::time::timeout(Duration::from_secs(1), async {
+            vec![starts.recv().await.unwrap(), starts.recv().await.unwrap()]
+        })
+        .await
+        .unwrap();
+        runtime.begin_shutdown();
+        assert!(!pass.is_finished());
+        release.add_permits(2);
+        assert!(
+            !tokio::time::timeout(Duration::from_secs(1), pass)
+                .await
+                .unwrap()
+                .unwrap()
+        );
+        assert_eq!(starts.recv().await, None);
+        let mut finished = Vec::new();
+        while let Some(creator) = completions.recv().await {
+            finished.push(creator);
+        }
+        admitted.sort();
+        finished.sort();
+        assert_eq!(finished, admitted);
+        assert!(!finished.contains(&creators[2]));
+    }
+
+    #[tokio::test]
+    async fn transport_pass_preserves_contention_across_mixed_outcomes() {
+        for deferred in [false, true] {
+            let runtime = test_server().await.runtime;
+            let creators = vec![Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+            let mut outcomes = vec![
+                TransportMaintenance::Failed {
+                    step: "adapter_build",
+                    category: "adapter_unavailable",
+                },
+                if deferred {
+                    TransportMaintenance::Deferred
+                } else {
+                    TransportMaintenance::Complete
+                },
+                TransportMaintenance::Complete,
+            ]
+            .into_iter();
+            let mut seen = Vec::new();
+            assert_eq!(
+                maintain_transport_pass(creators.clone(), 2, runtime, |creator| {
+                    seen.push(creator);
+                    let outcome = outcomes.next().unwrap();
+                    async move { outcome }
+                })
+                .await,
+                deferred,
+            );
+            assert_eq!(seen, creators, "a Creator failure must not stop the pass");
+            assert!(outcomes.next().is_none());
+        }
     }
 
     #[tokio::test]

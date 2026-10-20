@@ -3,8 +3,8 @@
 use url::Url;
 
 use crate::bitkit_claim::{
-    AuthRequest, ClaimError, QUERY_PARAMETER, parse_auth_request, parse_reconnect_auth_request,
-    required_capabilities, setup_claim_selection,
+    AuthRequest, ClaimError, PAYKIT_ACCESS_CLAIM, QUERY_PARAMETER, USDT_ADDRESS_CLAIM,
+    parse_auth_request, parse_reconnect_auth_request, required_capabilities, setup_claim_selection,
 };
 
 /// A secret-bearing request is retained only in the in-memory flow. Callers may
@@ -39,6 +39,7 @@ pub struct BitkitAuthStarter {
     bootstrap: paykit_sdk::PubkySessionBootstrap,
     capabilities: String,
     setup_selection: String,
+    usdt: bool,
 }
 
 impl BitkitAuthStarter {
@@ -47,28 +48,43 @@ impl BitkitAuthStarter {
             bootstrap,
             capabilities: required_capabilities(),
             setup_selection: setup_claim_selection(),
+            usdt: false,
         }
     }
 
     pub fn with_usdt(mut self) -> Self {
-        self.setup_selection = format!(
-            "{}.{}",
-            setup_claim_selection(),
-            crate::bitkit_claim::USDT_ADDRESS_CLAIM
-        );
+        self.setup_selection = format!("{}.{}", setup_claim_selection(), USDT_ADDRESS_CLAIM);
+        self.usdt = true;
         self
     }
 
+    pub fn usdt_enabled(&self) -> bool {
+        self.usdt
+    }
+
     pub async fn start(&self) -> Result<StartedBitkitAuth, ClaimError> {
-        self.start_request(false).await
+        self.start_request(&self.setup_selection, false).await
     }
 
     /// Refreshes delegated authority and authenticates optional replacement receiving details.
     pub async fn start_reconnect(&self) -> Result<StartedBitkitAuth, ClaimError> {
-        self.start_request(true).await
+        self.start_request(&self.setup_selection, true).await
     }
 
-    async fn start_request(&self, reconnect: bool) -> Result<StartedBitkitAuth, ClaimError> {
+    /// Refreshes delegated authority and asks for the USDT address alone, so Bitkit
+    /// prepares no Bitcoin account and the bound one stays.
+    pub async fn start_usdt_reconnect(&self) -> Result<StartedBitkitAuth, ClaimError> {
+        if !self.usdt {
+            return Err(ClaimError::InvalidAuthRequest);
+        }
+        self.start_request(&usdt_reconnect_selection(), true).await
+    }
+
+    async fn start_request(
+        &self,
+        selection: &str,
+        reconnect: bool,
+    ) -> Result<StartedBitkitAuth, ClaimError> {
         let request = self
             .bootstrap
             .start_sign_in_auth(&self.capabilities)
@@ -79,9 +95,8 @@ impl BitkitAuthStarter {
         if url.query_pairs().any(|(key, _)| key == QUERY_PARAMETER) {
             return Err(ClaimError::InvalidAuthRequest);
         }
-        let selection = self.setup_selection.clone();
         url.query_pairs_mut()
-            .append_pair(QUERY_PARAMETER, &selection);
+            .append_pair(QUERY_PARAMETER, selection);
         let authorization_url = url.to_string();
         let companion = if reconnect {
             parse_reconnect_auth_request(&authorization_url, &self.capabilities)?
@@ -95,6 +110,10 @@ impl BitkitAuthStarter {
             capabilities: self.capabilities.clone(),
         })
     }
+}
+
+fn usdt_reconnect_selection() -> String {
+    [PAYKIT_ACCESS_CLAIM, USDT_ADDRESS_CLAIM].join(".")
 }
 
 pub fn append_bitkit_claim(
@@ -170,5 +189,23 @@ mod tests {
             "paykit-access-v1.watch-only-account-v1"
         );
         assert!(started.request.reconnect());
+    }
+
+    #[tokio::test]
+    async fn usdt_reconnect_requests_no_watch_only_account() {
+        let starter = BitkitAuthStarter::new(
+            paykit_sdk::PubkySessionBootstrap::new(PAYKIT_CLIENT_ID).unwrap(),
+        );
+        assert_eq!(
+            starter.start_usdt_reconnect().await.unwrap_err(),
+            ClaimError::InvalidAuthRequest
+        );
+        let started = starter.with_usdt().start_usdt_reconnect().await.unwrap();
+        assert_eq!(
+            started.request.claim_type(),
+            "paykit-access-v1.usdt-address-v1"
+        );
+        assert!(started.request.reconnect());
+        assert!(!started.authorization_url.contains("watch-only-account-v1"));
     }
 }

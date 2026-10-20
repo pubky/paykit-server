@@ -1426,10 +1426,14 @@ async fn server_relinks_when_the_reader_publishes_a_recovery_marker() {
     // the request to the link the wallet abandoned.
     let second_payment =
         open_invoice(&pool, address, &signing_key, &creator, &reader, BUNDLE_B).await;
+    // Pause Creator operations only until the deliberate external lease is acquired.
+    let creator_id = creators.ready_ids().await.unwrap()[0];
+    let mutation_guard = paykit_server::paykit::acquire_creator_mutation_guard(creator_id).await;
     let busy = paykit_lib::with_write_lock::<_, paykit_lib::PaykitError, _, _>(
         &creator.access.session,
         paykit_lib::PAYKIT_SHARED_STATE_PATH,
         |_held| async {
+            drop(mutation_guard);
             Ok(send_http(
                 address,
                 connection_status_request(&signing_key, &creator, BUNDLE_B),
