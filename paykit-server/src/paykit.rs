@@ -4,7 +4,7 @@ mod allowances;
 mod buyer_contacts;
 mod payment_status;
 
-pub use allowances::{ALLOWANCE_INTAKE_COOLDOWN, AllowanceIntake, AllowanceIntakePasses};
+pub use allowances::{ALLOWANCE_INTAKE_COOLDOWN, AllowanceIntake, IntakeTurns};
 
 use std::{
     collections::HashMap,

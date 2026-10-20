@@ -29,8 +29,8 @@ use crate::{
     domain::locks::{BundleId, CreatorPubky, PubkyLockResource, ReaderPubky},
     http::{self, auth::SignedServiceAuth},
     paykit::{
-        ALLOWANCE_INTAKE_COOLDOWN, AllowanceIntake, AllowanceIntakePasses, CreatorSessions,
-        PaykitAdapter, creator_mutation_lock, sdk_error_label,
+        ALLOWANCE_INTAKE_COOLDOWN, AllowanceIntake, CreatorSessions, IntakeTurns, PaykitAdapter,
+        creator_mutation_lock, sdk_error_label,
     },
     persistence::{
         CreatorStore, InvoiceStore, MarketplacePreparationStore, OutboxRetryClass, OutboxStore,
@@ -572,16 +572,23 @@ async fn shared_transport_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runt
 /// It runs apart from the shared transport loop, one task per Creator, because
 /// the SDK derives a reader's whole Allowance history on each read: a large
 /// history delays only that Creator's intake, never transport or another
-/// Creator.
+/// Creator. At most `outbox_batch_size` passes run at once across Creators,
+/// and free slots go to the Creator whose last pass started longest ago.
 async fn allowance_intake_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtime>) {
     let intake = Arc::new(AllowanceIntake::new(ALLOWANCE_INTAKE_COOLDOWN));
-    let mut passes = AllowanceIntakePasses::default();
+    let limit = usize::try_from(workers.outbox_batch_size).expect("validated outbox batch size");
+    let mut tasks = CreatorTasks::new(limit, runtime.clone());
+    let mut turns = IntakeTurns::default();
     let mut interval = tokio::time::interval(workers.outbox_poll_interval);
     interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             _ = runtime.cancelled() => break,
+            Some(_) = tasks.join_next(), if !tasks.is_empty() => continue,
             _ = interval.tick() => {}
+        }
+        if tasks.available_slots() == 0 {
+            continue;
         }
         let creators = match workers.creators.ready_ids().await {
             Ok(creators) => creators,
@@ -595,44 +602,65 @@ async fn allowance_intake_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runt
                 continue;
             }
         };
-        for creator in creators {
-            if !runtime.may_start_worker_claim() {
-                break;
-            }
-            let (workers, intake) = (workers.clone(), intake.clone());
-            passes.start(creator, async move {
-                let failure = match creator_adapter(&workers, creator).await {
-                    Ok(adapter) => {
-                        match adapter.take_in_allowances(&intake, &workers.invoices).await {
-                            Ok(queued) => {
-                                // The transport worker delivers them, each Creator
-                                // on its own task.
-                                if queued > 0 {
-                                    workers.outbox.wake_transport(creator);
-                                }
-                                None
-                            }
-                            Err(
-                                PaykitSdkError::ConcurrentUpdate { .. }
-                                | PaykitSdkError::SharedStateBusy { .. },
-                            ) => None,
-                            Err(error) => Some(("take_in_allowances", sdk_error_label(&error))),
-                        }
-                    }
-                    Err(error) => Some(("adapter_build", error.diagnostic_label())),
-                };
-                if let Some((step, category)) = failure {
-                    tracing::warn!(
-                        stage = "allowance_intake",
-                        step,
-                        category,
-                        "Paykit Allowance intake failed"
-                    );
-                }
-            });
+        start_intake_passes(&mut tasks, &mut turns, creators, |creator| {
+            allowance_intake_pass(workers.clone(), intake.clone(), creator)
+        });
+    }
+    // An acceptance is never cut short, since it holds the Creator's lock.
+    while tasks.join_next().await.is_some() {}
+}
+
+/// Starts intake passes in the free slots, least recently started Creator
+/// first, skipping Creators whose pass is still running.
+fn start_intake_passes<Pass, PassFuture>(
+    tasks: &mut CreatorTasks<()>,
+    turns: &mut IntakeTurns,
+    creators: Vec<Uuid>,
+    mut pass: Pass,
+) where
+    Pass: FnMut(Uuid) -> PassFuture,
+    PassFuture: Future<Output = ()> + Send + 'static,
+{
+    let running = tasks.active_creators();
+    for creator in turns.order(creators) {
+        if tasks.available_slots() == 0 {
+            break;
+        }
+        if !running.contains(&creator) && tasks.try_spawn(creator, pass(creator)) {
+            turns.started(creator);
         }
     }
-    passes.drain().await;
+}
+
+async fn allowance_intake_pass(
+    workers: Arc<WorkerComponents>,
+    intake: Arc<AllowanceIntake>,
+    creator: Uuid,
+) {
+    let failure = match creator_adapter(&workers, creator).await {
+        Ok(adapter) => match adapter.take_in_allowances(&intake, &workers.invoices).await {
+            Ok(queued) => {
+                // The transport worker delivers them, each Creator on its own task.
+                if queued > 0 {
+                    workers.outbox.wake_transport(creator);
+                }
+                None
+            }
+            Err(
+                PaykitSdkError::ConcurrentUpdate { .. } | PaykitSdkError::SharedStateBusy { .. },
+            ) => None,
+            Err(error) => Some(("take_in_allowances", sdk_error_label(&error))),
+        },
+        Err(error) => Some(("adapter_build", error.diagnostic_label())),
+    };
+    if let Some((step, category)) = failure {
+        tracing::warn!(
+            stage = "allowance_intake",
+            step,
+            category,
+            "Paykit Allowance intake failed"
+        );
+    }
 }
 
 enum TransportMaintenance {
@@ -2046,6 +2074,44 @@ mod tests {
         assert_eq!(tasks.len(), 6);
         tasks.abort_all();
         while tasks.join_next().await.is_some() {}
+    }
+
+    #[tokio::test]
+    async fn allowance_intake_bounds_its_passes_and_gives_every_creator_a_turn() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let runtime = test_server().await.runtime;
+        let mut tasks = CreatorTasks::new(2, runtime);
+        let mut turns = IntakeTurns::default();
+        let creators = (0..5).map(|_| Uuid::new_v4()).collect::<Vec<_>>();
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        // Every pass stalls, as in a very large history, until released.
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let mut started = std::collections::HashSet::new();
+        for _ in 0..creators.len() {
+            start_intake_passes(&mut tasks, &mut turns, creators.clone(), |_| {
+                let (active, peak, release) = (active.clone(), peak.clone(), release.clone());
+                async move {
+                    peak.fetch_max(active.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+                    release.acquire().await.unwrap().forget();
+                    active.fetch_sub(1, Ordering::SeqCst);
+                }
+            });
+            assert_eq!(tasks.active_creators().len(), 2);
+            started.extend(tasks.active_creators());
+            // The longest-running pass finishes; its slot goes to a Creator
+            // that has waited longer, not back to the first in the list.
+            release.add_permits(1);
+            tokio::time::timeout(Duration::from_secs(1), tasks.join_next())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        assert_eq!(started.len(), creators.len(), "a Creator never got a turn");
+        release.add_permits(creators.len());
+        while tasks.join_next().await.is_some() {}
+        assert_eq!(peak.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

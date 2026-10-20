@@ -10,7 +10,6 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    future::Future,
     sync::Mutex as StdMutex,
     time::{Duration, Instant},
 };
@@ -21,7 +20,7 @@ use paykit_sdk::{
     AllowanceFilter, AllowanceHistoryStatus, AllowanceLifecycleState, AllowanceLocalRole,
     AllowanceRecord, LinkedPeerState, PaykitSdkError, PubkyPublicKey, StorageAdapter,
 };
-use tokio::{sync::Mutex as TokioMutex, task::JoinSet};
+use tokio::sync::Mutex as TokioMutex;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -45,9 +44,11 @@ pub const ALLOWANCE_INTAKE_COOLDOWN: Duration = Duration::from_secs(10);
 /// Only the scan counts: acceptances and sends are bounded per read.
 const ALLOWANCE_INTAKE_SPACING_FACTOR: u32 = 10;
 
-/// A Creator's pass starts no new read after this much time; the readers left
-/// over are read on the next pass.
-const ALLOWANCE_INTAKE_PASS_BUDGET: Duration = Duration::from_secs(5);
+/// A Creator's pass starts no new read after this much time spent reading;
+/// the readers left over are read on the next pass. Finding the due readers
+/// does not count, and the first read always starts, so every pass reads at
+/// least one due reader.
+const ALLOWANCE_INTAKE_READ_BUDGET: Duration = Duration::from_secs(5);
 
 /// Decides when a reader's Allowances are read. A read is worth doing only
 /// when the reader's link holds stream items an earlier read did not cover,
@@ -151,49 +152,30 @@ impl AllowanceIntake {
     }
 }
 
-/// Runs each Creator's intake pass on its own task, at most one per Creator.
-/// A pass that stalls, such as one deriving a very large history, holds back
-/// only its own Creator's next pass.
-#[derive(Default)]
-pub struct AllowanceIntakePasses {
-    running: HashSet<Uuid>,
-    passes: JoinSet<Uuid>,
+/// Orders ready Creators for the intake's bounded task slots: a Creator never
+/// started goes first, then the one whose last pass started longest ago. When
+/// slow passes hold every slot, each Creator still gets a turn.
+#[derive(Debug, Default)]
+pub struct IntakeTurns {
+    last_started: HashMap<Uuid, u64>,
+    next: u64,
 }
 
-impl AllowanceIntakePasses {
-    /// Starts a pass for `creator_id` unless its previous one is still running.
-    pub fn start<F>(&mut self, creator_id: Uuid, pass: F) -> bool
-    where
-        F: Future<Output = ()> + Send + 'static,
-    {
-        self.reap();
-        if !self.running.insert(creator_id) {
-            return false;
-        }
-        self.passes.spawn(async move {
-            pass.await;
-            creator_id
-        });
-        true
+impl IntakeTurns {
+    /// The ready Creators, least recently started first. A Creator that is no
+    /// longer ready is forgotten.
+    pub fn order(&mut self, mut ready: Vec<Uuid>) -> Vec<Uuid> {
+        let current = ready.iter().copied().collect::<HashSet<_>>();
+        self.last_started
+            .retain(|creator, _| current.contains(creator));
+        ready.sort_by_key(|creator| self.last_started.get(creator).copied());
+        ready
     }
 
-    fn reap(&mut self) {
-        while let Some(finished) = self.passes.try_join_next() {
-            if let Ok(creator_id) = finished {
-                self.running.remove(&creator_id);
-            }
-        }
-        // A panicked pass loses its Creator ID; forget every Creator whose task is gone.
-        if self.passes.is_empty() {
-            self.running.clear();
-        }
-    }
-
-    /// Lets the running passes finish. An acceptance is never cut short, since
-    /// it holds the Creator's shared-state lock.
-    pub async fn drain(&mut self) {
-        while self.passes.join_next().await.is_some() {}
-        self.running.clear();
+    /// Records that `creator`'s pass started.
+    pub fn started(&mut self, creator: Uuid) {
+        self.last_started.insert(creator, self.next);
+        self.next += 1;
     }
 }
 
@@ -212,7 +194,7 @@ impl PaykitAdapter {
         intake: &AllowanceIntake,
         invoices: &InvoiceStore,
     ) -> paykit_sdk::Result<usize> {
-        let pass_started = Instant::now();
+        let now = Instant::now();
         let linked = {
             let _guard = self.mutation_lock.lock().await;
             self.sdk.linked_peers().await?
@@ -230,7 +212,7 @@ impl PaykitAdapter {
             .filter_map(|peer| {
                 let newest = newest.get(&peer).copied();
                 intake
-                    .is_due(self.creator_id, &peer, newest, pass_started)
+                    .is_due(self.creator_id, &peer, newest, now)
                     .then_some((peer, newest?))
             })
             .collect::<Vec<_>>();
@@ -251,40 +233,21 @@ impl PaykitAdapter {
             .iter()
             .map(ReaderPubky::to_string)
             .collect::<HashSet<_>>();
-        let mut queued = 0;
-        for (peer, newest) in due {
-            if !reader_of(&peer).is_some_and(|reader| invoiced.contains(&reader.to_string())) {
-                continue;
-            }
-            if pass_started.elapsed() >= ALLOWANCE_INTAKE_PASS_BUDGET {
-                break;
-            }
-            let Some(ticket) = intake.begin(self.creator_id, &peer, Some(newest), Instant::now())
-            else {
-                continue;
-            };
-            let read = accept_proposals(self, &self.mutation_lock, &peer).await;
-            if read.accepted > 0 {
-                info!(
-                    accepted = read.accepted,
-                    "accepted Paykit Allowance proposals"
-                );
-            }
-            queued += read.accepted;
-            let drained = match read.result {
-                Ok(drained) => drained,
-                Err(error) => {
-                    warn!(
-                        stage = "allowance_intake",
-                        cause = sdk_error_label(&error),
-                        "Paykit Allowance intake failed; retried after the spacing"
-                    );
-                    false
-                }
-            };
-            intake.finish(ticket, drained, read.scan);
-        }
-        Ok(queued)
+        let readers = due
+            .into_iter()
+            .filter(|(peer, _)| {
+                reader_of(peer).is_some_and(|reader| invoiced.contains(&reader.to_string()))
+            })
+            .collect();
+        Ok(read_readers(
+            self,
+            &self.mutation_lock,
+            intake,
+            self.creator_id,
+            readers,
+            ALLOWANCE_INTAKE_READ_BUDGET,
+        )
+        .await)
     }
 
     async fn newest_stream_items(
@@ -347,6 +310,52 @@ struct IntakeRead {
     /// Whether no proposal is left waiting behind the per-read limit, or why
     /// the read stopped.
     result: paykit_sdk::Result<bool>,
+}
+
+/// Reads each due reader in turn, `(reader, newest stream item)`, until
+/// `budget` has passed since the first read started; the first read always
+/// starts. Returns how many acceptances it queued.
+async fn read_readers<L: AllowanceLink + ?Sized>(
+    link: &L,
+    mutation_lock: &TokioMutex<()>,
+    intake: &AllowanceIntake,
+    creator_id: Uuid,
+    readers: Vec<(PubkyPublicKey, u64)>,
+    budget: Duration,
+) -> usize {
+    let mut reading_since = None::<Instant>;
+    let mut queued = 0;
+    for (peer, newest) in readers {
+        if reading_since.is_some_and(|since| since.elapsed() >= budget) {
+            break;
+        }
+        let now = Instant::now();
+        let Some(ticket) = intake.begin(creator_id, &peer, Some(newest), now) else {
+            continue;
+        };
+        reading_since.get_or_insert(now);
+        let read = accept_proposals(link, mutation_lock, &peer).await;
+        if read.accepted > 0 {
+            info!(
+                accepted = read.accepted,
+                "accepted Paykit Allowance proposals"
+            );
+        }
+        queued += read.accepted;
+        let drained = match read.result {
+            Ok(drained) => drained,
+            Err(error) => {
+                warn!(
+                    stage = "allowance_intake",
+                    cause = sdk_error_label(&error),
+                    "Paykit Allowance intake failed; retried after the spacing"
+                );
+                false
+            }
+        };
+        intake.finish(ticket, drained, read.scan);
+    }
+    queued
 }
 
 /// Accepts up to [`MAX_ALLOWANCE_ACCEPTANCES_PER_READ`] pending proposals.
@@ -435,10 +444,7 @@ fn awaiting_allowee_acceptance(record: &AllowanceRecord) -> Option<(AllowanceId,
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    };
+    use std::sync::Arc;
 
     use super::*;
 
@@ -617,41 +623,91 @@ mod tests {
         );
     }
 
+    #[test]
+    fn creators_take_turns_least_recently_started_first() {
+        let mut turns = IntakeTurns::default();
+        let creators = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+
+        // Two slots: the first two start, and the third goes first next time.
+        let order = turns.order(creators.to_vec());
+        turns.started(order[0]);
+        turns.started(order[1]);
+        assert_eq!(turns.order(creators.to_vec())[0], order[2]);
+        turns.started(order[2]);
+        assert_eq!(turns.order(creators.to_vec()), order);
+
+        // A Creator that is no longer ready is forgotten; if it comes back it
+        // counts as never started.
+        turns.order(vec![order[1], order[2]]);
+        assert_eq!(turns.order(creators.to_vec())[0], order[0]);
+    }
+
     #[tokio::test]
-    async fn a_stalled_pass_holds_back_only_its_own_creator() {
-        let mut passes = AllowanceIntakePasses::default();
-        let (stalled, other) = (Uuid::new_v4(), Uuid::new_v4());
-        let release = Arc::new(tokio::sync::Notify::new());
-        let other_passes = Arc::new(AtomicUsize::new(0));
+    async fn every_pass_reads_a_due_reader_even_with_no_budget_left() {
+        let lock = TokioMutex::new(());
+        let intake = AllowanceIntake::new(Duration::from_secs(10));
+        let creator = Uuid::new_v4();
+        let link = ReadyLink::default();
+        let readers = vec![(reader(), 1), (other_reader(), 1)];
 
-        assert!(passes.start(stalled, {
-            let release = release.clone();
-            async move { release.notified().await }
-        }));
-        for _ in 0..3 {
-            let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-            let counter = other_passes.clone();
-            assert!(passes.start(other, async move {
-                counter.fetch_add(1, Ordering::SeqCst);
-                let _ = done_tx.send(());
-            }));
-            tokio::time::timeout(Duration::from_secs(5), done_rx)
-                .await
-                .expect("another Creator's pass waited for the stalled one")
-                .unwrap();
-            while passes.running.contains(&other) {
-                tokio::task::yield_now().await;
-                passes.reap();
-            }
-            // The stalled Creator gets no second, overlapping pass.
-            assert!(!passes.start(stalled, async {}));
+        // However long finding the due readers took, a pass reads one reader;
+        // with no budget, only one. The next pass reads the other.
+        for expected in [reader(), other_reader()] {
+            let queued = read_readers(
+                &link,
+                &lock,
+                &intake,
+                creator,
+                readers.clone(),
+                Duration::ZERO,
+            )
+            .await;
+            assert_eq!(queued, 1);
+            assert_eq!(link.scans.lock().unwrap().last(), Some(&expected));
         }
-        assert_eq!(other_passes.load(Ordering::SeqCst), 3);
+        assert_eq!(link.scans.lock().unwrap().len(), 2);
 
-        release.notify_one();
-        passes.drain().await;
-        assert!(passes.start(stalled, async {}));
-        passes.drain().await;
+        // With budget, one pass reads every due reader.
+        let intake = AllowanceIntake::new(Duration::from_secs(10));
+        let queued = read_readers(
+            &link,
+            &lock,
+            &intake,
+            creator,
+            readers,
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(queued, 2);
+    }
+
+    /// A link with one pending proposal on every scan.
+    #[derive(Default)]
+    struct ReadyLink {
+        scans: StdMutex<Vec<PubkyPublicKey>>,
+    }
+
+    #[async_trait]
+    impl AllowanceLink for ReadyLink {
+        async fn pending_proposals(
+            &self,
+            reader: &PubkyPublicKey,
+        ) -> paykit_sdk::Result<Vec<(AllowanceId, u64)>> {
+            self.scans.lock().unwrap().push(reader.clone());
+            Ok(vec![(
+                AllowanceId::new(Uuid::new_v4().to_string()).unwrap(),
+                1,
+            )])
+        }
+
+        async fn accept(
+            &self,
+            _reader: &PubkyPublicKey,
+            _id: &AllowanceId,
+            _stream_item_id: u64,
+        ) -> paykit_sdk::Result<()> {
+            Ok(())
+        }
     }
 
     /// A link whose scan can be held in flight, like the derivation of a
