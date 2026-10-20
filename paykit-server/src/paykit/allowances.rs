@@ -5,7 +5,8 @@
 //! acceptance, and the reader decides how large that history is. The intake
 //! therefore runs on its own worker, never in an outbox handoff or the shared
 //! transport loop, one task per Creator, and bounds how often and for how long
-//! it reads each reader.
+//! it reads each reader. It only queues acceptances; the transport worker
+//! delivers them.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -24,7 +25,7 @@ use tokio::{sync::Mutex as TokioMutex, task::JoinSet};
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use super::{PaykitAdapter, check_send_report, sdk_error_label};
+use super::{PaykitAdapter, sdk_error_label};
 use crate::{
     domain::locks::{ReaderPubky, parse_reader},
     persistence::InvoiceStore,
@@ -137,14 +138,6 @@ impl AllowanceIntake {
         })
     }
 
-    /// Marks the items up to `newest` as covered without reading them: the
-    /// link is not one the intake answers on.
-    fn pass_over(&self, creator_id: Uuid, reader: &PubkyPublicKey, newest: u64) {
-        self.with_reader(creator_id, reader, |state| {
-            state.covered_through = Some(newest);
-        });
-    }
-
     /// Records a finished read and how long its scan took. When it failed or
     /// left proposals behind the per-read limit, the same items stay due for
     /// the next read.
@@ -207,13 +200,18 @@ impl AllowanceIntakePasses {
 impl PaykitAdapter {
     /// One intake pass over this Creator's linked readers. Only readers this
     /// Creator has invoiced are read: a Linked peer that another App on the
-    /// shared identity linked is left to that App. Read and acceptance
-    /// failures are logged per reader and retried after the cooldown.
+    /// shared identity linked is left to that App. A peer is checked again on
+    /// every pass, and nothing it sent counts as covered until it is invoiced,
+    /// so a first invoice makes the proposals it already sent due. Read and
+    /// acceptance failures are logged per reader and retried after the spacing.
+    ///
+    /// Returns how many acceptances it queued. It sends none of them: the
+    /// caller wakes the transport worker, which delivers them.
     pub async fn take_in_allowances(
         &self,
         intake: &AllowanceIntake,
         invoices: &InvoiceStore,
-    ) -> paykit_sdk::Result<()> {
+    ) -> paykit_sdk::Result<usize> {
         let pass_started = Instant::now();
         let linked = {
             let _guard = self.mutation_lock.lock().await;
@@ -224,7 +222,7 @@ impl PaykitAdapter {
         .map(|peer| peer.counterparty)
         .collect::<Vec<_>>();
         if linked.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
         let newest = self.newest_stream_items(&linked).await?;
         let due = linked
@@ -237,7 +235,7 @@ impl PaykitAdapter {
             })
             .collect::<Vec<_>>();
         if due.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
         let candidates = due
             .iter()
@@ -253,9 +251,9 @@ impl PaykitAdapter {
             .iter()
             .map(ReaderPubky::to_string)
             .collect::<HashSet<_>>();
+        let mut queued = 0;
         for (peer, newest) in due {
             if !reader_of(&peer).is_some_and(|reader| invoiced.contains(&reader.to_string())) {
-                intake.pass_over(self.creator_id, &peer, newest);
                 continue;
             }
             if pass_started.elapsed() >= ALLOWANCE_INTAKE_PASS_BUDGET {
@@ -265,29 +263,28 @@ impl PaykitAdapter {
             else {
                 continue;
             };
-            let (drained, scan) = match accept_proposals(self, &self.mutation_lock, &peer).await {
-                Ok(outcome) => {
-                    if outcome.accepted > 0 {
-                        info!(
-                            accepted = outcome.accepted,
-                            "accepted Paykit Allowance proposals"
-                        );
-                        self.send_queued_messages(&peer).await;
-                    }
-                    (outcome.drained, outcome.scan)
-                }
+            let read = accept_proposals(self, &self.mutation_lock, &peer).await;
+            if read.accepted > 0 {
+                info!(
+                    accepted = read.accepted,
+                    "accepted Paykit Allowance proposals"
+                );
+            }
+            queued += read.accepted;
+            let drained = match read.result {
+                Ok(drained) => drained,
                 Err(error) => {
                     warn!(
                         stage = "allowance_intake",
                         cause = sdk_error_label(&error),
-                        "Paykit Allowance intake failed; retried after the cooldown"
+                        "Paykit Allowance intake failed; retried after the spacing"
                     );
-                    (false, Duration::ZERO)
+                    false
                 }
             };
-            intake.finish(ticket, drained, scan);
+            intake.finish(ticket, drained, read.scan);
         }
-        Ok(())
+        Ok(queued)
     }
 
     async fn newest_stream_items(
@@ -310,24 +307,6 @@ impl PaykitAdapter {
                     .collect())
             })
             .await
-    }
-
-    /// Sends what the intake queued now, rather than on the next transport
-    /// pass. A failure is left to that pass, which sends every queued message.
-    async fn send_queued_messages(&self, reader: &PubkyPublicKey) {
-        let _guard = self.mutation_lock.lock().await;
-        if self
-            .sdk
-            .process_outbound_private_messages(reader.clone())
-            .await
-            .and_then(check_send_report)
-            .is_err()
-        {
-            warn!(
-                stage = "allowance_intake",
-                "Paykit Allowance acceptances stay queued for the next poll"
-            );
-        }
     }
 }
 
@@ -360,12 +339,14 @@ trait AllowanceLink: Send + Sync {
     ) -> paykit_sdk::Result<()>;
 }
 
-struct IntakeOutcome {
+struct IntakeRead {
     accepted: usize,
-    /// How long reading the pending proposals took.
+    /// How long reading the pending proposals took, up to its failure if it
+    /// failed. It spaces out the next read on every outcome.
     scan: Duration,
-    /// No proposal is left waiting behind the per-read limit.
-    drained: bool,
+    /// Whether no proposal is left waiting behind the per-read limit, or why
+    /// the read stopped.
+    result: paykit_sdk::Result<bool>,
 }
 
 /// Accepts up to [`MAX_ALLOWANCE_ACCEPTANCES_PER_READ`] pending proposals.
@@ -375,21 +356,31 @@ async fn accept_proposals<L: AllowanceLink + ?Sized>(
     link: &L,
     mutation_lock: &TokioMutex<()>,
     reader: &PubkyPublicKey,
-) -> paykit_sdk::Result<IntakeOutcome> {
+) -> IntakeRead {
     let started = Instant::now();
-    let pending = link.pending_proposals(reader).await?;
-    let scan = started.elapsed();
-    let mut accepted = 0;
+    let pending = link.pending_proposals(reader).await;
+    let mut read = IntakeRead {
+        accepted: 0,
+        scan: started.elapsed(),
+        result: Ok(true),
+    };
+    let pending = match pending {
+        Ok(pending) => pending,
+        Err(error) => {
+            read.result = Err(error);
+            return read;
+        }
+    };
     for (id, stream_item_id) in pending.iter().take(MAX_ALLOWANCE_ACCEPTANCES_PER_READ) {
         let _guard = mutation_lock.lock().await;
-        link.accept(reader, id, *stream_item_id).await?;
-        accepted += 1;
+        if let Err(error) = link.accept(reader, id, *stream_item_id).await {
+            read.result = Err(error);
+            return read;
+        }
+        read.accepted += 1;
     }
-    Ok(IntakeOutcome {
-        accepted,
-        scan,
-        drained: pending.len() <= MAX_ALLOWANCE_ACCEPTANCES_PER_READ,
-    })
+    read.result = Ok(pending.len() <= MAX_ALLOWANCE_ACCEPTANCES_PER_READ);
+    read
 }
 
 #[async_trait]
@@ -592,15 +583,19 @@ mod tests {
     }
 
     #[test]
-    fn a_passed_over_link_is_not_due_until_it_receives_more() {
+    fn a_link_skipped_before_its_first_invoice_stays_due() {
         let intake = AllowanceIntake::new(Duration::from_secs(10));
         let creator = Uuid::new_v4();
         let now = Instant::now();
 
-        intake.pass_over(creator, &reader(), 8);
-
-        assert!(!intake.is_due(creator, &reader(), Some(8), now));
-        assert!(intake.is_due(creator, &reader(), Some(9), now));
+        // A pass that finds the peer not yet invoiced, including one whose
+        // invoice commits right after the lookup, checks only whether it is
+        // due. Its proposal stays due until a pass finds it invoiced.
+        for pass in 0..3 {
+            let at = now + Duration::from_secs(pass);
+            assert!(intake.is_due(creator, &reader(), Some(8), at));
+        }
+        assert!(intake.begin(creator, &reader(), Some(8), now).is_some());
     }
 
     #[test]
@@ -669,6 +664,8 @@ mod tests {
         scan_release: tokio::sync::Notify,
         lock_held_during_accepts: StdMutex<Vec<bool>>,
         lock_held_during_scan: StdMutex<Option<bool>>,
+        scan_takes: Duration,
+        fail_scan: bool,
         fail_accept: bool,
     }
 
@@ -681,6 +678,8 @@ mod tests {
                 scan_release: tokio::sync::Notify::new(),
                 lock_held_during_accepts: StdMutex::new(Vec::new()),
                 lock_held_during_scan: StdMutex::new(None),
+                scan_takes: Duration::ZERO,
+                fail_scan: false,
                 fail_accept: false,
             }
         }
@@ -695,6 +694,13 @@ mod tests {
             *self.lock_held_during_scan.lock().unwrap() = Some(self.lock.try_lock().is_err());
             self.scan_entered.notify_one();
             self.scan_release.notified().await;
+            tokio::time::sleep(self.scan_takes).await;
+            if self.fail_scan {
+                return Err(PaykitSdkError::Transport {
+                    context: "history not read".into(),
+                    source: None,
+                });
+            }
             Ok((0..self.pending as u64)
                 .map(|item| (AllowanceId::new(Uuid::new_v4().to_string()).unwrap(), item))
                 .collect())
@@ -740,7 +746,7 @@ mod tests {
         drop(other_creator_work);
 
         link.scan_release.notify_one();
-        let outcome = intake.await.unwrap().unwrap();
+        let outcome = intake.await.unwrap();
 
         assert_eq!(*link.lock_held_during_scan.lock().unwrap(), Some(false));
         // Each acceptance runs under the lock, and the lock is free between them.
@@ -749,7 +755,7 @@ mod tests {
             [true; MAX_ALLOWANCE_ACCEPTANCES_PER_READ]
         );
         assert_eq!(outcome.accepted, MAX_ALLOWANCE_ACCEPTANCES_PER_READ);
-        assert!(!outcome.drained);
+        assert!(!outcome.result.unwrap());
         assert!(lock.try_lock().is_ok());
     }
 
@@ -773,9 +779,12 @@ mod tests {
             let link = SlowLink::new(&lock, pending);
             link.scan_release.notify_one();
 
-            let outcome = accept_proposals(&link, &lock, &reader()).await.unwrap();
+            let outcome = accept_proposals(&link, &lock, &reader()).await;
 
-            assert_eq!((outcome.accepted, outcome.drained), (accepted, drained));
+            assert_eq!(
+                (outcome.accepted, outcome.result.unwrap()),
+                (accepted, drained)
+            );
         }
     }
 
@@ -786,11 +795,45 @@ mod tests {
         link.fail_accept = true;
         link.scan_release.notify_one();
 
-        let result = accept_proposals(&link, &lock, &reader()).await;
+        let read = accept_proposals(&link, &lock, &reader()).await;
 
-        assert!(matches!(result, Err(PaykitSdkError::Transport { .. })));
+        assert!(matches!(read.result, Err(PaykitSdkError::Transport { .. })));
+        assert_eq!(read.accepted, 0);
         assert_eq!(link.lock_held_during_accepts.lock().unwrap().len(), 1);
         assert!(lock.try_lock().is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_failed_read_is_spaced_out_by_the_time_its_scan_took() {
+        const SCAN: Duration = Duration::from_millis(200);
+        // A scan that fails after deriving a large history, and a scan that
+        // succeeds before an acceptance fails.
+        for (fail_scan, fail_accept) in [(true, false), (false, true)] {
+            let lock = Arc::new(TokioMutex::new(()));
+            let mut link = SlowLink::new(&lock, 3);
+            link.scan_takes = SCAN;
+            link.fail_scan = fail_scan;
+            link.fail_accept = fail_accept;
+            link.scan_release.notify_one();
+            let intake = AllowanceIntake::new(Duration::ZERO);
+            let creator = Uuid::new_v4();
+            let start = Instant::now();
+            let ticket = intake.begin(creator, &reader(), Some(1), start).unwrap();
+
+            let read = accept_proposals(&link, &lock, &reader()).await;
+            assert!(read.result.is_err());
+            assert!(read.scan >= SCAN, "{:?}", read.scan);
+            intake.finish(ticket, false, read.scan);
+
+            let spacing = read.scan * ALLOWANCE_INTAKE_SPACING_FACTOR;
+            let early = start + spacing - Duration::from_millis(1);
+            assert!(intake.begin(creator, &reader(), Some(1), early).is_none());
+            assert!(
+                intake
+                    .begin(creator, &reader(), Some(1), start + spacing)
+                    .is_some()
+            );
+        }
     }
 
     #[test]

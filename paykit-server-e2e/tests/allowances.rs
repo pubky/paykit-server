@@ -394,9 +394,13 @@ async fn wait_until_ready(address: SocketAddr) {
 /// in a way it cannot tell from an outage, which an ambiguous Pubky request
 /// failure under load does, and an exact replay of the invoice changes nothing.
 async fn post_locks_invoice(stack: &Stack, bundle: &str) {
+    post_locks_invoice_for(stack, bundle, &stack.reader).await;
+}
+
+async fn post_locks_invoice_for(stack: &Stack, bundle: &str, reader: &ReaderPubky) {
     let body = format!(
-        r#"{{"bundle_id":"{bundle}","lock_resource":"{}","reader":"{}"}}"#,
-        stack.lock_resource, stack.reader
+        r#"{{"bundle_id":"{bundle}","lock_resource":"{}","reader":"{reader}"}}"#,
+        stack.lock_resource
     );
     let preimage = signature_preimage("POST", "/invoices", body.as_bytes());
     let mut attempt = 1;
@@ -1001,9 +1005,10 @@ async fn a_backlog_of_proposals_is_drained_without_holding_up_requests() {
 }
 
 /// Another App on the Creator's identity can link a peer this server never
-/// invoiced. The server leaves that peer's Allowance proposals to that App.
+/// invoiced. The server leaves that peer's Allowance proposals to that App
+/// until it invoices the peer, then accepts the proposal already received.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
-async fn a_linked_peer_the_server_never_invoiced_gets_no_acceptance() {
+async fn a_linked_peer_is_accepted_only_once_the_server_invoices_it() {
     let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
     let stack = boot(73).await;
 
@@ -1112,6 +1117,23 @@ async fn a_linked_peer_the_server_never_invoiced_gets_no_acceptance() {
     assert_eq!(record.state, AllowanceLifecycleState::Proposed);
     assert_eq!(record.local_role, Some(AllowanceLocalRole::Allowee));
     assert!(record.acceptance_event_id.is_none(), "{record:?}");
+
+    // The server invoices the stranger. The stranger sends nothing more, and
+    // the proposal the intake skipped is accepted.
+    let stranger_reader = parse_reader(&format!("pubky{stranger_key}")).unwrap();
+    post_locks_invoice_for(&stack, BUNDLE_AFTER_GRANT, &stranger_reader).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let record = creator_record().await.unwrap();
+        if record.state == AllowanceLifecycleState::Accepted {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the stranger's proposal was not accepted after its first invoice: {record:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
 
     stack.shutdown().await;
 }

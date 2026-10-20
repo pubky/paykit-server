@@ -252,6 +252,12 @@ impl OutboxStore {
         }
     }
 
+    /// Asks the transport worker to send `creator`'s queued SDK work, such as
+    /// messages queued outside an outbox handoff.
+    pub fn wake_transport(&self, creator: Uuid) {
+        self.transport.notify(creator);
+    }
+
     /// Waits for coalesced Creator hints to process durably handed-off SDK work.
     pub async fn wait_for_transport(&self) -> Vec<Uuid> {
         self.transport.wait().await

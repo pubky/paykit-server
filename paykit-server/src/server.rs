@@ -604,8 +604,15 @@ async fn allowance_intake_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runt
                 let failure = match creator_adapter(&workers, creator).await {
                     Ok(adapter) => {
                         match adapter.take_in_allowances(&intake, &workers.invoices).await {
-                            Ok(())
-                            | Err(
+                            Ok(queued) => {
+                                // The transport worker delivers them, each Creator
+                                // on its own task.
+                                if queued > 0 {
+                                    workers.outbox.wake_transport(creator);
+                                }
+                                None
+                            }
+                            Err(
                                 PaykitSdkError::ConcurrentUpdate { .. }
                                 | PaykitSdkError::SharedStateBusy { .. },
                             ) => None,
