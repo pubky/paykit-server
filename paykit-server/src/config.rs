@@ -95,6 +95,7 @@ impl Config {
                 payment_window: raw.paykit.payment_window,
                 conversion_payment_window: raw.paykit.conversion_payment_window,
                 marketplace_prepare_ttl: raw.paykit.marketplace_prepare_ttl,
+                allowance_intake: raw.paykit.allowance_intake,
             },
             electrum: ElectrumConfig {
                 endpoint: electrum_endpoint,
@@ -443,6 +444,11 @@ pub struct PaykitConfig {
     pub payment_window: Duration,
     pub conversion_payment_window: Duration,
     pub marketplace_prepare_ttl: Duration,
+    /// Whether the server accepts the Allowance proposals its invoiced readers
+    /// send. Off by default: each read derives a reader's whole Allowance
+    /// history in the SDK, which cannot be bounded until Paykit offers an
+    /// operation that reads only actionable proposals.
+    pub allowance_intake: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -793,6 +799,8 @@ struct RawPaykitConfig {
     conversion_payment_window: Duration,
     #[serde(default = "default_marketplace_prepare_ttl", with = "humantime_serde")]
     marketplace_prepare_ttl: Duration,
+    #[serde(default)]
+    allowance_intake: bool,
 }
 
 const fn default_proposal_acceptance_window() -> Duration {

@@ -44,17 +44,18 @@ pub const ALLOWANCE_INTAKE_COOLDOWN: Duration = Duration::from_secs(10);
 /// Only the scan counts: acceptances and sends are bounded per read.
 const ALLOWANCE_INTAKE_SPACING_FACTOR: u32 = 10;
 
-/// Longest wait for one Allowance scan or one acceptance, including the wait
-/// for the Creator lock. The SDK leaves timeouts to the caller, and a cancelled
-/// shared-state operation exposes no unconfirmed state, so a stalled step is
-/// dropped and counts as a failed read.
-const ALLOWANCE_INTAKE_STEP_TIMEOUT: Duration = Duration::from_secs(20);
+/// Longest wait for the Creator lock before one acceptance. Giving up starts
+/// no SDK call, so the read ends as a failure with nothing to clean up.
+const ALLOWANCE_INTAKE_LOCK_WAIT: Duration = Duration::from_secs(20);
 
-/// Longest a Creator's whole intake pass may take, finding its due readers
-/// included: the read budget, one scan and the acceptances of the last read
-/// fit well within it. The worker drops a pass that overruns it, so every
-/// intake slot is freed within this time.
-pub const ALLOWANCE_INTAKE_PASS_DEADLINE: Duration = Duration::from_secs(150);
+/// Backstop for a hung intake pass, far above any pass that makes progress.
+/// SDK calls are otherwise never cut short: cancelling one mid-flight skips
+/// its homeserver unlock and leaves the identity's shared-state lease held
+/// until it expires, up to 60 s, which fails every other shared-state
+/// operation on the identity meanwhile. A call that hangs, for example on an
+/// HTTP request with no timeout, keeps renewing that lease, so cancelling it
+/// shortens how long the identity stays locked.
+pub const ALLOWANCE_INTAKE_PASS_DEADLINE: Duration = Duration::from_secs(600);
 
 /// A Creator's pass starts no new read after this much time spent reading;
 /// the readers left over are read on the next pass. Finding the due readers
@@ -132,7 +133,9 @@ impl AllowanceIntake {
     }
 
     /// Starts a due read. It counts against the spacing at once, so a failed
-    /// read is not retried sooner.
+    /// read is not retried sooner, and until it is finished it counts as a
+    /// scan that took the whole pass deadline: a read cut off by the deadline
+    /// or a panic is spaced out by ten times that.
     fn begin(
         &self,
         creator_id: Uuid,
@@ -143,7 +146,10 @@ impl AllowanceIntake {
         if !self.is_due(creator_id, reader, newest, now) {
             return None;
         }
-        self.with_reader(creator_id, reader, |state| state.last_started = Some(now));
+        self.with_reader(creator_id, reader, |state| {
+            state.last_started = Some(now);
+            state.last_scan = ALLOWANCE_INTAKE_PASS_DEADLINE;
+        });
         Some(IntakeTicket {
             creator_id,
             reader: reader.clone(),
@@ -210,6 +216,7 @@ impl PaykitAdapter {
         &self,
         intake: &AllowanceIntake,
         invoices: &InvoiceStore,
+        keep_reading: &(dyn Fn() -> bool + Sync),
     ) -> paykit_sdk::Result<usize> {
         let now = Instant::now();
         let linked = {
@@ -264,8 +271,11 @@ impl PaykitAdapter {
             intake,
             self.creator_id,
             readers,
-            ALLOWANCE_INTAKE_READ_BUDGET,
-            ALLOWANCE_INTAKE_STEP_TIMEOUT,
+            ReadLimits {
+                budget: ALLOWANCE_INTAKE_READ_BUDGET,
+                lock_wait: ALLOWANCE_INTAKE_LOCK_WAIT,
+            },
+            keep_reading,
         )
         .await)
     }
@@ -332,10 +342,19 @@ struct IntakeRead {
     result: paykit_sdk::Result<bool>,
 }
 
+/// How long a pass keeps starting reads, and how long an acceptance waits for
+/// the Creator lock.
+#[derive(Clone, Copy)]
+struct ReadLimits {
+    budget: Duration,
+    lock_wait: Duration,
+}
+
 /// Reads the due readers, `(reader, newest stream item)`, least recently read
 /// first, until `budget` has passed since the first read started; the first
 /// read always starts. A reader left with proposals behind the per-read limit
-/// therefore goes behind the others next pass. Returns how many acceptances it
+/// therefore goes behind the others next pass. No read starts once
+/// `keep_reading` turns false, as on shutdown. Returns how many acceptances it
 /// queued.
 async fn read_readers<L: AllowanceLink + ?Sized>(
     link: &L,
@@ -343,14 +362,15 @@ async fn read_readers<L: AllowanceLink + ?Sized>(
     intake: &AllowanceIntake,
     creator_id: Uuid,
     mut readers: Vec<(PubkyPublicKey, u64)>,
-    budget: Duration,
-    step_timeout: Duration,
+    limits: ReadLimits,
+    keep_reading: &(dyn Fn() -> bool + Sync),
 ) -> usize {
+    let ReadLimits { budget, lock_wait } = limits;
     readers.sort_by_key(|(peer, _)| intake.last_started(creator_id, peer));
     let mut reading_since = None::<Instant>;
     let mut queued = 0;
     for (peer, newest) in readers {
-        if reading_since.is_some_and(|since| since.elapsed() >= budget) {
+        if !keep_reading() || reading_since.is_some_and(|since| since.elapsed() >= budget) {
             break;
         }
         let now = Instant::now();
@@ -358,7 +378,7 @@ async fn read_readers<L: AllowanceLink + ?Sized>(
             continue;
         };
         reading_since.get_or_insert(now);
-        let read = accept_proposals(link, mutation_lock, &peer, step_timeout).await;
+        let read = accept_proposals(link, mutation_lock, &peer, lock_wait).await;
         if read.accepted > 0 {
             info!(
                 accepted = read.accepted,
@@ -389,12 +409,10 @@ async fn accept_proposals<L: AllowanceLink + ?Sized>(
     link: &L,
     mutation_lock: &TokioMutex<()>,
     reader: &PubkyPublicKey,
-    step_timeout: Duration,
+    lock_wait: Duration,
 ) -> IntakeRead {
     let started = Instant::now();
-    let pending = tokio::time::timeout(step_timeout, link.pending_proposals(reader))
-        .await
-        .unwrap_or_else(|_| Err(timed_out("Allowance scan")));
+    let pending = link.pending_proposals(reader).await;
     let mut read = IntakeRead {
         accepted: 0,
         scan: started.elapsed(),
@@ -408,13 +426,14 @@ async fn accept_proposals<L: AllowanceLink + ?Sized>(
         }
     };
     for (id, stream_item_id) in pending.iter().take(MAX_ALLOWANCE_ACCEPTANCES_PER_READ) {
-        let accepted = tokio::time::timeout(step_timeout, async {
-            let _guard = mutation_lock.lock().await;
-            link.accept(reader, id, *stream_item_id).await
-        })
-        .await
-        .unwrap_or_else(|_| Err(timed_out("Allowance acceptance")));
-        if let Err(error) = accepted {
+        let Ok(_guard) = tokio::time::timeout(lock_wait, mutation_lock.lock()).await else {
+            read.result = Err(PaykitSdkError::Transport {
+                context: "Creator lock wait timed out".into(),
+                source: None,
+            });
+            return read;
+        };
+        if let Err(error) = link.accept(reader, id, *stream_item_id).await {
             read.result = Err(error);
             return read;
         }
@@ -422,13 +441,6 @@ async fn accept_proposals<L: AllowanceLink + ?Sized>(
     }
     read.result = Ok(pending.len() <= MAX_ALLOWANCE_ACCEPTANCES_PER_READ);
     read
-}
-
-fn timed_out(step: &str) -> PaykitSdkError {
-    PaykitSdkError::Transport {
-        context: format!("{step} timed out"),
-        source: None,
-    }
 }
 
 #[async_trait]
@@ -488,7 +500,7 @@ mod tests {
     use super::*;
 
     const READER: &str = "8pinxxgqs41n4aididenw5apqp1urfmzdztr8jt4abrkdn435ewo";
-    const STEP: Duration = Duration::from_secs(5);
+    const LOCK_WAIT: Duration = Duration::from_secs(5);
 
     fn reader() -> PubkyPublicKey {
         PubkyPublicKey::from_raw_or_app_key(READER).unwrap()
@@ -699,8 +711,11 @@ mod tests {
                 &intake,
                 creator,
                 readers.clone(),
-                Duration::ZERO,
-                STEP,
+                ReadLimits {
+                    budget: Duration::ZERO,
+                    lock_wait: LOCK_WAIT,
+                },
+                &|| true,
             )
             .await;
             assert_eq!(queued, 1);
@@ -716,8 +731,11 @@ mod tests {
             &intake,
             creator,
             readers,
-            Duration::from_secs(5),
-            STEP,
+            ReadLimits {
+                budget: Duration::from_secs(5),
+                lock_wait: LOCK_WAIT,
+            },
+            &|| true,
         )
         .await;
         assert_eq!(queued, 2);
@@ -744,8 +762,11 @@ mod tests {
                 &intake,
                 creator,
                 readers.clone(),
-                Duration::ZERO,
-                STEP,
+                ReadLimits {
+                    budget: Duration::ZERO,
+                    lock_wait: LOCK_WAIT,
+                },
+                &|| true,
             )
             .await;
             // Past the scan's spacing: the backlogged reader is due again.
@@ -756,34 +777,64 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_stalled_scan_or_acceptance_ends_the_read_within_the_step_timeout() {
+    async fn an_acceptance_gives_up_on_a_held_creator_lock_without_calling_the_sdk() {
         const SHORT: Duration = Duration::from_millis(100);
-
-        // A scan that never returns, like a derivation that never finishes.
         let lock = Arc::new(TokioMutex::new(()));
-        let link = SlowLink::new(&lock, 1);
-        let read = tokio::time::timeout(
-            Duration::from_secs(5),
-            accept_proposals(&link, &lock, &reader(), SHORT),
-        )
-        .await
-        .expect("the stalled scan held the read");
-        assert!(matches!(read.result, Err(PaykitSdkError::Transport { .. })));
-        assert!(read.scan >= SHORT);
-
-        // An acceptance that cannot get the Creator lock.
         let link = SlowLink::new(&lock, 1);
         link.scan_release.notify_one();
         let held = lock.clone().lock_owned().await;
+
         let read = tokio::time::timeout(
             Duration::from_secs(5),
             accept_proposals(&link, &lock, &reader(), SHORT),
         )
         .await
-        .expect("the stalled acceptance held the read");
+        .expect("the held lock held the read");
+
         assert!(matches!(read.result, Err(PaykitSdkError::Transport { .. })));
         assert_eq!(read.accepted, 0);
+        // No SDK acceptance started, so none was cut short.
+        assert!(link.lock_held_during_accepts.lock().unwrap().is_empty());
         drop(held);
+    }
+
+    #[test]
+    fn a_read_that_never_reports_back_is_spaced_out_by_the_pass_deadline() {
+        let intake = AllowanceIntake::new(Duration::from_secs(10));
+        let creator = Uuid::new_v4();
+        let start = Instant::now();
+
+        // Cut off by the pass deadline or a panic: no finish.
+        let _ticket = intake.begin(creator, &reader(), Some(1), start).unwrap();
+
+        let spacing = ALLOWANCE_INTAKE_PASS_DEADLINE * ALLOWANCE_INTAKE_SPACING_FACTOR;
+        let early = start + spacing - Duration::from_secs(1);
+        assert!(!intake.is_due(creator, &reader(), Some(2), early));
+        assert!(intake.is_due(creator, &reader(), Some(2), start + spacing));
+    }
+
+    #[tokio::test]
+    async fn no_read_starts_once_the_intake_is_told_to_stop() {
+        let lock = TokioMutex::new(());
+        let intake = AllowanceIntake::new(Duration::from_secs(10));
+        let link = ReadyLink::default();
+
+        let queued = read_readers(
+            &link,
+            &lock,
+            &intake,
+            Uuid::new_v4(),
+            vec![(reader(), 1)],
+            ReadLimits {
+                budget: Duration::from_secs(5),
+                lock_wait: LOCK_WAIT,
+            },
+            &|| false,
+        )
+        .await;
+
+        assert_eq!(queued, 0);
+        assert!(link.scans.lock().unwrap().is_empty());
     }
 
     /// A link with one pending proposal on every scan, or `backlog` for a
@@ -895,7 +946,7 @@ mod tests {
         let link = Arc::new(SlowLink::new(&lock, 1_000));
         let intake = tokio::spawn({
             let (link, lock) = (link.clone(), lock.clone());
-            async move { accept_proposals(link.as_ref(), &lock, &reader(), STEP).await }
+            async move { accept_proposals(link.as_ref(), &lock, &reader(), LOCK_WAIT).await }
         });
 
         // The scan is in flight, as for a reader with a very large history.
@@ -942,7 +993,7 @@ mod tests {
             let link = SlowLink::new(&lock, pending);
             link.scan_release.notify_one();
 
-            let outcome = accept_proposals(&link, &lock, &reader(), STEP).await;
+            let outcome = accept_proposals(&link, &lock, &reader(), LOCK_WAIT).await;
 
             assert_eq!(
                 (outcome.accepted, outcome.result.unwrap()),
@@ -958,7 +1009,7 @@ mod tests {
         link.fail_accept = true;
         link.scan_release.notify_one();
 
-        let read = accept_proposals(&link, &lock, &reader(), STEP).await;
+        let read = accept_proposals(&link, &lock, &reader(), LOCK_WAIT).await;
 
         assert!(matches!(read.result, Err(PaykitSdkError::Transport { .. })));
         assert_eq!(read.accepted, 0);
@@ -983,7 +1034,7 @@ mod tests {
             let start = Instant::now();
             let ticket = intake.begin(creator, &reader(), Some(1), start).unwrap();
 
-            let read = accept_proposals(&link, &lock, &reader(), STEP).await;
+            let read = accept_proposals(&link, &lock, &reader(), LOCK_WAIT).await;
             assert!(read.result.is_err());
             assert!(read.scan >= SCAN, "{:?}", read.scan);
             intake.finish(ticket, false, read.scan);

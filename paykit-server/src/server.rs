@@ -481,7 +481,9 @@ fn spawn_owned_workers(workers: WorkerComponents, runtime: Arc<Runtime>) -> Join
     tasks.spawn(outbox_enqueue_loop(workers.clone(), runtime.clone()));
     tasks.spawn(outbox_reconciliation_loop(workers.clone(), runtime.clone()));
     tasks.spawn(shared_transport_loop(workers.clone(), runtime.clone()));
-    tasks.spawn(allowance_intake_loop(workers.clone(), runtime.clone()));
+    if workers.paykit.allowance_intake {
+        tasks.spawn(allowance_intake_loop(workers.clone(), runtime.clone()));
+    }
     tasks.spawn(buyer_contacts_loop(workers.clone(), runtime.clone()));
     tasks.spawn(observer_loop(workers, runtime));
     tasks
@@ -603,13 +605,32 @@ async fn allowance_intake_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runt
             }
         };
         start_intake_passes(&mut tasks, &mut turns, creators, |creator| {
-            allowance_intake_pass(workers.clone(), intake.clone(), creator)
+            allowance_intake_pass(workers.clone(), intake.clone(), runtime.clone(), creator)
         });
     }
-    // Intake is retried work, and the SDK leaves cancelled shared-state
-    // operations unexposed, so shutdown cancels the running passes rather
-    // than waiting out their deadline, and returns only once they are gone.
-    tasks.abort_and_join().await;
+    finish_intake_passes(&mut tasks, ALLOWANCE_INTAKE_SHUTDOWN_GRACE).await;
+}
+
+/// How long shutdown lets running intake passes finish, below the default
+/// drain timeout. Passes start no new read once shutdown begins.
+const ALLOWANCE_INTAKE_SHUTDOWN_GRACE: Duration = Duration::from_secs(20);
+
+/// Lets the running passes finish within `grace`, then cancels the rest and
+/// returns only once every pass has ended. Cancelling a pass inside an SDK
+/// call leaves the Creator's shared-state lease held until it expires, so it
+/// is the last resort; intake is retried work, and the SDK exposes no
+/// unconfirmed state after a cancelled operation.
+async fn finish_intake_passes(tasks: &mut CreatorTasks<()>, grace: Duration) {
+    let finished =
+        tokio::time::timeout(grace, async { while tasks.join_next().await.is_some() {} }).await;
+    if finished.is_err() {
+        tracing::warn!(
+            stage = "allowance_intake",
+            step = "shutdown",
+            "Paykit Allowance intake passes cancelled at shutdown"
+        );
+        tasks.abort_and_join().await;
+    }
 }
 
 /// Starts intake passes in the free slots, least recently started Creator
@@ -659,16 +680,17 @@ async fn contain_panic(pass: impl Future<Output = ()> + Send) {
     }
 }
 
-/// One Creator's intake pass, dropped if it overruns
+/// One Creator's intake pass, dropped only if it hangs past
 /// [`ALLOWANCE_INTAKE_PASS_DEADLINE`].
 async fn allowance_intake_pass(
     workers: Arc<WorkerComponents>,
     intake: Arc<AllowanceIntake>,
+    runtime: Arc<Runtime>,
     creator: Uuid,
 ) {
     if tokio::time::timeout(
         ALLOWANCE_INTAKE_PASS_DEADLINE,
-        run_allowance_intake_pass(&workers, &intake, creator),
+        run_allowance_intake_pass(&workers, &intake, &runtime, creator),
     )
     .await
     .is_err()
@@ -684,10 +706,15 @@ async fn allowance_intake_pass(
 async fn run_allowance_intake_pass(
     workers: &WorkerComponents,
     intake: &AllowanceIntake,
+    runtime: &Runtime,
     creator: Uuid,
 ) {
+    let keep_reading = || runtime.may_start_worker_claim();
     let failure = match creator_adapter(workers, creator).await {
-        Ok(adapter) => match adapter.take_in_allowances(intake, &workers.invoices).await {
+        Ok(adapter) => match adapter
+            .take_in_allowances(intake, &workers.invoices, &keep_reading)
+            .await
+        {
             Ok(queued) => {
                 // The transport worker delivers them, each Creator on its own task.
                 if queued > 0 {
@@ -2120,6 +2147,20 @@ mod tests {
     async fn production_spawn_path_owns_all_workers() {
         let server = test_server().await;
         let mut tasks = spawn_owned_workers(server.workers, server.runtime);
+        assert_eq!(tasks.len(), 5);
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+    }
+
+    #[tokio::test]
+    async fn allowance_intake_runs_only_when_enabled() {
+        let mut server = test_server().await;
+        assert!(
+            !server.workers.paykit.allowance_intake,
+            "intake is off by default"
+        );
+        server.workers.paykit.allowance_intake = true;
+        let mut tasks = spawn_owned_workers(server.workers, server.runtime);
         assert_eq!(tasks.len(), 6);
         tasks.abort_all();
         while tasks.join_next().await.is_some() {}
@@ -2194,12 +2235,35 @@ mod tests {
         });
         has_entered.await.unwrap();
 
-        tasks.abort_and_join().await;
+        // The pass never finishes; past the grace it is cancelled.
+        finish_intake_passes(&mut tasks, Duration::from_millis(50)).await;
 
         assert!(
             was_dropped.try_recv().is_ok(),
             "the pass outlived the intake worker"
         );
+        assert!(tasks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn shutdown_lets_a_pass_finish_within_its_grace() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let runtime = test_server().await.runtime;
+        let mut tasks = CreatorTasks::new(1, runtime);
+        let mut turns = IntakeTurns::default();
+        let finished = Arc::new(AtomicBool::new(false));
+        start_intake_passes(&mut tasks, &mut turns, vec![Uuid::new_v4()], |_| {
+            let finished = finished.clone();
+            async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                finished.store(true, Ordering::SeqCst);
+            }
+        });
+
+        finish_intake_passes(&mut tasks, Duration::from_secs(5)).await;
+
+        assert!(finished.load(Ordering::SeqCst), "the pass was cut short");
         assert!(tasks.is_empty());
     }
 

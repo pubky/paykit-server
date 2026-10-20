@@ -39,6 +39,10 @@ payment_window = "24h"
 conversion_payment_window = "1h"
 # Unpublished Marketplace preparations may activate only within this DB-clock TTL.
 marketplace_prepare_ttl = "15m"
+# Accept the Allowance proposals invoiced readers send on their links. Off by
+# default until Paykit can read a reader's actionable proposals without deriving
+# their whole Allowance history.
+allowance_intake = false
 # "testnet" targets the pinned Pubky client's fixed localhost testnet ports.
 # Run the Pubky static testnet; this is not a hosted public network.
 network = "testnet"

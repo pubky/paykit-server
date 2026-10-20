@@ -90,7 +90,7 @@ impl ElectrumPort for EmptyElectrum {
 /// is the production default: a handoff here is a link handshake with the
 /// wallet, an intake and a send over an in-process Pubky testnet, and under
 /// load it outlasts a short lease, which makes the outbox claim the row again.
-fn config(database_url: &str, signing_key: &SigningKey) -> Config {
+fn config(database_url: &str, signing_key: &SigningKey, allowance_intake: bool) -> Config {
     let trusted_key = pubky::PublicKey::from(
         pubky::pkarr::PublicKey::try_from(signing_key.verifying_key().as_bytes()).unwrap(),
     )
@@ -108,6 +108,7 @@ allowed_origins = ["https://app.example"]
 client_id = "app.paykit.server"
 app_id = "paykit-server"
 network = "testnet"
+allowance_intake = {allowance_intake}
 [bitcoin]
 network = "regtest"
 [electrum]
@@ -210,9 +211,13 @@ impl Stack {
 /// credentials, published `paykit-server` App and content lock) and one reader
 /// (a `bitkit` wallet SDK on its own identity, App published).
 async fn boot(seed: u8) -> Stack {
+    boot_with_intake(seed, true).await
+}
+
+async fn boot_with_intake(seed: u8, allowance_intake: bool) -> Stack {
     let database = TestDatabase::create().await;
     let signing_key = SigningKey::from_bytes(&[seed; 32]);
-    let server_config = config(database.database_url(), &signing_key);
+    let server_config = config(database.database_url(), &signing_key, allowance_intake);
     let pool = initialize_database(&server_config).await.unwrap();
     let testnet = EphemeralTestnet::builder()
         .postgres(
@@ -1134,6 +1139,70 @@ async fn a_linked_peer_is_accepted_only_once_the_server_invoices_it() {
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
+
+    stack.shutdown().await;
+}
+
+/// With Allowance intake off, the default, the server never answers a
+/// reader's proposal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn with_intake_off_a_proposal_is_never_accepted() {
+    let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
+    let stack = boot_with_intake(74, false).await;
+
+    post_locks_invoice(&stack, BUNDLE_BEFORE_GRANT).await;
+    wait_for_request(&stack, BUNDLE_BEFORE_GRANT).await;
+
+    let proposal = stack
+        .reader_sdk
+        .propose_allowance(
+            stack.creator_key.clone(),
+            AllowanceLocalRole::Allower,
+            allowance_terms("0.00005000"),
+        )
+        .await
+        .unwrap();
+    stack
+        .reader_sdk
+        .process_outbound_private_messages(stack.creator_key.clone())
+        .await
+        .unwrap();
+
+    // The server's transport stores the proposal; nothing accepts it.
+    let creator_record = || async {
+        when_unlocked(|| {
+            stack.creator_sdk.list_allowances(AllowanceFilter {
+                counterparty: Some(stack.reader_key.clone()),
+                local_role: None,
+                states: Vec::new(),
+            })
+        })
+        .await
+        .into_iter()
+        .find(|record| record.allowance_id == proposal.allowance_id)
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while creator_record().await.is_none() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the server never received the proposal"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    // Many intake intervals (100 ms in this config) pass.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let record = creator_record().await.unwrap();
+    assert_eq!(record.state, AllowanceLifecycleState::Proposed);
+    assert!(record.acceptance_event_id.is_none(), "{record:?}");
+    let state = when_unlocked(|| stack.creator_sdk.export_backup_state()).await;
+    assert!(
+        !state
+            .outbound_private_messages
+            .iter()
+            .any(|record| record.kind == "paykit.allowance_acceptance"),
+        "an acceptance was queued"
+    );
 
     stack.shutdown().await;
 }
