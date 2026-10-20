@@ -51,6 +51,14 @@ impl<T: Send + 'static> CreatorTasks<T> {
         true
     }
 
+    /// Cancels every running task and waits until each has ended, so none
+    /// outlives its owner. Only for work whose cancellation is safe.
+    pub(crate) async fn abort_and_join(&mut self) {
+        self.tasks.abort_all();
+        while self.tasks.join_next().await.is_some() {}
+        self.active.clear();
+    }
+
     pub(crate) async fn join_next(&mut self) -> Option<(Uuid, T)> {
         let (creator, result) = self
             .tasks

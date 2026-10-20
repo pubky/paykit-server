@@ -29,8 +29,8 @@ use crate::{
     domain::locks::{BundleId, CreatorPubky, PubkyLockResource, ReaderPubky},
     http::{self, auth::SignedServiceAuth},
     paykit::{
-        ALLOWANCE_INTAKE_COOLDOWN, AllowanceIntake, CreatorSessions, IntakeTurns, PaykitAdapter,
-        creator_mutation_lock, sdk_error_label,
+        ALLOWANCE_INTAKE_COOLDOWN, ALLOWANCE_INTAKE_PASS_DEADLINE, AllowanceIntake,
+        CreatorSessions, IntakeTurns, PaykitAdapter, creator_mutation_lock, sdk_error_label,
     },
     persistence::{
         CreatorStore, InvoiceStore, MarketplacePreparationStore, OutboxRetryClass, OutboxStore,
@@ -606,14 +606,17 @@ async fn allowance_intake_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runt
             allowance_intake_pass(workers.clone(), intake.clone(), creator)
         });
     }
-    // An acceptance is never cut short, since it holds the Creator's lock.
-    while tasks.join_next().await.is_some() {}
+    // Intake is retried work, and the SDK leaves cancelled shared-state
+    // operations unexposed, so shutdown cancels the running passes rather
+    // than waiting out their deadline, and returns only once they are gone.
+    tasks.abort_and_join().await;
 }
 
 /// Starts intake passes in the free slots, least recently started Creator
 /// first, skipping Creators whose pass is still running. A pass reads
-/// reader-supplied history, so it runs on its own task: a panic in it is
-/// logged and frees its slot instead of stopping the server.
+/// reader-supplied history, so a panic in it is caught in the pass's own
+/// future: it is logged and frees the slot instead of stopping the server,
+/// and the pass stays owned by the slot, so shutdown drops it.
 fn start_intake_passes<Pass, PassFuture>(
     tasks: &mut CreatorTasks<()>,
     turns: &mut IntakeTurns,
@@ -631,30 +634,60 @@ fn start_intake_passes<Pass, PassFuture>(
         if running.contains(&creator) {
             continue;
         }
-        let pass = pass(creator);
-        let contained = async move {
-            if let Err(error) = tokio::spawn(pass).await
-                && error.is_panic()
-            {
-                tracing::error!(
-                    stage = "allowance_intake",
-                    "Paykit Allowance intake pass panicked"
-                );
-            }
-        };
-        if tasks.try_spawn(creator, contained) {
+        if tasks.try_spawn(creator, contain_panic(pass(creator))) {
             turns.started(creator);
         }
     }
 }
 
+/// Runs `pass`, logging a panic in it instead of passing it on.
+async fn contain_panic(pass: impl Future<Output = ()> + Send) {
+    let mut pass = std::pin::pin!(pass);
+    let outcome = std::future::poll_fn(|cx| {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pass.as_mut().poll(cx))) {
+            Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
+            Ok(std::task::Poll::Ready(())) => std::task::Poll::Ready(Ok(())),
+            Err(panic) => std::task::Poll::Ready(Err(panic)),
+        }
+    })
+    .await;
+    if outcome.is_err() {
+        tracing::error!(
+            stage = "allowance_intake",
+            "Paykit Allowance intake pass panicked"
+        );
+    }
+}
+
+/// One Creator's intake pass, dropped if it overruns
+/// [`ALLOWANCE_INTAKE_PASS_DEADLINE`].
 async fn allowance_intake_pass(
     workers: Arc<WorkerComponents>,
     intake: Arc<AllowanceIntake>,
     creator: Uuid,
 ) {
-    let failure = match creator_adapter(&workers, creator).await {
-        Ok(adapter) => match adapter.take_in_allowances(&intake, &workers.invoices).await {
+    if tokio::time::timeout(
+        ALLOWANCE_INTAKE_PASS_DEADLINE,
+        run_allowance_intake_pass(&workers, &intake, creator),
+    )
+    .await
+    .is_err()
+    {
+        tracing::warn!(
+            stage = "allowance_intake",
+            step = "pass_deadline",
+            "Paykit Allowance intake pass overran its deadline"
+        );
+    }
+}
+
+async fn run_allowance_intake_pass(
+    workers: &WorkerComponents,
+    intake: &AllowanceIntake,
+    creator: Uuid,
+) {
+    let failure = match creator_adapter(workers, creator).await {
+        Ok(adapter) => match adapter.take_in_allowances(intake, &workers.invoices).await {
             Ok(queued) => {
                 // The transport worker delivers them, each Creator on its own task.
                 if queued > 0 {
@@ -2135,6 +2168,39 @@ mod tests {
         release.add_permits(creators.len());
         while tasks.join_next().await.is_some() {}
         assert_eq!(peak.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn shutdown_drops_a_running_intake_pass_before_it_returns() {
+        struct Dropped(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                let _ = self.0.take().unwrap().send(());
+            }
+        }
+        let runtime = test_server().await.runtime;
+        let mut tasks = CreatorTasks::new(1, runtime);
+        let mut turns = IntakeTurns::default();
+        let (dropped, mut was_dropped) = tokio::sync::oneshot::channel();
+        let (entered, has_entered) = tokio::sync::oneshot::channel();
+        let mut start = Some((Dropped(Some(dropped)), entered));
+        start_intake_passes(&mut tasks, &mut turns, vec![Uuid::new_v4()], |_| {
+            let (guard, entered) = start.take().unwrap();
+            async move {
+                let _guard = guard;
+                entered.send(()).unwrap();
+                std::future::pending::<()>().await;
+            }
+        });
+        has_entered.await.unwrap();
+
+        tasks.abort_and_join().await;
+
+        assert!(
+            was_dropped.try_recv().is_ok(),
+            "the pass outlived the intake worker"
+        );
+        assert!(tasks.is_empty());
     }
 
     #[tokio::test]
