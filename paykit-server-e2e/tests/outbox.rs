@@ -2021,6 +2021,13 @@ async fn assert_public_sdk_handoff(creator_initiates: bool) {
             .unwrap_err()
             .is_concurrent_update()
     );
+    assert!(
+        adapter
+            .maintain_outbound_transport()
+            .await
+            .unwrap_err()
+            .is_concurrent_update()
+    );
     storage
         .transaction(|tx| {
             assert_eq!(
@@ -2051,6 +2058,58 @@ async fn assert_public_sdk_handoff(creator_initiates: bool) {
         })
         .await
         .unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::ZERO, outbox.wait_for_transport())
+            .await
+            .unwrap(),
+        vec![creator_record.id()]
+    );
+    adapter.maintain_outbound_transport().await.unwrap();
+    assert_eq!(
+        storage
+            .transaction(|tx| {
+                Ok(tx
+                    .outbound_private_messages(&peer_bootstrap.public_key)
+                    .into_iter()
+                    .find(|record| record.outbound_message_id == *first_outbound)
+                    .unwrap()
+                    .status)
+            })
+            .await
+            .unwrap(),
+        OutboundPrivateMessageStatus::Sent
+    );
+    let periodic_list = creator_sdk
+        .enqueue_private_payment_list_with_receiving_details(
+            peer_bootstrap.public_key.clone(),
+            vec![paykit_sdk::PrivateReceivingDetail {
+                identifier: "btc-bitcoin-p2wpkh".into(),
+                payload: serde_json::json!({"value": "periodic-address"}).to_string(),
+            }],
+        )
+        .await
+        .unwrap();
+    // A fresh worker loses the handoff hints, but the periodic scan still finds
+    // the Creator and drains durable work even when another peer cannot receive.
+    let restarted_outbox = OutboxStore::new(database.pool(), crypto.clone());
+    assert!(
+        tokio::time::timeout(Duration::ZERO, restarted_outbox.wait_for_transport())
+            .await
+            .is_err()
+    );
+    creators.mark_setup_complete(&creator).await.unwrap();
+    assert!(
+        creators
+            .ready_ids()
+            .await
+            .unwrap()
+            .contains(&creator_record.id())
+    );
+    let restarted_sessions =
+        CreatorSessions::new(creators.clone(), testnet.sdk().unwrap(), config.clone());
+    let provider = restarted_sessions.provider(&creator);
+    let storage = paykit_sdk::PubkySharedStateStorage::new(provider.clone());
+    let adapter = PaykitAdapter::new(creator_record.id(), provider.clone(), &config).unwrap();
     assert!(matches!(
         adapter.maintain_transport().await,
         Err(paykit_sdk::PaykitSdkError::Transport { .. })
@@ -2075,6 +2134,15 @@ async fn assert_public_sdk_handoff(creator_initiates: bool) {
             .iter()
             .any(|record| record.outbound_message_id == *first_outbound
                 && record.status == OutboundPrivateMessageStatus::Sent)
+    );
+    assert!(
+        compacted
+            .outbound_private_messages
+            .iter()
+            .any(
+                |record| record.outbound_message_id == periodic_list.outbound_message_id
+                    && record.status == OutboundPrivateMessageStatus::Sent
+            )
     );
     peer_sdk
         .receive_private_messages(creator_bootstrap.public_key.clone())

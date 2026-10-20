@@ -452,6 +452,14 @@ impl PaykitAdapter {
             );
         }
         // A peer's receive failure must not prevent other peers' queued sends.
+        results.push(self.maintain_outbound_transport().await);
+        check_transport_results(&results)
+    }
+
+    /// Processes durable outbound work without polling linked-peer inboxes.
+    /// Periodic transport maintenance still receives before discovering queued sends.
+    pub async fn maintain_outbound_transport(&self) -> paykit_sdk::Result<()> {
+        let mut results = Vec::new();
         let pending = {
             let _guard = self.mutation_lock.lock().await;
             self.sdk.pending_outbound_private_counterparties().await
