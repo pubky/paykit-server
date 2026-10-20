@@ -1170,6 +1170,13 @@ pub(crate) fn creator_mutation_lock(creator_id: Uuid) -> Arc<CreatorMutationLock
     lock
 }
 
+/// Acquires the Creator-local mutation fence for controlled transport fixtures.
+#[cfg(feature = "test-utils")]
+#[doc(hidden)]
+pub async fn acquire_creator_mutation_guard(creator_id: Uuid) -> tokio::sync::OwnedMutexGuard<()> {
+    creator_mutation_lock(creator_id).lock_owned().await
+}
+
 fn parse_peer(reader: &str) -> Result<PubkyPublicKey, HandoffError> {
     PubkyPublicKey::from_raw_or_app_key(reader).map_err(|_| HandoffError::Permanent)
 }

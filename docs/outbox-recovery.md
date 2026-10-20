@@ -110,6 +110,12 @@ before claiming one due row, then rechecks its live fence before SDK effects.
 Shutdown stops new claims and drains admitted effects within the server deadline.
 Transport and reconciliation retain their own periodic worker scheduling.
 
+Each transport pass also admits at most `outbox.batch_size` concurrent Creators
+and refills a slot when a Creator finishes. A slow Creator occupies one slot;
+each Creator's SDK operations still take the existing local
+mutation lock. A pass finishes before the worker selects another full scan or
+hint, and shutdown drains its admitted work within the server deadline.
+
 After a successful handoff, the enqueue task attempts the associated Reader's
 queue while it still owns the Creator mutation lock. It reads the committed
 server association before sending. It does not receive from unrelated Readers
