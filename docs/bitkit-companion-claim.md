@@ -88,7 +88,10 @@ The canonical Creator must already exist before an AUTH request is created. It i
 retained in the in-memory flow and must exactly match the identity authenticated
 by Pubky AUTH; a different authorizer fails before credential writes or publication.
 Reconnect requests `paykit-access-v1.watch-only-account-v1`, plus
-`usdt-address-v1` when enabled. A 124-byte binary response explicitly supplies
+`usdt-address-v1` when enabled. `asset=USDT` requests
+`paykit-access-v1.usdt-address-v1` alone, so Bitkit prepares no account and the
+current one is retained; a reply carrying account material fails. It is refused
+when USDT is not enabled. A 124-byte binary response explicitly supplies
 the authenticated Bitcoin account; a 41-byte Paykit-only response is an
 authenticated omission and preserves the current account. Client IDs, display
 names, and relay URLs never select an account.

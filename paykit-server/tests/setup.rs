@@ -29,8 +29,8 @@ use paykit_server::{
     http::setup::{setup_router, setup_router_with_trusted_proxy_hops},
     real_setup::validate_xpub,
     setup::{
-        BeginError, Completion, ManualClock, PollResult, SetupAttempt, SetupCompleter, SetupLimits,
-        SetupService, StartedSetup,
+        BeginError, Completion, ManualClock, PollResult, ReconnectScope, SetupAttempt,
+        SetupCompleter, SetupLimits, SetupService, StartedSetup,
     },
 };
 use tokio::sync::{Mutex, Notify, Semaphore};
@@ -141,10 +141,15 @@ impl SetupCompleter for ReconnectCompleter {
     async fn start_reconnect(
         &self,
         creator: &paykit_server::domain::locks::CreatorPubky,
+        scope: ReconnectScope,
     ) -> Result<StartedSetup, Completion> {
         assert_eq!(creator, &self.0);
+        let selection = match scope {
+            ReconnectScope::Full => "paykit-access-v1",
+            ReconnectScope::UsdtOnly => "paykit-access-v1.usdt-address-v1",
+        };
         Ok(StartedSetup::new(
-            "pubkyauth://signin_grant?x-bitkit-claim=paykit-access-v1".into(),
+            format!("pubkyauth://signin_grant?x-bitkit-claim={selection}"),
             Box::new(MockAttempt),
         ))
     }
@@ -169,7 +174,11 @@ async fn reconnect_route_requires_one_explicit_canonical_creator() {
         format!("/setup/reconnect?{query}&creator=invalid"),
         format!("/setup/reconnect?{query}&creator={creator}&creator={creator}"),
         format!("/setup/reconnect?{query}&creator={creator}&cid=app.paykit.server"),
+        format!("/setup/reconnect?{query}&creator={creator}&asset=BTC"),
+        format!("/setup/reconnect?{query}&creator={creator}&asset=usdt"),
+        format!("/setup/reconnect?{query}&creator={creator}&asset=USDT&asset=USDT"),
         format!("/setup?{query}&creator={creator}"),
+        format!("/setup?{query}&asset=USDT"),
     ] {
         assert_eq!(
             request(router.clone(), Method::GET, &uri).await.status(),
@@ -177,7 +186,7 @@ async fn reconnect_route_requires_one_explicit_canonical_creator() {
         );
     }
     let response = request(
-        router,
+        router.clone(),
         Method::GET,
         &format!("/setup/reconnect?{query}&creator={creator}"),
     )
@@ -192,6 +201,22 @@ async fn reconnect_route_requires_one_explicit_canonical_creator() {
     .unwrap();
     assert!(body.contains("x-bitkit-claim=paykit-access-v1"));
     assert!(!body.contains("watch-only-account-v1"));
+
+    let response = request(
+        router,
+        Method::GET,
+        &format!("/setup/reconnect?{query}&creator={creator}&asset=USDT"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(body.contains("x-bitkit-claim=paykit-access-v1.usdt-address-v1"));
 }
 
 #[async_trait]

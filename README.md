@@ -269,7 +269,10 @@ duplicate, unknown, or one-only selections fail setup.
 Reconnect uses `GET /setup/reconnect?creator=pubky...&return_to=...&state=...`.
 The server requires an existing Creator and requests
 `paykit-access-v1.watch-only-account-v1`, adding optional `usdt-address-v1` when
-enabled. The AUTH identity must match that exact Creator. A signed 41-byte
+enabled. With `asset=USDT` (only when `[usdt]` is configured) it requests
+`paykit-access-v1.usdt-address-v1` alone: Bitkit prepares no Bitcoin account, a
+reply carrying one fails, and the Bitcoin account and its pending requests stay
+unchanged. The AUTH identity must match that exact Creator. A signed 41-byte
 Paykit-only response omits Bitcoin rotation; a signed 124-byte response explicitly
 supplies the account. Changed account material must be valid BIP84 for the configured
 network; Bitcoin receiving cannot be removed.

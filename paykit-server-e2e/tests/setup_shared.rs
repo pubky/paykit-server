@@ -43,7 +43,7 @@ use paykit_server::{
         run_migrations,
     },
     real_setup::{AppPublisher, RealSetupCompleter, SharedAppPublisher},
-    setup::{PollResult, SetupLimits, SetupService, StartedFlow, SystemClock},
+    setup::{PollResult, ReconnectScope, SetupLimits, SetupService, StartedFlow, SystemClock},
     setup_orchestration::PubkyCompanionRelay,
 };
 use paykit_server_e2e::postgres::TestDatabase;
@@ -1265,7 +1265,8 @@ signed_burst = 200
             .unwrap();
         let home = PubkyPublicKey::from_public_key(&testnet.homeserver_app().public_key());
         let crypto = Arc::new(Crypto::from_master_key(&[1; 32]).unwrap());
-        let creators = CreatorStore::new(database.pool(), crypto);
+        let creators = CreatorStore::new(database.pool(), crypto.clone());
+        let invoices = InvoiceStore::new(database.pool(), crypto);
         let sessions = CreatorSessions::new(
             creators.clone(),
             client.clone(),
@@ -1307,7 +1308,7 @@ signed_burst = 200
         };
         let without_usdt_config = StatusRoute {
             signer: SigningKey::from_bytes(&[7; 32]),
-            creators,
+            creators: creators.clone(),
             sessions,
             usdt_enabled: false,
         };
@@ -1420,6 +1421,72 @@ signed_burst = 200
                 .await,
             SETUP_REQUIRED
         );
+
+        // "Add USDT" asks for the USDT address alone: the Bitcoin account, its
+        // generation and a pending request stay as they were.
+        let adds_usdt = enroll(&bootstrap, &home).await;
+        assert_eq!(
+            setup(&service, &bootstrap, &adds_usdt, None).await,
+            PollResult::Complete
+        );
+        let (bound, generation) = creators
+            .load_with_bitcoin_account_generation(&adds_usdt.creator)
+            .await
+            .unwrap();
+        let reader = parse_reader(&never_set_up.creator.to_string()).unwrap();
+        allocate_invoice(
+            &invoices,
+            &adds_usdt.creator,
+            &reader,
+            b"pending-before-usdt",
+            0,
+            generation,
+        )
+        .await;
+        let before = business_rows(&database).await;
+        // A Bitcoin account smuggled into the USDT-only reply is refused.
+        assert_eq!(
+            usdt_only_reconnect(&service, &bootstrap, &adds_usdt, true).await,
+            PollResult::Failed
+        );
+        assert_eq!(
+            usdt_only_reconnect(&service, &bootstrap, &adds_usdt, false).await,
+            PollResult::Complete
+        );
+        let (after, after_generation) = creators
+            .load_with_bitcoin_account_generation(&adds_usdt.creator)
+            .await
+            .unwrap();
+        assert_eq!(after.bitcoin_account(), bound.bitcoin_account());
+        assert_eq!(after_generation, generation);
+        assert_eq!(after.usdt_address().unwrap().as_str(), USDT_ADDRESS);
+        assert_eq!(business_rows(&database).await, before);
+        assert_eq!(route.accepted(&adds_usdt.creator, "BTC").await, READY);
+        assert_eq!(route.accepted(&adds_usdt.creator, "USDT").await, READY);
         database.cleanup().await;
+    }
+
+    async fn usdt_only_reconnect(
+        service: &SetupService,
+        bootstrap: &PubkySessionBootstrap,
+        seller: &Seller,
+        bitcoin: bool,
+    ) -> PollResult {
+        let flow = service
+            .begin_scoped_reconnect(
+                "127.0.0.1".parse().unwrap(),
+                "https://app.example",
+                "add-usdt",
+                &seller.creator,
+                ReconnectScope::UsdtOnly,
+            )
+            .await
+            .unwrap();
+        let request =
+            parse_reconnect_auth_request(&flow.authorization_url, PAYKIT_SESSION_CAPABILITIES)
+                .unwrap();
+        assert_eq!(request.claim_type(), "paykit-access-v1.usdt-address-v1");
+        let payload = payload(seller, bitcoin, Some(USDT_ADDRESS));
+        approve_payload(service, bootstrap, &seller.root, flow, &payload, true).await
     }
 }
