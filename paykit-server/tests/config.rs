@@ -338,6 +338,26 @@ fn requires_a_nonempty_paykit_client_id() {
 }
 
 #[test]
+fn allowance_intake_is_off_by_default_and_cannot_be_enabled_yet() {
+    let config = Config::from_toml_and_environment(&valid_toml(), environment()).unwrap();
+    assert!(!config.paykit.allowance_intake);
+
+    let enabled = valid_toml().replace(
+        "network = \"testnet\"\n\n[bitcoin]",
+        "network = \"testnet\"\nallowance_intake = true\n\n[bitcoin]",
+    );
+    assert!(enabled.contains("allowance_intake = true"));
+    let result = Config::from_toml_and_environment(&enabled, environment());
+    #[cfg(not(feature = "test-utils"))]
+    assert!(matches!(
+        result,
+        Err(ConfigError::AllowanceIntakeUnavailable)
+    ));
+    #[cfg(feature = "test-utils")]
+    assert!(result.unwrap().paykit.allowance_intake);
+}
+
+#[test]
 fn rejects_removed_retention_section() {
     let config = format!("{}\n[retention]\ncleanup_batch_size = 100\n", valid_toml());
 

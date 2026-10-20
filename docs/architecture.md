@@ -50,6 +50,25 @@ The SDK owns encrypted identity-wide homeserver state under WebDAV locks. Apps
 share Encrypted Links and history; app IDs attribute requests and outbound records.
 The server does not maintain a PostgreSQL copy of SDK state. Its transport worker
 receives private events and processes queued delivery without executing payments.
+An Allowance intake worker can accept, as the Allowee, the Allowance proposals
+a reader leaves on the server link, so the reader's wallet can pay later
+requests without a prompt. It is withheld: production configuration rejects
+`paykit.allowance_intake = true`, and only `test-utils` builds can run it,
+because the pinned SDK derives a link's whole history synchronously for each
+read and each acceptance, the reader decides how large that history is, and
+nothing in the server can bound that work. Enabling it waits on a bounded Paykit
+operation that reads only a reader's actionable proposals.
+When enabled, the worker answers only readers the Creator has invoiced (a
+Reader assignment exists); a peer another App on the shared identity linked is
+left to that App. It never runs in an outbox handoff or the shared transport
+loop: it runs at most one pass per Creator, and at most the outbox batch size of
+passes at once. It reads a reader only after that reader's link received new
+items, least recently read first, no sooner than 10 seconds or ten times the
+last scan of its Allowances after the last read began, accepts at most four
+proposals per read, and takes the Creator mutation lock for one acceptance at a
+time. A pass starts no new read 5 seconds after its first read. SDK calls are
+not cancelled for being slow, since that strands the identity's shared-state
+lease; a 10-minute deadline catches a hung pass.
 The local reader demo likewise uses hosted SDK state; its encrypted local file
 retains only the app/Creator binding and a process ownership lock.
 

@@ -5,6 +5,7 @@
 //! envelopes before reporting invoice success.
 
 mod buyer_contacts;
+mod readers;
 mod settlement;
 mod usdt;
 

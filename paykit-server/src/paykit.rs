@@ -1,7 +1,12 @@
 //! Concrete per-Creator Paykit SDK boundary used by durable outbox workers.
 
+mod allowances;
 mod buyer_contacts;
 mod payment_status;
+
+pub use allowances::{
+    ALLOWANCE_INTAKE_COOLDOWN, ALLOWANCE_INTAKE_PASS_DEADLINE, AllowanceIntake, IntakeTurns,
+};
 
 use std::{
     collections::HashMap,
