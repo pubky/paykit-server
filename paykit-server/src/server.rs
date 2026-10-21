@@ -1,6 +1,6 @@
 //! Explicit production composition root for one multi-Creator Paykit Server process.
 
-use std::{future::Future, sync::Arc, time::Duration};
+use std::{collections::BTreeSet, future::Future, sync::Arc, time::Duration};
 
 use crate::{
     application::{
@@ -480,6 +480,10 @@ fn spawn_owned_workers(workers: WorkerComponents, runtime: Arc<Runtime>) -> Join
     let workers = Arc::new(workers);
     tasks.spawn(outbox_enqueue_loop(workers.clone(), runtime.clone()));
     tasks.spawn(outbox_reconciliation_loop(workers.clone(), runtime.clone()));
+    tasks.spawn(lifecycle_reconciliation_loop(
+        workers.clone(),
+        runtime.clone(),
+    ));
     tasks.spawn(shared_transport_loop(workers.clone(), runtime.clone()));
     if workers.paykit.allowance_intake {
         tasks.spawn(allowance_intake_loop(workers.clone(), runtime.clone()));
@@ -663,21 +667,24 @@ fn start_intake_passes<Pass, PassFuture>(
 
 /// Runs `pass`, logging a panic in it instead of passing it on.
 async fn contain_panic(pass: impl Future<Output = ()> + Send) {
-    let mut pass = std::pin::pin!(pass);
-    let outcome = std::future::poll_fn(|cx| {
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pass.as_mut().poll(cx))) {
-            Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
-            Ok(std::task::Poll::Ready(())) => std::task::Poll::Ready(Ok(())),
-            Err(panic) => std::task::Poll::Ready(Err(panic)),
-        }
-    })
-    .await;
-    if outcome.is_err() {
+    if pass_panicked(pass).await {
         tracing::error!(
             stage = "allowance_intake",
             "Paykit Allowance intake pass panicked"
         );
     }
+}
+
+async fn pass_panicked(pass: impl Future<Output = ()> + Send) -> bool {
+    let mut pass = std::pin::pin!(pass);
+    std::future::poll_fn(|cx| {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pass.as_mut().poll(cx))) {
+            Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
+            Ok(std::task::Poll::Ready(())) => std::task::Poll::Ready(false),
+            Err(_) => std::task::Poll::Ready(true),
+        }
+    })
+    .await
 }
 
 /// One Creator's intake pass, dropped only if it hangs past
@@ -1323,8 +1330,6 @@ async fn outbox_reconciliation_loop(workers: Arc<WorkerComponents>, runtime: Arc
                 outbox_available = false;
             }
         }
-        delivery_available &=
-            reconcile_payment_request_lifecycles(workers.clone(), hinted_creators.as_deref()).await;
         if !delivery_available || hinted_creators.is_none() {
             runtime.set_paykit_reconciliation_available(delivery_available);
         }
@@ -1334,65 +1339,154 @@ async fn outbox_reconciliation_loop(workers: Arc<WorkerComponents>, runtime: Arc
     }
 }
 
-/// Only failing to enumerate Creators is systemic here. One Creator's receive or
-/// projection failure (often one Reader's homeserver) is retried on the next pass
-/// and must not withdraw every Creator's rail; durable delivery failures still
-/// degrade readiness through `delivery_available`.
-async fn reconcile_payment_request_lifecycles(
-    workers: Arc<WorkerComponents>,
-    hinted_creators: Option<&[Uuid]>,
-) -> bool {
-    let creator_ids = match hinted_creators {
-        Some(creators) => creators.to_vec(),
-        None => match workers.payment_request_lifecycles.creator_ids().await {
-            Ok(creator_ids) => creator_ids,
-            Err(error) => {
-                tracing::warn!(
-                    stage = "lifecycle_reconciliation",
-                    step = "creator_ids_load",
-                    category = error.diagnostic_label(),
-                    "Payment request lifecycle reconciliation unavailable"
-                );
-                return false;
+/// Lifecycle receive does not wait behind an unrelated Creator's claimed outbox work.
+/// Each Creator has at most one pass; queued hints survive an occupied slot.
+async fn lifecycle_reconciliation_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtime>) {
+    let limit = usize::try_from(workers.outbox_batch_size).expect("validated outbox batch size");
+    let mut tasks = CreatorTasks::new(limit, runtime.clone());
+    let mut turns = IntakeTurns::default();
+    let mut pending = BTreeSet::new();
+    let mut readiness = LifecycleReadiness::default();
+    let mut interval = tokio::time::interval(workers.outbox_poll_interval);
+    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            biased;
+            _ = runtime.cancelled() => break,
+            Some((creator, available)) = tasks.join_next(), if !tasks.is_empty() => {
+                readiness.completed(creator, available, &runtime);
             }
-        },
-    };
-    let mut batch = JoinSet::new();
-    for creator_id in creator_ids {
-        let workers = workers.clone();
-        batch.spawn(async move {
-            let adapter = creator_adapter(&workers, creator_id)
-                .await
-                .map_err(|error| ("adapter_build", error.diagnostic_label()))?;
-            adapter
-                .receive_and_project_payment_requests(&workers.payment_request_lifecycles)
-                .await
-                .map_err(|error| ("receive_and_project", error.diagnostic_label()))
+            _ = interval.tick() => {
+                match workers.payment_request_lifecycles.creator_ids().await {
+                    Ok(creators) => {
+                        readiness.full_pass(&creators, &runtime);
+                        pending.extend(creators);
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            stage = "lifecycle_reconciliation",
+                            step = "creator_ids_load",
+                            category = error.diagnostic_label(),
+                            "Payment request lifecycle reconciliation unavailable"
+                        );
+                        readiness.failed(&runtime);
+                    }
+                }
+            }
+            creators = workers.outbox.wait_for_lifecycle_reconciliation() => {
+                pending.extend(creators);
+            }
+        }
+        start_lifecycle_passes(&mut tasks, &mut turns, &mut pending, |creator| {
+            reconcile_creator_lifecycle(workers.clone(), creator)
         });
     }
-    let mut available = true;
-    while let Some(result) = batch.join_next().await {
-        match result {
-            Ok(Ok(())) => {}
-            Ok(Err((step, category))) => {
-                tracing::warn!(
-                    stage = "lifecycle_reconciliation",
-                    step,
-                    category,
-                    "Creator payment request reconciliation deferred"
-                );
-            }
-            Err(_) => {
+    // Admitted SDK work drains under the server's existing shutdown deadline.
+    finish_lifecycle_passes(&mut tasks, &mut readiness, &runtime).await;
+}
+
+async fn finish_lifecycle_passes(
+    tasks: &mut CreatorTasks<bool>,
+    readiness: &mut LifecycleReadiness,
+    runtime: &Runtime,
+) {
+    while let Some((creator, available)) = tasks.join_next().await {
+        readiness.completed(creator, available, runtime);
+    }
+}
+
+/// A full enumeration and completion of its Creators recover readiness. Targeted
+/// hints cannot clear a failed enumeration or an earlier panicked pass.
+#[derive(Default)]
+struct LifecycleReadiness {
+    checking: Option<BTreeSet<Uuid>>,
+}
+
+impl LifecycleReadiness {
+    fn full_pass(&mut self, creators: &[Uuid], runtime: &Runtime) {
+        self.checking
+            .get_or_insert_with(|| creators.iter().copied().collect());
+        self.publish_if_complete(runtime);
+    }
+
+    fn failed(&mut self, runtime: &Runtime) {
+        self.checking = None;
+        runtime.set_paykit_lifecycle_available(false);
+    }
+
+    fn completed(&mut self, creator: Uuid, available: bool, runtime: &Runtime) {
+        if !available {
+            self.failed(runtime);
+        } else if let Some(checking) = &mut self.checking {
+            checking.remove(&creator);
+            self.publish_if_complete(runtime);
+        }
+    }
+
+    fn publish_if_complete(&mut self, runtime: &Runtime) {
+        if self.checking.as_ref().is_some_and(BTreeSet::is_empty) {
+            self.checking = None;
+            runtime.set_paykit_lifecycle_available(true);
+        }
+    }
+}
+
+fn start_lifecycle_passes<Pass, PassFuture>(
+    tasks: &mut CreatorTasks<bool>,
+    turns: &mut IntakeTurns,
+    pending: &mut BTreeSet<Uuid>,
+    mut pass: Pass,
+) where
+    Pass: FnMut(Uuid) -> PassFuture,
+    PassFuture: Future<Output = ()> + Send + 'static,
+{
+    let running = tasks.active_creators().into_iter().collect::<BTreeSet<_>>();
+    for creator in turns.order(pending.union(&running).copied().collect()) {
+        if tasks.available_slots() == 0 {
+            break;
+        }
+        if running.contains(&creator) || !pending.contains(&creator) {
+            continue;
+        }
+        let work = pass(creator);
+        if tasks.try_spawn(creator, async move {
+            let available = !pass_panicked(work).await;
+            if !available {
                 tracing::warn!(
                     stage = "lifecycle_reconciliation",
                     step = "task_join",
                     "Payment request lifecycle reconciliation task failed"
                 );
-                available = false;
             }
+            available
+        }) {
+            turns.started(creator);
+            pending.remove(&creator);
         }
     }
-    available
+}
+
+/// One Creator's receive/projection error is retried without withdrawing every
+/// Creator's rail; durable delivery failures retain their separate readiness owner.
+async fn reconcile_creator_lifecycle(workers: Arc<WorkerComponents>, creator: Uuid) {
+    let result = async {
+        let adapter = creator_adapter(&workers, creator)
+            .await
+            .map_err(|error| ("adapter_build", error.diagnostic_label()))?;
+        adapter
+            .receive_and_project_payment_requests(&workers.payment_request_lifecycles)
+            .await
+            .map_err(|error| ("receive_and_project", error.diagnostic_label()))
+    }
+    .await;
+    if let Err((step, category)) = result {
+        tracing::warn!(
+            stage = "lifecycle_reconciliation",
+            step,
+            category,
+            "Creator payment request reconciliation deferred"
+        );
+    }
 }
 
 /// A single failed tick is routine for a remote Electrum server. Readiness turns
@@ -2147,7 +2241,7 @@ mod tests {
     async fn production_spawn_path_owns_all_workers() {
         let server = test_server().await;
         let mut tasks = spawn_owned_workers(server.workers, server.runtime);
-        assert_eq!(tasks.len(), 5);
+        assert_eq!(tasks.len(), 6);
         tasks.abort_all();
         while tasks.join_next().await.is_some() {}
     }
@@ -2161,9 +2255,213 @@ mod tests {
         );
         server.workers.paykit.allowance_intake = true;
         let mut tasks = spawn_owned_workers(server.workers, server.runtime);
-        assert_eq!(tasks.len(), 6);
+        assert_eq!(tasks.len(), 7);
         tasks.abort_all();
         while tasks.join_next().await.is_some() {}
+    }
+
+    fn lifecycle_runtime() -> Arc<Runtime> {
+        struct Available;
+        #[async_trait]
+        impl crate::runtime::DependencyCheck for Available {
+            async fn postgres_ready(&self) -> bool {
+                true
+            }
+        }
+        let runtime = Arc::new(Runtime::new(Arc::new(Available), 1));
+        runtime.set_electrum_available(true);
+        runtime.set_outbox_available(true);
+        runtime.set_paykit_enqueue_available(true);
+        runtime.set_paykit_reconciliation_available(true);
+        runtime.set_paykit_transport_available(true);
+        runtime
+    }
+
+    #[tokio::test]
+    async fn lifecycle_passes_bound_work_retain_hints_and_advance_past_a_slow_creator() {
+        use crate::runtime::ComponentState;
+        let runtime = lifecycle_runtime();
+        let mut tasks = CreatorTasks::new(2, runtime.clone());
+        let mut turns = IntakeTurns::default();
+        let mut readiness = LifecycleReadiness::default();
+        let [slow, fast, queued] = [1, 2, 3].map(Uuid::from_u128);
+        let creators = [slow, fast, queued];
+        let gates = Arc::new(
+            creators
+                .map(|creator| (creator, tokio::sync::Semaphore::new(0)))
+                .into_iter()
+                .collect::<std::collections::HashMap<_, _>>(),
+        );
+        let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
+        let pass = |creator| {
+            let gates = gates.clone();
+            let started = started.clone();
+            async move {
+                started.send(creator).unwrap();
+                gates[&creator].acquire().await.unwrap().forget();
+            }
+        };
+        let mut pending = creators.into_iter().collect::<BTreeSet<_>>();
+        readiness.full_pass(&creators, &runtime);
+        start_lifecycle_passes(&mut tasks, &mut turns, &mut pending, &pass);
+        let first = tokio::time::timeout(Duration::from_secs(1), async {
+            BTreeSet::from([starts.recv().await.unwrap(), starts.recv().await.unwrap()])
+        })
+        .await
+        .unwrap();
+        assert_eq!(first, BTreeSet::from([slow, fast]));
+        assert_eq!(pending, BTreeSet::from([queued]));
+
+        // Hints arriving while both slots are occupied must survive, including
+        // another hint for the currently running slow Creator.
+        pending.extend([slow, fast]);
+        start_lifecycle_passes(&mut tasks, &mut turns, &mut pending, &pass);
+        assert_eq!(tasks.active_creators().len(), 2);
+        assert!(starts.try_recv().is_err());
+        for (completed, next) in [(fast, queued), (queued, fast)] {
+            gates[&completed].add_permits(1);
+            let (creator, available) =
+                tokio::time::timeout(Duration::from_secs(1), tasks.join_next())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!((creator, available), (completed, true));
+            readiness.completed(creator, available, &runtime);
+            start_lifecycle_passes(&mut tasks, &mut turns, &mut pending, &pass);
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(1), starts.recv())
+                    .await
+                    .unwrap(),
+                Some(next)
+            );
+            assert_eq!(tasks.active_creators().len(), 2);
+            assert_eq!(
+                runtime.readiness().await.paykit_delivery,
+                ComponentState::NotReady
+            );
+        }
+        gates[&fast].add_permits(1);
+        assert_eq!(tasks.join_next().await, Some((fast, true)));
+        assert_eq!(pending, BTreeSet::from([slow]));
+        assert_eq!(tasks.active_creators(), vec![slow]);
+        gates[&slow].add_permits(1);
+        let (creator, available) = tasks.join_next().await.unwrap();
+        assert_eq!((creator, available), (slow, true));
+        readiness.completed(creator, available, &runtime);
+        assert_eq!(runtime.readiness().await.status, ComponentState::Ready);
+        start_lifecycle_passes(&mut tasks, &mut turns, &mut pending, &pass);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), starts.recv())
+                .await
+                .unwrap(),
+            Some(slow)
+        );
+        gates[&slow].add_permits(1);
+        assert_eq!(tasks.join_next().await, Some((slow, true)));
+        assert!(tasks.is_empty());
+        assert!(pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn lifecycle_panic_frees_the_creator_but_only_a_full_pass_recovers_readiness() {
+        use crate::runtime::ComponentState;
+        let runtime = lifecycle_runtime();
+        let mut tasks = CreatorTasks::new(1, runtime.clone());
+        let mut turns = IntakeTurns::default();
+        let mut readiness = LifecycleReadiness::default();
+        let creator = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let mut pending = BTreeSet::from([creator]);
+        readiness.full_pass(&[creator], &runtime);
+        start_lifecycle_passes(&mut tasks, &mut turns, &mut pending, |_| async {
+            panic!("fixture panic")
+        });
+        let (finished, available) = tasks.join_next().await.unwrap();
+        assert_eq!((finished, available), (creator, false));
+        readiness.completed(finished, available, &runtime);
+        assert!(tasks.active_creators().is_empty());
+        assert_eq!(
+            runtime.readiness().await.paykit_delivery,
+            ComponentState::Degraded
+        );
+
+        pending.insert(creator);
+        start_lifecycle_passes(&mut tasks, &mut turns, &mut pending, |_| async {});
+        let (finished, available) = tasks.join_next().await.unwrap();
+        assert_eq!((finished, available), (creator, true));
+        readiness.completed(finished, available, &runtime);
+        assert_eq!(
+            runtime.readiness().await.paykit_delivery,
+            ComponentState::Degraded
+        );
+
+        readiness.full_pass(&[creator, other], &runtime);
+        readiness.completed(creator, true, &runtime);
+        // A later tick must not reset the outstanding full pass; an unrelated
+        // completed Creator cannot clear the pending one either.
+        readiness.full_pass(&[creator, other], &runtime);
+        readiness.completed(Uuid::new_v4(), true, &runtime);
+        assert_eq!(
+            runtime.readiness().await.paykit_delivery,
+            ComponentState::Degraded
+        );
+        readiness.completed(other, true, &runtime);
+        assert_eq!(runtime.readiness().await.status, ComponentState::Ready);
+
+        readiness.full_pass(&[creator], &runtime);
+        readiness.failed(&runtime); // Enumeration failure invalidates that pass.
+        readiness.completed(creator, true, &runtime);
+        assert_eq!(
+            runtime.readiness().await.paykit_delivery,
+            ComponentState::Degraded
+        );
+        readiness.full_pass(&[], &runtime);
+        assert_eq!(runtime.readiness().await.status, ComponentState::Ready);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_shutdown_drains_admitted_work_without_starting_queued_creators() {
+        let runtime = lifecycle_runtime();
+        let mut tasks = CreatorTasks::new(1, runtime.clone());
+        let mut turns = IntakeTurns::default();
+        let mut readiness = LifecycleReadiness::default();
+        let creators = [1, 2].map(Uuid::from_u128);
+        let mut pending = creators.into_iter().collect::<BTreeSet<_>>();
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
+        let (finished, mut finishes) = tokio::sync::mpsc::unbounded_channel();
+        let pass = |creator| {
+            let gate = gate.clone();
+            let started = started.clone();
+            let finished = finished.clone();
+            async move {
+                started.send(creator).unwrap();
+                gate.acquire().await.unwrap().forget();
+                finished.send(creator).unwrap();
+            }
+        };
+        start_lifecycle_passes(&mut tasks, &mut turns, &mut pending, &pass);
+        assert_eq!(starts.recv().await, Some(creators[0]));
+        runtime.begin_shutdown();
+        {
+            let drain = finish_lifecycle_passes(&mut tasks, &mut readiness, &runtime);
+            tokio::pin!(drain);
+            assert!(
+                tokio::time::timeout(Duration::ZERO, &mut drain)
+                    .await
+                    .is_err()
+            );
+            assert!(finishes.try_recv().is_err());
+            gate.add_permits(1);
+            tokio::time::timeout(Duration::from_secs(1), &mut drain)
+                .await
+                .unwrap();
+        }
+        assert_eq!(finishes.recv().await, Some(creators[0]));
+        start_lifecycle_passes(&mut tasks, &mut turns, &mut pending, &pass);
+        assert!(tasks.is_empty());
+        assert_eq!(pending, BTreeSet::from([creators[1]]));
+        assert!(starts.try_recv().is_err());
     }
 
     #[tokio::test]

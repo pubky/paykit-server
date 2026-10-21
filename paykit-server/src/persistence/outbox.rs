@@ -209,6 +209,7 @@ pub struct OutboxStore {
     crypto: std::sync::Arc<Crypto>,
     transport: std::sync::Arc<CreatorWakeup>,
     reconciliation: std::sync::Arc<CreatorWakeup>,
+    lifecycle_reconciliation: std::sync::Arc<CreatorWakeup>,
 }
 
 #[derive(Default)]
@@ -249,6 +250,7 @@ impl OutboxStore {
             crypto,
             transport: std::sync::Arc::new(CreatorWakeup::default()),
             reconciliation: std::sync::Arc::new(CreatorWakeup::default()),
+            lifecycle_reconciliation: std::sync::Arc::new(CreatorWakeup::default()),
         }
     }
 
@@ -266,6 +268,16 @@ impl OutboxStore {
     /// Waits for coalesced Creator hints to reconcile committed handoffs.
     pub async fn wait_for_reconciliation(&self) -> Vec<Uuid> {
         self.reconciliation.wait().await
+    }
+
+    pub(crate) async fn wait_for_lifecycle_reconciliation(&self) -> Vec<Uuid> {
+        self.lifecycle_reconciliation.wait().await
+    }
+
+    fn wake_handed_off(&self, creator: Uuid) {
+        self.transport.notify(creator);
+        self.reconciliation.notify(creator);
+        self.lifecycle_reconciliation.notify(creator);
     }
 
     /// Reports durable systemic delivery failures without treating individual
@@ -679,8 +691,7 @@ impl OutboxStore {
             .map_err(|_| PersistenceError::Unavailable)?;
         if changed.rows_affected() == 1 {
             // Hints never replace the durable row, due time, or claim fence.
-            self.transport.notify(claim.creator_id);
-            self.reconciliation.notify(claim.creator_id);
+            self.wake_handed_off(claim.creator_id);
         }
         Ok(changed.rows_affected() == 1)
     }
@@ -910,6 +921,48 @@ fn lookup_hash_from_storage(bytes: &[u8]) -> Result<LookupHash, PersistenceError
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn handoff_wakes_independent_claim_and_lifecycle_consumers() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://127.0.0.1:1/paykit")
+            .unwrap();
+        let crypto = std::sync::Arc::new(Crypto::from_master_key(&[7; 32]).unwrap());
+        let outbox = OutboxStore::new(&pool, crypto);
+        let worker = outbox.clone();
+        let first = Uuid::new_v4();
+        let later = Uuid::new_v4();
+        outbox.wake_handed_off(first);
+        assert_eq!(
+            tokio::time::timeout(Duration::ZERO, worker.wait_for_reconciliation())
+                .await
+                .unwrap(),
+            vec![first]
+        );
+        outbox.wake_handed_off(later);
+        assert_eq!(
+            tokio::time::timeout(Duration::ZERO, worker.wait_for_lifecycle_reconciliation())
+                .await
+                .unwrap()
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([first, later])
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::ZERO, worker.wait_for_reconciliation())
+                .await
+                .unwrap(),
+            vec![later]
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::ZERO, worker.wait_for_transport())
+                .await
+                .unwrap()
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([first, later])
+        );
+    }
 
     #[tokio::test]
     async fn creator_wakeups_coalesce_and_drain_without_losing_later_hints() {
