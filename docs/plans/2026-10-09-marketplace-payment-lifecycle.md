@@ -110,7 +110,7 @@ Accepted behavior:
 
 ## Multi-asset prepare and activate (PK1)
 
-Decision PK1 (John, 15 Oct 2026): one Paykit request carries every asset the seller accepts, so the Shop offers a single "Pay with Paykit" option and the buyer picks BTC or USDT0 in Bitkit.
+Decision PK1 (BitcoinErrorLog, 15 Oct 2026): one Paykit request carries every asset the seller accepts, so the Shop offers a single "Pay with Paykit" option and the buyer picks BTC or USDT0 in Bitkit.
 
 - Request terms: `amount` is a base-unit integer string in the Locks criterion format; `asset` is the denomination (`BTC`, `USD`, `USDT`). Paykit Server derives the endpoints from the seller's setup, as for Locks invoices: a fresh Bitcoin address from the seller's xpub, and the seller's USDT address when the deployment has `[usdt]`. The optional `accepted_assets` (non-empty, unique subset of `BTC`, `USDT`) only narrows; it never adds a rail. It exists because a shared USDT address cannot be removed on reconnect, so the Shop's "Accept USDT" toggle can only be honoured by narrowing. The retired `amount_sats` body and `total_sats` response and activation fields no longer exist; no compatibility path reads them.
 - Every combination is supported. USD and USDT are fixed parity (`"1"`). Anything crossing BTC uses one Blocktank rate fixed at prepare (ten-minute freshness) and stored as `PaymentConversion::Fixed` in the preparation. Activation never refetches the rate. Open question for Paykit maintainers: confirm prepare, not activation, as the fixing point.
