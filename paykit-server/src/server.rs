@@ -1346,6 +1346,7 @@ async fn lifecycle_reconciliation_loop(workers: Arc<WorkerComponents>, runtime: 
     let mut tasks = CreatorTasks::new(limit, runtime.clone());
     let mut turns = IntakeTurns::default();
     let mut pending = BTreeSet::new();
+    let mut known_creators = Vec::new();
     let mut readiness = LifecycleReadiness::default();
     let mut interval = tokio::time::interval(workers.outbox_poll_interval);
     interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -1360,7 +1361,8 @@ async fn lifecycle_reconciliation_loop(workers: Arc<WorkerComponents>, runtime: 
                 match workers.payment_request_lifecycles.creator_ids().await {
                     Ok(creators) => {
                         readiness.full_pass(&creators, &runtime);
-                        pending.extend(creators);
+                        pending.extend(creators.iter().copied());
+                        known_creators = creators;
                     }
                     Err(error) => {
                         tracing::warn!(
@@ -1377,9 +1379,13 @@ async fn lifecycle_reconciliation_loop(workers: Arc<WorkerComponents>, runtime: 
                 pending.extend(creators);
             }
         }
-        start_lifecycle_passes(&mut tasks, &mut turns, &mut pending, |creator| {
-            reconcile_creator_lifecycle(workers.clone(), creator)
-        });
+        start_lifecycle_passes(
+            &mut tasks,
+            &mut turns,
+            &mut pending,
+            &known_creators,
+            |creator| reconcile_creator_lifecycle(workers.clone(), creator),
+        );
     }
     // Admitted SDK work drains under the server's existing shutdown deadline.
     finish_lifecycle_passes(&mut tasks, &mut readiness, &runtime).await;
@@ -1435,13 +1441,18 @@ fn start_lifecycle_passes<Pass, PassFuture>(
     tasks: &mut CreatorTasks<bool>,
     turns: &mut IntakeTurns,
     pending: &mut BTreeSet<Uuid>,
+    known_creators: &[Uuid],
     mut pass: Pass,
 ) where
     Pass: FnMut(Uuid) -> PassFuture,
     PassFuture: Future<Output = ()> + Send + 'static,
 {
     let running = tasks.active_creators().into_iter().collect::<BTreeSet<_>>();
-    for creator in turns.order(pending.union(&running).copied().collect()) {
+    // Keep completed Creators in the ordering until discovery removes them, so
+    // a later hint cannot reset their turn ahead of older queued work.
+    let mut creators = pending.union(&running).copied().collect::<BTreeSet<_>>();
+    creators.extend(known_creators);
+    for creator in turns.order(creators.into_iter().collect()) {
         if tasks.available_slots() == 0 {
             break;
         }
@@ -2303,7 +2314,7 @@ mod tests {
         };
         let mut pending = creators.into_iter().collect::<BTreeSet<_>>();
         readiness.full_pass(&creators, &runtime);
-        start_lifecycle_passes(&mut tasks, &mut turns, &mut pending, &pass);
+        start_lifecycle_passes(&mut tasks, &mut turns, &mut pending, &creators, &pass);
         let first = tokio::time::timeout(Duration::from_secs(1), async {
             BTreeSet::from([starts.recv().await.unwrap(), starts.recv().await.unwrap()])
         })
@@ -2315,7 +2326,7 @@ mod tests {
         // Hints arriving while both slots are occupied must survive, including
         // another hint for the currently running slow Creator.
         pending.extend([slow, fast]);
-        start_lifecycle_passes(&mut tasks, &mut turns, &mut pending, &pass);
+        start_lifecycle_passes(&mut tasks, &mut turns, &mut pending, &creators, &pass);
         assert_eq!(tasks.active_creators().len(), 2);
         assert!(starts.try_recv().is_err());
         for (completed, next) in [(fast, queued), (queued, fast)] {
@@ -2327,7 +2338,7 @@ mod tests {
                     .unwrap();
             assert_eq!((creator, available), (completed, true));
             readiness.completed(creator, available, &runtime);
-            start_lifecycle_passes(&mut tasks, &mut turns, &mut pending, &pass);
+            start_lifecycle_passes(&mut tasks, &mut turns, &mut pending, &creators, &pass);
             assert_eq!(
                 tokio::time::timeout(Duration::from_secs(1), starts.recv())
                     .await
@@ -2349,7 +2360,7 @@ mod tests {
         assert_eq!((creator, available), (slow, true));
         readiness.completed(creator, available, &runtime);
         assert_eq!(runtime.readiness().await.status, ComponentState::Ready);
-        start_lifecycle_passes(&mut tasks, &mut turns, &mut pending, &pass);
+        start_lifecycle_passes(&mut tasks, &mut turns, &mut pending, &creators, &pass);
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(1), starts.recv())
                 .await
@@ -2363,6 +2374,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lifecycle_requeued_creator_waits_for_older_pending_work() {
+        use crate::runtime::ComponentState;
+        let runtime = lifecycle_runtime();
+        let mut tasks = CreatorTasks::new(1, runtime.clone());
+        let mut turns = IntakeTurns::default();
+        let mut readiness = LifecycleReadiness::default();
+        let [first, second, waiting] = [1, 2, 3].map(Uuid::from_u128);
+        let creators = [first, second, waiting];
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
+        let pass = |creator| {
+            let gate = gate.clone();
+            let started = started.clone();
+            async move {
+                started.send(creator).unwrap();
+                gate.acquire().await.unwrap().forget();
+            }
+        };
+        let mut pending = creators.into_iter().collect::<BTreeSet<_>>();
+        readiness.full_pass(&creators, &runtime);
+        start_lifecycle_passes(&mut tasks, &mut turns, &mut pending, &creators, &pass);
+        assert_eq!(starts.recv().await, Some(first));
+        gate.add_permits(1);
+        let (finished, available) = tasks.join_next().await.unwrap();
+        assert_eq!((finished, available), (first, true));
+        readiness.completed(finished, available, &runtime);
+
+        // The completed Creator is neither pending nor running when the next
+        // slot is filled. A later hint must not make it look never started.
+        start_lifecycle_passes(&mut tasks, &mut turns, &mut pending, &creators, &pass);
+        assert_eq!(starts.recv().await, Some(second));
+        pending.insert(first);
+        start_lifecycle_passes(&mut tasks, &mut turns, &mut pending, &creators, &pass);
+        assert_eq!(tasks.active_creators(), vec![second]);
+        assert_eq!(pending, BTreeSet::from([first, waiting]));
+        assert_eq!(
+            runtime.readiness().await.paykit_delivery,
+            ComponentState::NotReady
+        );
+        gate.add_permits(1);
+        let (finished, available) = tasks.join_next().await.unwrap();
+        assert_eq!((finished, available), (second, true));
+        readiness.completed(finished, available, &runtime);
+        start_lifecycle_passes(&mut tasks, &mut turns, &mut pending, &creators, &pass);
+        assert_eq!(starts.recv().await, Some(waiting));
+        gate.add_permits(1);
+        let (finished, available) = tasks.join_next().await.unwrap();
+        assert_eq!((finished, available), (waiting, true));
+        readiness.completed(finished, available, &runtime);
+        assert_eq!(runtime.readiness().await.status, ComponentState::Ready);
+        assert_eq!(pending, BTreeSet::from([first]));
+        start_lifecycle_passes(&mut tasks, &mut turns, &mut pending, &creators, &pass);
+        assert_eq!(starts.recv().await, Some(first));
+        gate.add_permits(1);
+        assert_eq!(tasks.join_next().await, Some((first, true)));
+        assert!(pending.is_empty());
+        assert!(tasks.is_empty());
+    }
+
+    #[tokio::test]
     async fn lifecycle_panic_frees_the_creator_but_only_a_full_pass_recovers_readiness() {
         use crate::runtime::ComponentState;
         let runtime = lifecycle_runtime();
@@ -2373,9 +2444,13 @@ mod tests {
         let other = Uuid::new_v4();
         let mut pending = BTreeSet::from([creator]);
         readiness.full_pass(&[creator], &runtime);
-        start_lifecycle_passes(&mut tasks, &mut turns, &mut pending, |_| async {
-            panic!("fixture panic")
-        });
+        start_lifecycle_passes(
+            &mut tasks,
+            &mut turns,
+            &mut pending,
+            &[creator],
+            |_| async { panic!("fixture panic") },
+        );
         let (finished, available) = tasks.join_next().await.unwrap();
         assert_eq!((finished, available), (creator, false));
         readiness.completed(finished, available, &runtime);
@@ -2386,7 +2461,13 @@ mod tests {
         );
 
         pending.insert(creator);
-        start_lifecycle_passes(&mut tasks, &mut turns, &mut pending, |_| async {});
+        start_lifecycle_passes(
+            &mut tasks,
+            &mut turns,
+            &mut pending,
+            &[creator],
+            |_| async {},
+        );
         let (finished, available) = tasks.join_next().await.unwrap();
         assert_eq!((finished, available), (creator, true));
         readiness.completed(finished, available, &runtime);
@@ -2440,7 +2521,7 @@ mod tests {
                 finished.send(creator).unwrap();
             }
         };
-        start_lifecycle_passes(&mut tasks, &mut turns, &mut pending, &pass);
+        start_lifecycle_passes(&mut tasks, &mut turns, &mut pending, &creators, &pass);
         assert_eq!(starts.recv().await, Some(creators[0]));
         runtime.begin_shutdown();
         {
@@ -2458,7 +2539,7 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(finishes.recv().await, Some(creators[0]));
-        start_lifecycle_passes(&mut tasks, &mut turns, &mut pending, &pass);
+        start_lifecycle_passes(&mut tasks, &mut turns, &mut pending, &creators, &pass);
         assert!(tasks.is_empty());
         assert_eq!(pending, BTreeSet::from([creators[1]]));
         assert!(starts.try_recv().is_err());

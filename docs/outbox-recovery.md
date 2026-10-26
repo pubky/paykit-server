@@ -119,9 +119,11 @@ hint, and shutdown drains its admitted work within the server deadline.
 Payment Request lifecycle receive/projection has a separate worker from durable
 outbox reconciliation. It keeps at most `outbox.batch_size` Creator passes active,
 with one pass per Creator, and gives free slots to the least recently started
-queued Creator. Handoff hints are copied to both workers after commit; a hint
-arriving during a Creator's pass remains queued. Periodic discovery continues
-while other Creator passes are running. Lifecycle enumeration or task failures
+queued Creator. Completed Creators retain their turn until discovery removes
+them, so a later hint cannot jump ahead of older queued work. Handoff hints are
+copied to both workers after commit; a hint arriving during a Creator's pass
+remains queued. Periodic discovery continues while other Creator passes are
+running. Lifecycle enumeration or task failures
 degrade delivery readiness until a full enumerated set completes; individual
 Creator receive/projection errors remain retried without withdrawing every rail.
 Lifecycle success cannot clear a durable reconciliation failure. Shutdown drains
