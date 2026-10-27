@@ -107,8 +107,10 @@ mod tests {
     use tracing::{Event, Subscriber};
     use tracing_subscriber::{Layer, layer::Context, prelude::*};
 
+    type CapturedEvents = Vec<Vec<(String, String)>>;
+
     #[derive(Clone, Default)]
-    struct EventCapture(Arc<Mutex<Vec<Vec<(String, String)>>>>);
+    struct EventCapture(Arc<Mutex<CapturedEvents>>);
 
     impl<S: Subscriber> Layer<S> for EventCapture {
         fn on_event(&self, event: &Event<'_>, _context: Context<'_, S>) {
