@@ -760,6 +760,26 @@ enum TransportMaintenance {
     },
 }
 
+fn record_shared_transport_timing(
+    full_scan: bool,
+    outcome: &TransportMaintenance,
+    started: Instant,
+) {
+    if full_scan && matches!(outcome, TransportMaintenance::Complete) {
+        return;
+    }
+    crate::diagnostics::timing(
+        "worker",
+        "shared_transport",
+        match outcome {
+            TransportMaintenance::Complete => crate::diagnostics::TimingOutcome::Completed,
+            TransportMaintenance::Deferred => crate::diagnostics::TimingOutcome::Deferred,
+            TransportMaintenance::Failed { .. } => crate::diagnostics::TimingOutcome::Failed,
+        },
+        started,
+    );
+}
+
 async fn maintain_transport_pass<Work, WorkFuture>(
     creators: Vec<Uuid>,
     limit: usize,
@@ -812,12 +832,7 @@ async fn maintain_creator_transport(
                 step: "adapter_build",
                 category: error.diagnostic_label(),
             };
-            crate::diagnostics::timing(
-                "worker",
-                "shared_transport",
-                crate::diagnostics::TimingOutcome::Failed,
-                started,
-            );
+            record_shared_transport_timing(full_scan, &outcome, started);
             return outcome;
         }
     };
@@ -837,16 +852,7 @@ async fn maintain_creator_transport(
             category: sdk_error_label(&error),
         },
     };
-    crate::diagnostics::timing(
-        "worker",
-        "shared_transport",
-        match outcome {
-            TransportMaintenance::Complete => crate::diagnostics::TimingOutcome::Completed,
-            TransportMaintenance::Deferred => crate::diagnostics::TimingOutcome::Deferred,
-            TransportMaintenance::Failed { .. } => crate::diagnostics::TimingOutcome::Failed,
-        },
-        started,
-    );
+    record_shared_transport_timing(full_scan, &outcome, started);
     outcome
 }
 
@@ -2035,6 +2041,59 @@ fn reader_authorization<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+    use tracing::{Event, Level, Subscriber};
+    use tracing_subscriber::{EnvFilter, Layer, layer::Context, prelude::*};
+
+    #[derive(Clone, Default)]
+    struct TimingCapture(Arc<Mutex<Vec<Level>>>);
+
+    impl<S: Subscriber> Layer<S> for TimingCapture {
+        fn on_event(&self, event: &Event<'_>, _context: Context<'_, S>) {
+            self.0.lock().unwrap().push(*event.metadata().level());
+        }
+    }
+
+    fn captured_shared_transport_timing(
+        full_scan: bool,
+        outcome: TransportMaintenance,
+    ) -> Vec<Level> {
+        let capture = TimingCapture::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(EnvFilter::new("off,paykit_server=info"))
+            .with(capture.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            record_shared_transport_timing(full_scan, &outcome, Instant::now());
+        });
+        capture.0.lock().unwrap().clone()
+    }
+
+    #[test]
+    fn idle_shared_transport_full_scan_is_quiet_under_production_filter() {
+        assert!(captured_shared_transport_timing(true, TransportMaintenance::Complete).is_empty());
+    }
+
+    #[test]
+    fn hinted_shared_transport_success_is_info_under_production_filter() {
+        assert_eq!(
+            captured_shared_transport_timing(false, TransportMaintenance::Complete),
+            vec![Level::INFO]
+        );
+    }
+
+    #[test]
+    fn shared_transport_failure_is_warn_under_production_filter() {
+        assert_eq!(
+            captured_shared_transport_timing(
+                true,
+                TransportMaintenance::Failed {
+                    step: "adapter_build",
+                    category: "adapter_unavailable",
+                },
+            ),
+            vec![Level::WARN]
+        );
+    }
 
     #[test]
     fn worker_processing_health_maps_to_coarse_timing_outcomes() {
