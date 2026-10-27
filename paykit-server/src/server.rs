@@ -1,6 +1,11 @@
 //! Explicit production composition root for one multi-Creator Paykit Server process.
 
-use std::{collections::BTreeSet, future::Future, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeSet,
+    future::Future,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use crate::{
     application::{
@@ -755,6 +760,26 @@ enum TransportMaintenance {
     },
 }
 
+fn record_shared_transport_timing(
+    full_scan: bool,
+    outcome: &TransportMaintenance,
+    started: Instant,
+) {
+    if full_scan && matches!(outcome, TransportMaintenance::Complete) {
+        return;
+    }
+    crate::diagnostics::timing(
+        "worker",
+        "shared_transport",
+        match outcome {
+            TransportMaintenance::Complete => crate::diagnostics::TimingOutcome::Completed,
+            TransportMaintenance::Deferred => crate::diagnostics::TimingOutcome::Deferred,
+            TransportMaintenance::Failed { .. } => crate::diagnostics::TimingOutcome::Failed,
+        },
+        started,
+    );
+}
+
 async fn maintain_transport_pass<Work, WorkFuture>(
     creators: Vec<Uuid>,
     limit: usize,
@@ -799,13 +824,16 @@ async fn maintain_creator_transport(
     creator: Uuid,
     full_scan: bool,
 ) -> TransportMaintenance {
+    let started = Instant::now();
     let adapter = match creator_adapter(workers, creator).await {
         Ok(adapter) => adapter,
         Err(error) => {
-            return TransportMaintenance::Failed {
+            let outcome = TransportMaintenance::Failed {
                 step: "adapter_build",
                 category: error.diagnostic_label(),
             };
+            record_shared_transport_timing(full_scan, &outcome, started);
+            return outcome;
         }
     };
     let result = if full_scan {
@@ -814,7 +842,7 @@ async fn maintain_creator_transport(
         // Handoff hints concern work already queued in the SDK.
         adapter.maintain_outbound_transport().await
     };
-    match result {
+    let outcome = match result {
         Ok(()) => TransportMaintenance::Complete,
         Err(PaykitSdkError::ConcurrentUpdate { .. } | PaykitSdkError::SharedStateBusy { .. }) => {
             TransportMaintenance::Deferred
@@ -823,7 +851,9 @@ async fn maintain_creator_transport(
             step: "maintain_transport",
             category: sdk_error_label(&error),
         },
-    }
+    };
+    record_shared_transport_timing(full_scan, &outcome, started);
+    outcome
 }
 
 fn outbox_batch_size(config: &OutboxConfig) -> i64 {
@@ -1049,6 +1079,18 @@ fn outbox_retry_schedule(
     RetrySchedule::new(default, link_establishment)
 }
 
+fn processing_timing_outcome(
+    result: &Result<(bool, ProcessingHealth), PersistenceError>,
+) -> crate::diagnostics::TimingOutcome {
+    match result {
+        Ok((_, ProcessingHealth::Available)) => crate::diagnostics::TimingOutcome::Completed,
+        Ok((_, ProcessingHealth::Retryable(_))) => crate::diagnostics::TimingOutcome::Deferred,
+        Ok((_, ProcessingHealth::PermanentFailure)) | Err(_) => {
+            crate::diagnostics::TimingOutcome::Failed
+        }
+    }
+}
+
 async fn outbox_enqueue_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtime>) {
     let owner = Uuid::new_v4();
     let limit = usize::try_from(workers.outbox_batch_size).expect("validated outbox batch size");
@@ -1126,12 +1168,25 @@ async fn process_creator_outbox(
     owner: Uuid,
     creator: Uuid,
 ) -> Result<Option<(bool, ProcessingHealth)>, PersistenceError> {
+    let task_started = Instant::now();
     // Setup/rotation takes this PostgreSQL fence before the process-local SDK
     // mutex. Keep the same ordering here to serialize external SDK effects with
     // durable cutover across processes without lock inversion.
     let mutation_fence = tokio::select! {
         _ = runtime.cancelled() => return Ok(None),
-        fence = workers.creators.acquire_setup_lock_for_creator_id(creator) => fence?,
+        fence = workers.creators.acquire_setup_lock_for_creator_id(creator) => fence,
+    };
+    let mutation_fence = match mutation_fence {
+        Ok(fence) => fence,
+        Err(error) => {
+            crate::diagnostics::timing(
+                "worker",
+                "outbox_enqueue",
+                crate::diagnostics::TimingOutcome::Failed,
+                task_started,
+            );
+            return Err(error);
+        }
     };
     let guard = tokio::select! {
         _ = runtime.cancelled() => return Ok(None),
@@ -1141,12 +1196,22 @@ async fn process_creator_outbox(
         return Ok(None);
     }
     // No row is leased while waiting for a scheduler slot or Creator ownership.
-    let Some(claim) = workers
+    let claim = workers
         .outbox
         .claim_for_creator(owner, creator, workers.outbox_lease_duration)
-        .await?
-    else {
-        return Ok(None);
+        .await;
+    let claim = match claim {
+        Ok(Some(claim)) => claim,
+        Ok(None) => return Ok(None),
+        Err(error) => {
+            crate::diagnostics::timing(
+                "worker",
+                "outbox_enqueue",
+                crate::diagnostics::TimingOutcome::Failed,
+                task_started,
+            );
+            return Err(error);
+        }
     };
     let retry_schedule = outbox_retry_schedule(
         workers.outbox_retry_initial,
@@ -1236,15 +1301,25 @@ async fn process_creator_outbox(
             "handed-off delivery deferred to transport maintenance"
         );
     }
+    let outcome = processing_timing_outcome(&result);
     let result = result.map(Some);
     let unlocked = mutation_fence.release().await;
-    match result {
-        Err(error) => Err(error),
-        Ok(result) => {
-            unlocked?;
-            Ok(result)
-        }
-    }
+    let result = match (result, unlocked) {
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Ok(result), Ok(())) => Ok(result),
+    };
+    crate::diagnostics::timing(
+        "worker",
+        "outbox_enqueue",
+        if result.is_err() {
+            crate::diagnostics::TimingOutcome::Failed
+        } else {
+            outcome
+        },
+        task_started,
+    );
+    result
 }
 
 async fn outbox_reconciliation_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtime>) {
@@ -1286,12 +1361,13 @@ async fn outbox_reconciliation_loop(workers: Arc<WorkerComponents>, runtime: Arc
         for claim in claims {
             let workers = workers.clone();
             batch.spawn(async move {
+                let started = Instant::now();
                 let delay = retry_delay(
                     workers.outbox_retry_initial,
                     workers.outbox_retry_max,
                     claim.attempt_count(),
                 );
-                match creator_adapter(&workers, claim.creator_id()).await {
+                let result = match creator_adapter(&workers, claim.creator_id()).await {
                     Ok(adapter) => {
                         process_reconciliation_with_health(&workers.outbox, &adapter, &claim, delay)
                             .await
@@ -1306,7 +1382,14 @@ async fn outbox_reconciliation_loop(workers: Arc<WorkerComponents>, runtime: Arc
                         .retry_reconciliation(&claim, delay, OutboxRetryClass::AdapterUnavailable)
                         .await
                         .map(|transitioned| (transitioned, ProcessingHealth::Retryable(delay))),
-                }
+                };
+                crate::diagnostics::timing(
+                    "worker",
+                    "outbox_reconciliation",
+                    processing_timing_outcome(&result),
+                    started,
+                );
+                result
             });
         }
         let mut delivery_available = true;
@@ -1559,6 +1642,7 @@ async fn observer_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtime>) {
         if !runtime.may_start_worker_claim() {
             break;
         }
+        let started = Instant::now();
         let mut failure: Option<(&'static str, &'static str)> = None;
         let mut observed = false;
         match workers.invoices.observation_targets().await {
@@ -1618,6 +1702,18 @@ async fn observer_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtime>) {
         }
         if tick == ElectrumTick::Succeeded {
             runtime.metrics().record_electrum_success(now.into_std());
+        }
+        if tick != ElectrumTick::Idle {
+            crate::diagnostics::timing(
+                "worker",
+                "observer",
+                if tick == ElectrumTick::Succeeded {
+                    crate::diagnostics::TimingOutcome::Completed
+                } else {
+                    crate::diagnostics::TimingOutcome::Failed
+                },
+                started,
+            );
         }
         runtime.set_electrum_available(available);
     }
@@ -1945,6 +2041,82 @@ fn reader_authorization<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+    use tracing::{Event, Level, Subscriber};
+    use tracing_subscriber::{EnvFilter, Layer, layer::Context, prelude::*};
+
+    #[derive(Clone, Default)]
+    struct TimingCapture(Arc<Mutex<Vec<Level>>>);
+
+    impl<S: Subscriber> Layer<S> for TimingCapture {
+        fn on_event(&self, event: &Event<'_>, _context: Context<'_, S>) {
+            self.0.lock().unwrap().push(*event.metadata().level());
+        }
+    }
+
+    fn captured_shared_transport_timing(
+        full_scan: bool,
+        outcome: TransportMaintenance,
+    ) -> Vec<Level> {
+        let capture = TimingCapture::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(EnvFilter::new("off,paykit_server=info"))
+            .with(capture.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            record_shared_transport_timing(full_scan, &outcome, Instant::now());
+        });
+        capture.0.lock().unwrap().clone()
+    }
+
+    #[test]
+    fn idle_shared_transport_full_scan_is_quiet_under_production_filter() {
+        assert!(captured_shared_transport_timing(true, TransportMaintenance::Complete).is_empty());
+    }
+
+    #[test]
+    fn hinted_shared_transport_success_is_info_under_production_filter() {
+        assert_eq!(
+            captured_shared_transport_timing(false, TransportMaintenance::Complete),
+            vec![Level::INFO]
+        );
+    }
+
+    #[test]
+    fn shared_transport_failure_is_warn_under_production_filter() {
+        assert_eq!(
+            captured_shared_transport_timing(
+                true,
+                TransportMaintenance::Failed {
+                    step: "adapter_build",
+                    category: "adapter_unavailable",
+                },
+            ),
+            vec![Level::WARN]
+        );
+    }
+
+    #[test]
+    fn worker_processing_health_maps_to_coarse_timing_outcomes() {
+        assert_eq!(
+            processing_timing_outcome(&Ok((true, ProcessingHealth::Available))),
+            crate::diagnostics::TimingOutcome::Completed
+        );
+        assert_eq!(
+            processing_timing_outcome(&Ok((
+                true,
+                ProcessingHealth::Retryable(Duration::from_secs(1)),
+            ))),
+            crate::diagnostics::TimingOutcome::Deferred
+        );
+        assert_eq!(
+            processing_timing_outcome(&Ok((true, ProcessingHealth::PermanentFailure))),
+            crate::diagnostics::TimingOutcome::Failed
+        );
+        assert_eq!(
+            processing_timing_outcome(&Err(PersistenceError::Unavailable)),
+            crate::diagnostics::TimingOutcome::Failed
+        );
+    }
 
     fn busy() -> Result<bool, PaykitSdkError> {
         Err(PaykitSdkError::SharedStateBusy {

@@ -422,6 +422,123 @@ fn service(
 }
 
 #[tokio::test]
+async fn invoice_stages_emit_elapsed_outcomes_without_domain_identifiers() {
+    let capture = EventCapture::default();
+    let subscriber = tracing_subscriber::registry().with(capture.clone());
+    let session = Arc::new(FakeSession {
+        result: Ok(()),
+        calls: AtomicUsize::default(),
+        creators: Mutex::new(vec![]),
+    });
+    let locks = Arc::new(FakeLocks {
+        result: Ok(valid_lock()),
+        calls: AtomicUsize::default(),
+    });
+    let store = Arc::new(FakeStore::with_preflight(InvoicePreflight::New));
+    let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+
+    service(session, locks, store)
+        .create(request())
+        .await
+        .unwrap();
+
+    let events: Vec<_> = capture
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| event_field(event, "event") == Some("paykit_task_timing"))
+        .cloned()
+        .collect();
+    let stages: Vec<_> = events
+        .iter()
+        .map(|event| event_field(event, "stage").unwrap())
+        .collect();
+    assert_eq!(
+        stages,
+        [
+            "invoice_preflight",
+            "creator_session",
+            "lock_fetch",
+            "lock_validation",
+            "reader_registry",
+            "reader_authorization",
+            "quote_preflight",
+            "creator_receiving",
+            "quote",
+            "db_commit",
+        ]
+    );
+    for event in &events {
+        assert_eq!(event_field(event, "operation"), Some("invoice_create"));
+        assert_eq!(event_field(event, "outcome"), Some("completed"));
+        assert!(
+            event_field(event, "elapsed_ms")
+                .unwrap()
+                .parse::<u64>()
+                .is_ok()
+        );
+        assert!(event.iter().all(|(name, _)| {
+            matches!(
+                name.as_str(),
+                "message" | "event" | "operation" | "stage" | "outcome" | "elapsed_ms"
+            )
+        }));
+    }
+    let rendered = format!("{events:?}");
+    assert!(!rendered.contains(CREATOR));
+    assert!(!rendered.contains(LOCK_RESOURCE));
+    assert!(!rendered.contains(BUNDLE));
+    assert!(!rendered.contains(&reader()));
+}
+
+#[tokio::test]
+async fn failed_invoice_stage_emits_only_coarse_timing_context() {
+    let capture = EventCapture::default();
+    let subscriber = tracing_subscriber::registry().with(capture.clone());
+    let session = Arc::new(FakeSession {
+        result: Ok(()),
+        calls: AtomicUsize::default(),
+        creators: Mutex::new(vec![]),
+    });
+    let mut invalid = valid_lock();
+    invalid.criteria[0].params["amount"] = serde_json::json!("0");
+    let locks = Arc::new(FakeLocks {
+        result: Ok(invalid),
+        calls: AtomicUsize::default(),
+    });
+    let store = Arc::new(FakeStore::with_preflight(InvoicePreflight::New));
+    let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+
+    assert_eq!(
+        service(session, locks, store).create(request()).await,
+        Err(CreateInvoiceError::InvalidRequest)
+    );
+
+    let events = capture.0.lock().unwrap();
+    let event = events
+        .iter()
+        .find(|event| {
+            event_field(event, "event") == Some("paykit_task_timing")
+                && event_field(event, "stage") == Some("lock_validation")
+        })
+        .expect("failed lock validation timing");
+    assert_eq!(event_field(event, "operation"), Some("invoice_create"));
+    assert_eq!(event_field(event, "outcome"), Some("failed"));
+    assert!(
+        event_field(event, "elapsed_ms")
+            .unwrap()
+            .parse::<u64>()
+            .is_ok()
+    );
+    let rendered = format!("{event:?}");
+    assert!(!rendered.contains(CREATOR));
+    assert!(!rendered.contains(LOCK_RESOURCE));
+    assert!(!rendered.contains(BUNDLE));
+    assert!(!rendered.contains(&reader()));
+}
+
+#[tokio::test]
 async fn invalid_locks_policy_never_persists_an_invoice() {
     let session = Arc::new(FakeSession {
         result: Ok(()),
