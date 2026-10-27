@@ -89,7 +89,7 @@ pub(crate) fn timing(
             "Paykit task timing"
         );
     } else {
-        tracing::debug!(
+        tracing::info!(
             event = "paykit_task_timing",
             operation,
             stage,
@@ -104,19 +104,27 @@ pub(crate) fn timing(
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
-    use tracing::{Event, Subscriber};
+    use tracing::{Event, Level, Subscriber};
     use tracing_subscriber::{Layer, layer::Context, prelude::*};
 
-    type CapturedEvents = Vec<Vec<(String, String)>>;
+    type CapturedFields = Vec<(String, String)>;
+
+    struct CapturedEvent {
+        level: Level,
+        fields: CapturedFields,
+    }
 
     #[derive(Clone, Default)]
-    struct EventCapture(Arc<Mutex<CapturedEvents>>);
+    struct EventCapture(Arc<Mutex<Vec<CapturedEvent>>>);
 
     impl<S: Subscriber> Layer<S> for EventCapture {
         fn on_event(&self, event: &Event<'_>, _context: Context<'_, S>) {
             let mut fields = Vec::new();
             event.record(&mut FieldVisitor(&mut fields));
-            self.0.lock().unwrap().push(fields);
+            self.0.lock().unwrap().push(CapturedEvent {
+                level: *event.metadata().level(),
+                fields,
+            });
         }
     }
 
@@ -149,6 +157,12 @@ mod tests {
             );
             timing(
                 "worker",
+                "outbox_retry",
+                TimingOutcome::Deferred,
+                std::time::Instant::now(),
+            );
+            timing(
+                "worker",
                 "outbox_enqueue",
                 TimingOutcome::Failed,
                 std::time::Instant::now(),
@@ -156,20 +170,30 @@ mod tests {
         });
 
         let events = capture.0.lock().unwrap();
-        assert_eq!(events.len(), 2);
-        assert_eq!(field(&events[0], "event"), Some("paykit_task_timing"));
-        assert_eq!(field(&events[0], "operation"), Some("invoice_create"));
-        assert_eq!(field(&events[0], "stage"), Some("invoice_preflight"));
-        assert_eq!(field(&events[0], "outcome"), Some("completed"));
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].level, Level::INFO);
+        assert_eq!(
+            field(&events[0].fields, "event"),
+            Some("paykit_task_timing")
+        );
+        assert_eq!(
+            field(&events[0].fields, "operation"),
+            Some("invoice_create")
+        );
+        assert_eq!(field(&events[0].fields, "stage"), Some("invoice_preflight"));
+        assert_eq!(field(&events[0].fields, "outcome"), Some("completed"));
         assert!(
-            field(&events[0], "elapsed_ms")
+            field(&events[0].fields, "elapsed_ms")
                 .unwrap()
                 .parse::<u64>()
                 .is_ok()
         );
-        assert_eq!(field(&events[1], "outcome"), Some("failed"));
+        assert_eq!(events[1].level, Level::INFO);
+        assert_eq!(field(&events[1].fields, "outcome"), Some("deferred"));
+        assert_eq!(events[2].level, Level::WARN);
+        assert_eq!(field(&events[2].fields, "outcome"), Some("failed"));
         for event in events.iter() {
-            assert!(event.iter().all(|(name, _)| {
+            assert!(event.fields.iter().all(|(name, _)| {
                 matches!(
                     name.as_str(),
                     "message" | "event" | "operation" | "stage" | "outcome" | "elapsed_ms"

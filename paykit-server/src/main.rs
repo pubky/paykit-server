@@ -110,8 +110,21 @@ mod tests {
                 target: "pubky::actors::auth::relay::auth_relay_listener",
                 "coarse dependency warning"
             );
+            tracing::info!(
+                target: "paykit_server::diagnostics",
+                event = "paykit_task_timing",
+                operation = "invoice_create",
+                stage = "invoice_preflight",
+                outcome = "completed",
+                elapsed_ms = 1_u64,
+                "Paykit task timing"
+            );
+            tracing::debug!(
+                target: "paykit_server::diagnostics",
+                "debug application event"
+            );
             tracing::info!(target: "paykit_server", "application event");
         });
-        assert_eq!(*capture.0.lock().unwrap(), 1);
+        assert_eq!(*capture.0.lock().unwrap(), 2);
     }
 }
