@@ -116,6 +116,19 @@ each Creator's SDK operations still take the existing local
 mutation lock. A pass finishes before the worker selects another full scan or
 hint, and shutdown drains its admitted work within the server deadline.
 
+Payment Request lifecycle receive/projection has a separate worker from durable
+outbox reconciliation. It keeps at most `outbox.batch_size` Creator passes active,
+with one pass per Creator, and gives free slots to the least recently started
+queued Creator. Completed Creators retain their turn until discovery removes
+them, so a later hint cannot jump ahead of older queued work. Handoff hints are
+copied to both workers after commit; a hint arriving during a Creator's pass
+remains queued. Periodic discovery continues while other Creator passes are
+running. Lifecycle enumeration or task failures
+degrade delivery readiness until a full enumerated set completes; individual
+Creator receive/projection errors remain retried without withdrawing every rail.
+Lifecycle success cannot clear a durable reconciliation failure. Shutdown drains
+admitted lifecycle work under the same server deadline.
+
 After a successful handoff, the enqueue task attempts the associated Reader's
 queue while it still owns the Creator mutation lock. It reads the committed
 server association before sending. It does not receive from unrelated Readers
