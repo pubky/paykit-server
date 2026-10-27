@@ -642,29 +642,35 @@ impl CreateInvoiceService {
             diagnose("request_binding", error);
         })?;
         let preflight_remaining = remaining_at(started, self.clock.now(), "invoice_preflight")?;
-        match tokio::time::timeout(
-            preflight_remaining,
-            self.store
-                .preflight(&creator, &bundle_binding, &payment_request_binding),
-        )
-        .await
-        .map_err(|_| deadline("invoice_preflight"))?
-        .map_err(|error| store_failure("invoice_preflight", error))?
-        {
+        let preflight = timed_stage("invoice_preflight", async {
+            tokio::time::timeout(
+                preflight_remaining,
+                self.store
+                    .preflight(&creator, &bundle_binding, &payment_request_binding),
+            )
+            .await
+            .map_err(|_| deadline("invoice_preflight"))?
+            .map_err(|error| store_failure("invoice_preflight", error))
+        })
+        .await?;
+        match preflight {
             InvoicePreflight::ExactReplay => {
                 let replay_remaining = remaining_at(started, self.clock.now(), "exact_replay")?;
-                return tokio::time::timeout(
-                    replay_remaining,
-                    self.store.exact_replay(
-                        &creator,
-                        &request.reader,
-                        &bundle_binding,
-                        &payment_request_binding,
-                    ),
-                )
-                .await
-                .map_err(|_| deadline("exact_replay"))?
-                .map_err(|error| store_failure("exact_replay", error));
+                return timed_stage("exact_replay", async {
+                    tokio::time::timeout(
+                        replay_remaining,
+                        self.store.exact_replay(
+                            &creator,
+                            &request.reader,
+                            &bundle_binding,
+                            &payment_request_binding,
+                        ),
+                    )
+                    .await
+                    .map_err(|_| deadline("exact_replay"))?
+                    .map_err(|error| store_failure("exact_replay", error))
+                })
+                .await;
             }
             InvoicePreflight::Conflict => {
                 diagnose("invoice_preflight", CreateInvoiceError::Conflict);
@@ -673,225 +679,294 @@ impl CreateInvoiceService {
             InvoicePreflight::New => {}
         }
         let session_remaining = remaining_at(started, self.clock.now(), "creator_session")?;
-        tokio::time::timeout(session_remaining, self.sessions.validate(&creator))
-            .await
-            .map_err(|_| deadline("creator_session"))?
-            .map_err(|error| match error {
-                SessionValidationError::Invalid => {
-                    diagnose("creator_session", CreateInvoiceError::CreatorSessionInvalid);
-                    CreateInvoiceError::CreatorSessionInvalid
-                }
-                SessionValidationError::Unavailable => {
-                    diagnose(
-                        "creator_session",
-                        CreateInvoiceError::CreatorSessionUnavailable,
-                    );
-                    CreateInvoiceError::CreatorSessionUnavailable
-                }
-            })?;
+        timed_stage("creator_session", async {
+            tokio::time::timeout(session_remaining, self.sessions.validate(&creator))
+                .await
+                .map_err(|_| deadline("creator_session"))?
+                .map_err(|error| match error {
+                    SessionValidationError::Invalid => {
+                        diagnose("creator_session", CreateInvoiceError::CreatorSessionInvalid);
+                        CreateInvoiceError::CreatorSessionInvalid
+                    }
+                    SessionValidationError::Unavailable => {
+                        diagnose(
+                            "creator_session",
+                            CreateInvoiceError::CreatorSessionUnavailable,
+                        );
+                        CreateInvoiceError::CreatorSessionUnavailable
+                    }
+                })
+        })
+        .await?;
         let lock_remaining = remaining_at(started, self.clock.now(), "lock_fetch")?;
-        let lock = tokio::time::timeout(lock_remaining, self.locks.fetch(&request.lock_resource))
-            .await
-            .map_err(|_| deadline("lock_fetch"))?
-            .map_err(|error| match error {
-                LockFetchError::NotFound => {
-                    diagnose("lock_fetch", CreateInvoiceError::LockNotFound);
-                    CreateInvoiceError::LockNotFound
-                }
-                LockFetchError::Unavailable => {
-                    diagnose("lock_fetch", CreateInvoiceError::LockUnavailable);
-                    CreateInvoiceError::LockUnavailable
-                }
-                LockFetchError::Invalid => {
-                    diagnose("lock_fetch", CreateInvoiceError::InvalidRequest);
-                    CreateInvoiceError::InvalidRequest
-                }
-            })?;
-        validate_lock(&request, &lock).inspect_err(|&error| {
-            diagnose("lock_validation", error);
+        let lock = timed_stage("lock_fetch", async {
+            tokio::time::timeout(lock_remaining, self.locks.fetch(&request.lock_resource))
+                .await
+                .map_err(|_| deadline("lock_fetch"))?
+                .map_err(|error| match error {
+                    LockFetchError::NotFound => {
+                        diagnose("lock_fetch", CreateInvoiceError::LockNotFound);
+                        CreateInvoiceError::LockNotFound
+                    }
+                    LockFetchError::Unavailable => {
+                        diagnose("lock_fetch", CreateInvoiceError::LockUnavailable);
+                        CreateInvoiceError::LockUnavailable
+                    }
+                    LockFetchError::Invalid => {
+                        diagnose("lock_fetch", CreateInvoiceError::InvalidRequest);
+                        CreateInvoiceError::InvalidRequest
+                    }
+                })
+        })
+        .await?;
+        timed_stage_sync("lock_validation", || {
+            validate_lock(&request, &lock).inspect_err(|&error| {
+                diagnose("lock_validation", error);
+            })
         })?;
         let mut registry_attempt = 1;
-        let discovered = loop {
-            let registry_remaining =
-                remaining_at(started, self.clock.now(), "reader_app_registry")?;
-            let result = tokio::time::timeout(
-                registry_remaining,
-                self.registries.discover(&request.reader),
+        timed_stage("reader_registry", async {
+            let discovered = loop {
+                let registry_remaining =
+                    remaining_at(started, self.clock.now(), "reader_app_registry")?;
+                let result = tokio::time::timeout(
+                    registry_remaining,
+                    self.registries.discover(&request.reader),
+                )
+                .await
+                .map_err(|_| deadline("reader_app_registry"))?;
+                match result {
+                    Ok(Some(registry)) => break Ok(registry),
+                    Ok(None) if registry_attempt < REGISTRY_READ_ATTEMPTS => {
+                        let delay_remaining =
+                            remaining_at(started, self.clock.now(), "reader_app_registry_retry")?;
+                        tokio::time::timeout(
+                            delay_remaining,
+                            self.registry_retry_delay.wait(registry_attempt - 1),
+                        )
+                        .await
+                        .map_err(|_| deadline("reader_app_registry_retry"))?;
+                        registry_attempt += 1;
+                    }
+                    Ok(None) => {
+                        diagnose(
+                            "reader_app_registry_check",
+                            CreateInvoiceError::ReaderSetupPending,
+                        );
+                        break Err(CreateInvoiceError::ReaderSetupPending);
+                    }
+                    Err(RegistryDiscoveryError::InvalidRequest) => {
+                        diagnose(
+                            "reader_app_registry_identity",
+                            CreateInvoiceError::InvalidRequest,
+                        );
+                        break Err(CreateInvoiceError::InvalidRequest);
+                    }
+                    Err(RegistryDiscoveryError::Unavailable) => {
+                        diagnose(
+                            "reader_app_registry_fetch",
+                            CreateInvoiceError::ReaderRegistryUnavailable,
+                        );
+                        break Err(CreateInvoiceError::ReaderRegistryUnavailable);
+                    }
+                    Err(RegistryDiscoveryError::Malformed) => {
+                        diagnose(
+                            "reader_app_registry_parse",
+                            CreateInvoiceError::ReaderRegistryMalformed,
+                        );
+                        break Err(CreateInvoiceError::ReaderRegistryMalformed);
+                    }
+                }
+            }?;
+            if !reader_is_capable(&discovered) {
+                diagnose(
+                    "reader_app_registry_check",
+                    CreateInvoiceError::ReaderNotPayable,
+                );
+                return Err(CreateInvoiceError::ReaderNotPayable);
+            }
+            Ok(discovered)
+        })
+        .await?;
+        let authorization_remaining =
+            remaining_at(started, self.clock.now(), "reader_authorization")?;
+        timed_stage("reader_authorization", async {
+            let authorization = tokio::time::timeout(
+                authorization_remaining,
+                self.registries.authorization(&request.reader),
             )
             .await
-            .map_err(|_| deadline("reader_app_registry"))?;
-            match result {
-                Ok(Some(registry)) => break registry,
-                Ok(None) if registry_attempt < REGISTRY_READ_ATTEMPTS => {
-                    let delay_remaining =
-                        remaining_at(started, self.clock.now(), "reader_app_registry_retry")?;
-                    tokio::time::timeout(
-                        delay_remaining,
-                        self.registry_retry_delay.wait(registry_attempt - 1),
-                    )
-                    .await
-                    .map_err(|_| deadline("reader_app_registry_retry"))?;
-                    registry_attempt += 1;
-                }
-                Ok(None) => {
+            .map_err(|_| deadline("reader_authorization"))?;
+            match authorization {
+                Ok(ReaderAuthorization::Verified) => {}
+                Ok(ReaderAuthorization::Missing) => {
                     diagnose(
-                        "reader_app_registry_check",
+                        "reader_authorization_check",
                         CreateInvoiceError::ReaderSetupPending,
                     );
                     return Err(CreateInvoiceError::ReaderSetupPending);
                 }
+                Ok(ReaderAuthorization::Invalid) => {
+                    diagnose(
+                        "reader_authorization_check",
+                        CreateInvoiceError::ReaderNotPayable,
+                    );
+                    return Err(CreateInvoiceError::ReaderNotPayable);
+                }
                 Err(RegistryDiscoveryError::InvalidRequest) => {
                     diagnose(
-                        "reader_app_registry_identity",
+                        "reader_authorization_identity",
                         CreateInvoiceError::InvalidRequest,
                     );
                     return Err(CreateInvoiceError::InvalidRequest);
                 }
                 Err(RegistryDiscoveryError::Unavailable) => {
                     diagnose(
-                        "reader_app_registry_fetch",
+                        "reader_authorization_fetch",
                         CreateInvoiceError::ReaderRegistryUnavailable,
                     );
                     return Err(CreateInvoiceError::ReaderRegistryUnavailable);
                 }
                 Err(RegistryDiscoveryError::Malformed) => {
                     diagnose(
-                        "reader_app_registry_parse",
+                        "reader_authorization_parse",
                         CreateInvoiceError::ReaderRegistryMalformed,
                     );
                     return Err(CreateInvoiceError::ReaderRegistryMalformed);
                 }
             }
-        };
-        if !reader_is_capable(&discovered) {
-            diagnose(
-                "reader_app_registry_check",
-                CreateInvoiceError::ReaderNotPayable,
-            );
-            return Err(CreateInvoiceError::ReaderNotPayable);
-        }
-        let authorization_remaining =
-            remaining_at(started, self.clock.now(), "reader_authorization")?;
-        let authorization = tokio::time::timeout(
-            authorization_remaining,
-            self.registries.authorization(&request.reader),
-        )
-        .await
-        .map_err(|_| deadline("reader_authorization"))?;
-        match authorization {
-            Ok(ReaderAuthorization::Verified) => {}
-            Ok(ReaderAuthorization::Missing) => {
-                diagnose(
-                    "reader_authorization_check",
-                    CreateInvoiceError::ReaderSetupPending,
-                );
-                return Err(CreateInvoiceError::ReaderSetupPending);
-            }
-            Ok(ReaderAuthorization::Invalid) => {
-                diagnose(
-                    "reader_authorization_check",
-                    CreateInvoiceError::ReaderNotPayable,
-                );
-                return Err(CreateInvoiceError::ReaderNotPayable);
-            }
-            Err(RegistryDiscoveryError::InvalidRequest) => {
-                diagnose(
-                    "reader_authorization_identity",
-                    CreateInvoiceError::InvalidRequest,
-                );
+            Ok(())
+        })
+        .await?;
+        let asset = timed_stage_sync("quote_preflight", || {
+            let (asset, _) = extract_terms(&lock)?;
+            if asset == CriterionAsset::Usdt && !self.usdt_enabled {
                 return Err(CreateInvoiceError::InvalidRequest);
             }
-            Err(RegistryDiscoveryError::Unavailable) => {
-                diagnose(
-                    "reader_authorization_fetch",
-                    CreateInvoiceError::ReaderRegistryUnavailable,
-                );
-                return Err(CreateInvoiceError::ReaderRegistryUnavailable);
-            }
-            Err(RegistryDiscoveryError::Malformed) => {
-                diagnose(
-                    "reader_authorization_parse",
-                    CreateInvoiceError::ReaderRegistryMalformed,
-                );
-                return Err(CreateInvoiceError::ReaderRegistryMalformed);
-            }
-        }
+            Ok(asset)
+        })?;
         let credentials_remaining =
             remaining_at(started, self.clock.now(), "creator_receiving_details")?;
-        let (asset, _) = extract_terms(&lock)?;
-        if asset == CriterionAsset::Usdt && !self.usdt_enabled {
-            return Err(CreateInvoiceError::InvalidRequest);
-        }
-        let mut receiving =
+        let mut receiving = timed_stage("creator_receiving", async {
             tokio::time::timeout(credentials_remaining, self.credentials.receiving(&creator))
                 .await
                 .map_err(|_| deadline("creator_receiving_details"))?
-                .map_err(|error| store_failure("creator_receiving_details", error))?;
-        if !self.usdt_enabled {
-            receiving.usdt = None;
-        }
-        if receiving.bitcoin.is_none() && receiving.usdt.is_none() {
-            return Err(CreateInvoiceError::InvalidRequest);
-        }
-        let cross_btc = (asset == CriterionAsset::Btc && receiving.usdt.is_some())
-            || (asset != CriterionAsset::Btc && receiving.bitcoin.is_some());
-        let price = if cross_btc {
-            let provider = self.rates.as_ref().ok_or(CreateInvoiceError::Unavailable)?;
-            Some(
-                tokio::time::timeout(
-                    remaining_at(started, self.clock.now(), "exchange_rate")?,
-                    provider.usd_per_btc(),
+                .map_err(|error| store_failure("creator_receiving_details", error))
+        })
+        .await?;
+        let (invoice_payloads, acceptance_window, payment_window) = timed_stage("quote", async {
+            if !self.usdt_enabled {
+                receiving.usdt = None;
+            }
+            if receiving.bitcoin.is_none() && receiving.usdt.is_none() {
+                return Err(CreateInvoiceError::InvalidRequest);
+            }
+            let cross_btc = (asset == CriterionAsset::Btc && receiving.usdt.is_some())
+                || (asset != CriterionAsset::Btc && receiving.bitcoin.is_some());
+            let price = if cross_btc {
+                let provider = self.rates.as_ref().ok_or(CreateInvoiceError::Unavailable)?;
+                Some(
+                    tokio::time::timeout(
+                        remaining_at(started, self.clock.now(), "exchange_rate")?,
+                        provider.usd_per_btc(),
+                    )
+                    .await
+                    .map_err(|_| deadline("exchange_rate"))??,
                 )
-                .await
-                .map_err(|_| deadline("exchange_rate"))??,
-            )
-        } else {
-            None
-        };
-        let rates = super::invoice_pricing::conversion_rates(
-            asset,
-            receiving.bitcoin.is_some(),
-            receiving.usdt.is_some(),
-            price.as_deref(),
-        )?;
-        let payment_window = if cross_btc {
-            self.payment_window.min(self.conversion_payment_window)
-        } else {
-            self.payment_window
-        };
-        let acceptance_window = if cross_btc {
-            self.proposal_acceptance_window
-                .min(Duration::from_secs(payment_window.as_secs() / 2))
-        } else {
-            self.proposal_acceptance_window
-        };
-        let invoice_payloads = DerivedInvoicePayloads {
-            intents: self.intents.clone(),
-            receiving,
-            rates,
-            network: self.bitcoin_network.clone(),
-            request: &request,
-            lock: &lock,
-            app_id: self.app_id.clone(),
-        };
+            } else {
+                None
+            };
+            let rates = super::invoice_pricing::conversion_rates(
+                asset,
+                receiving.bitcoin.is_some(),
+                receiving.usdt.is_some(),
+                price.as_deref(),
+            )?;
+            let payment_window = if cross_btc {
+                self.payment_window.min(self.conversion_payment_window)
+            } else {
+                self.payment_window
+            };
+            let acceptance_window = if cross_btc {
+                self.proposal_acceptance_window
+                    .min(Duration::from_secs(payment_window.as_secs() / 2))
+            } else {
+                self.proposal_acceptance_window
+            };
+            Ok((
+                DerivedInvoicePayloads {
+                    intents: self.intents.clone(),
+                    receiving,
+                    rates,
+                    network: self.bitcoin_network.clone(),
+                    request: &request,
+                    lock: &lock,
+                    app_id: self.app_id.clone(),
+                },
+                acceptance_window,
+                payment_window,
+            ))
+        })
+        .await?;
         remaining_at(started, self.clock.now(), "create_atomic")?;
         // Once PostgreSQL mutation starts it must be awaited to a factual
         // commit/rollback result. Canceling this future at the HTTP deadline
         // could otherwise return failure while COMMIT succeeds concurrently.
-        self.store
-            .create_atomic(AtomicInvoiceInput {
-                creator: &creator,
-                reader: &request.reader,
-                bundle_binding: &bundle_binding,
-                lock_resource_binding: &lock_resource_binding,
-                payment_request_binding: &payment_request_binding,
-                invoice_payloads: &invoice_payloads,
-                proposal_acceptance_seconds: acceptance_window.as_secs(),
-                payment_window_seconds: payment_window.as_secs(),
-            })
-            .await
-            .map_err(|error| store_failure("create_atomic", error))
+        timed_stage("db_commit", async {
+            self.store
+                .create_atomic(AtomicInvoiceInput {
+                    creator: &creator,
+                    reader: &request.reader,
+                    bundle_binding: &bundle_binding,
+                    lock_resource_binding: &lock_resource_binding,
+                    payment_request_binding: &payment_request_binding,
+                    invoice_payloads: &invoice_payloads,
+                    proposal_acceptance_seconds: acceptance_window.as_secs(),
+                    payment_window_seconds: payment_window.as_secs(),
+                })
+                .await
+                .map_err(|error| store_failure("create_atomic", error))
+        })
+        .await
     }
+}
+
+async fn timed_stage<T, E>(
+    stage: &'static str,
+    future: impl std::future::Future<Output = Result<T, E>>,
+) -> Result<T, E> {
+    let started = Instant::now();
+    let result = future.await;
+    crate::diagnostics::timing(
+        "invoice_create",
+        stage,
+        if result.is_ok() {
+            crate::diagnostics::TimingOutcome::Completed
+        } else {
+            crate::diagnostics::TimingOutcome::Failed
+        },
+        started,
+    );
+    result
+}
+
+fn timed_stage_sync<T, E>(
+    stage: &'static str,
+    work: impl FnOnce() -> Result<T, E>,
+) -> Result<T, E> {
+    let started = Instant::now();
+    let result = work();
+    crate::diagnostics::timing(
+        "invoice_create",
+        stage,
+        if result.is_ok() {
+            crate::diagnostics::TimingOutcome::Completed
+        } else {
+            crate::diagnostics::TimingOutcome::Failed
+        },
+        started,
+    );
+    result
 }
 
 fn request_binding(request: &CreateInvoiceRequest) -> Result<Vec<u8>, CreateInvoiceError> {
