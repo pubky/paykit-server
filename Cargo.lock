@@ -3474,8 +3474,7 @@ dependencies = [
 [[package]]
 name = "locks-core"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "780f349f56f10e658358cb897cd5dc1bcc03c297250a31efd6fa62f819bd74f5"
+source = "git+https://github.com/pubky/locks.git?tag=v0.1.1-rc1#2874fae2308b8070e034d7bbc68df7791c8feded"
 dependencies = [
  "base32",
  "blake3",
@@ -4053,7 +4052,7 @@ dependencies = [
 
 [[package]]
 name = "paykit-server"
-version = "0.1.0"
+version = "0.1.1-rc1"
 dependencies = [
  "alloy-primitives",
  "alloy-sol-types",
@@ -4102,7 +4101,7 @@ dependencies = [
 
 [[package]]
 name = "paykit-server-e2e"
-version = "0.1.0"
+version = "0.1.1-rc1"
 dependencies = [
  "anyhow",
  "async-trait",
