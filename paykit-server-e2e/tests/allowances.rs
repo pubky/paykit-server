@@ -806,7 +806,7 @@ async fn allowance_proposed_on_the_server_link_covers_the_next_locks_invoice() {
 
     // On the server, both acceptances were sent on the reader link ahead of
     // the second request, and the server keeps no Allowance accounting.
-    let state = stack.creator_sdk.export_backup_state().await.unwrap();
+    let state = when_unlocked(|| stack.creator_sdk.export_backup_state()).await;
     assert!(state.allowance_accounting.is_none());
     let outbound = |kind: &str| {
         state
