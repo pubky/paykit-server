@@ -16,10 +16,15 @@ RUN apt-get update \
 # no Docker-owned files and its workspace target directory is never transferred.
 RUN --mount=from=paykit-lib,target=/contexts/paykit-lib,ro \
     --mount=from=paykit-sdk,target=/contexts/paykit-sdk,ro \
+    --mount=from=locks,target=/contexts/locks,ro \
     set -eu; \
-    mkdir -p /build/paykit-rs; \
+    mkdir -p /build/paykit-rs /build/locks; \
     cp -a /contexts/paykit-lib /build/paykit-rs/paykit-lib; \
-    cp -a /contexts/paykit-sdk /build/paykit-rs/paykit-sdk
+    cp -a /contexts/paykit-sdk /build/paykit-rs/paykit-sdk; \
+    cp /contexts/locks/Cargo.toml /contexts/locks/Cargo.lock /build/locks/; \
+    cp -a /contexts/locks/locks-core /contexts/locks/locks-service \
+        /contexts/locks/locks-server /contexts/locks/locks-sdk \
+        /contexts/locks/locks-e2e /build/locks/
 
 COPY . /build/paykit-server
 WORKDIR /build/paykit-server
@@ -27,7 +32,7 @@ WORKDIR /build/paykit-server
 # Override only the copied manifest's Docker build source resolution. Exact
 # matches make dependency-pin drift fail closed; committed files stay unchanged.
 RUN sh scripts/prepare-local-docker-sources.sh \
-    && cargo update --package paykit-lib --package paykit-sdk
+    && cargo update --package locks-core --package paykit-lib --package paykit-sdk
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
