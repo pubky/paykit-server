@@ -99,17 +99,35 @@ impl InvoiceStore {
             .bind(received_at).bind(eligible).bind(now)
             .execute(&mut **tx).await.map_err(|_| PersistenceError::Unavailable)?;
         if eligible {
+            // One contact per buyer. An open one held on another invoice whose
+            // payment no longer qualifies moves to this one; one whose invoice
+            // still qualifies stays where it is.
+            let held: Option<Uuid> = sqlx::query_scalar(
+                "SELECT contact.invoice_id FROM buyer_contacts contact
+                 JOIN invoices invoice ON invoice.id = $1
+                 WHERE contact.creator_id = invoice.creator_id
+                   AND contact.reader_lookup_hash = invoice.reader_lookup_hash
+                   AND contact.completed_at IS NULL AND contact.invoice_id <> $1
+                 FOR UPDATE OF contact",
+            )
+            .bind(invoice)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+            let move_held = match held {
+                Some(held) => !self.contact_payment_qualifies(tx, held).await?,
+                None => false,
+            };
             sqlx::query(
-                // One contact per buyer. An open one held on an earlier invoice,
-                // whose payment no longer qualifies, moves to this one.
                 "INSERT INTO buyer_contacts (invoice_id, creator_id, reader_lookup_hash)
                  SELECT id, creator_id, reader_lookup_hash FROM invoices WHERE id = $1
                  ON CONFLICT (creator_id, reader_lookup_hash) DO UPDATE
                  SET invoice_id = EXCLUDED.invoice_id, next_attempt_at = NOW()
-                 WHERE buyer_contacts.completed_at IS NULL
+                 WHERE $2 AND buyer_contacts.completed_at IS NULL
                    AND buyer_contacts.invoice_id <> EXCLUDED.invoice_id",
             )
             .bind(invoice)
+            .bind(move_held)
             .execute(&mut **tx)
             .await
             .map_err(|_| PersistenceError::Unavailable)?;

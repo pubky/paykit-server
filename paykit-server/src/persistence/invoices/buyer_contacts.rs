@@ -92,12 +92,10 @@ impl InvoiceStore {
             .begin()
             .await
             .map_err(|_| PersistenceError::Unavailable)?;
-        let (open, bitcoin_backed): (bool, bool) = sqlx::query_as(
+        let open: bool = sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM buyer_contacts
                     WHERE invoice_id = $1 AND creator_id = $2 AND reader_lookup_hash = $3
-                        AND completed_at IS NULL),
-                    EXISTS (SELECT 1 FROM invoice_timely_amount_matched_outpoints
-                    WHERE invoice_id = $1)",
+                        AND completed_at IS NULL)",
         )
         .bind(pending.invoice_id)
         .bind(pending.creator_id)
@@ -110,11 +108,33 @@ impl InvoiceStore {
         .fetch_one(&mut *tx)
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
-        if !open || bitcoin_backed {
-            return Ok(open);
+        Ok(open
+            && self
+                .contact_payment_qualifies(&mut tx, pending.invoice_id)
+                .await?)
+    }
+
+    /// Whether `invoice`'s payment backs a buyer contact now: a timely Bitcoin
+    /// payment always does, and a USDT one only while it qualifies under the
+    /// current window.
+    pub(super) async fn contact_payment_qualifies(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        invoice: Uuid,
+    ) -> Result<bool, PersistenceError> {
+        let bitcoin_backed: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM invoice_timely_amount_matched_outpoints
+             WHERE invoice_id = $1)",
+        )
+        .bind(invoice)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        if bitcoin_backed {
+            return Ok(true);
         }
         Ok(self
-            .usdt_payment_status(&mut tx, pending.invoice_id)
+            .usdt_payment_status(tx, invoice)
             .await?
             .is_some_and(|usdt| usdt.paid_on_time))
     }

@@ -1168,19 +1168,41 @@ async fn a_held_legacy_contact_moves_to_the_buyers_next_qualifying_invoice() {
         .bind(ids[1]).bind(record(1).payment_request_id)
         .execute(database.pool()).await.unwrap();
     let rpc = Rpc::start().await;
-    store
-        .observe_usdt_request(
+    let second = record(1);
+    let observe_second = || {
+        store.observe_usdt_request(
             creator_id,
             &creator,
-            &record(1),
+            &second,
             &rpc.verifier,
             Some(&bundles[1]),
         )
+    };
+    // While the first invoice still qualifies, through a timely Bitcoin
+    // payment, the contact stays on it.
+    sqlx::query("INSERT INTO invoice_timely_amount_matched_outpoints (invoice_id, outpoint_lookup_hash) VALUES ($1, $2)")
+        .bind(ids[0]).bind([3u8; 32].as_slice())
+        .execute(database.pool()).await.unwrap();
+    observe_second().await.unwrap();
+    assert!(status(&store, &bundles[1]).await.0);
+    let contact_invoice: uuid::Uuid = sqlx::query_scalar("SELECT invoice_id FROM buyer_contacts")
+        .fetch_one(database.pool())
         .await
         .unwrap();
-    assert!(status(&store, &bundles[1]).await.0);
+    assert_eq!(contact_invoice, ids[0]);
+    sqlx::query("DELETE FROM invoice_timely_amount_matched_outpoints WHERE invoice_id = $1")
+        .bind(ids[0])
+        .execute(database.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE usdt_observations SET checked_at = NOW() - INTERVAL '1 minute'")
+        .execute(database.pool())
+        .await
+        .unwrap();
+    observe_second().await.unwrap();
 
-    // The open contact moved to the qualifying invoice and is due now.
+    // Once it no longer does, the open contact moves to the qualifying
+    // invoice and is due now.
     let moved = store.claim_buyer_contact().await.unwrap().unwrap();
     assert_eq!(moved.invoice_id, ids[1]);
     assert!(store.buyer_contact_is_pending(&moved).await.unwrap());
