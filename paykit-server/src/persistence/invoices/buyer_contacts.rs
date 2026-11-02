@@ -77,14 +77,27 @@ impl InvoiceStore {
 
     /// Checks that a claimed attempt still needs saving. Call under the Creator's
     /// shared-state lock and retain that lock through saving and completion.
+    ///
+    /// A contact backed by a timely Bitcoin payment is always due. One created
+    /// from USDT alone is due only while that payment still qualifies under the
+    /// current window, so a contact queued before the proposal-time bound
+    /// existed waits until its proposal time is recorded, and stays held if its
+    /// transfer predates the bound. It is held, not deleted.
     pub async fn buyer_contact_is_pending(
         &self,
         pending: &PendingBuyerContact,
     ) -> Result<bool, PersistenceError> {
-        sqlx::query_scalar(
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        let (open, bitcoin_backed): (bool, bool) = sqlx::query_as(
             "SELECT EXISTS (SELECT 1 FROM buyer_contacts
-             WHERE invoice_id = $1 AND creator_id = $2 AND reader_lookup_hash = $3
-                 AND completed_at IS NULL)",
+                    WHERE invoice_id = $1 AND creator_id = $2 AND reader_lookup_hash = $3
+                        AND completed_at IS NULL),
+                    EXISTS (SELECT 1 FROM invoice_timely_amount_matched_outpoints
+                    WHERE invoice_id = $1)",
         )
         .bind(pending.invoice_id)
         .bind(pending.creator_id)
@@ -94,9 +107,16 @@ impl InvoiceStore {
                 .as_bytes()
                 .as_slice(),
         )
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await
-        .map_err(|_| PersistenceError::Unavailable)
+        .map_err(|_| PersistenceError::Unavailable)?;
+        if !open || bitcoin_backed {
+            return Ok(open);
+        }
+        Ok(self
+            .usdt_payment_status(&mut tx, pending.invoice_id)
+            .await?
+            .is_some_and(|usdt| usdt.paid_on_time))
     }
 
     /// Retains a terminal record while the caller still holds the shared-state lock.

@@ -1027,6 +1027,91 @@ async fn usdt_older_than_the_recorded_proposal_less_tolerance_does_not_pay_an_in
 }
 
 #[tokio::test]
+async fn a_pre_upgrade_usdt_buyer_contact_waits_for_a_payment_the_current_window_accepts() {
+    let bundle = parse_bundle_id(BUNDLES[0]).unwrap();
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(&[7; 32]).unwrap());
+    let creator = parse_creator(CREATOR).unwrap();
+    let creator_id = CreatorStore::new(database.pool(), crypto.clone())
+        .create(&CreatorCredentials::new(
+            creator.clone(),
+            "test-session".into(),
+            PaykitIdentitySecretKey::new([9; 32], 1).unwrap(),
+            None,
+            Some(UsdtAddress::try_from(RECIPIENT.to_owned()).unwrap()),
+        ))
+        .await
+        .unwrap()
+        .id();
+    let store = InvoiceStore::new(database.pool(), crypto.clone());
+    let invoice = store
+        .create_atomic(AtomicInvoiceInput {
+            creator: &creator,
+            reader: &parse_reader(CREATOR).unwrap(),
+            bundle_binding: BUNDLES[0].as_bytes(),
+            lock_resource_binding: b"lock",
+            payment_request_binding: BUNDLES[0].as_bytes(),
+            invoice_payloads: &Payload { index: 0 },
+            proposal_acceptance_seconds: 3600,
+            payment_window_seconds: 3 * 86400,
+        })
+        .await
+        .unwrap();
+    // A database upgraded from v22: migration 0023 adds the proposal time as
+    // NULL, and v22 code already queued a contact for a USDT transfer that only
+    // its invoice window accepted.
+    sqlx::query("INSERT INTO payment_request_lifecycles (invoice_id,sdk_payment_request_id,request_state,last_event_at,last_stream_item_id) VALUES ($1,$2,'proof_submitted',NOW(),1)")
+        .bind(invoice.invoice_id()).bind(record(0).payment_request_id)
+        .execute(database.pool()).await.unwrap();
+    let proposal_recorded_at = invoice.invoice_created_at() + time::Duration::days(2);
+    let bound = (proposal_recorded_at - paykit_server::usdt::PROPOSAL_TIME_TOLERANCE)
+        .replace_nanosecond(0)
+        .unwrap()
+        .unix_timestamp();
+    let rpc = Rpc::start().await;
+    let request = record(0);
+    let observe = |timestamp: i64| {
+        rpc.chain.lock().unwrap().timestamp = timestamp;
+        store.observe_usdt_request(creator_id, &creator, &request, &rpc.verifier, Some(&bundle))
+    };
+    observe(bound - 1).await.unwrap();
+    sqlx::query(
+        "INSERT INTO buyer_contacts (invoice_id, creator_id, reader_lookup_hash)
+         SELECT id, creator_id, reader_lookup_hash FROM invoices WHERE id = $1",
+    )
+    .bind(invoice.invoice_id())
+    .execute(database.pool())
+    .await
+    .unwrap();
+    let pending = store.claim_buyer_contact().await.unwrap().unwrap();
+
+    // Held while the proposal time is unknown.
+    assert!(!store.buyer_contact_is_pending(&pending).await.unwrap());
+    // A timely Bitcoin payment backs a contact independently of USDT.
+    sqlx::query("INSERT INTO invoice_timely_amount_matched_outpoints (invoice_id, outpoint_lookup_hash) VALUES ($1, $2)")
+        .bind(invoice.invoice_id()).bind([3u8; 32].as_slice())
+        .execute(database.pool()).await.unwrap();
+    assert!(store.buyer_contact_is_pending(&pending).await.unwrap());
+    sqlx::query("DELETE FROM invoice_timely_amount_matched_outpoints WHERE invoice_id = $1")
+        .bind(invoice.invoice_id())
+        .execute(database.pool())
+        .await
+        .unwrap();
+
+    // Once the time is recorded, a transfer before the bound still holds it,
+    sqlx::query("UPDATE payment_request_lifecycles SET proposal_recorded_at = $1")
+        .bind(proposal_recorded_at)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    assert!(!store.buyer_contact_is_pending(&pending).await.unwrap());
+    // and a transfer the current window accepts releases it.
+    observe(bound).await.unwrap();
+    assert!(store.buyer_contact_is_pending(&pending).await.unwrap());
+}
+
+#[tokio::test]
 async fn either_quoted_payment_can_settle_without_overwriting_the_other() {
     let bundle = parse_bundle_id(BUNDLES[0]).unwrap();
     let database = TestDatabase::create().await;
