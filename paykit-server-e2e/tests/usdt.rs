@@ -1209,6 +1209,134 @@ async fn a_held_legacy_contact_moves_to_the_buyers_next_qualifying_invoice() {
     assert!(!store.buyer_contact_is_pending(&held).await.unwrap());
 }
 
+/// Migrates to v22: every migration before 0023, from the server's own files.
+async fn migrate_to_v22(pool: &sqlx::PgPool) {
+    let source =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../paykit-server/migrations");
+    let v22 = std::env::temp_dir().join(format!("paykit-v22-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&v22).unwrap();
+    for entry in std::fs::read_dir(&source).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path.file_name().unwrap().to_str().unwrap().to_owned();
+        if name.as_str() < "0023" {
+            std::fs::copy(&path, v22.join(name)).unwrap();
+        }
+    }
+    sqlx::migrate::Migrator::new(v22.as_path())
+        .await
+        .unwrap()
+        .run(pool)
+        .await
+        .unwrap();
+    std::fs::remove_dir_all(v22).unwrap();
+}
+
+#[tokio::test]
+async fn a_v22_usdt_payment_marker_is_recomputed_once_the_proposal_time_is_known() {
+    // (proposal recorded after invoice creation, marker kept)
+    for (label, proposal_after, kept) in [
+        // The transfer predates the proposal time less the tolerance.
+        ("stale", Some(time::Duration::days(2)), false),
+        // The transfer qualifies under the current rule.
+        ("legitimate", Some(time::Duration::hours(1)), true),
+        // Attribution is undecided: the marker stands.
+        ("undecided", None, true),
+    ] {
+        let bundle = parse_bundle_id(BUNDLES[0]).unwrap();
+        let database = TestDatabase::create().await;
+        migrate_to_v22(database.pool()).await;
+        let crypto = Arc::new(Crypto::from_master_key(&[7; 32]).unwrap());
+        let creator = parse_creator(CREATOR).unwrap();
+        let creator_id = CreatorStore::new(database.pool(), crypto.clone())
+            .create(&CreatorCredentials::new(
+                creator.clone(),
+                "test-session".into(),
+                PaykitIdentitySecretKey::new([9; 32], 1).unwrap(),
+                None,
+                Some(UsdtAddress::try_from(RECIPIENT.to_owned()).unwrap()),
+            ))
+            .await
+            .unwrap()
+            .id();
+        let store = InvoiceStore::new(database.pool(), crypto.clone());
+        let invoice = store
+            .create_atomic(AtomicInvoiceInput {
+                creator: &creator,
+                reader: &parse_reader(CREATOR).unwrap(),
+                bundle_binding: BUNDLES[0].as_bytes(),
+                lock_resource_binding: b"lock",
+                payment_request_binding: BUNDLES[0].as_bytes(),
+                invoice_payloads: &Payload { index: 0 },
+                proposal_acceptance_seconds: 3600,
+                payment_window_seconds: 3 * 86400,
+            })
+            .await
+            .unwrap();
+        let created = invoice.invoice_created_at();
+        let paid_at = (created + time::Duration::seconds(10))
+            .replace_nanosecond(0)
+            .unwrap();
+        // v22 state: the lifecycle row, and the payment marker v22 code set
+        // from a USDT transfer under the invoice-time window.
+        sqlx::query("INSERT INTO payment_request_lifecycles (invoice_id,sdk_payment_request_id,request_state,last_event_at,last_stream_item_id) VALUES ($1,$2,'proof_submitted',NOW(),1)")
+            .bind(invoice.invoice_id()).bind(record(0).payment_request_id)
+            .execute(database.pool()).await.unwrap();
+        sqlx::query("UPDATE invoices SET first_amount_matched_observed_at = $2 WHERE id = $1")
+            .bind(invoice.invoice_id())
+            .bind(paid_at)
+            .execute(database.pool())
+            .await
+            .unwrap();
+
+        run_migrations(database.pool()).await.unwrap();
+        if let Some(after) = proposal_after {
+            sqlx::query("UPDATE payment_request_lifecycles SET proposal_recorded_at = $1")
+                .bind(created + after)
+                .execute(database.pool())
+                .await
+                .unwrap();
+        }
+        let rpc = Rpc::start().await;
+        rpc.chain.lock().unwrap().timestamp = paid_at.unix_timestamp();
+        store
+            .observe_usdt_request(
+                creator_id,
+                &creator,
+                &record(0),
+                &rpc.verifier,
+                Some(&bundle),
+            )
+            .await
+            .unwrap();
+
+        // Drains read exactly these: a marker within the deadline is payment,
+        // an expiry is terminal, and neither is an open accepted request.
+        let marker = || async {
+            sqlx::query_as::<_, (Option<OffsetDateTime>, Option<OffsetDateTime>)>(
+                "SELECT first_amount_matched_observed_at, payment_expired_at FROM invoices WHERE id = $1",
+            )
+            .bind(invoice.invoice_id())
+            .fetch_one(database.pool())
+            .await
+            .unwrap()
+        };
+        let (paid, expired) = marker().await;
+        assert_eq!(paid.is_some(), kept, "{label}");
+        assert!(expired.is_none(), "{label}");
+        store
+            .observation_targets_at(created + time::Duration::days(4))
+            .await
+            .unwrap();
+        let (paid, expired) = marker().await;
+        assert_eq!(paid.is_some(), kept, "{label}");
+        assert_eq!(
+            expired.is_some(),
+            !kept,
+            "{label}: expiry after the deadline"
+        );
+    }
+}
+
 #[tokio::test]
 async fn either_quoted_payment_can_settle_without_overwriting_the_other() {
     let bundle = parse_bundle_id(BUNDLES[0]).unwrap();
