@@ -493,8 +493,7 @@ impl InvoiceStore {
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
         let window_start =
-            crate::usdt::payment_window_start(row.invoice_created_at, proposal_recorded_at)
-                .ok_or(PersistenceError::CorruptOrMissing)?;
+            crate::usdt::payment_window_start(row.invoice_created_at, proposal_recorded_at);
         let mut selected: Option<(String, super::settlement::ObservedPayment)> = None;
         for observation in observations {
             let (facts, _) = self.transfer_facts(
@@ -504,7 +503,8 @@ impl InvoiceStore {
                 observation.observation_envelope,
                 observation.transfer_lookup_hash,
             )?;
-            let timely = facts.timestamp >= window_start && facts.timestamp <= row.payment_deadline;
+            let timely = window_start.is_some_and(|start| facts.timestamp >= start)
+                && facts.timestamp <= row.payment_deadline;
             let candidate = super::settlement::ObservedPayment {
                 present: true,
                 matched: facts.amount >= required,

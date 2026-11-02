@@ -319,7 +319,7 @@ async fn invoices_share_an_address_but_never_share_payment_evidence() {
         let id = invoice.invoice_id();
         ids.push(id);
         // Establish the same durable attribution produced by the SDK lifecycle projection.
-        sqlx::query("INSERT INTO payment_request_lifecycles (invoice_id,sdk_payment_request_id,request_state,last_event_at,last_stream_item_id) VALUES ($1,$2,'proof_submitted',NOW(),1)").bind(id).bind(record(index).payment_request_id).execute(database.pool()).await.unwrap();
+        sqlx::query("INSERT INTO payment_request_lifecycles (invoice_id,sdk_payment_request_id,request_state,last_event_at,last_stream_item_id,proposal_recorded_at) VALUES ($1,$2,'proof_submitted',NOW(),1,NOW())").bind(id).bind(record(index).payment_request_id).execute(database.pool()).await.unwrap();
     }
     let rpc = Rpc::start().await;
     let paid_at = rpc.chain.lock().unwrap().timestamp;
@@ -973,17 +973,39 @@ async fn usdt_older_than_the_recorded_proposal_less_tolerance_does_not_pay_an_in
         })
         .await
         .unwrap();
+    // A lifecycle row from before the server kept the proposal time, as after
+    // the upgrade.
+    sqlx::query("INSERT INTO payment_request_lifecycles (invoice_id,sdk_payment_request_id,request_state,last_event_at,last_stream_item_id) VALUES ($1,$2,'proof_submitted',NOW(),1)")
+        .bind(invoice.invoice_id()).bind(record(0).payment_request_id)
+        .execute(database.pool()).await.unwrap();
     // The proposal reached the SDK two days after the invoice, as after a long
     // handoff delay, so the invoice window no longer bounds the evidence.
     let proposal_recorded_at = invoice.invoice_created_at() + time::Duration::days(2);
-    sqlx::query("INSERT INTO payment_request_lifecycles (invoice_id,sdk_payment_request_id,request_state,last_event_at,last_stream_item_id,proposal_recorded_at) VALUES ($1,$2,'proof_submitted',NOW(),1,$3)")
-        .bind(invoice.invoice_id()).bind(record(0).payment_request_id).bind(proposal_recorded_at)
-        .execute(database.pool()).await.unwrap();
     let bound = (proposal_recorded_at - paykit_server::usdt::PROPOSAL_TIME_TOLERANCE)
         .replace_nanosecond(0)
         .unwrap()
         .unix_timestamp();
     let rpc = Rpc::start().await;
+    // Until the proposal time is known, even a transfer at the bound pays
+    // nothing, and its receipt is kept.
+    rpc.chain.lock().unwrap().timestamp = bound;
+    store
+        .observe_usdt_request(
+            creator_id,
+            &creator,
+            &record(0),
+            &rpc.verifier,
+            Some(&bundle),
+        )
+        .await
+        .unwrap();
+    assert_eq!(status(&store, &bundle).await, (false, 2));
+    assert!(store.claim_buyer_contact().await.unwrap().is_none());
+    sqlx::query("UPDATE payment_request_lifecycles SET proposal_recorded_at = $1")
+        .bind(proposal_recorded_at)
+        .execute(database.pool())
+        .await
+        .unwrap();
     for (timestamp, paid) in [(bound - 1, false), (bound, true)] {
         rpc.chain.lock().unwrap().timestamp = timestamp;
         store
@@ -1041,7 +1063,7 @@ async fn either_quoted_payment_can_settle_without_overwriting_the_other() {
         invoice.invoice_id()
     );
     let id = invoice.invoice_id();
-    sqlx::query("INSERT INTO payment_request_lifecycles (invoice_id,sdk_payment_request_id,request_state,last_event_at,last_stream_item_id) VALUES ($1,$2,'proof_submitted',NOW(),1)")
+    sqlx::query("INSERT INTO payment_request_lifecycles (invoice_id,sdk_payment_request_id,request_state,last_event_at,last_stream_item_id,proposal_recorded_at) VALUES ($1,$2,'proof_submitted',NOW(),1,NOW())")
         .bind(id).bind(record(0).payment_request_id).execute(database.pool()).await.unwrap();
     let rpc = Rpc::start().await;
     let outpoint =
@@ -1202,7 +1224,7 @@ async fn timely_usdt_payment_remains_verifiable_after_drain_cleanup() {
         })
         .await
         .unwrap();
-    sqlx::query("INSERT INTO payment_request_lifecycles (invoice_id,sdk_payment_request_id,request_state,last_event_at,last_stream_item_id) VALUES ($1,$2,'proof_submitted',NOW(),1)")
+    sqlx::query("INSERT INTO payment_request_lifecycles (invoice_id,sdk_payment_request_id,request_state,last_event_at,last_stream_item_id,proposal_recorded_at) VALUES ($1,$2,'proof_submitted',NOW(),1,NOW())")
         .bind(invoice.invoice_id()).bind(record(0).payment_request_id).execute(database.pool()).await.unwrap();
     let drains = PaymentDrainStore::new(database.pool(), crypto.clone());
     let active = drains.create(&lock).await.unwrap();
@@ -1336,7 +1358,7 @@ async fn locks_ignores_a_transfer_a_marketplace_request_already_owns() {
         .await
         .unwrap()
         .invoice_id();
-    sqlx::query("INSERT INTO payment_request_lifecycles (invoice_id,sdk_payment_request_id,request_state,last_event_at,last_stream_item_id) VALUES ($1,$2,'proof_submitted',NOW(),1)")
+    sqlx::query("INSERT INTO payment_request_lifecycles (invoice_id,sdk_payment_request_id,request_state,last_event_at,last_stream_item_id,proposal_recorded_at) VALUES ($1,$2,'proof_submitted',NOW(),1,NOW())")
         .bind(locks_invoice)
         .bind(record(0).payment_request_id)
         .execute(database.pool())
@@ -1371,7 +1393,7 @@ async fn locks_ignores_a_transfer_a_marketplace_request_already_owns() {
         .await
         .unwrap()
         .unwrap();
-    sqlx::query("INSERT INTO payment_request_lifecycles (marketplace_preparation_id,sdk_payment_request_id,request_state,last_event_at,last_stream_item_id,state_event_id) VALUES ($1,$2,'proof_submitted',NOW(),1,'event')")
+    sqlx::query("INSERT INTO payment_request_lifecycles (marketplace_preparation_id,sdk_payment_request_id,request_state,last_event_at,last_stream_item_id,state_event_id,proposal_recorded_at) VALUES ($1,$2,'proof_submitted',NOW(),1,'event',NOW())")
         .bind(prepared.invoice_id())
         .bind(record(2).payment_request_id)
         .execute(database.pool())

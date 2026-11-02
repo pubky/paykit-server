@@ -95,17 +95,16 @@ pub const PROPOSAL_TIME_TOLERANCE: time::Duration = time::Duration::minutes(24 *
 
 /// The earliest block time that pays a Payment Request: `window_start`, or the
 /// server's earliest record of its proposal less [`PROPOSAL_TIME_TOLERANCE`]
-/// when that is later. Without a recorded proposal time the window is
-/// unchanged. Chain time has whole-second resolution, so the result is too.
+/// when that is later. Chain time has whole-second resolution, so the result is
+/// too. `None` until the proposal time is recorded, as for a lifecycle row from
+/// before the server kept it: no evidence pays the request until then, though
+/// its receipts are still kept.
 pub fn payment_window_start(
     window_start: OffsetDateTime,
     proposal_recorded_at: Option<OffsetDateTime>,
 ) -> Option<OffsetDateTime> {
-    let bound = match proposal_recorded_at {
-        Some(recorded) => window_start.max(recorded.checked_sub(PROPOSAL_TIME_TOLERANCE)?),
-        None => window_start,
-    };
-    bound.replace_nanosecond(0).ok()
+    let bound = proposal_recorded_at?.checked_sub(PROPOSAL_TIME_TOLERANCE)?;
+    window_start.max(bound).replace_nanosecond(0).ok()
 }
 
 #[derive(Clone, Copy)]
@@ -916,8 +915,8 @@ mod tests {
         let start = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap()
             + time::Duration::milliseconds(400);
         let floored = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
-        // No recorded proposal: the existing window, at the whole second.
-        assert_eq!(payment_window_start(start, None), Some(floored));
+        // No recorded proposal: nothing pays the request yet.
+        assert_eq!(payment_window_start(start, None), None);
         // A proposal recorded within the tolerance leaves the window as it was.
         assert_eq!(
             payment_window_start(start, Some(start + time::Duration::hours(1))),
