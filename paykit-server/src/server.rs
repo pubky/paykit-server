@@ -616,36 +616,23 @@ async fn allowance_intake_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runt
             allowance_intake_pass(workers.clone(), intake.clone(), runtime.clone(), creator)
         });
     }
-    finish_intake_passes(&mut tasks, ALLOWANCE_INTAKE_SHUTDOWN_GRACE).await;
+    finish_intake_passes(&mut tasks).await;
 }
 
-/// How long shutdown lets running intake passes finish, below the default
-/// drain timeout. Passes start no new read once shutdown begins.
-const ALLOWANCE_INTAKE_SHUTDOWN_GRACE: Duration = Duration::from_secs(20);
-
-/// Lets the running passes finish within `grace`, then cancels the rest and
-/// returns only once every pass has ended. Cancelling a pass inside an SDK
-/// call leaves the Creator's shared-state lease held until it expires, so it
-/// is the last resort; intake is retried work, and the SDK exposes no
-/// unconfirmed state after a cancelled operation.
-async fn finish_intake_passes(tasks: &mut CreatorTasks<()>, grace: Duration) {
-    let finished =
-        tokio::time::timeout(grace, async { while tasks.join_next().await.is_some() {} }).await;
-    if finished.is_err() {
-        tracing::warn!(
-            stage = "allowance_intake",
-            step = "shutdown",
-            "Paykit Allowance intake passes cancelled at shutdown"
-        );
-        tasks.abort_and_join().await;
-    }
+/// Waits for every running pass to end. A pass starts no new read once
+/// shutdown begins, and the one it is in is an SDK mutation that must settle:
+/// dropping it mid-flight would skip the shared-state unlock and leave state
+/// unconfirmed. Pubky requests are bounded by [`PUBKY_REQUEST_TIMEOUT`], so a
+/// running read ends in bounded time.
+async fn finish_intake_passes(tasks: &mut CreatorTasks<()>) {
+    while tasks.join_next().await.is_some() {}
 }
 
 /// Starts intake passes in the free slots, least recently started Creator
 /// first, skipping Creators whose pass is still running. A pass reads
 /// reader-supplied history, so a panic in it is caught in the pass's own
 /// future: it is logged and frees the slot instead of stopping the server,
-/// and the pass stays owned by the slot, so shutdown drops it.
+/// and the pass stays owned by the slot, so shutdown waits for it.
 fn start_intake_passes<Pass, PassFuture>(
     tasks: &mut CreatorTasks<()>,
     turns: &mut IntakeTurns,
@@ -691,27 +678,15 @@ async fn pass_panicked(pass: impl Future<Output = ()> + Send) -> bool {
     .await
 }
 
-/// One Creator's intake pass, dropped only if it hangs past
-/// [`ALLOWANCE_INTAKE_PASS_DEADLINE`].
+/// One Creator's intake pass. It is never cut short: each read is an SDK
+/// mutation, so the pass deadline only stops new reads from starting.
 async fn allowance_intake_pass(
     workers: Arc<WorkerComponents>,
     intake: Arc<AllowanceIntake>,
     runtime: Arc<Runtime>,
     creator: Uuid,
 ) {
-    if tokio::time::timeout(
-        ALLOWANCE_INTAKE_PASS_DEADLINE,
-        run_allowance_intake_pass(&workers, &intake, &runtime, creator),
-    )
-    .await
-    .is_err()
-    {
-        tracing::warn!(
-            stage = "allowance_intake",
-            step = "pass_deadline",
-            "Paykit Allowance intake pass overran its deadline"
-        );
-    }
+    run_allowance_intake_pass(&workers, &intake, &runtime, creator).await;
 }
 
 async fn run_allowance_intake_pass(
@@ -720,7 +695,8 @@ async fn run_allowance_intake_pass(
     runtime: &Runtime,
     creator: Uuid,
 ) {
-    let keep_reading = || runtime.may_start_worker_claim();
+    let deadline = Instant::now() + ALLOWANCE_INTAKE_PASS_DEADLINE;
+    let keep_reading = || runtime.may_start_worker_claim() && Instant::now() < deadline;
     let failure = match creator_adapter(workers, creator).await {
         Ok(adapter) => match adapter
             .take_in_allowances(intake, &workers.invoices, &keep_reading)
@@ -1718,12 +1694,22 @@ async fn observer_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtime>) {
     }
 }
 
+/// Longest any one Pubky HTTP request may take. An SDK call that writes
+/// shared state is never dropped mid-flight, so this is what bounds a call on
+/// a stalled homeserver: the request fails and the SDK settles its write
+/// lock. The companion relay sets its own timeout on each poll.
+const PUBKY_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
 fn configured_pubky(network: PaykitNetwork) -> Result<Pubky, ServerBuildError> {
-    match network {
-        PaykitNetwork::Mainnet => Pubky::new(),
-        PaykitNetwork::Testnet => Pubky::testnet(),
+    let mut builder = pubky::PubkyHttpClient::builder();
+    if network == PaykitNetwork::Testnet {
+        builder.testnet();
     }
-    .map_err(|_| ServerBuildError::Pubky)
+    let client = builder
+        .request_timeout(PUBKY_REQUEST_TIMEOUT)
+        .build()
+        .map_err(|_| ServerBuildError::Pubky)?;
+    Ok(Pubky::with_client(client))
 }
 
 fn map_electrum_error(_: ObserverError) -> ServerBuildError {
@@ -2762,41 +2748,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_drops_a_running_intake_pass_before_it_returns() {
-        struct Dropped(Option<tokio::sync::oneshot::Sender<()>>);
-        impl Drop for Dropped {
-            fn drop(&mut self) {
-                let _ = self.0.take().unwrap().send(());
-            }
-        }
+    async fn shutdown_waits_for_a_running_intake_pass_instead_of_dropping_it() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
         let runtime = test_server().await.runtime;
         let mut tasks = CreatorTasks::new(1, runtime);
         let mut turns = IntakeTurns::default();
-        let (dropped, mut was_dropped) = tokio::sync::oneshot::channel();
+        let release = Arc::new(tokio::sync::Notify::new());
         let (entered, has_entered) = tokio::sync::oneshot::channel();
-        let mut start = Some((Dropped(Some(dropped)), entered));
+        let finished = Arc::new(AtomicBool::new(false));
+        let mut entered = Some(entered);
         start_intake_passes(&mut tasks, &mut turns, vec![Uuid::new_v4()], |_| {
-            let (guard, entered) = start.take().unwrap();
+            let (release, finished, entered) =
+                (release.clone(), finished.clone(), entered.take().unwrap());
             async move {
-                let _guard = guard;
+                // Stands in for an SDK mutation still in flight at shutdown.
                 entered.send(()).unwrap();
-                std::future::pending::<()>().await;
+                release.notified().await;
+                finished.store(true, Ordering::SeqCst);
             }
         });
         has_entered.await.unwrap();
 
-        // The pass never finishes; past the grace it is cancelled.
-        finish_intake_passes(&mut tasks, Duration::from_millis(50)).await;
+        {
+            let shutdown = finish_intake_passes(&mut tasks);
+            tokio::pin!(shutdown);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), &mut shutdown)
+                    .await
+                    .is_err(),
+                "shutdown returned while the pass was still running"
+            );
+            release.notify_one();
+            shutdown.await;
+        }
 
-        assert!(
-            was_dropped.try_recv().is_ok(),
-            "the pass outlived the intake worker"
-        );
+        assert!(finished.load(Ordering::SeqCst), "the pass was dropped");
         assert!(tasks.is_empty());
     }
 
     #[tokio::test]
-    async fn shutdown_lets_a_pass_finish_within_its_grace() {
+    async fn shutdown_lets_a_pass_finish() {
         use std::sync::atomic::{AtomicBool, Ordering};
 
         let runtime = test_server().await.runtime;
@@ -2811,7 +2803,7 @@ mod tests {
             }
         });
 
-        finish_intake_passes(&mut tasks, Duration::from_secs(5)).await;
+        finish_intake_passes(&mut tasks).await;
 
         assert!(finished.load(Ordering::SeqCst), "the pass was cut short");
         assert!(tasks.is_empty());

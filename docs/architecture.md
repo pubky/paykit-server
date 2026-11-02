@@ -64,9 +64,12 @@ loop: it runs at most one pass per Creator, and at most the outbox batch size of
 passes at once. It reads a reader only after that reader's link received new
 items, least recently read first, no sooner than 10 seconds or ten times the
 time its last read took after that read began, accepts at most four
-proposals per read, and holds the Creator mutation lock for that one call. A pass starts no new read 5 seconds after its first read. SDK calls are
-not cancelled for being slow, since that strands the identity's shared-state
-lease; a 10-minute deadline catches a hung pass.
+proposals per read, and holds the Creator mutation lock for that one call. A pass starts no new read 5 seconds after its first read, or 10 minutes after
+it began. A read already started is never cancelled, since that strands the
+identity's shared-state lease; shutdown waits for it, and a 30-second Pubky
+request timeout bounds it on a stalled homeserver. Each read accepts no more
+than the link's headroom under the SDK's record cap, counting each
+Acceptance's Delivery Confirmation, and a link at the cap is not read.
 The local reader demo likewise uses hosted SDK state; its encrypted local file
 retains only the app/Creator binding and a process ownership lock.
 
