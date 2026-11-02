@@ -450,36 +450,38 @@ impl AllowanceLink for PaykitAdapter {
             .sdk
             .accept_pending_allowance_proposals(reader.clone(), limit)
             .await?;
-        Ok(link_acceptance(outcome))
+        link_acceptance(outcome)
     }
 }
 
 /// A link over the SDK's record cap is left alone: nothing on it is accepted
-/// automatically, and it counts as read until new items arrive.
-fn link_acceptance(outcome: PendingAllowanceAcceptance) -> LinkAcceptance {
+/// automatically, and it counts as read until new items arrive. An outcome
+/// this server does not know fails the read, so the link stays due and is
+/// retried after the spacing.
+fn link_acceptance(outcome: PendingAllowanceAcceptance) -> paykit_sdk::Result<LinkAcceptance> {
     match outcome {
         PendingAllowanceAcceptance::Accepted {
             records,
             more_pending,
-        } => LinkAcceptance {
+        } => Ok(LinkAcceptance {
             accepted: records.len(),
             more_pending,
-        },
+        }),
         PendingAllowanceAcceptance::LinkHistoryTooLarge { .. } => {
             warn!(
                 stage = "allowance_intake",
                 cause = "link_history_too_large",
                 "Paykit Allowance link over the record cap; not accepted automatically"
             );
-            LinkAcceptance {
+            Ok(LinkAcceptance {
                 accepted: 0,
                 more_pending: false,
-            }
+            })
         }
-        _ => LinkAcceptance {
-            accepted: 0,
-            more_pending: false,
-        },
+        _ => Err(PaykitSdkError::Protocol {
+            context: "unknown Allowance acceptance outcome".into(),
+            source: None,
+        }),
     }
 }
 
@@ -973,7 +975,8 @@ mod tests {
     #[test]
     fn a_link_over_the_record_cap_is_read_and_left_alone() {
         assert_eq!(
-            link_acceptance(PendingAllowanceAcceptance::LinkHistoryTooLarge { record_cap: 16_384 }),
+            link_acceptance(PendingAllowanceAcceptance::LinkHistoryTooLarge { record_cap: 16_384 })
+                .unwrap(),
             LinkAcceptance {
                 accepted: 0,
                 more_pending: false,
@@ -983,7 +986,8 @@ mod tests {
             link_acceptance(PendingAllowanceAcceptance::Accepted {
                 records: Vec::new(),
                 more_pending: true,
-            }),
+            })
+            .unwrap(),
             LinkAcceptance {
                 accepted: 0,
                 more_pending: true,
