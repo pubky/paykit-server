@@ -534,6 +534,46 @@ impl InvoiceStore {
         Ok(selected)
     }
 
+    /// Reconciles every flagged pre-upgrade USDT credit of `creator` whose
+    /// proposal time is known. Paths that read payment markers without
+    /// observing USDT first, such as payment drains, call it before they do.
+    pub async fn reconcile_usdt_credits(
+        &self,
+        creator: &CreatorPubky,
+    ) -> Result<(), PersistenceError> {
+        let rows: Vec<UsdtInvoiceRow> = sqlx::query_as(
+            "SELECT i.id, c.creator_lookup_hash, i.payment_record_envelope, i.invoice_envelope,
+                    i.invoice_created_at, i.payment_deadline
+             FROM invoices i JOIN creators c ON c.id = i.creator_id
+             WHERE c.creator_lookup_hash = $1 AND i.usdt_credit_reconcile",
+        )
+        .bind(
+            self.crypto
+                .lookup_hash(creator.to_string().as_bytes())
+                .as_bytes()
+                .as_slice(),
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        for row in rows {
+            let creator_hash = lookup_hash(&row.creator_lookup_hash)?;
+            let payment: InvoicePaymentRecordV1 = postcard::from_bytes(
+                &self
+                    .crypto
+                    .decrypt(
+                        &EnvelopeContext::invoice_payment_record(creator_hash, row.id),
+                        &EncryptedEnvelope::from_bytes(row.payment_record_envelope.clone()),
+                    )
+                    .map_err(|_| PersistenceError::CorruptOrMissing)?,
+            )
+            .map_err(|_| PersistenceError::CorruptOrMissing)?;
+            self.reconcile_usdt_credit(&row, creator_hash, &payment)
+                .await?;
+        }
+        Ok(())
+    }
+
     /// Recomputes a payment marker credited from USDT alone before the
     /// proposal-time rule, once the invoice's proposal time is recorded: the
     /// marker is cleared and rebuilt from the invoice's current evidence, so it

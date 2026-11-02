@@ -905,12 +905,27 @@ struct ProductionPaymentDrainOperations {
     paykit: PaykitConfig,
 }
 
+impl ProductionPaymentDrainOperations {
+    /// Drains read payment markers directly, so the Creator's flagged
+    /// pre-upgrade USDT credit is reconciled before any drain read.
+    async fn reconcile_usdt_credits(
+        &self,
+        lock_resource: &PubkyLockResource,
+    ) -> Result<(), PaymentDrainError> {
+        self.invoices
+            .reconcile_usdt_credits(lock_resource.creator())
+            .await
+            .map_err(|_| PaymentDrainError::Unavailable)
+    }
+}
+
 #[async_trait]
 impl PaymentDrainOperations for ProductionPaymentDrainOperations {
     async fn create(
         &self,
         lock_resource: &PubkyLockResource,
     ) -> Result<PaymentDrainSummary, PaymentDrainError> {
+        self.reconcile_usdt_credits(lock_resource).await?;
         if let Some(replay) = self
             .drains
             .exact_replay(lock_resource)
@@ -941,6 +956,7 @@ impl PaymentDrainOperations for ProductionPaymentDrainOperations {
         &self,
         lock_resource: &PubkyLockResource,
     ) -> Result<Option<PaymentDrainSummary>, PaymentDrainError> {
+        self.reconcile_usdt_credits(lock_resource).await?;
         self.drains
             .exact_replay(lock_resource)
             .await
@@ -953,6 +969,7 @@ impl PaymentDrainOperations for ProductionPaymentDrainOperations {
         lock_resource: &PubkyLockResource,
         cleanup_token: PaymentDrainCleanupToken,
     ) -> Result<(), PaymentDrainError> {
+        self.reconcile_usdt_credits(lock_resource).await?;
         self.drains
             .cleanup_completed(lock_resource, cleanup_token.as_bytes())
             .await

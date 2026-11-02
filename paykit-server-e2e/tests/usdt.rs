@@ -1232,7 +1232,8 @@ async fn migrate_to_v22(pool: &sqlx::PgPool) {
 }
 
 #[tokio::test]
-async fn a_v22_usdt_payment_marker_is_recomputed_once_the_proposal_time_is_known() {
+async fn a_v22_usdt_payment_marker_is_recomputed_before_a_drain_reads_it() {
+    const LOCK: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/app.locks/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json";
     // (proposal recorded after invoice creation, marker kept)
     for (label, proposal_after, kept) in [
         // The transfer predates the proposal time less the tolerance.
@@ -1264,7 +1265,7 @@ async fn a_v22_usdt_payment_marker_is_recomputed_once_the_proposal_time_is_known
                 creator: &creator,
                 reader: &parse_reader(CREATOR).unwrap(),
                 bundle_binding: BUNDLES[0].as_bytes(),
-                lock_resource_binding: b"lock",
+                lock_resource_binding: LOCK.as_bytes(),
                 payment_request_binding: BUNDLES[0].as_bytes(),
                 invoice_payloads: &Payload { index: 0 },
                 proposal_acceptance_seconds: 3600,
@@ -1276,9 +1277,9 @@ async fn a_v22_usdt_payment_marker_is_recomputed_once_the_proposal_time_is_known
         let paid_at = (created + time::Duration::seconds(10))
             .replace_nanosecond(0)
             .unwrap();
-        // v22 state: the lifecycle row, and the payment marker v22 code set
-        // from a USDT transfer under the invoice-time window.
-        sqlx::query("INSERT INTO payment_request_lifecycles (invoice_id,sdk_payment_request_id,request_state,last_event_at,last_stream_item_id) VALUES ($1,$2,'proof_submitted',NOW(),1)")
+        // v22 state: the accepted lifecycle row, and the payment marker v22
+        // code set from a USDT transfer under the invoice-time window.
+        sqlx::query("INSERT INTO payment_request_lifecycles (invoice_id,sdk_payment_request_id,request_state,last_event_at,last_stream_item_id) VALUES ($1,$2,'accepted',NOW(),1)")
             .bind(invoice.invoice_id()).bind(record(0).payment_request_id)
             .execute(database.pool()).await.unwrap();
         sqlx::query("UPDATE invoices SET first_amount_matched_observed_at = $2 WHERE id = $1")
@@ -1289,13 +1290,8 @@ async fn a_v22_usdt_payment_marker_is_recomputed_once_the_proposal_time_is_known
             .unwrap();
 
         run_migrations(database.pool()).await.unwrap();
-        if let Some(after) = proposal_after {
-            sqlx::query("UPDATE payment_request_lifecycles SET proposal_recorded_at = $1")
-                .bind(created + after)
-                .execute(database.pool())
-                .await
-                .unwrap();
-        }
+        // The receipt is observed while the proposal time is unknown: nothing
+        // is reconciled yet.
         let rpc = Rpc::start().await;
         rpc.chain.lock().unwrap().timestamp = paid_at.unix_timestamp();
         store
@@ -1308,29 +1304,43 @@ async fn a_v22_usdt_payment_marker_is_recomputed_once_the_proposal_time_is_known
             )
             .await
             .unwrap();
+        // A lifecycle refresh then records the proposal time, and the drain
+        // path reconciles before it reads markers, without the observer.
+        if let Some(after) = proposal_after {
+            sqlx::query("UPDATE payment_request_lifecycles SET proposal_recorded_at = $1")
+                .bind(created + after)
+                .execute(database.pool())
+                .await
+                .unwrap();
+        }
+        store.reconcile_usdt_credits(&creator).await.unwrap();
+        let drains = PaymentDrainStore::new(database.pool(), crypto.clone());
+        let lock = parse_addressed_lock_resource(LOCK).unwrap();
+        let drain = drains.create(&lock).await.unwrap();
+        assert_eq!(drain.accepted_count(), 1, "{label}");
+        // Replay reads the payment marker: a paid invoice is terminal and
+        // completes the drain, a stale one stays an open accepted request.
+        let replay = drains.exact_replay(&lock).await.unwrap().unwrap();
+        assert_eq!(replay.terminal_count(), u64::from(kept), "{label}");
+        assert_eq!(replay.accepted_count(), u64::from(!kept), "{label}");
+        assert_eq!(replay.completed(), kept, "{label}");
 
-        // Drains read exactly these: a marker within the deadline is payment,
-        // an expiry is terminal, and neither is an open accepted request.
-        let marker = || async {
-            sqlx::query_as::<_, (Option<OffsetDateTime>, Option<OffsetDateTime>)>(
-                "SELECT first_amount_matched_observed_at, payment_expired_at FROM invoices WHERE id = $1",
+        let expired = || async {
+            sqlx::query_scalar::<_, Option<OffsetDateTime>>(
+                "SELECT payment_expired_at FROM invoices WHERE id = $1",
             )
             .bind(invoice.invoice_id())
             .fetch_one(database.pool())
             .await
             .unwrap()
         };
-        let (paid, expired) = marker().await;
-        assert_eq!(paid.is_some(), kept, "{label}");
-        assert!(expired.is_none(), "{label}");
+        assert!(expired().await.is_none(), "{label}");
         store
             .observation_targets_at(created + time::Duration::days(4))
             .await
             .unwrap();
-        let (paid, expired) = marker().await;
-        assert_eq!(paid.is_some(), kept, "{label}");
         assert_eq!(
-            expired.is_some(),
+            expired().await.is_some(),
             !kept,
             "{label}: expiry after the deadline"
         );
