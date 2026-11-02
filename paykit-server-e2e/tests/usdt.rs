@@ -1112,6 +1112,82 @@ async fn a_pre_upgrade_usdt_buyer_contact_waits_for_a_payment_the_current_window
 }
 
 #[tokio::test]
+async fn a_held_legacy_contact_moves_to_the_buyers_next_qualifying_invoice() {
+    let bundles = BUNDLES.map(|value| parse_bundle_id(value).unwrap());
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(&[7; 32]).unwrap());
+    let creator = parse_creator(CREATOR).unwrap();
+    let creator_id = CreatorStore::new(database.pool(), crypto.clone())
+        .create(&CreatorCredentials::new(
+            creator.clone(),
+            "test-session".into(),
+            PaykitIdentitySecretKey::new([9; 32], 1).unwrap(),
+            None,
+            Some(UsdtAddress::try_from(RECIPIENT.to_owned()).unwrap()),
+        ))
+        .await
+        .unwrap()
+        .id();
+    let store = InvoiceStore::new(database.pool(), crypto.clone());
+    let mut ids = Vec::new();
+    for (index, binding) in BUNDLES.iter().enumerate().take(2) {
+        let invoice = store
+            .create_atomic(AtomicInvoiceInput {
+                creator: &creator,
+                reader: &parse_reader(CREATOR).unwrap(),
+                bundle_binding: binding.as_bytes(),
+                lock_resource_binding: b"lock",
+                payment_request_binding: binding.as_bytes(),
+                invoice_payloads: &Payload { index },
+                proposal_acceptance_seconds: 3600,
+                payment_window_seconds: 86400,
+            })
+            .await
+            .unwrap();
+        ids.push(invoice.invoice_id());
+    }
+    // Upgraded from v22: the first invoice's lifecycle row has no proposal
+    // time, and v22 code queued a contact for it that the current rule holds.
+    sqlx::query("INSERT INTO payment_request_lifecycles (invoice_id,sdk_payment_request_id,request_state,last_event_at,last_stream_item_id) VALUES ($1,$2,'proof_submitted',NOW(),1)")
+        .bind(ids[0]).bind(record(0).payment_request_id)
+        .execute(database.pool()).await.unwrap();
+    sqlx::query(
+        "INSERT INTO buyer_contacts (invoice_id, creator_id, reader_lookup_hash)
+         SELECT id, creator_id, reader_lookup_hash FROM invoices WHERE id = $1",
+    )
+    .bind(ids[0])
+    .execute(database.pool())
+    .await
+    .unwrap();
+    let held = store.claim_buyer_contact().await.unwrap().unwrap();
+    assert!(!store.buyer_contact_is_pending(&held).await.unwrap());
+
+    // The same buyer then pays a second invoice under the current rule.
+    sqlx::query("INSERT INTO payment_request_lifecycles (invoice_id,sdk_payment_request_id,request_state,last_event_at,last_stream_item_id,proposal_recorded_at) VALUES ($1,$2,'proof_submitted',NOW(),1,NOW())")
+        .bind(ids[1]).bind(record(1).payment_request_id)
+        .execute(database.pool()).await.unwrap();
+    let rpc = Rpc::start().await;
+    store
+        .observe_usdt_request(
+            creator_id,
+            &creator,
+            &record(1),
+            &rpc.verifier,
+            Some(&bundles[1]),
+        )
+        .await
+        .unwrap();
+    assert!(status(&store, &bundles[1]).await.0);
+
+    // The open contact moved to the qualifying invoice and is due now.
+    let moved = store.claim_buyer_contact().await.unwrap().unwrap();
+    assert_eq!(moved.invoice_id, ids[1]);
+    assert!(store.buyer_contact_is_pending(&moved).await.unwrap());
+    assert!(!store.buyer_contact_is_pending(&held).await.unwrap());
+}
+
+#[tokio::test]
 async fn either_quoted_payment_can_settle_without_overwriting_the_other() {
     let bundle = parse_bundle_id(BUNDLES[0]).unwrap();
     let database = TestDatabase::create().await;

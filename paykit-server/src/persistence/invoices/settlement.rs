@@ -100,9 +100,14 @@ impl InvoiceStore {
             .execute(&mut **tx).await.map_err(|_| PersistenceError::Unavailable)?;
         if eligible {
             sqlx::query(
+                // One contact per buyer. An open one held on an earlier invoice,
+                // whose payment no longer qualifies, moves to this one.
                 "INSERT INTO buyer_contacts (invoice_id, creator_id, reader_lookup_hash)
                  SELECT id, creator_id, reader_lookup_hash FROM invoices WHERE id = $1
-                 ON CONFLICT (creator_id, reader_lookup_hash) DO NOTHING",
+                 ON CONFLICT (creator_id, reader_lookup_hash) DO UPDATE
+                 SET invoice_id = EXCLUDED.invoice_id, next_attempt_at = NOW()
+                 WHERE buyer_contacts.completed_at IS NULL
+                   AND buyer_contacts.invoice_id <> EXCLUDED.invoice_id",
             )
             .bind(invoice)
             .execute(&mut **tx)
