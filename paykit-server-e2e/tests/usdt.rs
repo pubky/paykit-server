@@ -1320,10 +1320,26 @@ async fn a_v22_usdt_payment_marker_is_recomputed_before_a_drain_reads_it() {
         assert_eq!(drain.accepted_count(), 1, "{label}");
         // Replay reads the payment marker: a paid invoice is terminal and
         // completes the drain, a stale one stays an open accepted request.
+        // Only a reconciled marker pays: an undecided one keeps the request
+        // open, so the drain cannot complete on evidence that may turn stale.
+        let paid = kept && proposal_after.is_some();
         let replay = drains.exact_replay(&lock).await.unwrap().unwrap();
-        assert_eq!(replay.terminal_count(), u64::from(kept), "{label}");
-        assert_eq!(replay.accepted_count(), u64::from(!kept), "{label}");
-        assert_eq!(replay.completed(), kept, "{label}");
+        assert_eq!(replay.terminal_count(), u64::from(paid), "{label}");
+        assert_eq!(replay.accepted_count(), u64::from(!paid), "{label}");
+        assert_eq!(replay.completed(), paid, "{label}");
+        if proposal_after.is_none() {
+            // The proposal time recorded after that replay proves the transfer
+            // stale: the drain still has not completed, and it stays open.
+            sqlx::query("UPDATE payment_request_lifecycles SET proposal_recorded_at = $1")
+                .bind(created + time::Duration::days(2))
+                .execute(database.pool())
+                .await
+                .unwrap();
+            let replay = drains.exact_replay(&lock).await.unwrap().unwrap();
+            assert_eq!(replay.terminal_count(), 0, "{label}: after backfill");
+            assert!(!replay.completed(), "{label}: after backfill");
+            continue;
+        }
 
         let expired = || async {
             sqlx::query_scalar::<_, Option<OffsetDateTime>>(

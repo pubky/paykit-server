@@ -122,7 +122,9 @@ impl PaymentDrainStore {
 
     /// Drains read invoice payment markers directly, so every drain read
     /// first reconciles the Creator's flagged pre-upgrade USDT credit whose
-    /// proposal time is known, whatever the server's USDT configuration.
+    /// proposal time is known, whatever the server's USDT configuration. A
+    /// marker still flagged, because its proposal time is not yet known, never
+    /// counts as payment, so a drain waits for it rather than completing.
     async fn reconcile_usdt_credits(
         &self,
         lock_resource: &PubkyLockResource,
@@ -194,6 +196,7 @@ impl PaymentDrainStore {
                            AND NOT (
                                invoice.first_amount_matched_observed_at IS NOT NULL
                                AND invoice.first_amount_matched_observed_at <= invoice.payment_deadline
+                               AND NOT invoice.usdt_credit_reconcile
                            )
                      ) AS accepted_count,
                      COUNT(*) FILTER (
@@ -205,6 +208,7 @@ impl PaymentDrainStore {
                                     OR (
                                         invoice.first_amount_matched_observed_at IS NOT NULL
                                         AND invoice.first_amount_matched_observed_at <= invoice.payment_deadline
+                                        AND NOT invoice.usdt_credit_reconcile
                                     )
                                 )
                             )
@@ -375,6 +379,7 @@ impl PaymentDrainStore {
                        AND NOT (
                            invoice.first_amount_matched_observed_at IS NOT NULL
                            AND invoice.first_amount_matched_observed_at <= invoice.payment_deadline
+                           AND NOT invoice.usdt_credit_reconcile
                        )
                  ),
                  COUNT(*) FILTER (
@@ -382,7 +387,8 @@ impl PaymentDrainStore {
                         OR (item.classification = 'accepted' AND (
                             invoice.payment_expired_at IS NOT NULL
                             OR (invoice.first_amount_matched_observed_at IS NOT NULL
-                                AND invoice.first_amount_matched_observed_at <= invoice.payment_deadline)
+                                AND invoice.first_amount_matched_observed_at <= invoice.payment_deadline
+                                AND NOT invoice.usdt_credit_reconcile)
                         ))
                  ),
                  COUNT(*),
