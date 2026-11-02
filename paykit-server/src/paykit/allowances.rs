@@ -16,7 +16,8 @@ use std::{
 
 use async_trait::async_trait;
 use paykit_sdk::{
-    LinkedPeerState, PaykitSdkError, PendingAllowanceAcceptance, PubkyPublicKey, StorageAdapter,
+    LinkedPeerState, MAX_PENDING_ALLOWANCE_LINK_RECORDS, PaykitSdkError,
+    PendingAllowanceAcceptance, PubkyPublicKey, StorageAdapter,
 };
 use tokio::sync::Mutex as TokioMutex;
 use tracing::{info, warn};
@@ -33,6 +34,19 @@ use crate::{
 /// later read accepts the rest.
 const MAX_ALLOWANCE_ACCEPTANCES_PER_READ: usize = 4;
 
+/// Records one Acceptance adds to its link: the outbound Acceptance and the
+/// reader's Delivery Confirmation of it.
+const RECORDS_PER_ACCEPTANCE: usize = 2;
+
+/// Acceptances one read may queue on a link holding `records` records: never
+/// so many that the server's own Acceptances, and their confirmations, take
+/// the link past the SDK's record cap, where automatic acceptance stops and
+/// the proposals left are for manual acceptance.
+fn acceptance_limit(records: usize) -> usize {
+    (MAX_PENDING_ALLOWANCE_LINK_RECORDS.saturating_sub(records) / RECORDS_PER_ACCEPTANCE)
+        .min(MAX_ALLOWANCE_ACCEPTANCES_PER_READ)
+}
+
 /// Least time between two reads of one reader's Allowances.
 pub const ALLOWANCE_INTAKE_COOLDOWN: Duration = Duration::from_secs(10);
 
@@ -45,13 +59,11 @@ const ALLOWANCE_INTAKE_SPACING_FACTOR: u32 = 10;
 /// no SDK call, so the read ends as a failure with nothing to clean up.
 const ALLOWANCE_INTAKE_LOCK_WAIT: Duration = Duration::from_secs(20);
 
-/// Backstop for a hung intake pass, far above any pass that makes progress.
-/// SDK calls are otherwise never cut short: cancelling one mid-flight skips
-/// its homeserver unlock and leaves the identity's shared-state lease held
-/// until it expires, up to 60 s, which fails every other shared-state
-/// operation on the identity meanwhile. A call that hangs, for example on an
-/// HTTP request with no timeout, keeps renewing that lease, so cancelling it
-/// shortens how long the identity stays locked.
+/// A pass starts no new read this long after it began, far above any pass
+/// that makes progress. A read already started is never cut short: each one
+/// is an SDK mutation, and dropping it mid-flight would skip its homeserver
+/// unlock and leave state unconfirmed. The server's Pubky request timeout
+/// bounds a read on a stalled homeserver instead.
 pub const ALLOWANCE_INTAKE_PASS_DEADLINE: Duration = Duration::from_secs(600);
 
 /// A Creator's pass starts no new read after this much time spent reading;
@@ -249,14 +261,14 @@ impl PaykitAdapter {
         if eligible.is_empty() {
             return Ok(0);
         }
-        let newest = self.newest_stream_items(&eligible).await?;
+        let activity = self.link_activity(&eligible).await?;
         let readers = eligible
             .into_iter()
             .filter_map(|peer| {
-                let newest = newest.get(&peer).copied();
+                let (newest, limit) = *activity.get(&peer)?;
                 intake
-                    .is_due(self.creator_id, &peer, newest, now)
-                    .then_some((peer, newest?))
+                    .is_due(self.creator_id, &peer, Some(newest), now)
+                    .then_some((peer, newest, limit))
             })
             .collect::<Vec<_>>();
         if readers.is_empty() {
@@ -277,22 +289,32 @@ impl PaykitAdapter {
         .await)
     }
 
-    async fn newest_stream_items(
+    /// Each link's newest stream item, and how many acceptances a read of it
+    /// may queue under the SDK's record cap. The cap count visits no record,
+    /// and a link with no headroom is left out before its items are read, so
+    /// the items read per link are bounded by the cap.
+    async fn link_activity(
         &self,
         linked: &[PubkyPublicKey],
-    ) -> paykit_sdk::Result<HashMap<PubkyPublicKey, u64>> {
+    ) -> paykit_sdk::Result<HashMap<PubkyPublicKey, (u64, usize)>> {
         let linked = linked.to_vec();
         self.storage
             .transaction(move |transaction| {
                 Ok(linked
                     .into_iter()
                     .filter_map(|peer| {
+                        let records = transaction
+                            .link_record_count_up_to(&peer, MAX_PENDING_ALLOWANCE_LINK_RECORDS + 1);
+                        let limit = acceptance_limit(records);
+                        if limit == 0 {
+                            return None;
+                        }
                         let newest = transaction
                             .private_stream_items(&peer)
                             .iter()
                             .map(|item| item.stream_item_id)
                             .max()?;
-                        Some((peer, newest))
+                        Some((peer, (newest, limit)))
                     })
                     .collect())
             })
@@ -345,7 +367,7 @@ struct ReadLimits {
     lock_wait: Duration,
 }
 
-/// Reads the due readers, `(reader, newest stream item)`, least recently read
+/// Reads the due readers, `(reader, newest stream item, acceptance limit)`, least recently read
 /// first, until `budget` has passed since the first read started; the first
 /// read always starts. A reader left with proposals behind the per-read limit
 /// therefore goes behind the others next pass. No read starts once
@@ -356,15 +378,15 @@ async fn read_readers<L: AllowanceLink + ?Sized>(
     mutation_lock: &TokioMutex<()>,
     intake: &AllowanceIntake,
     creator_id: Uuid,
-    mut readers: Vec<(PubkyPublicKey, u64)>,
+    mut readers: Vec<(PubkyPublicKey, u64, usize)>,
     limits: ReadLimits,
     keep_reading: &(dyn Fn() -> bool + Sync),
 ) -> usize {
     let ReadLimits { budget, lock_wait } = limits;
-    readers.sort_by_key(|(peer, _)| intake.last_started(creator_id, peer));
+    readers.sort_by_key(|(peer, _, _)| intake.last_started(creator_id, peer));
     let mut reading_since = None::<Instant>;
     let mut queued = 0;
-    for (peer, newest) in readers {
+    for (peer, newest, limit) in readers {
         if !keep_reading() || reading_since.is_some_and(|since| since.elapsed() >= budget) {
             break;
         }
@@ -373,7 +395,7 @@ async fn read_readers<L: AllowanceLink + ?Sized>(
             continue;
         };
         reading_since.get_or_insert(now);
-        let read = accept_proposals(link, mutation_lock, &peer, lock_wait).await;
+        let read = accept_proposals(link, mutation_lock, &peer, limit, lock_wait).await;
         if read.accepted > 0 {
             info!(
                 accepted = read.accepted,
@@ -397,16 +419,30 @@ async fn read_readers<L: AllowanceLink + ?Sized>(
     queued
 }
 
-/// Accepts up to [`MAX_ALLOWANCE_ACCEPTANCES_PER_READ`] pending proposals in
-/// one SDK call, under the Creator mutation lock. The call's work is bounded
-/// by the SDK's per-link record cap, so other Creator work waits at most that
-/// long. Giving up on the lock starts no SDK call.
+/// Accepts up to `limit` pending proposals in one SDK call, under the Creator
+/// mutation lock. The call's work is bounded by the SDK's per-link record cap,
+/// so other Creator work waits at most that long. Giving up on the lock starts
+/// no SDK call, and neither does a link at the cap (`limit` 0): its proposals
+/// are left for manual acceptance and it counts as read.
 async fn accept_proposals<L: AllowanceLink + ?Sized>(
     link: &L,
     mutation_lock: &TokioMutex<()>,
     reader: &PubkyPublicKey,
+    limit: usize,
     lock_wait: Duration,
 ) -> IntakeRead {
+    if limit == 0 {
+        warn!(
+            stage = "allowance_intake",
+            cause = "link_history_at_cap",
+            "Paykit Allowance link at the record cap; not accepted automatically"
+        );
+        return IntakeRead {
+            accepted: 0,
+            scan: Duration::ZERO,
+            result: Ok(true),
+        };
+    }
     let Ok(_guard) = tokio::time::timeout(lock_wait, mutation_lock.lock()).await else {
         return IntakeRead {
             accepted: 0,
@@ -418,9 +454,7 @@ async fn accept_proposals<L: AllowanceLink + ?Sized>(
         };
     };
     let started = Instant::now();
-    let outcome = link
-        .accept_pending(reader, MAX_ALLOWANCE_ACCEPTANCES_PER_READ)
-        .await;
+    let outcome = link.accept_pending(reader, limit).await;
     let scan = started.elapsed();
     match outcome {
         Ok(LinkAcceptance {
@@ -664,7 +698,10 @@ mod tests {
         let intake = AllowanceIntake::new(Duration::from_secs(10));
         let creator = Uuid::new_v4();
         let link = ReadyLink::default();
-        let readers = vec![(reader(), 1), (other_reader(), 1)];
+        let readers = vec![
+            (reader(), 1, MAX_ALLOWANCE_ACCEPTANCES_PER_READ),
+            (other_reader(), 1, MAX_ALLOWANCE_ACCEPTANCES_PER_READ),
+        ];
 
         // However long finding the due readers took, a pass reads one reader;
         // with no budget, only one. The next pass reads the other.
@@ -715,7 +752,10 @@ mod tests {
             backlog: HashMap::from([(reader(), MAX_ALLOWANCE_ACCEPTANCES_PER_READ * 3)]),
             ..ReadyLink::default()
         };
-        let readers = vec![(reader(), 1), (other_reader(), 1)];
+        let readers = vec![
+            (reader(), 1, MAX_ALLOWANCE_ACCEPTANCES_PER_READ),
+            (other_reader(), 1, MAX_ALLOWANCE_ACCEPTANCES_PER_READ),
+        ];
 
         // One read per pass. The backlogged reader is read first, is not
         // drained, and the next pass reads the other reader before it again.
@@ -750,7 +790,13 @@ mod tests {
 
         let read = tokio::time::timeout(
             Duration::from_secs(5),
-            accept_proposals(&link, &lock, &reader(), SHORT),
+            accept_proposals(
+                &link,
+                &lock,
+                &reader(),
+                MAX_ALLOWANCE_ACCEPTANCES_PER_READ,
+                SHORT,
+            ),
         )
         .await
         .expect("the held lock held the read");
@@ -788,7 +834,7 @@ mod tests {
             &lock,
             &intake,
             Uuid::new_v4(),
-            vec![(reader(), 1)],
+            vec![(reader(), 1, MAX_ALLOWANCE_ACCEPTANCES_PER_READ)],
             ReadLimits {
                 budget: Duration::from_secs(5),
                 lock_wait: LOCK_WAIT,
@@ -884,7 +930,16 @@ mod tests {
         let link = Arc::new(SlowLink::new(&lock, 1_000));
         let intake = tokio::spawn({
             let (link, lock) = (link.clone(), lock.clone());
-            async move { accept_proposals(link.as_ref(), &lock, &reader(), LOCK_WAIT).await }
+            async move {
+                accept_proposals(
+                    link.as_ref(),
+                    &lock,
+                    &reader(),
+                    MAX_ALLOWANCE_ACCEPTANCES_PER_READ,
+                    LOCK_WAIT,
+                )
+                .await
+            }
         });
 
         // The call mutates the Creator's state, so it runs under the lock.
@@ -920,7 +975,14 @@ mod tests {
             let link = SlowLink::new(&lock, pending);
             link.call_release.notify_one();
 
-            let outcome = accept_proposals(&link, &lock, &reader(), LOCK_WAIT).await;
+            let outcome = accept_proposals(
+                &link,
+                &lock,
+                &reader(),
+                MAX_ALLOWANCE_ACCEPTANCES_PER_READ,
+                LOCK_WAIT,
+            )
+            .await;
 
             assert_eq!(
                 (outcome.accepted, outcome.result.unwrap()),
@@ -936,7 +998,14 @@ mod tests {
         link.fail = true;
         link.call_release.notify_one();
 
-        let read = accept_proposals(&link, &lock, &reader(), LOCK_WAIT).await;
+        let read = accept_proposals(
+            &link,
+            &lock,
+            &reader(),
+            MAX_ALLOWANCE_ACCEPTANCES_PER_READ,
+            LOCK_WAIT,
+        )
+        .await;
 
         assert!(matches!(read.result, Err(PaykitSdkError::Transport { .. })));
         assert_eq!(read.accepted, 0);
@@ -957,7 +1026,14 @@ mod tests {
         let start = Instant::now();
         let ticket = intake.begin(creator, &reader(), Some(1), start).unwrap();
 
-        let read = accept_proposals(&link, &lock, &reader(), LOCK_WAIT).await;
+        let read = accept_proposals(
+            &link,
+            &lock,
+            &reader(),
+            MAX_ALLOWANCE_ACCEPTANCES_PER_READ,
+            LOCK_WAIT,
+        )
+        .await;
         assert!(read.result.is_err());
         assert!(read.scan >= CALL, "{:?}", read.scan);
         intake.finish(ticket, false, read.scan);
@@ -970,6 +1046,67 @@ mod tests {
                 .begin(creator, &reader(), Some(1), start + spacing)
                 .is_some()
         );
+    }
+
+    /// A link that refuses, as the SDK does, once it holds more records than
+    /// the cap, and that counts the Acceptances it appends.
+    struct CappedLink {
+        records: StdMutex<usize>,
+        calls: StdMutex<usize>,
+    }
+
+    #[async_trait]
+    impl AllowanceLink for CappedLink {
+        async fn accept_pending(
+            &self,
+            _reader: &PubkyPublicKey,
+            limit: usize,
+        ) -> paykit_sdk::Result<LinkAcceptance> {
+            *self.calls.lock().unwrap() += 1;
+            let mut records = self.records.lock().unwrap();
+            if *records > MAX_PENDING_ALLOWANCE_LINK_RECORDS {
+                return Ok(LinkAcceptance {
+                    accepted: 0,
+                    more_pending: false,
+                });
+            }
+            // Far more proposals are pending than any read accepts; each
+            // Acceptance comes back with its Delivery Confirmation.
+            *records += limit * RECORDS_PER_ACCEPTANCE;
+            Ok(LinkAcceptance {
+                accepted: limit,
+                more_pending: true,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn intake_never_takes_a_link_past_the_record_cap() {
+        let lock = Arc::new(TokioMutex::new(()));
+        let link = CappedLink {
+            records: StdMutex::new(MAX_PENDING_ALLOWANCE_LINK_RECORDS - 3),
+            calls: StdMutex::new(0),
+        };
+
+        // Headroom for one Acceptance and its confirmation; more stay pending.
+        let limit = acceptance_limit(*link.records.lock().unwrap());
+        let first = accept_proposals(&link, &lock, &reader(), limit, LOCK_WAIT).await;
+        assert_eq!(first.accepted, 1);
+        assert!(!first.result.unwrap());
+
+        // One record left: no SDK call, so the server's own Acceptances never cross it.
+        let limit = acceptance_limit(*link.records.lock().unwrap());
+        let second = accept_proposals(&link, &lock, &reader(), limit, LOCK_WAIT).await;
+        assert_eq!(second.accepted, 0);
+        assert!(second.result.unwrap());
+        assert_eq!(
+            *link.records.lock().unwrap(),
+            MAX_PENDING_ALLOWANCE_LINK_RECORDS - 1
+        );
+        assert_eq!(*link.calls.lock().unwrap(), 1);
+
+        assert_eq!(acceptance_limit(0), MAX_ALLOWANCE_ACCEPTANCES_PER_READ);
+        assert_eq!(acceptance_limit(MAX_PENDING_ALLOWANCE_LINK_RECORDS + 1), 0);
     }
 
     #[test]
