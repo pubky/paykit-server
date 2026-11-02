@@ -431,22 +431,40 @@ impl Server {
         F: Future<Output = ()> + Send,
     {
         let drain_timeout = self.config.shutdown.drain_timeout;
-        let (mut tasks, intake) = spawn_owned_workers(self.workers, self.runtime.clone());
+        let (mut tasks, mut intake) = spawn_owned_workers(self.workers, self.runtime.clone());
         let serving = crate::runtime::serve(listener, self.router, self.runtime.clone());
         tokio::pin!(serving);
         tokio::pin!(shutdown);
-        tokio::select! {
+        enum Stop {
+            Shutdown,
+            Served(std::io::Result<()>),
+            WorkerExited,
+            IntakeExited,
+        }
+        let stop = tokio::select! {
             biased;
-            _ = &mut shutdown => {}
-            _ = self.runtime.cancelled() => {}
-            result = &mut serving => {
+            _ = &mut shutdown => Stop::Shutdown,
+            _ = self.runtime.cancelled() => Stop::Shutdown,
+            result = &mut serving => Stop::Served(result),
+            _ = tasks.join_next() => Stop::WorkerExited,
+            () = intake_exited(&mut intake) => Stop::IntakeExited,
+        };
+        match stop {
+            Stop::Shutdown => {}
+            Stop::Served(result) => {
                 self.runtime.begin_shutdown();
                 abort_owned_workers(&mut tasks, intake).await;
                 return result;
             }
-            _ = tasks.join_next() => {
+            Stop::WorkerExited => {
                 self.runtime.begin_shutdown();
                 abort_owned_workers(&mut tasks, intake).await;
+                return Err(std::io::Error::other("owned worker exited unexpectedly"));
+            }
+            // Intake runs until shutdown; returning or panicking before is fatal.
+            Stop::IntakeExited => {
+                self.runtime.begin_shutdown();
+                abort_owned_workers(&mut tasks, None).await;
                 return Err(std::io::Error::other("owned worker exited unexpectedly"));
             }
         }
@@ -474,6 +492,18 @@ async fn join_owned_workers(tasks: &mut JoinSet<()>) -> std::io::Result<()> {
         result.map_err(|_| std::io::Error::other("owned worker exited unexpectedly"))?;
     }
     Ok(())
+}
+
+/// Completes when Allowance intake's root task ends, by returning or panicking;
+/// never, when intake is off. The handle is spent once this completes.
+async fn intake_exited(intake: &mut Option<tokio::task::JoinHandle<()>>) {
+    match intake.as_mut() {
+        Some(handle) => {
+            let _ = handle.await;
+            *intake = None;
+        }
+        None => std::future::pending().await,
+    }
 }
 
 /// Aborts the abortable owned workers, then waits for Allowance intake, which
@@ -2442,6 +2472,36 @@ mod tests {
         assert!(intake.is_some());
         runtime.begin_shutdown();
         abort_owned_workers(&mut tasks, intake).await;
+    }
+
+    #[tokio::test]
+    async fn an_intake_root_that_returns_or_panics_is_noticed_while_serving() {
+        let mut off = None;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), intake_exited(&mut off))
+                .await
+                .is_err(),
+            "intake that is off never counts as exited"
+        );
+        let running: tokio::task::JoinHandle<()> = tokio::spawn(std::future::pending());
+        let mut running = Some(running);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), intake_exited(&mut running))
+                .await
+                .is_err()
+        );
+        running.take().unwrap().abort();
+        for root in [
+            tokio::spawn(async {}),
+            tokio::spawn(async { panic!("intake root panicked") }),
+        ] {
+            let mut intake = Some(root);
+            tokio::time::timeout(Duration::from_secs(5), intake_exited(&mut intake))
+                .await
+                .expect("the exit was noticed");
+            // The spent handle is never awaited again at shutdown.
+            assert!(intake.is_none());
+        }
     }
 
     #[tokio::test]
