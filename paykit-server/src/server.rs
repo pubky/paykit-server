@@ -580,9 +580,8 @@ async fn shared_transport_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runt
 }
 
 /// Accepts the Allowance proposals invoiced readers leave on the server link.
-/// It runs apart from the shared transport loop, one task per Creator, because
-/// the SDK derives a reader's whole Allowance history on each read: a large
-/// history delays only that Creator's intake, never transport or another
+/// It runs apart from the shared transport loop, one task per Creator, so a
+/// slow read delays only that Creator's intake, never transport or another
 /// Creator. At most `outbox_batch_size` passes run at once across Creators,
 /// and free slots go to the Creator whose last pass started longest ago.
 async fn allowance_intake_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtime>) {

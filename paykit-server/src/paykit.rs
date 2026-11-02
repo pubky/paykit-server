@@ -1487,6 +1487,8 @@ mod tests {
             proposal_outbound_message_id: None,
             proposal_outbound_status: None,
             proposal_event_id: Some(Uuid::new_v4().to_string()),
+            proposal_recorded_at: None,
+            acceptance_recorded_at: None,
             terms: Some(PaymentRequestTermsRecord {
                 amount: AmountRecord {
                     asset: "BTC".into(),
