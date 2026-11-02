@@ -14,14 +14,14 @@ Locks release sources selected in `Cargo.toml`:
 
 ```bash
 docker buildx build --load \
-  --build-context paykit-lib='https://github.com/pubky/paykit-rs.git#f0dd83ddfd8246c31e5f761e7ea7ffca08b735b9:paykit-lib' \
-  --build-context paykit-sdk='https://github.com/pubky/paykit-rs.git#f0dd83ddfd8246c31e5f761e7ea7ffca08b735b9:paykit-sdk' \
+  --build-context paykit-lib='https://github.com/pubky/paykit-rs.git#v0.1.1-rc5:paykit-lib' \
+  --build-context paykit-sdk='https://github.com/pubky/paykit-rs.git#v0.1.1-rc5:paykit-sdk' \
   --build-context locks='https://github.com/pubky/locks.git#v0.1.1-rc1' \
   -f Dockerfile.local \
   -t paykit-server:local .
 ```
 
-The Paykit contexts use revision `f0dd83d`, the one pinned in `Cargo.toml`. The Locks context uses tag `v0.1.1-rc1`; that release's `locks-core` package inherits workspace version `0.1.0`.
+The Paykit contexts use tag `v0.1.1-rc5`, the one pinned in `Cargo.toml`. The Locks context uses tag `v0.1.1-rc1`; that release's `locks-core` package inherits workspace version `0.1.0`.
 These contexts are anonymously reachable and reproducible. Update the URLs
 together with the corresponding `Cargo.toml` pins; exact dependency-pin matches
 make source drift fail closed.
