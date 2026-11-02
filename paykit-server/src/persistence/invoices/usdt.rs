@@ -578,7 +578,8 @@ impl InvoiceStore {
     /// proposal-time rule, once the invoice's proposal time is recorded: the
     /// marker is cleared and rebuilt from the invoice's current evidence, so it
     /// stays only if that evidence qualifies now, and expiry follows. A marker
-    /// backed by a Bitcoin outpoint is kept. Until the proposal time is
+    /// backed by a timely Bitcoin outpoint is kept; a late amount-matched one
+    /// is not settlement evidence. Until the proposal time is
     /// recorded the marker stands.
     async fn reconcile_usdt_credit(
         &self,
@@ -609,8 +610,10 @@ impl InvoiceStore {
             "UPDATE invoices
              SET usdt_credit_reconcile = FALSE,
                  first_amount_matched_observed_at = CASE
-                     WHEN first_amount_matched_outpoint_lookup_hash IS NULL THEN NULL
-                     ELSE first_amount_matched_observed_at
+                     WHEN EXISTS (
+                         SELECT 1 FROM invoice_timely_amount_matched_outpoints timely
+                         WHERE timely.invoice_id = invoices.id
+                     ) THEN first_amount_matched_observed_at
                  END,
                  updated_at = NOW()
              WHERE id = $1",

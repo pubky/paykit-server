@@ -1235,13 +1235,20 @@ async fn migrate_to_v22(pool: &sqlx::PgPool) {
 async fn a_v22_usdt_payment_marker_is_recomputed_before_a_drain_reads_it() {
     const LOCK: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/app.locks/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json";
     // (proposal recorded after invoice creation, marker kept)
-    for (label, proposal_after, kept) in [
+    for (label, proposal_after, late_bitcoin, kept) in [
         // The transfer predates the proposal time less the tolerance.
-        ("stale", Some(time::Duration::days(2)), false),
+        ("stale", Some(time::Duration::days(2)), false, false),
+        // A late amount-matched Bitcoin output is not settlement evidence.
+        (
+            "stale with late Bitcoin",
+            Some(time::Duration::days(2)),
+            true,
+            false,
+        ),
         // The transfer qualifies under the current rule.
-        ("legitimate", Some(time::Duration::hours(1)), true),
+        ("legitimate", Some(time::Duration::hours(1)), false, true),
         // Attribution is undecided: the marker stands.
-        ("undecided", None, true),
+        ("undecided", None, false, true),
     ] {
         let bundle = parse_bundle_id(BUNDLES[0]).unwrap();
         let database = TestDatabase::create().await;
@@ -1288,6 +1295,18 @@ async fn a_v22_usdt_payment_marker_is_recomputed_before_a_drain_reads_it() {
             .execute(database.pool())
             .await
             .unwrap();
+        if late_bitcoin {
+            // v22 records the outpoint of every amount-matched output, also
+            // one seen after the deadline, which is not timely.
+            sqlx::query(
+                "UPDATE invoices SET first_amount_matched_outpoint_lookup_hash = $2 WHERE id = $1",
+            )
+            .bind(invoice.invoice_id())
+            .bind([4u8; 32].as_slice())
+            .execute(database.pool())
+            .await
+            .unwrap();
+        }
 
         run_migrations(database.pool()).await.unwrap();
         // The receipt is observed while the proposal time is unknown: nothing
