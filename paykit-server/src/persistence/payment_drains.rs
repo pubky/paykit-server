@@ -120,12 +120,25 @@ impl PaymentDrainStore {
         }
     }
 
+    /// Drains read invoice payment markers directly, so every drain read
+    /// first reconciles the Creator's flagged pre-upgrade USDT credit whose
+    /// proposal time is known, whatever the server's USDT configuration.
+    async fn reconcile_usdt_credits(
+        &self,
+        lock_resource: &PubkyLockResource,
+    ) -> Result<(), PersistenceError> {
+        super::InvoiceStore::new(&self.pool, self.crypto.clone())
+            .reconcile_usdt_credits(lock_resource.creator())
+            .await
+    }
+
     /// Returns an authenticated immutable replay without performing SDK or
     /// classification work. `None` means this lock has not been drained.
     pub async fn exact_replay(
         &self,
         lock_resource: &PubkyLockResource,
     ) -> Result<Option<PaymentDrainSnapshot>, PersistenceError> {
+        self.reconcile_usdt_credits(lock_resource).await?;
         let canonical_lock = lock_resource.to_string();
         let creator_hash = self
             .crypto
@@ -244,6 +257,7 @@ impl PaymentDrainStore {
         lock_resource: &PubkyLockResource,
         cleanup_token: &[u8; 32],
     ) -> Result<(), PersistenceError> {
+        self.reconcile_usdt_credits(lock_resource).await?;
         let canonical_lock = lock_resource.to_string();
         let creator_hash = self
             .crypto
@@ -447,6 +461,7 @@ impl PaymentDrainStore {
         lock_resource: &PubkyLockResource,
         receive_evidence: Option<(&PaymentRequestLifecycleStore, &[RequiredReceiveTarget])>,
     ) -> Result<PaymentDrainSnapshot, PersistenceError> {
+        self.reconcile_usdt_credits(lock_resource).await?;
         let canonical_lock = lock_resource.to_string();
         let creator_hash = self
             .crypto

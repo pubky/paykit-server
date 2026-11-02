@@ -616,18 +616,6 @@ impl PaykitAdapter {
         Ok(records)
     }
 
-    /// Reconciles this Creator's flagged pre-upgrade USDT credit. Only a
-    /// server with USDT configured can hold such credit.
-    async fn reconcile_usdt_credits(&self) -> Result<(), PaymentDrainError> {
-        let Some((invoices, _)) = &self.usdt else {
-            return Ok(());
-        };
-        invoices
-            .reconcile_usdt_credits(&self.creator)
-            .await
-            .map_err(map_drain_persistence_error)
-    }
-
     async fn observe_usdt_requests(
         &self,
         records: &[PaymentRequestRecord],
@@ -758,10 +746,6 @@ impl PaykitAdapter {
             return Err(PaymentDrainError::CreatorMismatch);
         }
         let _guard = self.mutation_lock.lock().await;
-        // A drain reads payment markers directly, so pre-upgrade USDT credit is
-        // reconciled first, and again once the refresh below records new
-        // proposal times.
-        self.reconcile_usdt_credits().await?;
         if let Some(replay) = drains
             .exact_replay(lock_resource)
             .await
@@ -779,7 +763,6 @@ impl PaykitAdapter {
         self.refresh_payment_requests_locked(lifecycles, &parsed_targets)
             .await
             .map_err(map_lifecycle_drain_error)?;
-        self.reconcile_usdt_credits().await?;
         drains
             .create_after_receive(lifecycles, lock_resource, &required_targets)
             .await

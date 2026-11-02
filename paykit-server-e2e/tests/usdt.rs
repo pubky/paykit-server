@@ -1305,7 +1305,8 @@ async fn a_v22_usdt_payment_marker_is_recomputed_before_a_drain_reads_it() {
             .await
             .unwrap();
         // A lifecycle refresh then records the proposal time, and the drain
-        // path reconciles before it reads markers, without the observer.
+        // reads markers next, without the observer: the drain store itself
+        // reconciles first, whatever the USDT configuration.
         if let Some(after) = proposal_after {
             sqlx::query("UPDATE payment_request_lifecycles SET proposal_recorded_at = $1")
                 .bind(created + after)
@@ -1313,7 +1314,6 @@ async fn a_v22_usdt_payment_marker_is_recomputed_before_a_drain_reads_it() {
                 .await
                 .unwrap();
         }
-        store.reconcile_usdt_credits(&creator).await.unwrap();
         let drains = PaymentDrainStore::new(database.pool(), crypto.clone());
         let lock = parse_addressed_lock_resource(LOCK).unwrap();
         let drain = drains.create(&lock).await.unwrap();
