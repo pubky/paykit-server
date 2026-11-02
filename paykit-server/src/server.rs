@@ -431,7 +431,7 @@ impl Server {
         F: Future<Output = ()> + Send,
     {
         let drain_timeout = self.config.shutdown.drain_timeout;
-        let mut tasks = spawn_owned_workers(self.workers, self.runtime.clone());
+        let (mut tasks, intake) = spawn_owned_workers(self.workers, self.runtime.clone());
         let serving = crate::runtime::serve(listener, self.router, self.runtime.clone());
         tokio::pin!(serving);
         tokio::pin!(shutdown);
@@ -441,14 +441,12 @@ impl Server {
             _ = self.runtime.cancelled() => {}
             result = &mut serving => {
                 self.runtime.begin_shutdown();
-                tasks.abort_all();
-                while tasks.join_next().await.is_some() {}
+                abort_owned_workers(&mut tasks, intake).await;
                 return result;
             }
             _ = tasks.join_next() => {
                 self.runtime.begin_shutdown();
-                tasks.abort_all();
-                while tasks.join_next().await.is_some() {}
+                abort_owned_workers(&mut tasks, intake).await;
                 return Err(std::io::Error::other("owned worker exited unexpectedly"));
             }
         }
@@ -462,14 +460,12 @@ impl Server {
             serving_result?;
             worker_result
         };
-        match tokio::time::timeout(drain_timeout, joined).await {
+        let result = match tokio::time::timeout(drain_timeout, joined).await {
             Ok(result) => result,
-            Err(_) => {
-                tasks.abort_all();
-                while tasks.join_next().await.is_some() {}
-                Ok(())
-            }
-        }
+            Err(_) => Ok(()),
+        };
+        abort_owned_workers(&mut tasks, intake).await;
+        result
     }
 }
 
@@ -480,7 +476,23 @@ async fn join_owned_workers(tasks: &mut JoinSet<()>) -> std::io::Result<()> {
     Ok(())
 }
 
-fn spawn_owned_workers(workers: WorkerComponents, runtime: Arc<Runtime>) -> JoinSet<()> {
+/// Aborts the abortable owned workers, then waits for Allowance intake, which
+/// is never aborted: its running passes are SDK mutations that must settle,
+/// and it starts no new one once shutdown has begun.
+async fn abort_owned_workers(tasks: &mut JoinSet<()>, intake: Option<tokio::task::JoinHandle<()>>) {
+    tasks.abort_all();
+    while tasks.join_next().await.is_some() {}
+    if let Some(intake) = intake {
+        let _ = intake.await;
+    }
+}
+
+/// Spawns the owned workers. Allowance intake runs outside the abortable set,
+/// so a drain deadline never drops a running intake mutation.
+fn spawn_owned_workers(
+    workers: WorkerComponents,
+    runtime: Arc<Runtime>,
+) -> (JoinSet<()>, Option<tokio::task::JoinHandle<()>>) {
     let mut tasks = JoinSet::new();
     let workers = Arc::new(workers);
     tasks.spawn(outbox_enqueue_loop(workers.clone(), runtime.clone()));
@@ -490,12 +502,13 @@ fn spawn_owned_workers(workers: WorkerComponents, runtime: Arc<Runtime>) -> Join
         runtime.clone(),
     ));
     tasks.spawn(shared_transport_loop(workers.clone(), runtime.clone()));
-    if workers.paykit.allowance_intake {
-        tasks.spawn(allowance_intake_loop(workers.clone(), runtime.clone()));
-    }
+    let intake = workers
+        .paykit
+        .allowance_intake
+        .then(|| tokio::spawn(allowance_intake_loop(workers.clone(), runtime.clone())));
     tasks.spawn(buyer_contacts_loop(workers.clone(), runtime.clone()));
     tasks.spawn(observer_loop(workers, runtime));
-    tasks
+    (tasks, intake)
 }
 
 async fn buyer_contacts_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtime>) {
@@ -2408,10 +2421,10 @@ mod tests {
     #[tokio::test]
     async fn production_spawn_path_owns_all_workers() {
         let server = test_server().await;
-        let mut tasks = spawn_owned_workers(server.workers, server.runtime);
+        let (mut tasks, intake) = spawn_owned_workers(server.workers, server.runtime);
         assert_eq!(tasks.len(), 6);
-        tasks.abort_all();
-        while tasks.join_next().await.is_some() {}
+        assert!(intake.is_none());
+        abort_owned_workers(&mut tasks, intake).await;
     }
 
     #[tokio::test]
@@ -2422,10 +2435,42 @@ mod tests {
             "intake is off by default"
         );
         server.workers.paykit.allowance_intake = true;
-        let mut tasks = spawn_owned_workers(server.workers, server.runtime);
-        assert_eq!(tasks.len(), 7);
-        tasks.abort_all();
-        while tasks.join_next().await.is_some() {}
+        let runtime = server.runtime.clone();
+        let (mut tasks, intake) = spawn_owned_workers(server.workers, server.runtime);
+        // Intake runs outside the abortable set.
+        assert_eq!(tasks.len(), 6);
+        assert!(intake.is_some());
+        runtime.begin_shutdown();
+        abort_owned_workers(&mut tasks, intake).await;
+    }
+
+    #[tokio::test]
+    async fn a_drain_deadline_never_aborts_a_running_intake_mutation() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let mut tasks = JoinSet::new();
+        // An ordinary worker that would run forever: aborted at the deadline.
+        tasks.spawn(std::future::pending::<()>());
+        // Intake whose SDK mutation is still running when the drain deadline
+        // passes; it must settle rather than be dropped.
+        let settled = Arc::new(AtomicBool::new(false));
+        let intake = tokio::spawn({
+            let settled = settled.clone();
+            async move {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                settled.store(true, Ordering::SeqCst);
+            }
+        });
+        let drained = tokio::time::timeout(Duration::from_millis(10), std::future::pending::<()>());
+        assert!(drained.await.is_err(), "the drain deadline passed");
+
+        abort_owned_workers(&mut tasks, Some(intake)).await;
+
+        assert!(
+            settled.load(Ordering::SeqCst),
+            "the intake mutation was dropped"
+        );
+        assert!(tasks.is_empty());
     }
 
     fn lifecycle_runtime() -> Arc<Runtime> {
