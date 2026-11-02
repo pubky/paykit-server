@@ -80,6 +80,8 @@ pub struct PaymentRequestLifecycleProjection {
     pub last_stream_item_id: Option<u64>,
     pub last_outbound_message_id: Option<u64>,
     pub last_event_at: OffsetDateTime,
+    /// When the SDK recorded this server's proposal, by the server's clock.
+    pub proposal_recorded_at: Option<OffsetDateTime>,
 }
 
 /// Complete persisted-intent fields available in every SDK proposal record.

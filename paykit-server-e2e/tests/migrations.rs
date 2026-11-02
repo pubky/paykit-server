@@ -93,7 +93,19 @@ async fn migrations_create_the_required_schema_and_are_restart_safe() {
             .fetch_all(pool)
             .await
             .unwrap();
-    assert_eq!(applied_versions, (1..=22).collect::<Vec<_>>());
+    assert_eq!(applied_versions, (1..=23).collect::<Vec<_>>());
+
+    let proposal_recorded_at: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM information_schema.columns
+         WHERE table_schema = 'public'
+           AND table_name = 'payment_request_lifecycles'
+           AND column_name = 'proposal_recorded_at'
+           AND is_nullable = 'YES'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(proposal_recorded_at, 1);
 
     let rotation_columns: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM information_schema.columns

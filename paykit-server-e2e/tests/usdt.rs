@@ -942,6 +942,69 @@ async fn status(store: &InvoiceStore, bundle: &BundleId) -> (bool, u32) {
 }
 
 #[tokio::test]
+async fn usdt_older_than_the_recorded_proposal_less_tolerance_does_not_pay_an_invoice() {
+    let bundle = parse_bundle_id(BUNDLES[0]).unwrap();
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(&[7; 32]).unwrap());
+    let creator = parse_creator(CREATOR).unwrap();
+    let creator_id = CreatorStore::new(database.pool(), crypto.clone())
+        .create(&CreatorCredentials::new(
+            creator.clone(),
+            "test-session".into(),
+            PaykitIdentitySecretKey::new([9; 32], 1).unwrap(),
+            None,
+            Some(UsdtAddress::try_from(RECIPIENT.to_owned()).unwrap()),
+        ))
+        .await
+        .unwrap()
+        .id();
+    let store = InvoiceStore::new(database.pool(), crypto.clone());
+    let invoice = store
+        .create_atomic(AtomicInvoiceInput {
+            creator: &creator,
+            reader: &parse_reader(CREATOR).unwrap(),
+            bundle_binding: BUNDLES[0].as_bytes(),
+            lock_resource_binding: b"lock",
+            payment_request_binding: BUNDLES[0].as_bytes(),
+            invoice_payloads: &Payload { index: 0 },
+            proposal_acceptance_seconds: 3600,
+            payment_window_seconds: 3 * 86400,
+        })
+        .await
+        .unwrap();
+    // The proposal reached the SDK two days after the invoice, as after a long
+    // handoff delay, so the invoice window no longer bounds the evidence.
+    let proposal_recorded_at = invoice.invoice_created_at() + time::Duration::days(2);
+    sqlx::query("INSERT INTO payment_request_lifecycles (invoice_id,sdk_payment_request_id,request_state,last_event_at,last_stream_item_id,proposal_recorded_at) VALUES ($1,$2,'proof_submitted',NOW(),1,$3)")
+        .bind(invoice.invoice_id()).bind(record(0).payment_request_id).bind(proposal_recorded_at)
+        .execute(database.pool()).await.unwrap();
+    let bound = (proposal_recorded_at - paykit_server::usdt::PROPOSAL_TIME_TOLERANCE)
+        .replace_nanosecond(0)
+        .unwrap()
+        .unix_timestamp();
+    let rpc = Rpc::start().await;
+    for (timestamp, paid) in [(bound - 1, false), (bound, true)] {
+        rpc.chain.lock().unwrap().timestamp = timestamp;
+        store
+            .observe_usdt_request(
+                creator_id,
+                &creator,
+                &record(0),
+                &rpc.verifier,
+                Some(&bundle),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            status(&store, &bundle).await.0,
+            paid,
+            "timestamp={timestamp}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn either_quoted_payment_can_settle_without_overwriting_the_other() {
     let bundle = parse_bundle_id(BUNDLES[0]).unwrap();
     let database = TestDatabase::create().await;

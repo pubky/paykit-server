@@ -86,6 +86,28 @@ pub struct ArbitrumVerifier {
 
 const CHAIN_TIP_TTL: Duration = Duration::from_secs(5);
 
+/// How much earlier than the server's proposal record time a transfer's block
+/// timestamp can be and still pay the request. Arbitrum allows block timestamps
+/// up to 24 hours behind the current time
+/// (<https://docs.arbitrum.io/build-decentralized-apps/arbitrum-vs-ethereum/block-numbers-and-time>);
+/// five more minutes cover this server's clock skew.
+pub const PROPOSAL_TIME_TOLERANCE: time::Duration = time::Duration::minutes(24 * 60 + 5);
+
+/// The earliest block time that pays a Payment Request: `window_start`, or the
+/// server's earliest record of its proposal less [`PROPOSAL_TIME_TOLERANCE`]
+/// when that is later. Without a recorded proposal time the window is
+/// unchanged. Chain time has whole-second resolution, so the result is too.
+pub fn payment_window_start(
+    window_start: OffsetDateTime,
+    proposal_recorded_at: Option<OffsetDateTime>,
+) -> Option<OffsetDateTime> {
+    let bound = match proposal_recorded_at {
+        Some(recorded) => window_start.max(recorded.checked_sub(PROPOSAL_TIME_TOLERANCE)?),
+        None => window_start,
+    };
+    bound.replace_nanosecond(0).ok()
+}
+
 #[derive(Clone, Copy)]
 struct ChainTip {
     head: u64,
@@ -886,6 +908,30 @@ mod tests {
         assert_eq!(
             verifier.scans.lock().await.requests.len(),
             MAX_SCAN_REQUESTS
+        );
+    }
+
+    #[test]
+    fn the_payment_window_opens_no_earlier_than_the_proposal_less_tolerance() {
+        let start = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap()
+            + time::Duration::milliseconds(400);
+        let floored = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        // No recorded proposal: the existing window, at the whole second.
+        assert_eq!(payment_window_start(start, None), Some(floored));
+        // A proposal recorded within the tolerance leaves the window as it was.
+        assert_eq!(
+            payment_window_start(start, Some(start + time::Duration::hours(1))),
+            Some(floored)
+        );
+        // A proposal recorded later moves it to that time less the tolerance.
+        let late = start + time::Duration::days(2);
+        assert_eq!(
+            payment_window_start(start, Some(late)),
+            Some(
+                (late - PROPOSAL_TIME_TOLERANCE)
+                    .replace_nanosecond(0)
+                    .unwrap()
+            )
         );
     }
 }

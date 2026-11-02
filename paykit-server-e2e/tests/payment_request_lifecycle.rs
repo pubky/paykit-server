@@ -285,6 +285,7 @@ fn projection(
         last_stream_item_id: Some(cursor),
         last_outbound_message_id: Some(1),
         last_event_at: recorded_at,
+        proposal_recorded_at: None,
     }
 }
 

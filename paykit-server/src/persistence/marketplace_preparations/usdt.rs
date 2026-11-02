@@ -456,11 +456,18 @@ impl MarketplacePreparationStore {
             };
         }
         let required = payment.usdt_required_amount()?;
-        // Chain time has one-second resolution; the window opens at the whole second
-        // of activation, as for Locks invoices.
-        let window_start = activated_at
-            .replace_nanosecond(0)
-            .map_err(|_| PersistenceError::CorruptOrMissing)?;
+        // The window opens at activation, or later at the server's proposal record
+        // time less the chain's timestamp tolerance, as for Locks invoices.
+        let proposal_recorded_at: Option<OffsetDateTime> = sqlx::query_scalar(
+            "SELECT MIN(proposal_recorded_at) FROM payment_request_lifecycles
+             WHERE marketplace_preparation_id = $1",
+        )
+        .bind(preparation_id)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        let window_start = crate::usdt::payment_window_start(activated_at, proposal_recorded_at)
+            .ok_or(PersistenceError::CorruptOrMissing)?;
         let mut selected: Option<((bool, bool, bool, u32), MarketplaceUsdtStatus)> = None;
         let mut first_qualifying_at: Option<OffsetDateTime> = None;
         for row in rows {

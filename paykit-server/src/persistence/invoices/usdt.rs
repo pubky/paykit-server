@@ -485,6 +485,16 @@ impl InvoiceStore {
         let observations: Vec<UsdtObservationRow> = sqlx::query_as(
             "SELECT id, observation_envelope, transfer_lookup_hash, confirmations, finalized FROM usdt_observations WHERE invoice_id = $1 AND present")
             .bind(row.id).fetch_all(&mut **tx).await.map_err(|_| PersistenceError::Unavailable)?;
+        let proposal_recorded_at: Option<OffsetDateTime> = sqlx::query_scalar(
+            "SELECT MIN(proposal_recorded_at) FROM payment_request_lifecycles WHERE invoice_id = $1",
+        )
+        .bind(row.id)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        let window_start =
+            crate::usdt::payment_window_start(row.invoice_created_at, proposal_recorded_at)
+                .ok_or(PersistenceError::CorruptOrMissing)?;
         let mut selected: Option<(String, super::settlement::ObservedPayment)> = None;
         for observation in observations {
             let (facts, _) = self.transfer_facts(
@@ -494,12 +504,7 @@ impl InvoiceStore {
                 observation.observation_envelope,
                 observation.transfer_lookup_hash,
             )?;
-            let timely = facts.timestamp
-                >= row
-                    .invoice_created_at
-                    .replace_nanosecond(0)
-                    .map_err(|_| PersistenceError::CorruptOrMissing)?
-                && facts.timestamp <= row.payment_deadline;
+            let timely = facts.timestamp >= window_start && facts.timestamp <= row.payment_deadline;
             let candidate = super::settlement::ObservedPayment {
                 present: true,
                 matched: facts.amount >= required,
