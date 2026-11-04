@@ -5,7 +5,7 @@ use paykit_server_e2e::postgres::TestDatabase;
 use sqlx::{Connection, PgConnection, PgPool, Row, postgres::PgConnectOptions};
 use uuid::Uuid;
 
-const REQUIRED_TABLES: [&str; 11] = [
+const REQUIRED_TABLES: [&str; 14] = [
     "deployment_metadata",
     "creators",
     "reader_assignments",
@@ -17,6 +17,9 @@ const REQUIRED_TABLES: [&str; 11] = [
     "marketplace_payment_preparations",
     "marketplace_settlements",
     "bitcoin_address_owners",
+    "invoice_provider_v2",
+    "invoice_provider_v2_current_sample",
+    "invoice_provider_v2_first_threshold_evidence",
 ];
 
 const PRE_SETTLEMENT_MIGRATIONS: [&str; 13] = [
@@ -93,7 +96,9 @@ async fn migrations_create_the_required_schema_and_are_restart_safe() {
             .fetch_all(pool)
             .await
             .unwrap();
-    assert_eq!(applied_versions, (1..=22).collect::<Vec<_>>());
+    let mut expected_versions = (1..=22).collect::<Vec<_>>();
+    expected_versions.push(24);
+    assert_eq!(applied_versions, expected_versions);
 
     let rotation_columns: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM information_schema.columns

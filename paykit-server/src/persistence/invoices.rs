@@ -5,11 +5,13 @@
 //! envelopes before reporting invoice success.
 
 mod buyer_contacts;
+mod provider_v2;
 mod readers;
 mod settlement;
 mod usdt;
 
 pub use buyer_contacts::PendingBuyerContact;
+pub use provider_v2::{ProviderV2AtomicInvoiceInput, ProviderV2CreateResult, ProviderV2Status};
 
 use std::sync::Arc;
 
@@ -418,6 +420,54 @@ impl InvoiceStore {
         self.observation_targets_with_time(None).await
     }
 
+    /// Revalidates provider-v2 observation deadlines immediately before Electrum I/O.
+    /// The returned database timestamp is the trusted observation sample time, so
+    /// a batch that started before the deadline remains timely even if processing
+    /// finishes later.
+    pub async fn fence_observation_targets(
+        &self,
+        targets: &[ObservationTarget],
+    ) -> Result<(OffsetDateTime, Vec<ObservationTarget>), PersistenceError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        let mut deadlines = Vec::with_capacity(targets.len());
+        for target in targets {
+            let address_hash = self
+                .crypto
+                .bitcoin_address_lookup_hash(target.address().as_bytes());
+            let deadline = sqlx::query_scalar::<_, OffsetDateTime>(
+                "SELECT invoices.payment_deadline
+                 FROM invoices
+                 JOIN invoice_provider_v2 provider ON provider.invoice_id = invoices.id
+                 WHERE invoices.bitcoin_address_lookup_hash = $1
+                 ORDER BY invoices.id
+                 FOR KEY SHARE OF invoices",
+            )
+            .bind(address_hash.as_bytes())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+            deadlines.push(deadline);
+        }
+        let observed_at = sqlx::query_scalar("SELECT clock_timestamp()")
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        let eligible = targets
+            .iter()
+            .zip(deadlines)
+            .filter(|(_, deadline)| deadline.is_none_or(|deadline| observed_at < deadline))
+            .map(|(target, _)| target.clone())
+            .collect();
+        tx.commit()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        Ok((observed_at, eligible))
+    }
+
     /// Loads non-final observation targets after durably expiring invoices whose
     /// inclusive payment deadline has passed without an amount-matched observation.
     /// Expiry is a business decision and does not stop factual reconciliation.
@@ -464,6 +514,17 @@ impl InvoiceStore {
         .execute(&mut *tx)
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
+        sqlx::query(
+            "UPDATE invoices SET payment_expired_at = $1, updated_at = NOW()
+             WHERE payment_expired_at IS NULL
+               AND payment_deadline < $1
+               AND EXISTS (SELECT 1 FROM invoice_provider_v2 provider WHERE provider.invoice_id = invoices.id)
+               AND NOT EXISTS (SELECT 1 FROM invoice_provider_v2_first_threshold_evidence evidence WHERE evidence.invoice_id = invoices.id)",
+        )
+        .bind(observed_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
         let rows = sqlx::query_as::<_, ObservationTargetRow>(
             "SELECT invoices.id AS invoice_id, creators.creator_lookup_hash, \
                     invoices.payment_record_envelope, invoices.bitcoin_address_lookup_hash, \
@@ -473,11 +534,14 @@ impl InvoiceStore {
              LEFT JOIN bitcoin_observations AS observations \
                ON observations.invoice_id = invoices.id AND observations.active \
              WHERE invoices.bitcoin_address_lookup_hash IS NOT NULL \
+               AND (NOT EXISTS (SELECT 1 FROM invoice_provider_v2 provider WHERE provider.invoice_id = invoices.id)
+                    OR invoices.payment_deadline > $1) \
                AND NOT EXISTS (SELECT 1 FROM invoice_timely_amount_matched_outpoints timely \
                    WHERE timely.invoice_id = invoices.id AND timely.outpoint_lookup_hash = observations.outpoint_lookup_hash \
                      AND observations.present AND observations.confirmations >= 6) \
              ORDER BY invoices.id",
         )
+        .bind(observed_at)
         .fetch_all(&mut *tx)
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
@@ -587,7 +651,9 @@ impl InvoiceStore {
         let bundle_hash = self.crypto.lookup_hash(bundle_binding);
         let payment_hash = self.crypto.lookup_hash(payment_request_binding);
         let existing = sqlx::query_as::<_, ExistingInvoice>(
-            "SELECT invoices.payment_request_lookup_hash FROM invoices \
+            "SELECT invoices.payment_request_lookup_hash,
+                    EXISTS (SELECT 1 FROM invoice_provider_v2 provider WHERE provider.invoice_id = invoices.id) AS provider_v2
+             FROM invoices \
              JOIN creators ON creators.id = invoices.creator_id \
              WHERE creators.creator_lookup_hash = $1 AND invoices.bundle_lookup_hash = $2",
         )
@@ -598,7 +664,10 @@ impl InvoiceStore {
         .map_err(|_| PersistenceError::Unavailable)?;
         Ok(match existing {
             None => InvoicePreflight::New,
-            Some(existing) if existing.payment_request_lookup_hash == payment_hash.as_bytes() => {
+            Some(existing)
+                if !existing.provider_v2
+                    && existing.payment_request_lookup_hash == payment_hash.as_bytes() =>
+            {
                 InvoicePreflight::ExactReplay
             }
             Some(_) => InvoicePreflight::Conflict,
@@ -679,7 +748,8 @@ impl InvoiceStore {
         }
         let existing = sqlx::query_as::<_, ReplayInvoice>(
             "SELECT id, payment_request_lookup_hash, invoice_envelope, invoice_created_at,
-                    payment_deadline
+                    payment_deadline,
+                    EXISTS (SELECT 1 FROM invoice_provider_v2 provider WHERE provider.invoice_id = invoices.id) AS provider_v2
              FROM invoices \
              WHERE creator_id = $1 AND bundle_lookup_hash = $2 FOR UPDATE",
         )
@@ -689,7 +759,7 @@ impl InvoiceStore {
         .await
         .map_err(|_| PersistenceError::Unavailable)?
         .ok_or(PersistenceError::CorruptOrMissing)?;
-        if existing.payment_request_lookup_hash != payment_hash.as_bytes() {
+        if existing.provider_v2 || existing.payment_request_lookup_hash != payment_hash.as_bytes() {
             return Err(PersistenceError::Conflict);
         }
         self.validate_replay_intent(creator_hash, existing.id, existing.invoice_envelope, reader)?;
@@ -1038,21 +1108,12 @@ impl InvoiceStore {
         Ok(applied)
     }
 
-    #[cfg(any(test, feature = "test-utils"))]
     pub(crate) async fn apply_bitcoin_observation_batch_at(
         &self,
         observations: &[BitcoinObservationInput],
         observed_at: OffsetDateTime,
     ) -> Result<usize, PersistenceError> {
         self.apply_bitcoin_observation_batch_with_time(observations, Some(observed_at))
-            .await
-    }
-
-    pub(crate) async fn apply_bitcoin_observation_batch(
-        &self,
-        observations: &[BitcoinObservationInput],
-    ) -> Result<usize, PersistenceError> {
-        self.apply_bitcoin_observation_batch_with_time(observations, None)
             .await
     }
 
@@ -1138,7 +1199,8 @@ impl InvoiceStore {
         let invoice = sqlx::query_as::<_, BitcoinInvoiceRow>(
             "SELECT invoices.id, invoices.payment_record_envelope,
                     invoices.bitcoin_address_lookup_hash, invoices.payment_deadline,
-                    creators.creator_lookup_hash
+                    creators.creator_lookup_hash,
+                    EXISTS (SELECT 1 FROM invoice_provider_v2 provider WHERE provider.invoice_id = invoices.id) AS provider_v2
              FROM invoices JOIN creators ON creators.id = invoices.creator_id
              WHERE invoices.bitcoin_address_lookup_hash = $1 FOR UPDATE OF invoices",
         )
@@ -1215,12 +1277,13 @@ impl InvoiceStore {
             .transpose()?;
 
         // Final matching Bitcoin outputs stay immutable independently of the other payment option.
-        if active
-            .as_ref()
-            .zip(active_record.as_ref())
-            .is_some_and(|(row, record)| {
-                row.present && row.confirmations >= 6 && record.observed_sats >= required
-            })
+        if !invoice.provider_v2
+            && active
+                .as_ref()
+                .zip(active_record.as_ref())
+                .is_some_and(|(row, record)| {
+                    row.present && row.confirmations >= 6 && record.observed_sats >= required
+                })
         {
             return Ok(true);
         }
@@ -1240,6 +1303,13 @@ impl InvoiceStore {
             .as_ref()
             .zip(active_record.as_ref())
             .map(|(row, record)| {
+                if invoice.provider_v2 {
+                    return if record.outpoint == outpoint || !present {
+                        ObservationAction::Update
+                    } else {
+                        ObservationAction::Replace
+                    };
+                }
                 DirectBinding::new(
                     &record.outpoint,
                     record.observed_sats,
@@ -1327,7 +1397,7 @@ impl InvoiceStore {
             .await
             .map_err(|_| PersistenceError::Unavailable)?;
         }
-        if amount_matched {
+        if amount_matched && !invoice.provider_v2 {
             sqlx::query("UPDATE invoices SET first_amount_matched_observed_at = COALESCE(first_amount_matched_observed_at, $2),
                 first_amount_matched_outpoint_lookup_hash = COALESCE(first_amount_matched_outpoint_lookup_hash, $3) WHERE id = $1")
                 .bind(invoice.id).bind(observed_at).bind(outpoint_lookup_hash.as_bytes().as_slice())
@@ -1335,6 +1405,16 @@ impl InvoiceStore {
         }
         self.project_payments(tx, invoice.id, creator_hash, &payment_record, observed_at)
             .await?;
+        self.project_provider_v2_sample(
+            tx,
+            invoice.id,
+            observation_id,
+            observed_at,
+            present,
+            confirmations,
+            amount_matched,
+        )
+        .await?;
         Ok(true)
     }
 
@@ -1414,7 +1494,8 @@ impl InvoiceStore {
 
         if let Some(existing) = sqlx::query_as::<_, ReplayInvoice>(
             "SELECT id, payment_request_lookup_hash, invoice_envelope, invoice_created_at,
-                    payment_deadline
+                    payment_deadline,
+                    EXISTS (SELECT 1 FROM invoice_provider_v2 provider WHERE provider.invoice_id = invoices.id) AS provider_v2
              FROM invoices \
              WHERE creator_id = $1 AND bundle_lookup_hash = $2 FOR UPDATE",
         )
@@ -1424,7 +1505,9 @@ impl InvoiceStore {
         .await
         .map_err(|_| PersistenceError::Unavailable)?
         {
-            if existing.payment_request_lookup_hash != payment_request_hash.as_bytes() {
+            if existing.provider_v2
+                || existing.payment_request_lookup_hash != payment_request_hash.as_bytes()
+            {
                 return Err(PersistenceError::Conflict);
             }
             self.validate_replay_intent(
@@ -1851,6 +1934,7 @@ struct BitcoinInvoiceRow {
     bitcoin_address_lookup_hash: Vec<u8>,
     payment_deadline: OffsetDateTime,
     creator_lookup_hash: Vec<u8>,
+    provider_v2: bool,
 }
 
 #[derive(sqlx::FromRow)]
@@ -1881,6 +1965,7 @@ struct ObservationTargetRow {
 #[derive(sqlx::FromRow)]
 struct ExistingInvoice {
     payment_request_lookup_hash: Vec<u8>,
+    provider_v2: bool,
 }
 
 #[derive(sqlx::FromRow)]
@@ -1890,6 +1975,7 @@ struct ReplayInvoice {
     invoice_envelope: Vec<u8>,
     invoice_created_at: OffsetDateTime,
     payment_deadline: OffsetDateTime,
+    provider_v2: bool,
 }
 
 #[derive(sqlx::FromRow)]

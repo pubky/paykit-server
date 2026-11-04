@@ -8,6 +8,7 @@ use paykit_server::domain::{
         parse_addressed_lock_resource, parse_bundle_id, parse_creator, parse_reader,
     },
     payment::{BitcoinOutpoint, PaymentBinding, PaymentReference, PaymentStatus},
+    provider_v2::{ProviderV2Payment, ProviderV2Sample, ProviderV2SampleStatus},
 };
 
 const CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
@@ -209,6 +210,84 @@ fn domain_criterion_accepts_supported_assets_and_positive_decimal_u64_satoshis()
             "{invalid:?} must fail"
         );
     }
+}
+
+#[test]
+fn provider_v2_payment_is_btc_only_preserves_amount_lexeme_and_bounds_threshold() {
+    let creator = parse_creator(CREATOR).unwrap();
+    let payment = ProviderV2Payment::parse(CREATOR, "0001", "BTC", 6, &creator).unwrap();
+
+    assert_eq!(payment.amount_lexeme(), "0001");
+    assert_eq!(payment.amount_sats(), 1);
+    assert_eq!(payment.minimum_confirmations(), 6);
+
+    for (recipient, amount, asset, threshold) in [
+        (CREATOR, "0", "BTC", 0),
+        (CREATOR, "1", "btc", 0),
+        (CREATOR, "1", "BTC", 7),
+    ] {
+        assert!(ProviderV2Payment::parse(recipient, amount, asset, threshold, &creator).is_err());
+    }
+    assert!(
+        ProviderV2Payment::parse(&another_creator().to_string(), "1", "BTC", 0, &creator).is_err()
+    );
+}
+
+#[test]
+fn provider_v2_threshold_zero_still_requires_detected_matched_output() {
+    let deadline = time::OffsetDateTime::UNIX_EPOCH;
+    let outpoint = BitcoinOutpoint::new(&"a".repeat(64), 0).unwrap();
+    let undetected =
+        ProviderV2Sample::new(deadline, ProviderV2SampleStatus::Undetected, None, 0, false)
+            .unwrap();
+    let underpaid = ProviderV2Sample::new(
+        deadline,
+        ProviderV2SampleStatus::Detected,
+        Some(outpoint.clone()),
+        0,
+        false,
+    )
+    .unwrap();
+    let matched = ProviderV2Sample::new(
+        deadline,
+        ProviderV2SampleStatus::Detected,
+        Some(outpoint),
+        0,
+        true,
+    )
+    .unwrap();
+
+    assert!(!undetected.qualifies(0, deadline));
+    assert!(!underpaid.qualifies(0, deadline));
+    assert!(matched.qualifies(0, deadline));
+}
+
+#[test]
+fn provider_v2_threshold_evidence_is_inclusive_at_deadline_and_bounded_to_six() {
+    let deadline = time::OffsetDateTime::UNIX_EPOCH;
+    let outpoint = BitcoinOutpoint::new(&"b".repeat(64), 1).unwrap();
+    let exact = ProviderV2Sample::new(
+        deadline,
+        ProviderV2SampleStatus::Confirmed,
+        Some(outpoint.clone()),
+        6,
+        true,
+    )
+    .unwrap();
+    let late = ProviderV2Sample::new(
+        deadline + time::Duration::microseconds(1),
+        ProviderV2SampleStatus::Confirmed,
+        Some(outpoint),
+        6,
+        true,
+    )
+    .unwrap();
+
+    assert!(exact.qualifies(6, deadline));
+    assert!(!late.qualifies(6, deadline));
+    assert!(
+        ProviderV2Sample::new(deadline, ProviderV2SampleStatus::Confirmed, None, 7, true,).is_err()
+    );
 }
 
 #[test]

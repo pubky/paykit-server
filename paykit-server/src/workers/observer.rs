@@ -252,10 +252,18 @@ pub async fn observe_once(
     network: &BitcoinNetwork,
     targets: &[ObservationTarget],
 ) -> Result<usize, ObserverError> {
-    let observations = port.observations(targets).await?;
-    let observations = validate_batch(observations, network, targets)?;
+    let had_targets = !targets.is_empty();
+    let (observed_at, targets) = invoices
+        .fence_observation_targets(targets)
+        .await
+        .map_err(map_persistence)?;
+    if had_targets && targets.is_empty() {
+        return Ok(0);
+    }
+    let observations = port.observations(&targets).await?;
+    let observations = validate_batch(observations, network, &targets)?;
     invoices
-        .apply_bitcoin_observation_batch(&observations)
+        .apply_bitcoin_observation_batch_at(&observations, observed_at)
         .await
         .map_err(map_persistence)
 }

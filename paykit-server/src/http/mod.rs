@@ -10,6 +10,7 @@ pub mod marketplace_status;
 mod marketplace_terms;
 pub mod payment_drains;
 pub mod payment_requests;
+pub mod provider_v2;
 pub(crate) mod request_diagnostics;
 pub mod setup;
 pub mod setup_status;

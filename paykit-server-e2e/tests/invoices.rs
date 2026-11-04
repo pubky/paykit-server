@@ -14,13 +14,16 @@ use paykit_server::{
     persistence::{
         AtomicInvoiceInput, CreatorCredentials, CreatorStore, InvoicePayloadFactory,
         InvoicePayloads, InvoiceStore, OutboxStore, PaymentDrainStore,
-        PaymentRequestLifecycleStore, PersistenceError, run_migrations,
+        PaymentRequestLifecycleStore, PersistenceError, ProviderV2AtomicInvoiceInput,
+        run_migrations,
     },
 };
 use paykit_server_e2e::postgres::TestDatabase;
 use sqlx::Row;
+use time::OffsetDateTime;
 
 const CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
+const PROVIDER_V2_BUNDLE: &str = "000G40R40M30E209185GR38E1W";
 const LOCK_RESOURCE: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/app.locks/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json";
 mod common;
 
@@ -184,6 +187,208 @@ fn input<'a>(
         proposal_acceptance_seconds: 60 * 60,
         payment_window_seconds: 24 * 60 * 60,
     }
+}
+
+fn provider_v2_input<'a>(
+    creator: &'a CreatorPubky,
+    reader: &'a ReaderPubky,
+    bundle: &'a [u8],
+    request_hash: [u8; 32],
+    deadline: OffsetDateTime,
+) -> ProviderV2AtomicInvoiceInput<'a> {
+    ProviderV2AtomicInvoiceInput {
+        creator,
+        reader,
+        bundle_binding: bundle,
+        lock_resource_binding: bundle,
+        request_hash,
+        deadline,
+        minimum_confirmations: 1,
+        invoice_payloads: &TEST_PAYLOADS,
+        proposal_acceptance_seconds: 60,
+    }
+}
+
+#[tokio::test]
+async fn provider_v2_create_is_atomic_replayable_and_cross_version_closed() {
+    let database = TestDatabase::create().await;
+    let store = invoice_store(&database).await;
+    let creator = creator();
+    let reader = reader();
+    let deadline = (OffsetDateTime::now_utc() + time::Duration::hours(1))
+        .replace_nanosecond(123_456_000)
+        .unwrap();
+
+    let created = store
+        .create_provider_v2_atomic(provider_v2_input(
+            &creator,
+            &reader,
+            PROVIDER_V2_BUNDLE.as_bytes(),
+            [42; 32],
+            deadline,
+        ))
+        .await
+        .unwrap();
+    assert!(!created.replayed());
+
+    let replayed = store
+        .create_provider_v2_atomic(provider_v2_input(
+            &creator,
+            &reader,
+            PROVIDER_V2_BUNDLE.as_bytes(),
+            [42; 32],
+            deadline,
+        ))
+        .await
+        .unwrap();
+    assert!(replayed.replayed());
+    assert_eq!(replayed.invoice_id(), created.invoice_id());
+    assert_eq!(replayed.invoice_created_at(), created.invoice_created_at());
+    assert_eq!(
+        replayed.proposal_expires_at(),
+        created.proposal_expires_at()
+    );
+    assert_eq!(replayed.deadline(), created.deadline());
+
+    assert_eq!(
+        store
+            .create_provider_v2_atomic(provider_v2_input(
+                &creator,
+                &reader,
+                PROVIDER_V2_BUNDLE.as_bytes(),
+                [43; 32],
+                deadline,
+            ))
+            .await,
+        Err(PersistenceError::Conflict)
+    );
+    assert_eq!(
+        store
+            .create_atomic(input(
+                &creator,
+                &reader,
+                PROVIDER_V2_BUNDLE.as_bytes(),
+                b"v1-request",
+            ))
+            .await,
+        Err(PersistenceError::Conflict)
+    );
+
+    let counts: (i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM invoices WHERE id = $1),
+                (SELECT count(*) FROM invoice_provider_v2 WHERE invoice_id = $1),
+                (SELECT count(*) FROM outbox WHERE invoice_id = $1 AND intent_kind = 'payment_request_proposal')",
+    )
+    .bind(created.invoice_id())
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(counts, (1, 1, 1));
+
+    let status = store
+        .provider_v2_status(&creator, &parse_bundle_id(PROVIDER_V2_BUNDLE).unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status.request_state.as_str(), "proposed");
+    assert_eq!(status.payment_state, "undetected");
+    assert_eq!(status.deadline, deadline);
+    assert!(status.current_sample.is_none());
+    assert!(status.first_threshold_satisfied.is_none());
+    assert!(
+        store
+            .provider_v2_status(
+                &second_creator(),
+                &parse_bundle_id(PROVIDER_V2_BUNDLE).unwrap(),
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn provider_v2_concurrent_exact_creates_converge_on_one_invoice_and_outbox() {
+    let database = TestDatabase::create().await;
+    let store = invoice_store(&database).await;
+    let creator = creator();
+    let reader = reader();
+    let deadline: OffsetDateTime =
+        sqlx::query_scalar("SELECT clock_timestamp() + INTERVAL '1 hour'")
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+
+    let first = store.create_provider_v2_atomic(provider_v2_input(
+        &creator,
+        &reader,
+        b"provider-v2-concurrent",
+        [45; 32],
+        deadline,
+    ));
+    let second = store.create_provider_v2_atomic(provider_v2_input(
+        &creator,
+        &reader,
+        b"provider-v2-concurrent",
+        [45; 32],
+        deadline,
+    ));
+    let (first, second) = tokio::join!(first, second);
+    let first = first.unwrap();
+    let second = second.unwrap();
+
+    assert_eq!(first.invoice_id(), second.invoice_id());
+    assert_ne!(first.replayed(), second.replayed());
+    let counts: (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM invoices),
+                (SELECT count(*) FROM outbox WHERE intent_kind = 'payment_request_proposal')",
+    )
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(counts, (1, 1));
+
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn provider_v2_fresh_create_uses_database_deadline_fence() {
+    let database = TestDatabase::create().await;
+    let store = invoice_store(&database).await;
+    let creator = creator();
+    let reader = reader();
+    let elapsed: OffsetDateTime = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+
+    assert!(
+        !store
+            .provider_v2_deadline_gate(&creator, elapsed)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .create_provider_v2_atomic(provider_v2_input(
+                &creator,
+                &reader,
+                b"elapsed-provider-v2",
+                [44; 32],
+                elapsed,
+            ))
+            .await,
+        Err(PersistenceError::DeadlineElapsed)
+    );
+    let invoice_count: i64 = sqlx::query_scalar("SELECT count(*) FROM invoices")
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+    assert_eq!(invoice_count, 0);
+
+    database.cleanup().await;
 }
 
 #[tokio::test]

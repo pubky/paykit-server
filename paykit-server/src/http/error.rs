@@ -39,6 +39,7 @@ pub enum ApiError {
     SellerBitcoinAndUsdtSetupPending,
     AssetUnsupported,
     PaymentWindowExceedsCap,
+    DeadlineElapsed,
 }
 
 #[derive(Serialize)]
@@ -218,6 +219,11 @@ impl ApiError {
                 StatusCode::BAD_REQUEST,
                 "payment_window_exceeds_cap",
                 "payment window exceeds the cap for this request",
+            ),
+            Self::DeadlineElapsed => (
+                StatusCode::CONFLICT,
+                "deadline_elapsed",
+                "payment deadline has elapsed",
             ),
         }
     }

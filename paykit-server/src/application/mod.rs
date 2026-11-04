@@ -8,6 +8,7 @@ pub mod marketplace_terms;
 pub mod payment_drain;
 pub mod payment_request_status;
 pub mod payment_status;
+pub mod provider_v2;
 pub mod reader_registry;
 pub mod semantic_intent;
 pub mod setup_status;
