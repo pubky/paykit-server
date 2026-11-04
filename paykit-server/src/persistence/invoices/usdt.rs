@@ -126,6 +126,8 @@ impl InvoiceStore {
         let Some(destination) = &payment.usdt else {
             return Ok(());
         };
+        self.reconcile_usdt_credit(&row, creator_hash, &payment)
+            .await?;
         let intent: DeliveryIntentV1 = postcard::from_bytes(
             &self
                 .crypto
@@ -485,6 +487,15 @@ impl InvoiceStore {
         let observations: Vec<UsdtObservationRow> = sqlx::query_as(
             "SELECT id, observation_envelope, transfer_lookup_hash, confirmations, finalized FROM usdt_observations WHERE invoice_id = $1 AND present")
             .bind(row.id).fetch_all(&mut **tx).await.map_err(|_| PersistenceError::Unavailable)?;
+        let proposal_recorded_at: Option<OffsetDateTime> = sqlx::query_scalar(
+            "SELECT MIN(proposal_recorded_at) FROM payment_request_lifecycles WHERE invoice_id = $1",
+        )
+        .bind(row.id)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        let window_start =
+            crate::usdt::payment_window_start(row.invoice_created_at, proposal_recorded_at);
         let mut selected: Option<(String, super::settlement::ObservedPayment)> = None;
         for observation in observations {
             let (facts, _) = self.transfer_facts(
@@ -494,11 +505,7 @@ impl InvoiceStore {
                 observation.observation_envelope,
                 observation.transfer_lookup_hash,
             )?;
-            let timely = facts.timestamp
-                >= row
-                    .invoice_created_at
-                    .replace_nanosecond(0)
-                    .map_err(|_| PersistenceError::CorruptOrMissing)?
+            let timely = window_start.is_some_and(|start| facts.timestamp >= start)
                 && facts.timestamp <= row.payment_deadline;
             let candidate = super::settlement::ObservedPayment {
                 present: true,
@@ -525,6 +532,103 @@ impl InvoiceStore {
             }
         }
         Ok(selected)
+    }
+
+    /// Reconciles every flagged pre-upgrade USDT credit of `creator` whose
+    /// proposal time is known. Paths that read payment markers without
+    /// observing USDT first, such as payment drains, call it before they do.
+    pub async fn reconcile_usdt_credits(
+        &self,
+        creator: &CreatorPubky,
+    ) -> Result<(), PersistenceError> {
+        let rows: Vec<UsdtInvoiceRow> = sqlx::query_as(
+            "SELECT i.id, c.creator_lookup_hash, i.payment_record_envelope, i.invoice_envelope,
+                    i.invoice_created_at, i.payment_deadline
+             FROM invoices i JOIN creators c ON c.id = i.creator_id
+             WHERE c.creator_lookup_hash = $1 AND i.usdt_credit_reconcile",
+        )
+        .bind(
+            self.crypto
+                .lookup_hash(creator.to_string().as_bytes())
+                .as_bytes()
+                .as_slice(),
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        for row in rows {
+            let creator_hash = lookup_hash(&row.creator_lookup_hash)?;
+            let payment: InvoicePaymentRecordV1 = postcard::from_bytes(
+                &self
+                    .crypto
+                    .decrypt(
+                        &EnvelopeContext::invoice_payment_record(creator_hash, row.id),
+                        &EncryptedEnvelope::from_bytes(row.payment_record_envelope.clone()),
+                    )
+                    .map_err(|_| PersistenceError::CorruptOrMissing)?,
+            )
+            .map_err(|_| PersistenceError::CorruptOrMissing)?;
+            self.reconcile_usdt_credit(&row, creator_hash, &payment)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Recomputes a payment marker credited from USDT alone before the
+    /// proposal-time rule, once the invoice's proposal time is recorded: the
+    /// marker is cleared and rebuilt from the invoice's current evidence, so it
+    /// stays only if that evidence qualifies now, and expiry follows. A marker
+    /// backed by a timely Bitcoin outpoint is kept; a late amount-matched one
+    /// is not settlement evidence. Until the proposal time is
+    /// recorded the marker stands.
+    async fn reconcile_usdt_credit(
+        &self,
+        row: &UsdtInvoiceRow,
+        creator_hash: LookupHash,
+        payment: &InvoicePaymentRecordV1,
+    ) -> Result<(), PersistenceError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        let due: bool = sqlx::query_scalar(
+            "SELECT invoice.usdt_credit_reconcile AND EXISTS (
+                 SELECT 1 FROM payment_request_lifecycles lifecycle
+                 WHERE lifecycle.invoice_id = invoice.id
+                   AND lifecycle.proposal_recorded_at IS NOT NULL)
+             FROM invoices invoice WHERE invoice.id = $1 FOR UPDATE OF invoice",
+        )
+        .bind(row.id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        if !due {
+            return Ok(());
+        }
+        sqlx::query(
+            "UPDATE invoices
+             SET usdt_credit_reconcile = FALSE,
+                 first_amount_matched_observed_at = CASE
+                     WHEN EXISTS (
+                         SELECT 1 FROM invoice_timely_amount_matched_outpoints timely
+                         WHERE timely.invoice_id = invoices.id
+                     ) THEN first_amount_matched_observed_at
+                 END,
+                 updated_at = NOW()
+             WHERE id = $1",
+        )
+        .bind(row.id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        let now: OffsetDateTime = sqlx::query_scalar("SELECT clock_timestamp()")
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        self.project_payments(&mut tx, row.id, creator_hash, payment, now)
+            .await?;
+        tx.commit().await.map_err(|_| PersistenceError::Unavailable)
     }
 
     pub(super) async fn usdt_payment_status(

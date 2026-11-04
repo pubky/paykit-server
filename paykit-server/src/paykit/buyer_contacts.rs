@@ -20,6 +20,15 @@ impl PaykitAdapter {
                 source: None,
             });
         }
+        // Skip a held contact before resolving the buyer's profile; it is
+        // checked again under the shared-state lock below.
+        if !invoices
+            .buyer_contact_is_pending(pending)
+            .await
+            .map_err(contact_store_error)?
+        {
+            return Ok(());
+        }
         let buyer = PubkyPublicKey::from_raw_or_app_key(pending.reader.to_string())?;
         let owner = PubkyPublicKey::from_raw_or_app_key(self.creator.to_string())?;
         let contact = self.resolve_buyer_contact(&owner, buyer).await?;

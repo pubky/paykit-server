@@ -86,8 +86,8 @@ async fn offered_with_window(rig: &Rig, index: usize, accepted: &[&str], window:
     sqlx::query(
         "INSERT INTO payment_request_lifecycles (
              marketplace_preparation_id, sdk_payment_request_id, request_state,
-             state_event_id, last_stream_item_id, last_event_at
-         ) VALUES ($1, $2, 'proof_submitted', $3, 1, clock_timestamp())",
+             state_event_id, last_stream_item_id, last_event_at, proposal_recorded_at
+         ) VALUES ($1, $2, 'proof_submitted', $3, 1, clock_timestamp(), clock_timestamp())",
     )
     .bind(Uuid::parse_str(&invoice).unwrap())
     .bind(
@@ -744,6 +744,48 @@ async fn underpaid_early_and_late_receipts_are_visible_but_never_the_paid_asset(
         assert!(
             request.payment_deadline > request.activated_at,
             "window sanity"
+        );
+        rig.cleanup().await;
+    }
+}
+
+#[tokio::test]
+async fn usdt_older_than_the_recorded_proposal_less_tolerance_is_not_paid_on_time() {
+    for (label, recorded, before_bound, on_time) in [
+        ("before the bound", true, 1, false),
+        ("at the bound", true, 0, true),
+        // A lifecycle row from before the server kept the proposal time.
+        ("proposal time not yet recorded", false, 0, false),
+    ] {
+        let rig = rig(BOTH_RAILS, true).await;
+        let rpc = Rpc::start().await;
+        let request = offered(&rig, 0, &[]).await;
+        // The proposal reached the SDK long after activation, as after a long
+        // handoff delay, so activation no longer bounds the evidence. The bound
+        // lands ten minutes into the payment window.
+        let proposal_recorded_at = request.activated_at
+            + paykit_server::usdt::PROPOSAL_TIME_TOLERANCE
+            + time::Duration::minutes(10);
+        sqlx::query("UPDATE payment_request_lifecycles SET proposal_recorded_at = $1")
+            .bind(recorded.then_some(proposal_recorded_at))
+            .execute(rig.database.pool())
+            .await
+            .unwrap();
+        let bound = (proposal_recorded_at - paykit_server::usdt::PROPOSAL_TIME_TOLERANCE)
+            .replace_nanosecond(0)
+            .unwrap()
+            .unix_timestamp();
+        chain(&rpc, |chain| {
+            transfer(chain, REQUIRED_USDT);
+            chain.timestamp = bound - before_bound;
+        });
+        submit(&rig, &rpc, 0).await;
+        let status = rig.status(&request.invoice).await;
+        assert_eq!(status["usdt_arbitrum"]["paid_on_time"], on_time, "{label}");
+        assert_eq!(
+            status["paid_asset"],
+            if on_time { json!("USDT") } else { Value::Null },
+            "{label}"
         );
         rig.cleanup().await;
     }

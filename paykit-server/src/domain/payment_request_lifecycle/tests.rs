@@ -76,6 +76,7 @@ fn lifecycle_projection_debug_redacts_correlation_metadata() {
         last_stream_item_id: Some(123_456),
         last_outbound_message_id: Some(654_321),
         last_event_at: OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap(),
+        proposal_recorded_at: None,
     };
 
     let debug = format!("{projection:?}");
