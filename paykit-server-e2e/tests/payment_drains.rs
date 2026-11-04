@@ -1674,6 +1674,119 @@ async fn replay_monotonically_completes_accepted_item_after_timely_amount_match(
 }
 
 #[tokio::test]
+async fn paid_provider_v2_invoice_completes_cleanup_and_allows_next_invoice() {
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(&[62; 32]).unwrap());
+    let creator_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO creators (creator_lookup_hash, credential_envelope)
+         VALUES ($1, $2) RETURNING id",
+    )
+    .bind(crypto.lookup_hash(CREATOR.as_bytes()).as_bytes().as_slice())
+    .bind(b"encrypted-creator".as_slice())
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    let (accepted_invoice, _) = insert_invoice(
+        &database,
+        &crypto,
+        creator_id,
+        0,
+        0,
+        PaymentRequestLifecycleState::Accepted,
+    )
+    .await;
+    sqlx::query(
+        "INSERT INTO invoice_provider_v2
+             (invoice_id, request_hash, deadline, minimum_confirmations, proposal_expires_at)
+         SELECT id, decode(repeat('62', 32), 'hex'), payment_deadline, 1,
+                proposal_expires_at
+         FROM invoices WHERE id = $1",
+    )
+    .bind(accepted_invoice)
+    .execute(database.pool())
+    .await
+    .unwrap();
+
+    let store = PaymentDrainStore::new(database.pool(), crypto.clone());
+    let active = store.create(&lock_resource()).await.unwrap();
+    assert!(!active.completed());
+    assert_eq!(active.accepted_count(), 1);
+    assert_eq!(active.terminal_count(), 0);
+
+    let observation_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO bitcoin_observations
+             (invoice_id, observation_envelope, outpoint_lookup_hash, confirmations,
+              first_observed_at)
+         SELECT id, $2, decode(repeat('63', 32), 'hex'), 1, invoice_created_at
+         FROM invoices WHERE id = $1
+         RETURNING id",
+    )
+    .bind(accepted_invoice)
+    .bind(b"encrypted-observation".as_slice())
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO invoice_provider_v2_first_threshold_evidence
+             (invoice_id, observation_id, observed_at, status, confirmations, amount_matched)
+         SELECT $1, $2, invoice_created_at, 'confirmed', 1, TRUE
+         FROM invoices WHERE id = $1",
+    )
+    .bind(accepted_invoice)
+    .bind(observation_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+
+    let completed = store.exact_replay(&lock_resource()).await.unwrap().unwrap();
+    assert!(completed.completed());
+    assert_eq!(completed.accepted_count(), 0);
+    assert_eq!(completed.terminal_count(), 1);
+    assert_eq!(completed.drain_id(), active.drain_id());
+    let legacy_lifecycle: (Option<OffsetDateTime>, Option<OffsetDateTime>) = sqlx::query_as(
+        "SELECT first_amount_matched_observed_at, payment_expired_at
+         FROM invoices WHERE id = $1",
+    )
+    .bind(accepted_invoice)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(legacy_lifecycle, (None, None));
+
+    let cleanup_token = crypto.payment_drain_cleanup_token(active.drain_id());
+    store
+        .cleanup_completed(&lock_resource(), cleanup_token.as_bytes())
+        .await
+        .unwrap();
+    let generation: (i64, Option<Uuid>) =
+        sqlx::query_as("SELECT current_generation, active_drain_id FROM lock_payment_generations")
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(generation, (1, None));
+    let retained_evidence: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM invoice_provider_v2_first_threshold_evidence
+         WHERE invoice_id = $1",
+    )
+    .bind(accepted_invoice)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(retained_evidence, 1);
+
+    let invoices = InvoiceStore::new(database.pool(), crypto);
+    let creator = parse_creator(CREATOR).unwrap();
+    let reader = parse_reader(READER).unwrap();
+    invoices
+        .create_atomic(admission_input(&creator, &reader))
+        .await
+        .unwrap();
+
+    database.cleanup().await;
+}
+
+#[tokio::test]
 async fn durable_cancellation_enqueue_is_sufficient_for_completion() {
     let database = TestDatabase::create().await;
     run_migrations(database.pool()).await.unwrap();
