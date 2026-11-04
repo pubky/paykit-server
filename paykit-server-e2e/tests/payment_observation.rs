@@ -234,24 +234,30 @@ async fn provider_v2_current_sample_changes_but_first_threshold_evidence_is_immu
     .await;
     assert!(delete_error.is_err());
 
+    let mut delete_binding = database.pool().begin().await.unwrap();
     sqlx::query("DELETE FROM invoice_provider_v2_current_sample WHERE invoice_id = $1")
         .bind(created.invoice_id())
-        .execute(database.pool())
+        .execute(&mut *delete_binding)
         .await
         .unwrap();
-    sqlx::query("DELETE FROM invoice_provider_v2 WHERE invoice_id = $1")
+    let binding_delete_error = sqlx::query("DELETE FROM invoice_provider_v2 WHERE invoice_id = $1")
         .bind(created.invoice_id())
-        .execute(database.pool())
-        .await
-        .unwrap();
-    let remaining_evidence: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM invoice_provider_v2_first_threshold_evidence WHERE invoice_id = $1",
+        .execute(&mut *delete_binding)
+        .await;
+    assert!(binding_delete_error.is_err());
+    delete_binding.rollback().await.unwrap();
+
+    let retained_rows: (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM invoices WHERE id = $1),
+                (SELECT count(*) FROM invoice_provider_v2 WHERE invoice_id = $1),
+                (SELECT count(*) FROM invoice_provider_v2_current_sample WHERE invoice_id = $1),
+                (SELECT count(*) FROM invoice_provider_v2_first_threshold_evidence WHERE invoice_id = $1)",
     )
     .bind(created.invoice_id())
     .fetch_one(database.pool())
     .await
     .unwrap();
-    assert_eq!(remaining_evidence, 0);
+    assert_eq!(retained_rows, (1, 1, 1, 1));
 
     database.cleanup().await;
 }

@@ -1,6 +1,14 @@
 use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
+use axum::{
+    body::{Body, to_bytes},
+    extract::Extension,
+    http::{Method, Request, StatusCode},
+};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use bitcoin::hashes::{Hash, sha256};
+use ed25519_dalek::{Signer, SigningKey};
 use paykit_lib::{PaykitAppId, PaykitAppRegistry};
 use paykit_sdk::PaykitIdentitySecretKey;
 use paykit_server::{
@@ -15,13 +23,17 @@ use paykit_server::{
         },
         semantic_intent::DeliveryIntentV1,
     },
-    config::BitcoinNetwork,
+    config::{BitcoinNetwork, Config, ConfigEnvironment},
     crypto::{Crypto, EncryptedEnvelope, EnvelopeContext},
     domain::locks::{
         CreatorPubky, ReaderPubky, parse_addressed_lock_resource, parse_bundle_id, parse_creator,
         parse_reader,
     },
-    domain::provider_v2::ProviderV2Payment,
+    domain::{payment::BitcoinOutpoint, provider_v2::ProviderV2Payment},
+    http::{
+        auth::{SignedServiceAuth, signature_preimage},
+        provider_v2::provider_v2_router,
+    },
     persistence::{
         AtomicInvoiceInput, CreatorCredentials, CreatorStore, InvoicePayloadFactory,
         InvoicePayloads, InvoiceStore, OutboxStore, PaymentDrainStore,
@@ -31,7 +43,8 @@ use paykit_server::{
 };
 use paykit_server_e2e::postgres::TestDatabase;
 use sqlx::Row;
-use time::OffsetDateTime;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use tower::ServiceExt;
 
 const CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
 const PROVIDER_V2_BUNDLE: &str = "000G40R40M30E209185GR38E1W";
@@ -293,6 +306,217 @@ fn provider_request(
 
 fn provider_request_hash(request: &ProviderV2CreateRequest) -> [u8; 32] {
     provider_v2_request_hash(request).unwrap()
+}
+
+fn provider_v2_signed_auth(key: &SigningKey) -> Arc<SignedServiceAuth> {
+    let trusted_key = pubky::PublicKey::from(
+        pubky::pkarr::PublicKey::try_from(key.verifying_key().as_bytes()).unwrap(),
+    )
+    .to_string();
+    let config = Config::from_toml_and_environment(
+        &format!(
+            r#"
+[http]
+listen_addr = "127.0.0.1:8080"
+[signed_services]
+trusted_public_keys = ["{trusted_key}"]
+[setup]
+allowed_origins = ["https://app.example"]
+[paykit]
+client_id = "app.paykit.server"
+app_id = "paykit-server"
+network = "testnet"
+[bitcoin]
+network = "regtest"
+[electrum]
+endpoint = "tcp://electrum.example:50001"
+[outbox]
+poll_interval = "5s"
+[limits]
+request_body_bytes = 16384
+[rate_limits]
+signed_requests_per_second = 100
+signed_burst = 100
+"#,
+        ),
+        ConfigEnvironment {
+            database_url: Some("postgres://paykit:***@localhost/paykit".into()),
+            master_key: Some("AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE".into()),
+        },
+    )
+    .unwrap();
+    Arc::new(SignedServiceAuth::from_config(&config))
+}
+
+fn signed_provider_v2_request(key: &SigningKey, path: &str, body: &[u8]) -> Request<Body> {
+    let preimage = signature_preimage("POST", path, body);
+    Request::builder()
+        .method(Method::POST)
+        .uri(path)
+        .header(
+            "X-Paykit-Signature",
+            URL_SAFE_NO_PAD.encode(key.sign(&preimage).to_bytes()),
+        )
+        .body(Body::from(body.to_vec()))
+        .unwrap()
+}
+
+async fn exact_response_body(response: axum::response::Response) -> String {
+    assert_eq!(response.status(), StatusCode::OK);
+    String::from_utf8(
+        to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn signed_provider_v2_routes_emit_exact_create_replay_and_status_vectors() {
+    let database = TestDatabase::create().await;
+    let store = invoice_store(&database).await;
+    let deadline = OffsetDateTime::parse("2099-01-01T00:00:00Z", &Rfc3339).unwrap();
+    let request = provider_request(reader(), "1", deadline);
+    let created = store
+        .create_provider_v2_atomic(provider_v2_input(
+            &creator(),
+            &reader(),
+            PROVIDER_V2_BUNDLE.as_bytes(),
+            provider_request_hash(&request),
+            deadline,
+        ))
+        .await
+        .unwrap();
+    let mut fixed_timestamps = database.pool().begin().await.unwrap();
+    sqlx::query(
+        "UPDATE invoices
+         SET invoice_created_at = '2098-12-31T23:58:00Z',
+             proposal_expires_at = '2098-12-31T23:59:00Z',
+             payment_deadline = '2099-01-01T00:00:00Z'
+         WHERE id = $1",
+    )
+    .bind(created.invoice_id())
+    .execute(&mut *fixed_timestamps)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE invoice_provider_v2
+         SET proposal_expires_at = '2098-12-31T23:59:00Z',
+             deadline = '2099-01-01T00:00:00Z'
+         WHERE invoice_id = $1",
+    )
+    .bind(created.invoice_id())
+    .execute(&mut *fixed_timestamps)
+    .await
+    .unwrap();
+    fixed_timestamps.commit().await.unwrap();
+
+    let key = SigningKey::from_bytes(&[31; 32]);
+    let router = provider_v2_router(Arc::new(provider_v2_service_with_panicking_adapters(
+        store.clone(),
+    )))
+    .layer(Extension(provider_v2_signed_auth(&key)));
+    let create_body = serde_json_canonicalizer::to_vec(&serde_json::json!({
+        "bundle_id": PROVIDER_V2_BUNDLE,
+        "lock_resource": LOCK_RESOURCE,
+        "reader": reader().to_string(),
+        "payment": {
+            "recipient_pubky": CREATOR,
+            "amount": "1",
+            "asset": "BTC",
+            "minimum_confirmations": 1
+        },
+        "deadline": "2099-01-01T00:00:00Z"
+    }))
+    .unwrap();
+    let expected_create = r#"{"invoice_created_at":"2098-12-31T23:58:00Z","proposal_expires_at":"2098-12-31T23:59:00Z","deadline":"2099-01-01T00:00:00Z"}"#;
+    let first_create = exact_response_body(
+        router
+            .clone()
+            .oneshot(signed_provider_v2_request(
+                &key,
+                "/v2/invoices",
+                &create_body,
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(first_create, expected_create);
+    let replay = exact_response_body(
+        router
+            .clone()
+            .oneshot(signed_provider_v2_request(
+                &key,
+                "/v2/invoices",
+                &create_body,
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(replay, first_create);
+
+    let status_body = serde_json_canonicalizer::to_vec(&serde_json::json!({
+        "creator": CREATOR,
+        "bundle_id": PROVIDER_V2_BUNDLE
+    }))
+    .unwrap();
+    let absent = exact_response_body(
+        router
+            .clone()
+            .oneshot(signed_provider_v2_request(
+                &key,
+                "/v2/invoices/status",
+                &status_body,
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        absent,
+        format!(
+            r#"{{"creator":"{CREATOR}","bundle_id":"{PROVIDER_V2_BUNDLE}","request_state":"proposed","payment_state":"undetected","invoice_created_at":"2098-12-31T23:58:00Z","proposal_expires_at":"2098-12-31T23:59:00Z","deadline":"2099-01-01T00:00:00Z","asset":"BTC","minimum_confirmations":1,"current_sample":null,"first_threshold_satisfied":null}}"#
+        )
+    );
+
+    let txid = sha256::Hash::hash(b"provider-v2-http-vector").to_string();
+    let outpoint = BitcoinOutpoint::new(&txid, 7).unwrap();
+    store
+        .apply_bitcoin_observation_at(
+            "test-address-0",
+            &outpoint,
+            100,
+            1,
+            true,
+            OffsetDateTime::parse("2098-12-31T23:59:30Z", &Rfc3339).unwrap(),
+        )
+        .await
+        .unwrap();
+    let populated = exact_response_body(
+        router
+            .oneshot(signed_provider_v2_request(
+                &key,
+                "/v2/invoices/status",
+                &status_body,
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let sample = format!(
+        r#"{{"observed_at":"2098-12-31T23:59:30Z","status":"confirmed","outpoint":{{"txid":"{txid}","vout":7}},"confirmations":1,"amount_matched":true}}"#
+    );
+    assert_eq!(
+        populated,
+        format!(
+            r#"{{"creator":"{CREATOR}","bundle_id":"{PROVIDER_V2_BUNDLE}","request_state":"proposed","payment_state":"confirmed","invoice_created_at":"2098-12-31T23:58:00Z","proposal_expires_at":"2098-12-31T23:59:00Z","deadline":"2099-01-01T00:00:00Z","asset":"BTC","minimum_confirmations":1,"current_sample":{sample},"first_threshold_satisfied":{sample}}}"#
+        )
+    );
+
+    database.cleanup().await;
 }
 
 #[tokio::test]
