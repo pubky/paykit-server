@@ -314,6 +314,14 @@ impl SetupCompleter for RealSetupCompleter {
         ))
     }
 
+    async fn creator_held(&self, creator: &CreatorPubky) -> Result<bool, Completion> {
+        self.creators
+            .load_optional(creator)
+            .await
+            .map(|credentials| credentials.is_some())
+            .map_err(|_| Completion::TransientUnavailable)
+    }
+
     async fn complete(&self, attempt: Box<dyn SetupAttempt>) -> Completion {
         let Ok(attempt) = attempt.into_any().downcast::<BitkitSetupAttempt>() else {
             return Completion::DefinitiveFailure;

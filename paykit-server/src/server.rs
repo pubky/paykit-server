@@ -233,6 +233,10 @@ impl Server {
                     config.rate_limits.setup_per_ip_per_minute,
                 )
                 .expect("validated setup rate limit fits usize"),
+                creator_held_per_ip_per_minute: usize::try_from(
+                    config.rate_limits.creator_held_per_ip_per_minute,
+                )
+                .expect("validated creator-held rate limit fits usize"),
                 max_pending_setup_flows: config.rate_limits.max_pending_setup_flows(),
             },
             config.setup.log_authorization_url,

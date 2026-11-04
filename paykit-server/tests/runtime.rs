@@ -376,6 +376,12 @@ async fn production_constructor_mounts_all_routes() {
             StatusCode::METHOD_NOT_ALLOWED,
         ),
         (
+            Request::delete("/setup/creator-held")
+                .body(Body::empty())
+                .unwrap(),
+            StatusCode::METHOD_NOT_ALLOWED,
+        ),
+        (
             Request::post("/invoices").body(Body::empty()).unwrap(),
             StatusCode::UNAUTHORIZED,
         ),
