@@ -56,6 +56,22 @@ CREATE TRIGGER invoice_provider_v2_first_evidence_no_update
 BEFORE UPDATE ON invoice_provider_v2_first_threshold_evidence
 FOR EACH ROW EXECUTE FUNCTION reject_provider_v2_first_evidence_mutation();
 
+CREATE FUNCTION reject_direct_provider_v2_first_evidence_delete()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM invoice_provider_v2 WHERE invoice_id = OLD.invoice_id
+    ) THEN
+        RAISE EXCEPTION 'provider-v2 first threshold evidence may only follow parent deletion';
+    END IF;
+    RETURN OLD;
+END
+$$;
+
+CREATE TRIGGER invoice_provider_v2_first_evidence_no_direct_delete
+BEFORE DELETE ON invoice_provider_v2_first_threshold_evidence
+FOR EACH ROW EXECUTE FUNCTION reject_direct_provider_v2_first_evidence_delete();
+
 -- V2 carries an exact caller-owned timestamp, so the legacy whole-second
 -- equality checks cannot apply to those rows. Deferred triggers retain the v1
 -- equations and require v2 binding timestamps to agree byte-for-byte with the

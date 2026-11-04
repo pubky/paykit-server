@@ -22,6 +22,7 @@ use paykit_server::{
 use paykit_server_e2e::postgres::TestDatabase;
 use sqlx::Row;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use tokio::sync::Notify;
 
 mod common;
 
@@ -225,6 +226,149 @@ async fn provider_v2_current_sample_changes_but_first_threshold_evidence_is_immu
     .await;
     assert!(update_error.is_err());
 
+    let delete_error = sqlx::query(
+        "DELETE FROM invoice_provider_v2_first_threshold_evidence WHERE invoice_id = $1",
+    )
+    .bind(created.invoice_id())
+    .execute(database.pool())
+    .await;
+    assert!(delete_error.is_err());
+
+    sqlx::query("DELETE FROM invoice_provider_v2_current_sample WHERE invoice_id = $1")
+        .bind(created.invoice_id())
+        .execute(database.pool())
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM invoice_provider_v2 WHERE invoice_id = $1")
+        .bind(created.invoice_id())
+        .execute(database.pool())
+        .await
+        .unwrap();
+    let remaining_evidence: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM invoice_provider_v2_first_threshold_evidence WHERE invoice_id = $1",
+    )
+    .bind(created.invoice_id())
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(remaining_evidence, 0);
+
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn provider_v2_sample_timeliness_never_transfers_between_outpoints() {
+    let database = TestDatabase::create().await;
+    let store = store(&database).await;
+    let now: OffsetDateTime = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+    let deadline = now + time::Duration::hours(1);
+    let first_invoice = store
+        .create_provider_v2_atomic(ProviderV2AtomicInvoiceInput {
+            creator: &creator(),
+            reader: &reader(),
+            bundle_binding: b"sample-identity-first",
+            lock_resource_binding: b"sample-identity-first",
+            request_hash: [94; 32],
+            deadline,
+            minimum_confirmations: 1,
+            invoice_payloads: &PAYLOADS,
+            proposal_acceptance_seconds: 60,
+        })
+        .await
+        .unwrap();
+    let first_id = first_invoice.invoice_id();
+    let a = persisted_outpoint("sample-identity-a");
+    let b = persisted_outpoint("sample-identity-b");
+    store
+        .apply_bitcoin_observation_at("bitcoin-address-0", &a, 100, 1, true, now)
+        .await
+        .unwrap();
+    let immutable_a: uuid::Uuid = sqlx::query_scalar(
+        "SELECT observation_id FROM invoice_provider_v2_first_threshold_evidence WHERE invoice_id = $1",
+    )
+    .bind(first_id)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    store
+        .apply_bitcoin_observation_at(
+            "bitcoin-address-0",
+            &b,
+            100,
+            1,
+            true,
+            now + time::Duration::microseconds(1),
+        )
+        .await
+        .unwrap();
+    store
+        .apply_bitcoin_observation_at(
+            "bitcoin-address-0",
+            &a,
+            100,
+            1,
+            true,
+            deadline + time::Duration::microseconds(1),
+        )
+        .await
+        .unwrap();
+    let after_late_a: (uuid::Uuid, uuid::Uuid) = sqlx::query_as(
+        "SELECT current.observation_id, first_evidence.observation_id
+         FROM invoice_provider_v2_current_sample current
+         JOIN invoice_provider_v2_first_threshold_evidence first_evidence USING (invoice_id)
+         WHERE current.invoice_id = $1",
+    )
+    .bind(first_id)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(after_late_a.1, immutable_a);
+    assert_eq!(after_late_a.0, immutable_a);
+
+    let second = store
+        .create_provider_v2_atomic(ProviderV2AtomicInvoiceInput {
+            creator: &creator(),
+            reader: &reader(),
+            bundle_binding: b"sample-identity-second",
+            lock_resource_binding: b"sample-identity-second",
+            request_hash: [95; 32],
+            deadline,
+            minimum_confirmations: 1,
+            invoice_payloads: &PAYLOADS,
+            proposal_acceptance_seconds: 60,
+        })
+        .await
+        .unwrap();
+    // Outpoints are globally owned. Use a distinct A/B pair for this invoice
+    // while proving the same timely-A then unseen-late-B identity sequence.
+    let second_a = persisted_outpoint("sample-identity-second-a");
+    let second_b = persisted_outpoint("sample-identity-second-b");
+    store
+        .apply_bitcoin_observation_at("bitcoin-address-1", &second_a, 100, 0, true, now)
+        .await
+        .unwrap();
+    store
+        .apply_bitcoin_observation_at(
+            "bitcoin-address-1",
+            &second_b,
+            100,
+            1,
+            true,
+            deadline + time::Duration::microseconds(1),
+        )
+        .await
+        .unwrap();
+    let second_evidence: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM invoice_provider_v2_first_threshold_evidence WHERE invoice_id = $1",
+    )
+    .bind(second.invoice_id())
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(second_evidence, 0);
     database.cleanup().await;
 }
 
@@ -348,6 +492,160 @@ impl ElectrumPort for CountingElectrum {
         self.0.fetch_add(1, Ordering::SeqCst);
         Ok(Vec::new())
     }
+}
+
+struct ControlledElectrum {
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+    output: ObservedOutput,
+}
+
+#[async_trait]
+impl ElectrumPort for ControlledElectrum {
+    async fn observations(
+        &self,
+        _targets: &[ObservationTarget],
+    ) -> Result<Vec<ObservedOutput>, ObserverError> {
+        self.entered.notify_one();
+        self.release.notified().await;
+        Ok(vec![self.output.clone()])
+    }
+}
+
+async fn provider_v2_deadline_invoice(
+    database: &TestDatabase,
+    deadline_after: time::Duration,
+    request_hash: [u8; 32],
+) -> (InvoiceStore, uuid::Uuid, OffsetDateTime) {
+    let store = store(database).await;
+    let deadline: OffsetDateTime = sqlx::query_scalar("SELECT clock_timestamp() + $1")
+        .bind(deadline_after)
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+    let created = store
+        .create_provider_v2_atomic(ProviderV2AtomicInvoiceInput {
+            creator: &creator(),
+            reader: &reader(),
+            bundle_binding: &request_hash,
+            lock_resource_binding: &request_hash,
+            request_hash,
+            deadline,
+            minimum_confirmations: 0,
+            invoice_payloads: &FixedPayloads(REGTEST_ADDRESS),
+            proposal_acceptance_seconds: 1,
+        })
+        .await
+        .unwrap();
+    (store, created.invoice_id(), deadline)
+}
+
+fn matched_output(label: u8) -> ObservedOutput {
+    ObservedOutput {
+        network: BitcoinNetwork::Regtest,
+        address: REGTEST_ADDRESS.into(),
+        outpoint: provider_outpoint(label),
+        sats: 100,
+        confirmations: 0,
+        present: true,
+    }
+}
+
+#[tokio::test]
+async fn provider_v2_delayed_electrum_response_cannot_backdate_first_evidence() {
+    let database = TestDatabase::create().await;
+    let (store, invoice_id, deadline) =
+        provider_v2_deadline_invoice(&database, time::Duration::milliseconds(200), [91; 32]).await;
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let port = ControlledElectrum {
+        entered: entered.clone(),
+        release: release.clone(),
+        output: matched_output(91),
+    };
+    let task = tokio::spawn(async move {
+        observe_once(
+            &port,
+            &store,
+            &BitcoinNetwork::Regtest,
+            &[ObservationTarget::new(REGTEST_ADDRESS, None)],
+        )
+        .await
+    });
+    entered.notified().await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    release.notify_one();
+    assert_eq!(task.await.unwrap().unwrap(), 1);
+
+    let current_at: OffsetDateTime = sqlx::query_scalar(
+        "SELECT observed_at FROM invoice_provider_v2_current_sample WHERE invoice_id = $1",
+    )
+    .bind(invoice_id)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert!(current_at > deadline);
+    let evidence_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM invoice_provider_v2_first_threshold_evidence WHERE invoice_id = $1",
+    )
+    .bind(invoice_id)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(evidence_count, 0);
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn provider_v2_apply_lock_wait_cannot_backdate_first_evidence() {
+    let database = TestDatabase::create().await;
+    let (store, invoice_id, deadline) =
+        provider_v2_deadline_invoice(&database, time::Duration::milliseconds(300), [92; 32]).await;
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let port = ControlledElectrum {
+        entered: entered.clone(),
+        release: release.clone(),
+        output: matched_output(92),
+    };
+    let task = tokio::spawn(async move {
+        observe_once(
+            &port,
+            &store,
+            &BitcoinNetwork::Regtest,
+            &[ObservationTarget::new(REGTEST_ADDRESS, None)],
+        )
+        .await
+    });
+    entered.notified().await;
+    let mut blocker = database.pool().begin().await.unwrap();
+    sqlx::query("SELECT id FROM invoices WHERE id = $1 FOR UPDATE")
+        .bind(invoice_id)
+        .fetch_one(&mut *blocker)
+        .await
+        .unwrap();
+    release.notify_one();
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    blocker.commit().await.unwrap();
+    assert_eq!(task.await.unwrap().unwrap(), 1);
+
+    let current_at: OffsetDateTime = sqlx::query_scalar(
+        "SELECT observed_at FROM invoice_provider_v2_current_sample WHERE invoice_id = $1",
+    )
+    .bind(invoice_id)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert!(current_at > deadline);
+    let evidence_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM invoice_provider_v2_first_threshold_evidence WHERE invoice_id = $1",
+    )
+    .bind(invoice_id)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(evidence_count, 0);
+    database.cleanup().await;
 }
 
 #[tokio::test]

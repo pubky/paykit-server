@@ -421,9 +421,9 @@ impl InvoiceStore {
     }
 
     /// Revalidates provider-v2 observation deadlines immediately before Electrum I/O.
-    /// The returned database timestamp is the trusted observation sample time, so
-    /// a batch that started before the deadline remains timely even if processing
-    /// finishes later.
+    /// The returned timestamp proves call-start eligibility only. Observation
+    /// samples use a fresh authoritative timestamp after response validation and
+    /// decisive invoice-row serialization.
     pub async fn fence_observation_targets(
         &self,
         targets: &[ObservationTarget],
@@ -1108,12 +1108,21 @@ impl InvoiceStore {
         Ok(applied)
     }
 
+    #[cfg(any(test, feature = "test-utils"))]
     pub(crate) async fn apply_bitcoin_observation_batch_at(
         &self,
         observations: &[BitcoinObservationInput],
         observed_at: OffsetDateTime,
     ) -> Result<usize, PersistenceError> {
         self.apply_bitcoin_observation_batch_with_time(observations, Some(observed_at))
+            .await
+    }
+
+    pub(crate) async fn apply_bitcoin_observation_batch(
+        &self,
+        observations: &[BitcoinObservationInput],
+    ) -> Result<usize, PersistenceError> {
+        self.apply_bitcoin_observation_batch_with_time(observations, None)
             .await
     }
 

@@ -433,6 +433,105 @@ async fn signed_unknown_field_is_rejected_for_a_plain_serde_dto() {
 }
 
 #[tokio::test]
+async fn provider_v2_routes_enforce_signed_closed_canonical_wire_contract() {
+    let key = SigningKey::from_bytes(&[7; 32]);
+    let untrusted = SigningKey::from_bytes(&[8; 32]);
+    let config = config_for(&key, 100, 200, 16 * 1024);
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .connect_lazy("postgres://127.0.0.1:1/paykit")
+        .unwrap();
+    let router = Server::build(config, pool).await.unwrap().router();
+    let creator = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
+    let bundle = "000G40R40M30E209185GR38E1W";
+    let lock_id = "000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG";
+    let valid = format!(
+        r#"{{"bundle_id":"{bundle}","deadline":"2030-01-01T00:00:00Z","lock_resource":"{creator}/pub/app.locks/{lock_id}.json","payment":{{"amount":"1","asset":"BTC","minimum_confirmations":0,"recipient_pubky":"{creator}"}},"reader":"{creator}"}}"#,
+    );
+
+    let unsigned = Request::builder()
+        .method(Method::POST)
+        .uri("/v2/invoices")
+        .body(Body::from(valid.clone()))
+        .unwrap();
+    let malformed = Request::builder()
+        .method(Method::POST)
+        .uri("/v2/invoices")
+        .header("X-Paykit-Signature", "not_base64!")
+        .body(Body::from(valid.clone()))
+        .unwrap();
+    for request in [
+        unsigned,
+        malformed,
+        signed_request_for_path(&untrusted, "/v2/invoices", valid.as_bytes()),
+    ] {
+        assert_eq!(
+            router.clone().oneshot(request).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    let invalid_bodies = [
+        format!("{{ {} }}", &valid[1..valid.len() - 1]),
+        valid.replace("\"BTC\"", "\"btc\""),
+        valid.replace("\"amount\":\"1\"", "\"amount\":\"0\""),
+        valid.replace("\"minimum_confirmations\":0", "\"minimum_confirmations\":7"),
+        valid.replace("2030-01-01T00:00:00Z", "2030-01-01T01:00:00+01:00"),
+        format!("{},\"unknown\":true}}", &valid[..valid.len() - 1]),
+    ];
+    for body in invalid_bodies {
+        let response = router
+            .clone()
+            .oneshot(signed_request_for_path(
+                &key,
+                "/v2/invoices",
+                body.as_bytes(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+    }
+    let query = router
+        .clone()
+        .oneshot(signed_request_for_path(
+            &key,
+            "/v2/invoices?unexpected=true",
+            valid.as_bytes(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(query.status(), StatusCode::BAD_REQUEST);
+
+    let status_unknown =
+        format!(r#"{{"bundle_id":"{bundle}","creator":"{creator}","unknown":true}}"#,);
+    assert_eq!(
+        router
+            .oneshot(signed_request_for_path(
+                &key,
+                "/v2/invoices/status",
+                status_unknown.as_bytes(),
+            ))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+}
+
+#[test]
+fn provider_v2_signature_vector_is_byte_exact() {
+    let key = SigningKey::from_bytes(&[7; 32]);
+    let preimage = paykit_server::http::auth::signature_preimage("POST", "/v2/invoices", b"{}");
+    assert_eq!(
+        preimage,
+        b"paykit-http-signature-v1\0POST\0/v2/invoices\0{}"
+    );
+    assert_eq!(
+        URL_SAFE_NO_PAD.encode(key.sign(&preimage).to_bytes()),
+        "UR4WdtdlFSOXLmImDszN6FyQ68-SY2lcFpDlzAmKvwcKuNIJW8VbxBw4o5-JRYhDyeTNALR4li3FfSL5MfLlBw"
+    );
+}
+
+#[tokio::test]
 async fn raw_body_limit_precedes_signature_and_json_processing() {
     let key = SigningKey::from_bytes(&[7; 32]);
     let oversized = vec![b'x'; 16 * 1024 + 1];

@@ -1,16 +1,27 @@
 use std::{sync::Arc, time::Duration};
 
+use async_trait::async_trait;
+use paykit_lib::{PaykitAppId, PaykitAppRegistry};
 use paykit_sdk::PaykitIdentitySecretKey;
 use paykit_server::{
     application::{
+        create_invoice::{
+            AppRegistryDiscovery, CreatorReceivingProvider, ReaderAuthorization, ReceivingDetails,
+            RegistryDiscoveryError, SessionValidationError, SessionValidator,
+        },
         payment_request_status::{PaymentRequestStatusOperations, PaymentState},
+        provider_v2::{
+            ProviderV2CreateRequest, ProviderV2Error, ProviderV2Service, provider_v2_request_hash,
+        },
         semantic_intent::DeliveryIntentV1,
     },
+    config::BitcoinNetwork,
     crypto::{Crypto, EncryptedEnvelope, EnvelopeContext},
     domain::locks::{
         CreatorPubky, ReaderPubky, parse_addressed_lock_resource, parse_bundle_id, parse_creator,
         parse_reader,
     },
+    domain::provider_v2::ProviderV2Payment,
     persistence::{
         AtomicInvoiceInput, CreatorCredentials, CreatorStore, InvoicePayloadFactory,
         InvoicePayloads, InvoiceStore, OutboxStore, PaymentDrainStore,
@@ -127,6 +138,55 @@ fn second_reader() -> ReaderPubky {
     parse_reader(&second_creator().to_string()).unwrap()
 }
 
+struct PanicAdapters;
+
+#[async_trait]
+impl SessionValidator for PanicAdapters {
+    async fn validate(&self, _creator: &CreatorPubky) -> Result<(), SessionValidationError> {
+        panic!("status must not validate a session")
+    }
+}
+
+#[async_trait]
+impl AppRegistryDiscovery for PanicAdapters {
+    async fn discover(
+        &self,
+        _reader: &ReaderPubky,
+    ) -> Result<Option<PaykitAppRegistry>, RegistryDiscoveryError> {
+        panic!("status must not discover a registry")
+    }
+
+    async fn authorization(
+        &self,
+        _reader: &ReaderPubky,
+    ) -> Result<ReaderAuthorization, RegistryDiscoveryError> {
+        panic!("status must not read reader authorization")
+    }
+}
+
+#[async_trait]
+impl CreatorReceivingProvider for PanicAdapters {
+    async fn receiving(
+        &self,
+        _creator: &CreatorPubky,
+    ) -> Result<ReceivingDetails, PersistenceError> {
+        panic!("status must not load receiving adapters")
+    }
+}
+
+fn provider_v2_service_with_panicking_adapters(store: InvoiceStore) -> ProviderV2Service {
+    let adapters = Arc::new(PanicAdapters);
+    ProviderV2Service::new(
+        adapters.clone(),
+        adapters.clone(),
+        adapters,
+        store,
+        PaykitAppId::new("paykit-server").unwrap(),
+        BitcoinNetwork::Regtest,
+        Duration::from_secs(60),
+    )
+}
+
 async fn invoice_store(database: &TestDatabase) -> InvoiceStore {
     run_migrations(database.pool()).await.unwrap();
     let crypto = crypto();
@@ -209,34 +269,105 @@ fn provider_v2_input<'a>(
     }
 }
 
+fn provider_request(
+    reader: ReaderPubky,
+    amount: &str,
+    deadline: OffsetDateTime,
+) -> ProviderV2CreateRequest {
+    let lock_resource = parse_addressed_lock_resource(LOCK_RESOURCE).unwrap();
+    ProviderV2CreateRequest {
+        bundle_id: parse_bundle_id(PROVIDER_V2_BUNDLE).unwrap(),
+        payment: ProviderV2Payment::parse(
+            &creator().to_string(),
+            amount,
+            "BTC",
+            1,
+            lock_resource.creator(),
+        )
+        .unwrap(),
+        lock_resource,
+        reader,
+        deadline,
+    }
+}
+
+fn provider_request_hash(request: &ProviderV2CreateRequest) -> [u8; 32] {
+    provider_v2_request_hash(request).unwrap()
+}
+
 #[tokio::test]
 async fn provider_v2_create_is_atomic_replayable_and_cross_version_closed() {
     let database = TestDatabase::create().await;
     let store = invoice_store(&database).await;
     let creator = creator();
     let reader = reader();
-    let deadline = (OffsetDateTime::now_utc() + time::Duration::hours(1))
-        .replace_nanosecond(123_456_000)
-        .unwrap();
+    let deadline: OffsetDateTime =
+        sqlx::query_scalar("SELECT clock_timestamp() + INTERVAL '200 milliseconds'")
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+
+    let exact_request = provider_request(reader.clone(), "1", deadline);
+    let exact_hash = provider_request_hash(&exact_request);
 
     let created = store
         .create_provider_v2_atomic(provider_v2_input(
             &creator,
             &reader,
             PROVIDER_V2_BUNDLE.as_bytes(),
-            [42; 32],
+            exact_hash,
             deadline,
         ))
         .await
         .unwrap();
     assert!(!created.replayed());
+    let durable_outbox_id: uuid::Uuid = sqlx::query_scalar(
+        "SELECT id FROM outbox WHERE invoice_id = $1 AND intent_kind = 'payment_request_proposal'",
+    )
+    .bind(created.invoice_id())
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    let service = provider_v2_service_with_panicking_adapters(store.clone());
+    let before_deadline = service
+        .status(&creator, &parse_bundle_id(PROVIDER_V2_BUNDLE).unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(before_deadline.deadline, deadline);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let replay_after_deadline = service.create(exact_request.clone()).await.unwrap();
+    assert!(replay_after_deadline.replayed());
+    assert_eq!(replay_after_deadline.invoice_id(), created.invoice_id());
+    let replayed_outbox_id: uuid::Uuid = sqlx::query_scalar(
+        "SELECT id FROM outbox WHERE invoice_id = $1 AND intent_kind = 'payment_request_proposal'",
+    )
+    .bind(created.invoice_id())
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(replayed_outbox_id, durable_outbox_id);
+    for changed in [
+        provider_request(second_reader(), "1", deadline),
+        provider_request(reader.clone(), "2", deadline),
+        provider_request(
+            reader.clone(),
+            "1",
+            deadline + time::Duration::milliseconds(1),
+        ),
+    ] {
+        assert_eq!(
+            service.create(changed).await,
+            Err(ProviderV2Error::Conflict)
+        );
+    }
 
     let replayed = store
         .create_provider_v2_atomic(provider_v2_input(
             &creator,
             &reader,
             PROVIDER_V2_BUNDLE.as_bytes(),
-            [42; 32],
+            exact_hash,
             deadline,
         ))
         .await
@@ -285,8 +416,8 @@ async fn provider_v2_create_is_atomic_replayable_and_cross_version_closed() {
     .unwrap();
     assert_eq!(counts, (1, 1, 1));
 
-    let status = store
-        .provider_v2_status(&creator, &parse_bundle_id(PROVIDER_V2_BUNDLE).unwrap())
+    let status = service
+        .status(&creator, &parse_bundle_id(PROVIDER_V2_BUNDLE).unwrap())
         .await
         .unwrap()
         .unwrap();
@@ -296,8 +427,8 @@ async fn provider_v2_create_is_atomic_replayable_and_cross_version_closed() {
     assert!(status.current_sample.is_none());
     assert!(status.first_threshold_satisfied.is_none());
     assert!(
-        store
-            .provider_v2_status(
+        service
+            .status(
                 &second_creator(),
                 &parse_bundle_id(PROVIDER_V2_BUNDLE).unwrap(),
             )
@@ -350,6 +481,30 @@ async fn provider_v2_concurrent_exact_creates_converge_on_one_invoice_and_outbox
     .unwrap();
     assert_eq!(counts, (1, 1));
 
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn provider_v2_deadline_gate_resamples_after_creator_row_lock_wait() {
+    let database = TestDatabase::create().await;
+    let store = invoice_store(&database).await;
+    let creator = creator();
+    let mut blocker = database.pool().begin().await.unwrap();
+    sqlx::query("SELECT id FROM creators FOR UPDATE")
+        .fetch_one(&mut *blocker)
+        .await
+        .unwrap();
+    let deadline: OffsetDateTime =
+        sqlx::query_scalar("SELECT clock_timestamp() + INTERVAL '200 milliseconds'")
+            .fetch_one(&mut *blocker)
+            .await
+            .unwrap();
+    let task =
+        tokio::spawn(async move { store.provider_v2_deadline_gate(&creator, deadline).await });
+    wait_for_lock_wait(&database, "SELECT id FROM creators").await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    blocker.commit().await.unwrap();
+    assert!(!task.await.unwrap().unwrap());
     database.cleanup().await;
 }
 
@@ -1731,6 +1886,64 @@ async fn atomic_store_rejects_empty_address_and_wrong_reader_before_any_insert()
     .unwrap();
     assert_eq!(counts, (0, 0, 0));
 
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn provider_v2_invoice_binding_and_outbox_roll_back_together() {
+    let database = TestDatabase::create().await;
+    let store = invoice_store(&database).await;
+    let creator = creator();
+    let reader = reader();
+    sqlx::query(
+        "CREATE FUNCTION fail_provider_v2_outbox_insert() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN IF NEW.invoice_id IS NOT NULL THEN RAISE EXCEPTION 'forced provider-v2 outbox failure'; END IF; RETURN NEW; END; $$",
+    )
+    .execute(database.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER fail_provider_v2_outbox_insert BEFORE INSERT ON outbox \
+         FOR EACH ROW EXECUTE FUNCTION fail_provider_v2_outbox_insert()",
+    )
+    .execute(database.pool())
+    .await
+    .unwrap();
+    let deadline: OffsetDateTime =
+        sqlx::query_scalar("SELECT clock_timestamp() + INTERVAL '1 hour'")
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+
+    assert!(
+        store
+            .create_provider_v2_atomic(provider_v2_input(
+                &creator,
+                &reader,
+                b"provider-v2-rollback",
+                [93; 32],
+                deadline,
+            ))
+            .await
+            .is_err()
+    );
+    let counts: (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM reader_assignments),
+                (SELECT COUNT(*) FROM invoices),
+                (SELECT COUNT(*) FROM invoice_provider_v2),
+                (SELECT COUNT(*) FROM outbox)",
+    )
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(counts, (0, 0, 0, 0));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT next_child_index FROM creators")
+            .fetch_one(database.pool())
+            .await
+            .unwrap(),
+        0
+    );
     database.cleanup().await;
 }
 

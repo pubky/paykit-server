@@ -290,6 +290,13 @@ fn canonical_binding(request: &ProviderV2CreateRequest) -> Result<Vec<u8>, Provi
     .map_err(|_| ProviderV2Error::InvalidRequest)
 }
 
+#[cfg(feature = "test-utils")]
+pub fn provider_v2_request_hash(
+    request: &ProviderV2CreateRequest,
+) -> Result<[u8; 32], ProviderV2Error> {
+    Ok(*blake3::hash(&canonical_binding(request)?).as_bytes())
+}
+
 fn map_registry(error: RegistryDiscoveryError) -> ProviderV2Error {
     match error {
         RegistryDiscoveryError::InvalidRequest => ProviderV2Error::InvalidRequest,
