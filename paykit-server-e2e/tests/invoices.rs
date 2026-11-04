@@ -497,6 +497,7 @@ async fn signed_provider_v2_routes_emit_exact_create_replay_and_status_vectors()
         .unwrap();
     let populated = exact_response_body(
         router
+            .clone()
             .oneshot(signed_provider_v2_request(
                 &key,
                 "/v2/invoices/status",
@@ -515,6 +516,26 @@ async fn signed_provider_v2_routes_emit_exact_create_replay_and_status_vectors()
             r#"{{"creator":"{CREATOR}","bundle_id":"{PROVIDER_V2_BUNDLE}","request_state":"proposed","payment_state":"confirmed","invoice_created_at":"2098-12-31T23:58:00Z","proposal_expires_at":"2098-12-31T23:59:00Z","deadline":"2099-01-01T00:00:00Z","asset":"BTC","minimum_confirmations":1,"current_sample":{sample},"first_threshold_satisfied":{sample}}}"#
         )
     );
+
+    assert!(
+        store
+            .observation_targets_at(deadline + time::Duration::seconds(1))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let after_deadline = exact_response_body(
+        router
+            .oneshot(signed_provider_v2_request(
+                &key,
+                "/v2/invoices/status",
+                &status_body,
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(after_deadline, populated);
 
     database.cleanup().await;
 }

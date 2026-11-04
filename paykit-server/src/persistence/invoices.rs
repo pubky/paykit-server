@@ -492,6 +492,7 @@ impl InvoiceStore {
             "SELECT id FROM invoices
              WHERE payment_expired_at IS NULL
                AND first_amount_matched_observed_at IS NULL
+               AND NOT EXISTS (SELECT 1 FROM invoice_provider_v2 provider WHERE provider.invoice_id = invoices.id)
              ORDER BY id FOR UPDATE",
         )
         .fetch_all(&mut *tx)
@@ -508,7 +509,8 @@ impl InvoiceStore {
             "UPDATE invoices SET payment_expired_at = $1, updated_at = NOW()
              WHERE payment_expired_at IS NULL
                AND first_amount_matched_observed_at IS NULL
-               AND payment_deadline < $1",
+               AND payment_deadline < $1
+               AND NOT EXISTS (SELECT 1 FROM invoice_provider_v2 provider WHERE provider.invoice_id = invoices.id)",
         )
         .bind(observed_at)
         .execute(&mut *tx)
@@ -1439,7 +1441,8 @@ impl InvoiceStore {
              WHERE bitcoin_address_lookup_hash = $2
                AND payment_deadline = $1
                AND first_amount_matched_observed_at IS NULL
-               AND payment_expired_at IS NULL",
+               AND payment_expired_at IS NULL
+               AND NOT EXISTS (SELECT 1 FROM invoice_provider_v2 provider WHERE provider.invoice_id = invoices.id)",
         )
         .bind(observed_at)
         .bind(address_lookup_hash.as_bytes().as_slice())
