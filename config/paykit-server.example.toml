@@ -78,6 +78,12 @@ lock_fetch_timeout = "10s"
 signed_requests_per_second = 100
 signed_burst = 200
 setup_per_ip_per_minute = 10
+# Public `GET /setup/creator-held?creator=pubky...` reads have this separate,
+# per-client-IP budget. Default 600/minute allows aggregate traffic from one App
+# server (held cached 2m, absent cached 15s, concurrent same-creator reads
+# coalesced) without consuming setup/reconnect starts. Behind proxies, every
+# creator resolved to the same client IP shares this budget.
+creator_held_per_ip_per_minute = 600
 max_pending_setup_flows = 100
 max_completion_polls_per_flow = 2
 max_completion_polls = 200

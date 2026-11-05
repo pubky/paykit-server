@@ -553,6 +553,7 @@ fn parses_accepted_durations_and_uses_ledger_defaults() {
     assert_eq!(config.rate_limits.signed_requests_per_second, 100);
     assert_eq!(config.rate_limits.signed_burst, 200);
     assert_eq!(config.rate_limits.setup_per_ip_per_minute, 10);
+    assert_eq!(config.rate_limits.creator_held_per_ip_per_minute, 600);
     assert_eq!(config.rate_limits.max_pending_setup_flows(), 100);
     assert_eq!(config.rate_limits.max_completion_polls_per_flow, 2);
     assert_eq!(config.rate_limits.max_completion_polls, 200);
@@ -564,6 +565,25 @@ fn parses_accepted_durations_and_uses_ledger_defaults() {
     );
     let configured = Config::from_toml_and_environment(&input, environment()).unwrap();
     assert_eq!(configured.electrum.poll_interval, Duration::from_secs(30));
+}
+
+#[test]
+fn creator_held_read_budget_is_configurable_and_must_be_positive() {
+    let configured = format!(
+        "{}\n[rate_limits]\ncreator_held_per_ip_per_minute = 42\n",
+        valid_toml()
+    );
+    let config = Config::from_toml_and_environment(&configured, environment()).unwrap();
+    assert_eq!(config.rate_limits.creator_held_per_ip_per_minute, 42);
+
+    let zero = configured.replace(
+        "creator_held_per_ip_per_minute = 42",
+        "creator_held_per_ip_per_minute = 0",
+    );
+    assert_eq!(
+        Config::from_toml_and_environment(&zero, environment()).unwrap_err(),
+        ConfigError::ZeroValue("rate_limits.creator_held_per_ip_per_minute")
+    );
 }
 
 #[test]

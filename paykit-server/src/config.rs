@@ -182,6 +182,10 @@ impl Config {
                 self.rate_limits.setup_per_ip_per_minute,
             ),
             (
+                "rate_limits.creator_held_per_ip_per_minute",
+                self.rate_limits.creator_held_per_ip_per_minute,
+            ),
+            (
                 "rate_limits.max_pending_setup_flows",
                 self.rate_limits.max_pending_setup_flows,
             ),
@@ -511,6 +515,7 @@ pub struct RateLimitsConfig {
     pub signed_requests_per_second: u64,
     pub signed_burst: u64,
     pub setup_per_ip_per_minute: u64,
+    pub creator_held_per_ip_per_minute: u64,
     max_pending_setup_flows: u64,
     pub max_completion_polls_per_flow: u64,
     pub max_completion_polls: u64,
@@ -895,6 +900,8 @@ struct RawRateLimitsConfig {
     signed_burst: u64,
     #[serde(default = "default_setup_per_ip_per_minute")]
     setup_per_ip_per_minute: u64,
+    #[serde(default = "default_creator_held_per_ip_per_minute")]
+    creator_held_per_ip_per_minute: u64,
     #[serde(default = "default_max_pending_setup_flows")]
     max_pending_setup_flows: u64,
     #[serde(default = "default_max_completion_polls_per_flow")]
@@ -926,6 +933,7 @@ impl Default for RawRateLimitsConfig {
             signed_requests_per_second: default_signed_requests_per_second(),
             signed_burst: default_signed_burst(),
             setup_per_ip_per_minute: default_setup_per_ip_per_minute(),
+            creator_held_per_ip_per_minute: default_creator_held_per_ip_per_minute(),
             max_pending_setup_flows: default_max_pending_setup_flows(),
             max_completion_polls_per_flow: default_max_completion_polls_per_flow(),
             max_completion_polls: default_max_completion_polls(),
@@ -973,6 +981,7 @@ impl From<RawRateLimitsConfig> for RateLimitsConfig {
             signed_requests_per_second: value.signed_requests_per_second,
             signed_burst: value.signed_burst,
             setup_per_ip_per_minute: value.setup_per_ip_per_minute,
+            creator_held_per_ip_per_minute: value.creator_held_per_ip_per_minute,
             max_pending_setup_flows: value.max_pending_setup_flows,
             max_completion_polls_per_flow: value.max_completion_polls_per_flow,
             max_completion_polls: value.max_completion_polls,
@@ -1024,6 +1033,9 @@ const fn default_signed_burst() -> u64 {
 }
 const fn default_setup_per_ip_per_minute() -> u64 {
     10
+}
+const fn default_creator_held_per_ip_per_minute() -> u64 {
+    600
 }
 const fn default_max_pending_setup_flows() -> u64 {
     100

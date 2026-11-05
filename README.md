@@ -57,6 +57,7 @@ Business routes:
 
 - `GET /setup`
 - `GET /setup/reconnect`
+- `GET /setup/creator-held`
 - `POST /setup/{flow_id}/complete`
 - signed `POST /invoices`
 - signed `POST /v2/invoices`
@@ -226,6 +227,22 @@ non-retryable `500 internal_error`, not `503 dependency_unavailable`.
 `POST /setup/status` is the readiness check for an authenticated Creator. Its closed body is `{"creator":"pubky..."}` with optional `asset: "BTC"`, `"USD"`, or `"USDT"` to check whether approved receiving details can accept that denomination, and optional `accepted_asset: "BTC"` or `"USDT"` to check whether the Creator has approved receiving details for that payment asset (see [Direct USDT0 invoices](#direct-usdt0-invoices)). Every signed route verifies Ed25519 over `b"paykit-http-signature-v1\0" + uppercase_method + b"\0" + exact_query_free_path + b"\0" + exact_raw_body`; there is no body-only fallback. It returns exactly one coarse state: `ready` when the persisted session, delegated key, App Registry entry, and hosted state are usable; `setup_required` when authority is absent or confirmed invalid; and `unavailable` for validation timeouts and storage, rate-limit, server, DNS, or transport failures. Reading the hosted state takes the Creator's shared-state write lock, which Bitkit, the outbox workers and concurrent status checks also hold, including during uncertain-write reconciliation; when that lock is busy and this process read the Creator's hosted state within the last 10 minutes, that read stands and the other checks decide the answer, so a busy lock alone never turns a ready Creator `unavailable`. Untyped Pubky 401 responses are also `unavailable`: they cannot distinguish revoked grants from recoverable PoP failures. A revoked grant reported this way requires explicit reconnect. Callers must not convert `unavailable` into a new authorization flow.
 
 ### Setup iframe
+
+`GET /setup/creator-held?creator=pubky...` is a public, server-to-server,
+read-only presence lookup. It accepts exactly one canonical `creator` query
+parameter and returns only `200 {"held":true}` or `200 {"held":false}`. It needs
+no cookie, CORS permission, `return_to`, state, signed service request, Pubky
+session validation, or browser flow. Malformed input returns `400`; exhausted
+read budget returns `429`; storage failure returns `503`. Neither failure is
+reported as `held:false`.
+
+`held` means only that persisted Creator credentials exist. It does not mean
+payment readiness or reconnect eligibility. Call signed `POST /setup/status` for
+readiness. The endpoint intentionally exposes presence publicly: the previous
+public reconnect route already revealed the same fact through its 200/400 result,
+while adding credentials would create a new cross-service deployment secret.
+Pubky App caches a held answer for 2 minutes, an absent answer for 15 seconds,
+coalesces concurrent checks for the same Creator, and does not cache failures.
 
 `GET /setup` is the production Bitkit setup surface. On desktop it renders the
 normal secret-bearing Pubky Auth request as a QR code; on touch devices it
@@ -448,6 +465,15 @@ client-supplied and are never used. A value larger than the real proxy count
 selects a client-supplied entry, so any client can choose its own bucket and bypass
 the limit; only set it when the listener is reachable exclusively through those
 proxies. A smaller value keys clients by a proxy address. Values above 8 are rejected.
+
+`rate_limits.creator_held_per_ip_per_minute` is a separate fixed-window budget
+for `GET /setup/creator-held`; reads consume neither setup/reconnect starts nor
+`max_pending_setup_flows`. Its default is 600/minute (10/second aggregate), sized
+for many distinct Creators behind one App-server IP after the caching and
+coalescing above. It uses the same trusted-proxy client-IP calculation, so all
+requests resolved to one proxy or App-server IP share this read budget. Operators
+must size it for aggregate traffic, not per Creator. A refusal returns `429` with
+`Retry-After: 60`.
 
 The parser rejects the retired `[inbox]` section. The executable exposes no payer
 inbox API or worker, and the baseline schema contains no payer inbox tables.
