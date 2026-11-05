@@ -380,6 +380,16 @@ async fn production_constructor_mounts_all_routes() {
             StatusCode::UNAUTHORIZED,
         ),
         (
+            Request::post("/v2/invoices").body(Body::empty()).unwrap(),
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            Request::post("/v2/invoices/status")
+                .body(Body::empty())
+                .unwrap(),
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
             Request::post("/marketplace/payment-requests/prepare")
                 .body(Body::empty())
                 .unwrap(),

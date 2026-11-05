@@ -647,6 +647,30 @@ impl OutboxStore {
             .map_err(|_| PersistenceError::Unavailable)
     }
 
+    /// Revalidates a claimed provider-v2 invoice against authoritative database time.
+    /// V1 and non-invoice claims are unaffected.
+    pub async fn provider_v2_deadline_expired(
+        &self,
+        claim: &ClaimedOutbox,
+    ) -> Result<bool, PersistenceError> {
+        sqlx::query_scalar(
+            "SELECT EXISTS (
+                 SELECT 1
+                 FROM outbox
+                 JOIN invoices ON invoices.id = outbox.invoice_id
+                 JOIN invoice_provider_v2 provider ON provider.invoice_id = invoices.id
+                 WHERE outbox.id = $1
+                   AND outbox.claim_token = $2
+                   AND invoices.payment_deadline <= clock_timestamp()
+             )",
+        )
+        .bind(claim.id())
+        .bind(claim.claim_token())
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)
+    }
+
     /// Records the exact SDK enqueue result while the enqueue fence is live.
     pub async fn mark_handed_off(
         &self,

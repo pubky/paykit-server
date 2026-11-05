@@ -5,7 +5,7 @@ use paykit_server_e2e::postgres::TestDatabase;
 use sqlx::{Connection, PgConnection, PgPool, Row, postgres::PgConnectOptions};
 use uuid::Uuid;
 
-const REQUIRED_TABLES: [&str; 11] = [
+const REQUIRED_TABLES: [&str; 14] = [
     "deployment_metadata",
     "creators",
     "reader_assignments",
@@ -17,6 +17,9 @@ const REQUIRED_TABLES: [&str; 11] = [
     "marketplace_payment_preparations",
     "marketplace_settlements",
     "bitcoin_address_owners",
+    "invoice_provider_v2",
+    "invoice_provider_v2_current_sample",
+    "invoice_provider_v2_first_threshold_evidence",
 ];
 
 const PRE_SETTLEMENT_MIGRATIONS: [&str; 13] = [
@@ -52,6 +55,8 @@ const CREATOR_ROTATION_MIGRATION: &str =
     include_str!("../../paykit-server/migrations/0021_creator_bitcoin_account_rotation.sql");
 const DRAIN_CANCELLATION_OWNERSHIP_MIGRATION: &str =
     include_str!("../../paykit-server/migrations/0022_payment_drain_cancellation_ownership.sql");
+const PROVIDER_V2_MIGRATION: &str =
+    include_str!("../../paykit-server/migrations/0024_provider_v2_contract.sql");
 
 /// PostgreSQL advisory locks are server-wide, not database-scoped. These
 /// migration tests deliberately use the production migration lock key, so
@@ -60,6 +65,82 @@ const DRAIN_CANCELLATION_OWNERSHIP_MIGRATION: &str =
 fn migration_test_lock() -> &'static tokio::sync::Mutex<()> {
     static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+#[tokio::test]
+async fn provider_v2_migration_preserves_v1_rows_and_closes_binding_constraints() {
+    let _migration_test_guard = migration_test_lock().lock().await;
+    let database = TestDatabase::create().await;
+    let pool = database.pool();
+    apply_migrations_through_creator_rotation(pool).await;
+    sqlx::raw_sql(DRAIN_CANCELLATION_OWNERSHIP_MIGRATION)
+        .execute(pool)
+        .await
+        .unwrap();
+    let creator_id = insert_creator(pool).await;
+    insert_invoice(pool, creator_id, b"legacy-bundle-a", b"legacy-request-a").await;
+    insert_invoice(pool, creator_id, b"legacy-bundle-b", b"legacy-request-b").await;
+
+    sqlx::raw_sql(PROVIDER_V2_MIGRATION)
+        .execute(pool)
+        .await
+        .unwrap();
+    let legacy_bindings: i64 = sqlx::query_scalar("SELECT count(*) FROM invoice_provider_v2")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(legacy_bindings, 0);
+    let rows: Vec<(Uuid, time::OffsetDateTime, time::OffsetDateTime)> = sqlx::query_as(
+        "SELECT id, payment_deadline, proposal_expires_at FROM invoices ORDER BY payment_request_lookup_hash",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 2);
+
+    for invalid_threshold in [-1_i16, 7_i16] {
+        assert_check_violation(
+            sqlx::query(
+                "INSERT INTO invoice_provider_v2
+                 (invoice_id, request_hash, deadline, minimum_confirmations, proposal_expires_at)
+                 VALUES ($1,$2,$3,$4,$5)",
+            )
+            .bind(rows[0].0)
+            .bind([invalid_threshold as u8; 32].as_slice())
+            .bind(rows[0].1)
+            .bind(invalid_threshold)
+            .bind(rows[0].2)
+            .execute(pool)
+            .await,
+        );
+    }
+    let request_hash = [101_u8; 32];
+    sqlx::query(
+        "INSERT INTO invoice_provider_v2
+         (invoice_id, request_hash, deadline, minimum_confirmations, proposal_expires_at)
+         VALUES ($1,$2,$3,1,$4)",
+    )
+    .bind(rows[0].0)
+    .bind(request_hash.as_slice())
+    .bind(rows[0].1)
+    .bind(rows[0].2)
+    .execute(pool)
+    .await
+    .unwrap();
+    assert_unique_violation(
+        sqlx::query(
+            "INSERT INTO invoice_provider_v2
+             (invoice_id, request_hash, deadline, minimum_confirmations, proposal_expires_at)
+             VALUES ($1,$2,$3,1,$4)",
+        )
+        .bind(rows[1].0)
+        .bind(request_hash.as_slice())
+        .bind(rows[1].1)
+        .bind(rows[1].2)
+        .execute(pool)
+        .await,
+    );
+    database.cleanup().await;
 }
 
 #[tokio::test]
@@ -93,7 +174,9 @@ async fn migrations_create_the_required_schema_and_are_restart_safe() {
             .fetch_all(pool)
             .await
             .unwrap();
-    assert_eq!(applied_versions, (1..=22).collect::<Vec<_>>());
+    let mut expected_versions = (1..=22).collect::<Vec<_>>();
+    expected_versions.push(24);
+    assert_eq!(applied_versions, expected_versions);
 
     let rotation_columns: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM information_schema.columns

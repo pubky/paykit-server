@@ -59,6 +59,8 @@ Business routes:
 - `GET /setup/reconnect`
 - `POST /setup/{flow_id}/complete`
 - signed `POST /invoices`
+- signed `POST /v2/invoices`
+- signed `POST /v2/invoices/status`
 - signed `POST /marketplace/payment-requests/prepare`
 - signed `POST /marketplace/payment-requests/activate`
 - signed `POST /marketplace/payment-requests/void`
@@ -90,6 +92,23 @@ not payment or verification completion.
 Shared-state lock contention returns `503 dependency_unavailable`; callers can
 retry the read. Other storage or state-validation failures remain errors, not
 connection-state responses.
+
+The additive provider-v2 API is BTC-only and leaves every v1 route unchanged.
+`POST /v2/invoices` accepts one normalized payment object (`recipient_pubky`, a
+positive decimal-sats `amount`, exact `asset: "BTC"`, and
+`minimum_confirmations` from 0 through 6) plus an exact canonical UTC `deadline`.
+The Creator is derived from `lock_resource`, and `recipient_pubky` must match it.
+Exact replay is local and returns the persisted `invoice_created_at`, separate
+`proposal_expires_at`, and exact accepted `deadline`; a changed binding, a v1/v2
+handle collision, or a new request at or after its deadline returns `409`.
+
+`POST /v2/invoices/status` is a pure persisted read keyed by `creator` and
+`bundle_id`. It returns BTC request/payment state, the bounded latest factual
+sample, and immutable first threshold-satisfying evidence. Threshold zero still
+requires a detected amount-matched output. Evidence observed exactly at the
+deadline is timely; later replacement, disappearance, reorg, or confirmation
+decrease may change `current_sample` but never rewrites first evidence. The
+status route performs no Pubky, Paykit SDK, registry, pricing, or Electrum call.
 
 Overlapping polls in one Server process for the same Creator and persisted Reader
 share an in-flight SDK read. Each

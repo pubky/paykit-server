@@ -181,6 +181,11 @@ impl PaymentDrainStore {
                            AND NOT (
                                invoice.first_amount_matched_observed_at IS NOT NULL
                                AND invoice.first_amount_matched_observed_at <= invoice.payment_deadline
+                               OR EXISTS (
+                                   SELECT 1
+                                   FROM invoice_provider_v2_first_threshold_evidence evidence
+                                   WHERE evidence.invoice_id = invoice.id
+                               )
                            )
                      ) AS accepted_count,
                      COUNT(*) FILTER (
@@ -192,6 +197,11 @@ impl PaymentDrainStore {
                                     OR (
                                         invoice.first_amount_matched_observed_at IS NOT NULL
                                         AND invoice.first_amount_matched_observed_at <= invoice.payment_deadline
+                                    )
+                                    OR EXISTS (
+                                        SELECT 1
+                                        FROM invoice_provider_v2_first_threshold_evidence evidence
+                                        WHERE evidence.invoice_id = invoice.id
                                     )
                                 )
                             )
@@ -361,6 +371,11 @@ impl PaymentDrainStore {
                        AND NOT (
                            invoice.first_amount_matched_observed_at IS NOT NULL
                            AND invoice.first_amount_matched_observed_at <= invoice.payment_deadline
+                           OR EXISTS (
+                               SELECT 1
+                               FROM invoice_provider_v2_first_threshold_evidence evidence
+                               WHERE evidence.invoice_id = invoice.id
+                           )
                        )
                  ),
                  COUNT(*) FILTER (
@@ -369,6 +384,11 @@ impl PaymentDrainStore {
                             invoice.payment_expired_at IS NOT NULL
                             OR (invoice.first_amount_matched_observed_at IS NOT NULL
                                 AND invoice.first_amount_matched_observed_at <= invoice.payment_deadline)
+                            OR EXISTS (
+                                SELECT 1
+                                FROM invoice_provider_v2_first_threshold_evidence evidence
+                                WHERE evidence.invoice_id = invoice.id
+                            )
                         ))
                  ),
                  COUNT(*),
