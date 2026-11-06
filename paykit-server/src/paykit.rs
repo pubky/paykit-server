@@ -1223,6 +1223,10 @@ pub(crate) const fn sdk_error_label(error: &PaykitSdkError) -> &'static str {
         PaykitSdkError::Policy { .. } => "policy",
         PaykitSdkError::PaymentAdapter { .. } => "payment_adapter",
         PaykitSdkError::RecoveryRequired { .. } => "recovery_required",
+        // The server receives by polling. Another runtime that runs Paykit's
+        // SSE-assisted intake over the same identity state owns its peers,
+        // and polling them fails until that runtime drains and stops.
+        PaykitSdkError::PrivateIntakeModeConflict { .. } => "private_intake_mode_conflict",
         _ => "other",
     }
 }
@@ -1899,6 +1903,54 @@ mod tests {
             Err(HandoffError::Retryable(
                 RetryableHandoffCause::RecoveryRequired
             ))
+        );
+    }
+
+    fn private_intake_mode_conflict() -> PaykitSdkError {
+        PaykitSdkError::PrivateIntakeModeConflict {
+            counterparty: PubkyPublicKey::from_raw_or_app_key(CREATOR).unwrap(),
+        }
+    }
+
+    #[test]
+    fn a_peer_owned_by_sse_intake_is_a_named_receive_failure() {
+        let error = private_intake_mode_conflict();
+        assert_eq!(sdk_error_label(&error), "private_intake_mode_conflict");
+        assert_eq!(
+            sdk_error_label(&PaykitSdkError::Transport {
+                context: "read failed".into(),
+                source: None,
+            }),
+            "transport"
+        );
+    }
+
+    #[test]
+    fn a_peer_owned_by_sse_intake_is_neither_contention_nor_an_empty_inbox() {
+        // Contention defers to the next pass; an intake mode conflict does not
+        // clear on its own, so it fails the pass.
+        assert!(matches!(
+            check_transport_results(&[Err(PaykitSdkError::SharedStateBusy {
+                context: "busy".into(),
+                source: None,
+            })]),
+            Err(PaykitSdkError::ConcurrentUpdate { .. })
+        ));
+        assert!(matches!(
+            check_transport_results(&[Ok(()), Err(private_intake_mode_conflict())]),
+            Err(PaykitSdkError::Transport { .. })
+        ));
+
+        // A refused receive never proves the reader sent nothing.
+        let target = receive_target(CREATOR);
+        let refused = PrivateStreamCounterpartyIntakeReport {
+            counterparty: target.counterparty.clone(),
+            error: Some(private_intake_mode_conflict().to_string()),
+            report: None,
+        };
+        assert_eq!(
+            receive_health_for_required_targets(&[refused], &[target]),
+            ReceiveHealth::Unavailable
         );
     }
 

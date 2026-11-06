@@ -373,7 +373,7 @@ Different Creators may use the same numeric child index because their xpubs and 
 
 ## Persistence, startup, and upgrades
 
-PostgreSQL stores server credentials, address allocation, invoices, and delivery intents. The Paykit SDK stores encrypted identity-wide state on the Creator's homeserver under WebDAV locks; it is not cached as an authoritative PostgreSQL SDK blob. Other authorized apps can advance the same links and delivery queue. A background worker receives private messages and processes outbound work without executing wallet payments.
+PostgreSQL stores server credentials, address allocation, invoices, and delivery intents. The Paykit SDK stores encrypted identity-wide state on the Creator's homeserver under WebDAV locks; it is not cached as an authoritative PostgreSQL SDK blob. Other authorized apps can advance the same links and delivery queue. A background worker receives private messages by polling each linked peer and processes outbound work without executing wallet payments. The [architecture contract](docs/architecture.md#state-ownership) explains why the server does not use Paykit's SSE-assisted private intake.
 
 Paykit `v0.1.1-rc6` stores that identity-wide state as SDK state blob version 4. The
 server reads state written by earlier Paykit releases, and its first write to a
