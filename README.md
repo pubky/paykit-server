@@ -23,6 +23,20 @@ TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres \
   cargo test --locked -p paykit-server-e2e -- --test-threads=1
 ```
 
+Provider-v2 drain fencing also has a deterministic protocol-real Compose gate:
+
+```bash
+docker compose -p paykit-provider-v2-drain \
+  -f docker-compose.provider-v2-drain-e2e.yml \
+  up --abort-on-container-exit --exit-code-from provider-v2-drain-e2e
+```
+
+The gate starts PostgreSQL plus a Pubky testnet, then launches two distinct
+`paykit-server` OS processes. Signed HTTP requests exercise delayed create versus
+drain ordering, drain-first rejection, exact replay, and server-process restart
+against one durable database. It then runs the complete invoice, drain, and
+migration integration targets.
+
 The two live-adapter tests remain ignored by default because they require either a local Pubky static testnet or a recorded public Electrum fixture. See [`docs/live-adapter-smoke.md`](docs/live-adapter-smoke.md) before running them explicitly.
 
 For a complete local SDK payment without a frontend or Bitkit, run

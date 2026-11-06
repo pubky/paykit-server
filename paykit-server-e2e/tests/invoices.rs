@@ -939,6 +939,119 @@ async fn aborted_provider_v2_create_rolls_back_before_drain_snapshot_acknowledge
 }
 
 #[tokio::test]
+async fn aborted_drain_commit_rolls_back_fence_and_snapshot_before_restart_retry() {
+    let database = TestDatabase::create().await;
+    let store = invoice_store(&database).await;
+    let crypto = crypto();
+    let creator = creator();
+    let reader = reader();
+    let lock_resource = parse_addressed_lock_resource(LOCK_RESOURCE).unwrap();
+    let created = store
+        .create_provider_v2_atomic(ProviderV2AtomicInvoiceInput {
+            creator: &creator,
+            reader: &reader,
+            bundle_binding: b"provider-v2-before-aborted-drain",
+            lock_resource_binding: LOCK_RESOURCE.as_bytes(),
+            request_hash: [52; 32],
+            deadline: OffsetDateTime::now_utc().replace_nanosecond(0).unwrap()
+                + time::Duration::hours(1),
+            minimum_confirmations: 1,
+            invoice_payloads: &TEST_PAYLOADS,
+            proposal_acceptance_seconds: 60,
+        })
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO payment_request_lifecycles (
+             invoice_id, sdk_payment_request_id, request_state, state_event_id,
+             last_stream_item_id, last_outbound_message_id, last_event_at
+         ) VALUES ($1, '00000000-0000-4000-8000-000000000052', 'accepted',
+                   'provider-v2-aborted-drain-accepted', 1, 1, clock_timestamp())",
+    )
+    .bind(created.invoice_id())
+    .execute(database.pool())
+    .await
+    .unwrap();
+    sqlx::raw_sql(
+        r#"
+        CREATE FUNCTION abort_drain_after_snapshot_item()
+        RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+            RAISE EXCEPTION 'deterministic drain pre-commit crash';
+        END
+        $$;
+        CREATE TRIGGER abort_drain_after_snapshot_item
+        AFTER INSERT ON payment_drain_items
+        FOR EACH ROW EXECUTE FUNCTION abort_drain_after_snapshot_item();
+        "#,
+    )
+    .execute(database.pool())
+    .await
+    .unwrap();
+
+    assert_eq!(
+        PaymentDrainStore::new(database.pool(), crypto.clone())
+            .create(&lock_resource)
+            .await,
+        Err(PersistenceError::Unavailable)
+    );
+    let rollback_state: (i64, i64, bool, Option<uuid::Uuid>) = sqlx::query_as(
+        "SELECT
+             (SELECT COUNT(*) FROM payment_drains),
+             (SELECT COUNT(*) FROM payment_drain_items),
+             generation.provider_v2_drain_fenced,
+             generation.active_drain_id
+         FROM lock_payment_generations generation",
+    )
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(rollback_state, (0, 0, false, None));
+
+    sqlx::raw_sql(
+        "DROP TRIGGER abort_drain_after_snapshot_item ON payment_drain_items;
+         DROP FUNCTION abort_drain_after_snapshot_item();",
+    )
+    .execute(database.pool())
+    .await
+    .unwrap();
+    let restarted_pool = sqlx::PgPool::connect(database.database_url())
+        .await
+        .unwrap();
+    let restarted_drains = PaymentDrainStore::new(&restarted_pool, crypto.clone());
+    let frozen = restarted_drains.create(&lock_resource).await.unwrap();
+    assert_eq!(frozen.accepted_count(), 1);
+    let frozen_invoice: uuid::Uuid =
+        sqlx::query_scalar("SELECT invoice_id FROM payment_drain_items WHERE drain_id = $1")
+            .bind(frozen.drain_id())
+            .fetch_one(&restarted_pool)
+            .await
+            .unwrap();
+    assert_eq!(frozen_invoice, created.invoice_id());
+    let replay = restarted_drains.create(&lock_resource).await.unwrap();
+    assert!(replay.replayed());
+    assert_eq!(replay.drain_id(), frozen.drain_id());
+
+    let rejected = InvoiceStore::new(&restarted_pool, crypto)
+        .create_provider_v2_atomic(ProviderV2AtomicInvoiceInput {
+            creator: &creator,
+            reader: &reader,
+            bundle_binding: b"provider-v2-after-retried-drain",
+            lock_resource_binding: LOCK_RESOURCE.as_bytes(),
+            request_hash: [53; 32],
+            deadline: OffsetDateTime::now_utc().replace_nanosecond(0).unwrap()
+                + time::Duration::hours(1),
+            minimum_confirmations: 1,
+            invoice_payloads: &TEST_PAYLOADS,
+            proposal_acceptance_seconds: 60,
+        })
+        .await;
+    assert_eq!(rejected, Err(PersistenceError::Conflict));
+    restarted_pool.close().await;
+    database.cleanup().await;
+}
+
+#[tokio::test]
 async fn drain_first_blocks_new_provider_v2_create_across_store_instances() {
     let database = TestDatabase::create().await;
     let store = invoice_store(&database).await;

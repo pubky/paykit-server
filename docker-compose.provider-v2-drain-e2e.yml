@@ -21,7 +21,9 @@ services:
       TEST_DATABASE_URL: postgres://postgres:postgres@postgres:5432/postgres
       CARGO_HOME: /cargo
       CARGO_TARGET_DIR: /target
+      TMPDIR: /tmp
       CARGO_INCREMENTAL: "0"
+      RUSTUP_TOOLCHAIN: 1.91.1-x86_64-unknown-linux-gnu
     volumes:
       - .:/workspace:ro
       - provider-v2-drain-cargo:/cargo
@@ -33,6 +35,9 @@ services:
         apt-get update
         apt-get install -y --no-install-recommends clang lld cmake libssl-dev pkg-config
         rm -rf /var/lib/apt/lists/*
+        mkdir -p "$$TMPDIR"
+        cargo build --locked -p paykit-server --bin paykit-server
+        cargo test --locked -p paykit-server-e2e --test server_workflow protocol_real_provider_v2_drain_fence_survives_process_race_and_restart -- --exact --nocapture
         cargo test --locked -p paykit-server-e2e --test invoices -- --test-threads=1
         cargo test --locked -p paykit-server-e2e --test payment_drains -- --test-threads=1
         cargo test --locked -p paykit-server-e2e --test migrations -- --test-threads=1
