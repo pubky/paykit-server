@@ -34,14 +34,20 @@ Before submitting changes, read [`CONTRIBUTING.md`](CONTRIBUTING.md). Report sec
 
 The [architecture contract](docs/architecture.md) describes shared identity,
 credential ownership, and immutable invoice attribution. Rust dependencies pin
-the published `paykit-lib` and `paykit-sdk` crates to `0.1.0` in `Cargo.toml` and
-`Cargo.lock`. Direct `pubky` and `pubky-testnet` dependencies are pinned to `0.16.2`.
+`paykit-lib` and `paykit-sdk` to the paykit-rs `v0.1.1-rc6` release tag in
+`Cargo.toml`, and `Cargo.lock` records its commit
+`9919198a8a810652945f7366defacae8c3135632`. Paykit release candidates are
+published as Git tags, not on crates.io. Direct `pubky` and `pubky-testnet`
+dependencies are pinned to `0.16.2`.
 
 Shared-state recovery requires Homeserver `0.16.2` or newer with the required GCS
 behavior on every serving instance. Drain older writes and coordinate all
 writers before adopting this release; updating the dependency does not deploy
 Homeservers or establish operational readiness. See the
-[Paykit 0.1.0 integration requirements](https://github.com/pubky/paykit-rs/releases/tag/v0.1.0).
+[Paykit 0.1.0 integration requirements](https://github.com/pubky/paykit-rs/releases/tag/v0.1.0)
+and the [Paykit v0.1.1-rc6 release](https://github.com/pubky/paykit-rs/releases/tag/v0.1.1-rc6).
+Before deploying this release, read [Persistence, startup, and upgrades](#persistence-startup-and-upgrades):
+Paykit `v0.1.1-rc6` stores hosted state in a format earlier Paykit releases cannot read.
 
 ## Executable boundary
 
@@ -368,6 +374,14 @@ Different Creators may use the same numeric child index because their xpubs and 
 ## Persistence, startup, and upgrades
 
 PostgreSQL stores server credentials, address allocation, invoices, and delivery intents. The Paykit SDK stores encrypted identity-wide state on the Creator's homeserver under WebDAV locks; it is not cached as an authoritative PostgreSQL SDK blob. Other authorized apps can advance the same links and delivery queue. A background worker receives private messages and processes outbound work without executing wallet payments.
+
+Paykit `v0.1.1-rc6` stores that identity-wide state as SDK state blob version 4. The
+server reads state written by earlier Paykit releases, and its first write to a
+Creator's hosted state stores it in the new format. Paykit releases before
+`v0.1.1-rc6` cannot read version 4 and fail every operation on that state, and
+there is no way back to the old format. Before deploying, confirm that every other
+app that uses a Creator's hosted state, such as that Creator's Bitkit, runs a Paykit
+build from `v0.1.1-rc6` or later. Updating the server does not update those apps.
 
 Shared hosted-state deployments require Pubky Homeserver **0.16.2 or newer**
 with the required GCS behavior on every serving instance.

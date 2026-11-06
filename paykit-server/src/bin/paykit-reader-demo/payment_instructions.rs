@@ -222,6 +222,7 @@ mod tests {
             )
             .unwrap(),
             proposal_app_id: Some(PaykitAppId::new("paykit-server").unwrap()),
+            proposal_recorded_at: None,
             payer_app_id: None,
             execution_claim_app_id: None,
             conversion_quotes: Vec::new(),
@@ -252,6 +253,7 @@ mod tests {
             }),
             accepted_event_id: None,
             accepted_outbound_status: None,
+            acceptance_recorded_at: None,
             rejected_event_id: None,
             rejected_outbound_status: None,
             canceled_event_id: None,

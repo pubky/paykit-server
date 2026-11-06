@@ -1484,6 +1484,7 @@ mod tests {
         PaymentRequestRecord {
             counterparty: PubkyPublicKey::from_raw_or_app_key(CREATOR).unwrap(),
             proposal_app_id: Some(server_app_id()),
+            proposal_recorded_at: None,
             payer_app_id: None,
             execution_claim_app_id: None,
             conversion_quotes: Vec::new(),
@@ -1514,6 +1515,7 @@ mod tests {
             }),
             accepted_event_id: None,
             accepted_outbound_status: None,
+            acceptance_recorded_at: None,
             rejected_event_id: None,
             rejected_outbound_status: None,
             canceled_event_id: None,
