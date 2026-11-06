@@ -54,6 +54,7 @@ async fn build_pubky_testnet() -> EphemeralTestnet {
     let postgres = pubky_testnet::pubky_homeserver::ConnectionString::new(&postgres).unwrap();
     EphemeralTestnet::builder()
         .postgres(postgres)
+        .with_http_relay()
         .build()
         .await
         .unwrap()
@@ -603,7 +604,17 @@ async fn shared_foreign_app_records_do_not_poison_existing_invoice_refresh_or_ne
     run_migrations(database.pool()).await.unwrap();
     let testnet = build_pubky_testnet().await;
     let pubky = testnet.sdk().unwrap();
-    let bootstrap = PubkySessionBootstrap::with_pubky(pubky.clone(), "app.paykit.server").unwrap();
+    let bootstrap = PubkySessionBootstrap::with_pubky(pubky.clone(), "app.paykit.server")
+        .unwrap()
+        .with_auth_relay(
+            testnet
+                .http_relay()
+                .local_url()
+                .join("inbox")
+                .unwrap()
+                .as_str(),
+        )
+        .unwrap();
     let homeserver = PubkyPublicKey::from_public_key(&testnet.homeserver_app().public_key());
     let crypto = Arc::new(Crypto::from_master_key(&[51; 32]).unwrap());
 
