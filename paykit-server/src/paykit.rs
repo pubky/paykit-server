@@ -1020,14 +1020,19 @@ fn lifecycle_projection(
     let last_event_at = record
         .last_event_at
         .ok_or(LifecycleSyncError::InvalidProjection)?;
-    let seconds = i128::from(last_event_at.timestamp());
-    let nanos = i128::from(last_event_at.timestamp_subsec_nanos());
-    let timestamp_nanos = seconds
-        .checked_mul(1_000_000_000)
-        .and_then(|value| value.checked_add(nanos))
-        .ok_or(LifecycleSyncError::InvalidProjection)?;
-    let last_event_at = time::OffsetDateTime::from_unix_timestamp_nanos(timestamp_nanos)
-        .map_err(|_| LifecycleSyncError::InvalidProjection)?;
+    let last_event_at = record_time(
+        last_event_at.timestamp(),
+        last_event_at.timestamp_subsec_nanos(),
+    )?;
+    let acceptance_recorded_at = record
+        .acceptance_recorded_at
+        .map(|recorded_at| {
+            record_time(
+                recorded_at.timestamp(),
+                recorded_at.timestamp_subsec_nanos(),
+            )
+        })
+        .transpose()?;
     Ok(PaymentRequestLifecycleProjection {
         payment_request_id: record.payment_request_id.clone(),
         proposal: ProposalCorrelation {
@@ -1071,7 +1076,18 @@ fn lifecycle_projection(
         last_stream_item_id: record.last_stream_item_id,
         last_outbound_message_id: record.last_outbound_message_id,
         last_event_at,
+        acceptance_recorded_at,
     })
+}
+
+/// Converts an SDK record time, given as Unix seconds and subsecond nanos.
+fn record_time(seconds: i64, nanos: u32) -> Result<time::OffsetDateTime, LifecycleSyncError> {
+    let timestamp_nanos = i128::from(seconds)
+        .checked_mul(1_000_000_000)
+        .and_then(|value| value.checked_add(i128::from(nanos)))
+        .ok_or(LifecycleSyncError::InvalidProjection)?;
+    time::OffsetDateTime::from_unix_timestamp_nanos(timestamp_nanos)
+        .map_err(|_| LifecycleSyncError::InvalidProjection)
 }
 
 fn lifecycle_projections(
@@ -1431,6 +1447,7 @@ fn require_linked(state: LinkedPeerState) -> Result<(), HandoffError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::payment_request_lifecycle::late_acceptance_rederivation_allowed;
     use paykit_sdk::{
         AmountRecord, OutboundPrivateSendFailure, PaymentRequestTermsRecord,
         RecoveryMarkerPublishFailure, ReservationCleanupFailure,
@@ -1580,6 +1597,61 @@ mod tests {
                 vec![Err(LifecycleSyncError::InvalidProjection)]
             );
         }
+    }
+
+    fn record_time_at(seconds: u64, nanos: u32) -> paykit_sdk::PaymentRequestRecord {
+        let mut record = canonical_record(Some(PaymentRequestLocalRole::Payee));
+        record.state = SdkPaymentRequestLifecycleState::Accepted;
+        record.accepted_event_id = Some(Uuid::new_v4().to_string());
+        record.acceptance_recorded_at = Some(
+            (std::time::SystemTime::UNIX_EPOCH + std::time::Duration::new(seconds, nanos)).into(),
+        );
+        record
+    }
+
+    #[test]
+    fn projection_carries_the_acceptance_record_time() {
+        let accepted = record_time_at(1_800_000_000, 250);
+        let projection = lifecycle_projection(&accepted).unwrap();
+        assert_eq!(
+            projection.acceptance_recorded_at,
+            Some(
+                time::OffsetDateTime::from_unix_timestamp_nanos(1_800_000_000_000_000_250).unwrap()
+            )
+        );
+        assert_eq!(projection.state_event_id, accepted.accepted_event_id);
+
+        let proposed = canonical_record(Some(PaymentRequestLocalRole::Payee));
+        assert_eq!(
+            lifecycle_projection(&proposed)
+                .unwrap()
+                .acceptance_recorded_at,
+            None
+        );
+    }
+
+    #[test]
+    fn only_an_acceptance_fetched_after_expiry_moves_a_stored_invalid_request() {
+        // canonical_record's proposal expires at 2027-01-15T08:00:00Z.
+        let expires_at = 1_800_000_000;
+        assert_eq!(
+            time::OffsetDateTime::from_unix_timestamp(expires_at as i64)
+                .unwrap()
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap(),
+            "2027-01-15T08:00:00Z"
+        );
+        let fetched_late = lifecycle_projection(&record_time_at(expires_at + 60, 0)).unwrap();
+        assert!(late_acceptance_rederivation_allowed(
+            PersistedPaymentRequestLifecycleState::InvalidConflict,
+            &fetched_late,
+        ));
+
+        let fetched_in_time = lifecycle_projection(&record_time_at(expires_at - 60, 0)).unwrap();
+        assert!(!late_acceptance_rederivation_allowed(
+            PersistedPaymentRequestLifecycleState::InvalidConflict,
+            &fetched_in_time,
+        ));
     }
 
     fn receive_target(counterparty: &str) -> ReceiveTarget {
@@ -2072,6 +2144,7 @@ mod tests {
             last_stream_item_id: Some(index),
             last_outbound_message_id: None,
             last_event_at: time::OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap(),
+            acceptance_recorded_at: None,
         }
     }
 

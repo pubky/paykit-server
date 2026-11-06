@@ -651,6 +651,12 @@ payment window. Arbitrum additionally reports `finalized` from the verified
 canonical receipt and the RPC finalized block. Amounts and confirmation counts
 are never combined across rails.
 
+A request that Paykit before `v0.1.1-rc6` recorded as invalid only because the
+server fetched an in-time Acceptance after the proposal expiry is no longer
+invalid. Paykit now derives `accepted` for it, or `proof_submitted` once a Payment
+Proof arrived, and the server stores that state. A status read that answered with
+a `409` conflict for such a request reports that lifecycle after the upgrade.
+
 `payment_state: confirmed` means a payment is included in a block, not that it
 meets Locks' settlement policy. Locks must check the request lifecycle, then
 choose a qualifying observation (`amount_matched` and `paid_on_time`) and apply
