@@ -101,7 +101,12 @@ positive decimal-sats `amount`, exact `asset: "BTC"`, and
 The Creator is derived from `lock_resource`, and `recipient_pubky` must match it.
 Exact replay is local and returns the persisted `invoice_created_at`, separate
 `proposal_expires_at`, and exact accepted `deadline`; a changed binding, a v1/v2
-handle collision, or a new request at or after its deadline returns `409`.
+handle collision, or a new request at or after its deadline returns `409`. A
+successful `POST /payment-request-drains` durably fences this canonical lock
+resource before acknowledging its immutable snapshot. Provider-v2 creates that
+won the database order are included; later new creates return `409`. Exact replay
+of an included provider-v2 invoice remains valid. Operational drain cleanup keeps
+this provider-v2 tombstone while preserving the existing v1 generation boundary.
 
 `POST /v2/invoices/status` is a pure persisted read keyed by `creator` and
 `bundle_id`. It returns BTC request/payment state, the bounded latest factual
