@@ -4,6 +4,7 @@ ARG RUST_IMAGE=rust:1.91.1-slim-bookworm@sha256:8514999d4786ef12efe89239e86b3d0a
 ARG RUNTIME_IMAGE=debian:bookworm-20260112-slim@sha256:56ff6d36d4eb3db13a741b342ec466f121480b5edded42e4b7ee850ce7a418ee
 
 FROM ${RUST_IMAGE} AS builder
+ARG TARGETPLATFORM
 ENV RUSTUP_TOOLCHAIN=1.91.1
 WORKDIR /build/paykit-server
 
@@ -16,9 +17,11 @@ COPY . /build/paykit-server
 # Dependencies resolve from the public sources pinned in Cargo.toml and Cargo.lock.
 # Dockerfile.local uses path dependencies for local worktree builds; published
 # images use the committed dependency pins.
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/build/paykit-server/target \
+# Registry and Git caches are shared across platforms, so serialize writers.
+# Target artifacts are platform-specific; isolate them and same-platform writers.
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=paykit-server-target-${TARGETPLATFORM},target=/build/paykit-server/target,sharing=locked \
     cargo build --locked --release -p paykit-server --bin paykit-server && \
     install -Dm755 target/release/paykit-server /out/paykit-server
 
