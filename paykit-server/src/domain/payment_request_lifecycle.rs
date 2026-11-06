@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use time::OffsetDateTime;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::application::semantic_intent::PaymentTermsV1;
 
@@ -70,6 +70,37 @@ pub(crate) fn cursor_stable_transition_allowed(
             || incoming == PaymentRequestLifecycleState::RecoveryRequired))
 }
 
+/// Whether a row stored as `invalid_conflict` may take the incoming state at
+/// equal source cursors.
+///
+/// Paykit `v0.1.1-rc6` no longer marks a payee's request invalid when it
+/// stores an otherwise-valid Acceptance at or after the proposal expiry, such
+/// as an in-time Acceptance fetched late. It derives those requests from the
+/// same stored events as `accepted`, or `proof_submitted` once a Payment Proof
+/// arrived. That is the only change that leaves `invalid_conflict` without a
+/// new source event, so the projection must carry the Acceptance's local
+/// record time and that time must not be earlier than the proposal expiry.
+pub(crate) fn late_acceptance_rederivation_allowed(
+    existing: PaymentRequestLifecycleState,
+    incoming: &PaymentRequestLifecycleProjection,
+) -> bool {
+    let expires_at = incoming
+        .proposal
+        .terms
+        .proposal_expires_at
+        .as_deref()
+        .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok());
+    existing == PaymentRequestLifecycleState::InvalidConflict
+        && matches!(
+            incoming.request_state,
+            PaymentRequestLifecycleState::Accepted | PaymentRequestLifecycleState::ProofSubmitted
+        )
+        && incoming
+            .acceptance_recorded_at
+            .zip(expires_at)
+            .is_some_and(|(recorded_at, expires_at)| recorded_at >= expires_at)
+}
+
 /// One canonical SDK-derived lifecycle snapshot and its independent source cursors.
 #[derive(Clone, PartialEq)]
 pub struct PaymentRequestLifecycleProjection {
@@ -80,6 +111,10 @@ pub struct PaymentRequestLifecycleProjection {
     pub last_stream_item_id: Option<u64>,
     pub last_outbound_message_id: Option<u64>,
     pub last_event_at: OffsetDateTime,
+    /// Local time the SDK stored the recorded Acceptance, if any. For the
+    /// server this is when it fetched the Acceptance, not when the reader
+    /// accepted.
+    pub acceptance_recorded_at: Option<OffsetDateTime>,
 }
 
 /// Complete persisted-intent fields available in every SDK proposal record.
