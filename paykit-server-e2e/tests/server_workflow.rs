@@ -228,6 +228,16 @@ async fn create_creator(
     store: &CreatorStore,
     spec: CreatorSpec,
 ) -> CreatorFixture {
+    create_creator_with_auth_relay(bootstrap, homeserver, store, spec, None).await
+}
+
+async fn create_creator_with_auth_relay(
+    bootstrap: &PubkySessionBootstrap,
+    homeserver: &PubkyPublicKey,
+    store: &CreatorStore,
+    spec: CreatorSpec,
+    auth_relay: Option<&str>,
+) -> CreatorFixture {
     let CreatorSpec {
         seed,
         account_index,
@@ -281,17 +291,23 @@ async fn create_creator(
         ))
         .await
         .unwrap();
-    let observer = PubkySessionBootstrap::with_pubky(
+    let observer_bootstrap = PubkySessionBootstrap::with_pubky(
         account.access.outbox_client.clone(),
         "app.paykit.test-observer",
     )
-    .unwrap()
-    .sign_in(
-        &PubkyLocalSecretKey::new(keypair.secret_key()),
-        paykit_sdk::PAYKIT_AUTHORIZER_SESSION_CAPABILITIES,
-    )
-    .await
     .unwrap();
+    let observer_bootstrap = if let Some(auth_relay) = auth_relay {
+        observer_bootstrap.with_auth_relay(auth_relay).unwrap()
+    } else {
+        observer_bootstrap
+    };
+    let observer = observer_bootstrap
+        .sign_in(
+            &PubkyLocalSecretKey::new(keypair.secret_key()),
+            paykit_sdk::PAYKIT_AUTHORIZER_SESSION_CAPABILITIES,
+        )
+        .await
+        .unwrap();
     let access = observer.access;
     let sdk = sdk_fixtures::hosted_sdk(access.clone(), "paykit-server", counter_seed).await;
     store.mark_setup_complete(&creator).await.unwrap();
@@ -1048,11 +1064,20 @@ async fn protocol_real_provider_v2_drain_fence_survives_process_race_and_restart
     let homeserver_database = TestDatabase::create().await;
     let testnet = build_static_pubky_testnet(homeserver_database.database_url()).await;
     let pubky = Pubky::testnet().unwrap();
-    let bootstrap = PubkySessionBootstrap::with_pubky(pubky, "app.paykit.server").unwrap();
+    let auth_relay = testnet
+        .http_relay()
+        .local_url()
+        .join("inbox")
+        .unwrap()
+        .to_string();
+    let bootstrap = PubkySessionBootstrap::with_pubky(pubky, "app.paykit.server")
+        .unwrap()
+        .with_auth_relay(&auth_relay)
+        .unwrap();
     let homeserver = PubkyPublicKey::from_public_key(&testnet.homeserver_app().public_key());
     let creators = CreatorStore::new(&pool, Arc::new(Crypto::from_master_key(&[1; 32]).unwrap()));
     let (reader, peer_key, peer_sdk) = create_peer(&bootstrap, &homeserver).await;
-    let creator_before_drain = create_creator(
+    let creator_before_drain = create_creator_with_auth_relay(
         &bootstrap,
         &homeserver,
         &creators,
@@ -1062,9 +1087,10 @@ async fn protocol_real_provider_v2_drain_fence_survives_process_race_and_restart
             amount_sats: 100,
             counter_seed: 7_300,
         },
+        Some(&auth_relay),
     )
     .await;
-    let creator_after_drain = create_creator(
+    let creator_after_drain = create_creator_with_auth_relay(
         &bootstrap,
         &homeserver,
         &creators,
@@ -1074,6 +1100,7 @@ async fn protocol_real_provider_v2_drain_fence_survives_process_race_and_restart
             amount_sats: 200,
             counter_seed: 7_400,
         },
+        Some(&auth_relay),
     )
     .await;
     link(
