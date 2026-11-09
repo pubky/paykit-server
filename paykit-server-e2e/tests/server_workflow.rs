@@ -1,6 +1,9 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
+    fs,
     net::SocketAddr,
+    path::PathBuf,
+    process::{Child, Command, Stdio},
     str::FromStr,
     sync::{Arc, Once},
     time::Duration,
@@ -26,6 +29,7 @@ use locks_core::{
         VerifierType,
     },
 };
+use paykit_lib::PaymentRequestId;
 use paykit_sdk::{
     LinkedPeerState, PaykitSdkError, PubkyLocalSecretKey, PubkyPublicKey, PubkySessionAccess,
     PubkySessionBootstrap, SdkBackupState,
@@ -44,7 +48,10 @@ use paykit_server::{
     workers::observer::{ElectrumPort, ObserverError},
 };
 use paykit_server_e2e::postgres::TestDatabase;
-use pubky_testnet::{EphemeralTestnet, pubky::Keypair};
+use pubky_testnet::{
+    EphemeralTestnet, StaticTestnet,
+    pubky::{Keypair, Pubky},
+};
 use sqlx::PgPool;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tower::ServiceExt;
@@ -153,6 +160,25 @@ async fn build_pubky_testnet() -> EphemeralTestnet {
         .unwrap()
 }
 
+async fn build_static_pubky_testnet(database_url: &str) -> StaticTestnet {
+    let config_path = std::env::temp_dir().join(format!(
+        "paykit-provider-v2-static-testnet-{}.toml",
+        Uuid::new_v4()
+    ));
+    fs::write(
+        &config_path,
+        format!("[general]\nsignup_mode = \"open\"\ndatabase_url = {database_url:?}\n"),
+    )
+    .unwrap();
+    let testnet = StaticTestnet::builder()
+        .homeserver_config(config_path.clone())
+        .build()
+        .await
+        .unwrap();
+    fs::remove_file(config_path).unwrap();
+    testnet
+}
+
 fn account_xpub(seed: u8, account_index: u32) -> String {
     let secp = Secp256k1::new();
     let account = Xpriv::new_master(Network::Testnet, &[seed; 32])
@@ -201,6 +227,16 @@ async fn create_creator(
     homeserver: &PubkyPublicKey,
     store: &CreatorStore,
     spec: CreatorSpec,
+) -> CreatorFixture {
+    create_creator_with_auth_relay(bootstrap, homeserver, store, spec, None).await
+}
+
+async fn create_creator_with_auth_relay(
+    bootstrap: &PubkySessionBootstrap,
+    homeserver: &PubkyPublicKey,
+    store: &CreatorStore,
+    spec: CreatorSpec,
+    auth_relay: Option<&str>,
 ) -> CreatorFixture {
     let CreatorSpec {
         seed,
@@ -255,17 +291,23 @@ async fn create_creator(
         ))
         .await
         .unwrap();
-    let observer = PubkySessionBootstrap::with_pubky(
+    let observer_bootstrap = PubkySessionBootstrap::with_pubky(
         account.access.outbox_client.clone(),
         "app.paykit.test-observer",
     )
-    .unwrap()
-    .sign_in(
-        &PubkyLocalSecretKey::new(keypair.secret_key()),
-        paykit_sdk::PAYKIT_AUTHORIZER_SESSION_CAPABILITIES,
-    )
-    .await
     .unwrap();
+    let observer_bootstrap = if let Some(auth_relay) = auth_relay {
+        observer_bootstrap.with_auth_relay(auth_relay).unwrap()
+    } else {
+        observer_bootstrap
+    };
+    let observer = observer_bootstrap
+        .sign_in(
+            &PubkyLocalSecretKey::new(keypair.secret_key()),
+            paykit_sdk::PAYKIT_AUTHORIZER_SESSION_CAPABILITIES,
+        )
+        .await
+        .unwrap();
     let access = observer.access;
     let sdk = sdk_fixtures::hosted_sdk(access.clone(), "paykit-server", counter_seed).await;
     store.mark_setup_complete(&creator).await.unwrap();
@@ -351,16 +393,15 @@ async fn link(
     }
 }
 
-fn config(database_url: &str, signing_key: &SigningKey, poll_interval: &str) -> Config {
+fn config_source(signing_key: &SigningKey, poll_interval: &str, listen_addr: &str) -> String {
     let trusted_key = pubky::PublicKey::from(
         pubky::pkarr::PublicKey::try_from(signing_key.verifying_key().as_bytes()).unwrap(),
     )
     .to_string();
-    Config::from_toml_and_environment(
-        &format!(
-            r#"
+    format!(
+        r#"
 [http]
-listen_addr = "127.0.0.1:0"
+listen_addr = "{listen_addr}"
 [signed_services]
 trusted_public_keys = ["{trusted_key}"]
 [setup]
@@ -385,7 +426,12 @@ retry_max = "2s"
 [shutdown]
 drain_timeout = "2s"
 "#
-        ),
+    )
+}
+
+fn config(database_url: &str, signing_key: &SigningKey, poll_interval: &str) -> Config {
+    Config::from_toml_and_environment(
+        &config_source(signing_key, poll_interval, "127.0.0.1:0"),
         ConfigEnvironment {
             database_url: Some(database_url.to_owned()),
             master_key: Some(MASTER_KEY.to_owned()),
@@ -544,6 +590,207 @@ async fn wait_until_ready(address: SocketAddr) {
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+}
+
+fn reserve_loopback_address() -> SocketAddr {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.local_addr().unwrap()
+}
+
+fn paykit_server_binary() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_paykit-server-e2e-process"))
+}
+
+struct ServerProcess {
+    child: Child,
+    config_path: PathBuf,
+    database_url: String,
+}
+
+impl ServerProcess {
+    fn spawn(database_url: &str, signing_key: &SigningKey, address: SocketAddr) -> Self {
+        let config_path =
+            std::env::temp_dir().join(format!("paykit-provider-v2-drain-{}.toml", Uuid::new_v4()));
+        fs::write(
+            &config_path,
+            config_source(signing_key, "50ms", &address.to_string()),
+        )
+        .unwrap();
+        let child = Command::new(paykit_server_binary())
+            .env("PAYKIT_CONFIG", &config_path)
+            .env("PAYKIT_DATABASE_URL", database_url)
+            .env("PAYKIT_MASTER_KEY", MASTER_KEY)
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
+        Self {
+            child,
+            config_path,
+            database_url: database_url.to_owned(),
+        }
+    }
+
+    fn id(&self) -> u32 {
+        self.child.id()
+    }
+
+    fn restart(&mut self) {
+        self.child.kill().unwrap();
+        self.child.wait().unwrap();
+        self.child = Command::new(paykit_server_binary())
+            .env("PAYKIT_CONFIG", &self.config_path)
+            .env("PAYKIT_DATABASE_URL", &self.database_url)
+            .env("PAYKIT_MASTER_KEY", MASTER_KEY)
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
+    }
+}
+
+impl Drop for ServerProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = fs::remove_file(&self.config_path);
+    }
+}
+
+fn provider_v2_request(
+    signing_key: &SigningKey,
+    fixture: &CreatorFixture,
+    reader: &ReaderPubky,
+    bundle: &str,
+    deadline: &str,
+) -> Request<Body> {
+    signed_request(
+        signing_key,
+        Method::POST,
+        "/v2/invoices",
+        serde_json_canonicalizer::to_string(&serde_json::json!({
+            "bundle_id": bundle,
+            "lock_resource": fixture.lock_resource,
+            "reader": reader.to_string(),
+            "payment": {
+                "recipient_pubky": fixture.creator.to_string(),
+                "amount": fixture.amount_sats.to_string(),
+                "asset": "BTC",
+                "minimum_confirmations": 1
+            },
+            "deadline": deadline
+        }))
+        .unwrap(),
+    )
+}
+
+fn drain_request(signing_key: &SigningKey, fixture: &CreatorFixture) -> Request<Body> {
+    signed_request(
+        signing_key,
+        Method::POST,
+        "/payment-request-drains",
+        serde_json_canonicalizer::to_string(&serde_json::json!({
+            "lock_resource": fixture.lock_resource
+        }))
+        .unwrap(),
+    )
+}
+
+async fn warm_provider_v2_session(
+    address: SocketAddr,
+    signing_key: &SigningKey,
+    fixture: &CreatorFixture,
+    reader: &ReaderPubky,
+    bundle: &str,
+    deadline: &str,
+) {
+    for _ in 0..50 {
+        let response = send_http(
+            address,
+            provider_v2_request(signing_key, fixture, reader, bundle, deadline),
+        )
+        .await;
+        if !response
+            .body
+            .windows(b"creator_session_".len())
+            .any(|window| window == b"creator_session_")
+        {
+            assert_eq!(
+                response.status,
+                StatusCode::CONFLICT,
+                "warmup response: {}",
+                String::from_utf8_lossy(&response.body)
+            );
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("server process did not initialize creator session");
+}
+
+async fn accept_provider_v2_request(peer: &PeerSdk, fixture: &CreatorFixture, bundle: &str) {
+    let creator = PubkyPublicKey::from_raw_or_app_key(fixture.creator.to_string()).unwrap();
+    tokio::time::timeout(Duration::from_secs(180), async {
+        loop {
+            let _ = peer.ensure_link_with_peer(creator.clone(), 8).await;
+            let _ = peer.receive_private_messages(creator.clone()).await;
+            peer.process_outbound_private_messages(creator.clone())
+                .await
+                .unwrap();
+            if let Some(request) = peer
+                .received_payment_requests_from(&creator)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|request| {
+                    request.terms.as_ref().is_some_and(|terms| {
+                        terms.metadata.get("bundle_id") == Some(&serde_json::json!(bundle))
+                    })
+                })
+            {
+                let proposal = request.proposal_stream_item_id.unwrap();
+                let id = PaymentRequestId::new(request.payment_request_id).unwrap();
+                peer.claim_payment_request_for_execution(creator.clone(), &id)
+                    .await
+                    .unwrap();
+                peer.accept_payment_request(creator.clone(), &id, proposal)
+                    .await
+                    .unwrap();
+                peer.process_outbound_private_messages(creator)
+                    .await
+                    .unwrap();
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+async fn wait_for_database_wait(pool: &PgPool, query_fragment: &str) {
+    let pattern = format!("%{query_fragment}%");
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let blocked: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM pg_stat_activity
+                 WHERE datname = current_database()
+                   AND query LIKE $1
+                   AND state = 'active'
+                   AND wait_event_type = 'Lock'",
+            )
+            .bind(&pattern)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            if blocked > 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
 }
 
 async fn creator_backup_state(sdk: &CreatorSdk) -> SdkBackupState {
@@ -800,6 +1047,307 @@ async fn assert_persisted_workflow_inputs(
         8,
         "Creator-bound envelopes must be distinct"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn protocol_real_provider_v2_drain_fence_survives_process_race_and_restart() {
+    let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
+    let database = TestDatabase::create().await;
+    let signing_key = SigningKey::from_bytes(&[73; 32]);
+    let setup_config = config(database.database_url(), &signing_key, "1h");
+    let pool = initialize_database(&setup_config).await.unwrap();
+    let homeserver_database = TestDatabase::create().await;
+    let testnet = build_static_pubky_testnet(homeserver_database.database_url()).await;
+    let pubky = Pubky::testnet().unwrap();
+    let auth_relay = testnet
+        .http_relay()
+        .local_url()
+        .join("inbox")
+        .unwrap()
+        .to_string();
+    let bootstrap = PubkySessionBootstrap::with_pubky(pubky, "app.paykit.server")
+        .unwrap()
+        .with_auth_relay(&auth_relay)
+        .unwrap();
+    let homeserver = PubkyPublicKey::from_public_key(&testnet.homeserver_app().public_key());
+    let creators = CreatorStore::new(&pool, Arc::new(Crypto::from_master_key(&[1; 32]).unwrap()));
+    let (reader, peer_key, peer_sdk) = create_peer(&bootstrap, &homeserver).await;
+    let creator_before_drain = create_creator_with_auth_relay(
+        &bootstrap,
+        &homeserver,
+        &creators,
+        CreatorSpec {
+            seed: 73,
+            account_index: 0,
+            amount_sats: 100,
+            counter_seed: 7_300,
+        },
+        Some(&auth_relay),
+    )
+    .await;
+    let creator_after_drain = create_creator_with_auth_relay(
+        &bootstrap,
+        &homeserver,
+        &creators,
+        CreatorSpec {
+            seed: 74,
+            account_index: 1,
+            amount_sats: 200,
+            counter_seed: 7_400,
+        },
+        Some(&auth_relay),
+    )
+    .await;
+    link(
+        &creator_before_drain.sdk,
+        PubkyPublicKey::from_raw_or_app_key(creator_before_drain.creator.to_string()).unwrap(),
+        &peer_sdk,
+        peer_key.clone(),
+    )
+    .await;
+    link(
+        &creator_after_drain.sdk,
+        PubkyPublicKey::from_raw_or_app_key(creator_after_drain.creator.to_string()).unwrap(),
+        &peer_sdk,
+        peer_key,
+    )
+    .await;
+    let bundle_before_drain = BUNDLE_A.to_owned();
+    let bundle_after_drain = BUNDLE_B.to_owned();
+
+    sqlx::raw_sql(
+        "CREATE FUNCTION delay_provider_v2_binding() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+             PERFORM pg_advisory_xact_lock(8702603);
+             RETURN NEW;
+         END $$;
+         CREATE TRIGGER delay_provider_v2_binding BEFORE INSERT ON invoice_provider_v2
+         FOR EACH ROW EXECUTE FUNCTION delay_provider_v2_binding();
+         CREATE FUNCTION abort_provider_v2_warmup() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN RAISE EXCEPTION 'provider-v2 session warmup'; END $$;
+         CREATE TRIGGER abort_provider_v2_warmup BEFORE INSERT ON invoice_provider_v2
+         FOR EACH ROW EXECUTE FUNCTION abort_provider_v2_warmup();",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let address_a = reserve_loopback_address();
+    let address_b = reserve_loopback_address();
+    let server_a = ServerProcess::spawn(database.database_url(), &signing_key, address_a);
+    wait_until_listening(address_a).await;
+
+    let deadline = (time::OffsetDateTime::now_utc()
+        .replace_nanosecond(0)
+        .unwrap()
+        + time::Duration::hours(1))
+    .format(&time::format_description::well_known::Rfc3339)
+    .unwrap();
+    warm_provider_v2_session(
+        address_a,
+        &signing_key,
+        &creator_before_drain,
+        &reader,
+        &bundle_before_drain,
+        &deadline,
+    )
+    .await;
+    warm_provider_v2_session(
+        address_a,
+        &signing_key,
+        &creator_after_drain,
+        &reader,
+        &bundle_after_drain,
+        &deadline,
+    )
+    .await;
+
+    sqlx::raw_sql(
+        "DROP TRIGGER abort_provider_v2_warmup ON invoice_provider_v2;
+         DROP FUNCTION abort_provider_v2_warmup();",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let mut blocker = pool.acquire().await.unwrap();
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(8_702_603_i64)
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+    let mut create_before = tokio::spawn({
+        let request = provider_v2_request(
+            &signing_key,
+            &creator_before_drain,
+            &reader,
+            &bundle_before_drain,
+            &deadline,
+        );
+        async move { send_http(address_a, request).await }
+    });
+    tokio::select! {
+        () = wait_for_database_wait(&pool, "INSERT INTO invoice_provider_v2") => {}
+        response = &mut create_before => {
+            let response = response.unwrap();
+            panic!(
+                "provider-v2 create returned before serialization point: status={}, body={}",
+                response.status,
+                String::from_utf8_lossy(&response.body)
+            );
+        }
+    }
+    let server_b = ServerProcess::spawn(database.database_url(), &signing_key, address_b);
+    assert_ne!(server_a.id(), server_b.id());
+    wait_until_listening(address_b).await;
+    let mut drain_while_create_uncommitted = tokio::spawn({
+        let request = drain_request(&signing_key, &creator_before_drain);
+        async move { send_http(address_b, request).await }
+    });
+    let early_drain_response = tokio::select! {
+        () = wait_for_database_wait(&pool, "SELECT id, creator_lookup_hash FROM creators") => None,
+        response = &mut drain_while_create_uncommitted => Some(response.unwrap()),
+    };
+    sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(8_702_603_i64)
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+    drop(blocker);
+
+    let create_before = create_before.await.unwrap();
+    let drain_while_create_uncommitted = match early_drain_response {
+        Some(response) => response,
+        None => tokio::time::timeout(Duration::from_secs(20), drain_while_create_uncommitted)
+            .await
+            .expect("drain must fail closed after the competing create resolves")
+            .unwrap(),
+    };
+    assert_eq!(
+        drain_while_create_uncommitted.status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "uncommitted-create drain response: {}",
+        String::from_utf8_lossy(&drain_while_create_uncommitted.body)
+    );
+    drop(server_b);
+
+    assert_eq!(
+        create_before.status,
+        StatusCode::OK,
+        "create response: {}",
+        String::from_utf8_lossy(&create_before.body)
+    );
+    drop(server_a);
+    let mut server_b = ServerProcess::spawn(database.database_url(), &signing_key, address_b);
+    wait_until_listening(address_b).await;
+    accept_provider_v2_request(&peer_sdk, &creator_before_drain, &bundle_before_drain).await;
+    let mut drain_after = send_http(
+        address_b,
+        drain_request(&signing_key, &creator_before_drain),
+    )
+    .await;
+    for _ in 0..50 {
+        if drain_after.status != StatusCode::SERVICE_UNAVAILABLE {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        drain_after = send_http(
+            address_b,
+            drain_request(&signing_key, &creator_before_drain),
+        )
+        .await;
+    }
+    assert_eq!(
+        drain_after.status,
+        StatusCode::OK,
+        "drain response: {}",
+        String::from_utf8_lossy(&drain_after.body)
+    );
+    let drain_body: serde_json::Value = serde_json::from_slice(&drain_after.body).unwrap();
+    assert_eq!(drain_body["accepted_count"], 1);
+    let frozen_provider_v2_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)
+         FROM payment_drain_items item
+         JOIN invoice_provider_v2 provider ON provider.invoice_id = item.invoice_id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(frozen_provider_v2_count, 1);
+
+    server_b.restart();
+    wait_until_listening(address_b).await;
+    let drain_replay = send_http(
+        address_b,
+        drain_request(&signing_key, &creator_before_drain),
+    )
+    .await;
+    assert_eq!(drain_replay.status, StatusCode::OK);
+    assert_eq!(drain_replay.body, drain_after.body);
+    let create_replay = send_http(
+        address_b,
+        provider_v2_request(
+            &signing_key,
+            &creator_before_drain,
+            &reader,
+            &bundle_before_drain,
+            &deadline,
+        ),
+    )
+    .await;
+    assert_eq!(create_replay.status, StatusCode::OK);
+    assert_eq!(create_replay.body, create_before.body);
+    let changed_deadline = (time::OffsetDateTime::now_utc()
+        .replace_nanosecond(0)
+        .unwrap()
+        + time::Duration::hours(2))
+    .format(&time::format_description::well_known::Rfc3339)
+    .unwrap();
+    let new_after_fence = send_http(
+        address_b,
+        provider_v2_request(
+            &signing_key,
+            &creator_before_drain,
+            &reader,
+            &bundle_before_drain,
+            &changed_deadline,
+        ),
+    )
+    .await;
+    assert_eq!(new_after_fence.status, StatusCode::CONFLICT);
+
+    let mut drain_first =
+        send_http(address_b, drain_request(&signing_key, &creator_after_drain)).await;
+    for _ in 0..50 {
+        if drain_first.status != StatusCode::SERVICE_UNAVAILABLE {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        drain_first = send_http(address_b, drain_request(&signing_key, &creator_after_drain)).await;
+    }
+    assert_eq!(
+        drain_first.status,
+        StatusCode::OK,
+        "drain-first response: {}",
+        String::from_utf8_lossy(&drain_first.body)
+    );
+    let create_after = send_http(
+        address_b,
+        provider_v2_request(
+            &signing_key,
+            &creator_after_drain,
+            &reader,
+            &bundle_after_drain,
+            &deadline,
+        ),
+    )
+    .await;
+    assert_eq!(create_after.status, StatusCode::CONFLICT);
+
+    drop(server_b);
+    pool.close().await;
+    drop(testnet);
+    homeserver_database.cleanup().await;
+    database.cleanup().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]

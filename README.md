@@ -23,6 +23,20 @@ TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres \
   cargo test --locked -p paykit-server-e2e -- --test-threads=1
 ```
 
+Provider-v2 drain fencing also has a deterministic protocol-real Compose gate:
+
+```bash
+docker compose -p paykit-provider-v2-drain \
+  -f docker-compose.provider-v2-drain-e2e.yml \
+  up --abort-on-container-exit --exit-code-from provider-v2-drain-e2e
+```
+
+The gate starts PostgreSQL plus a Pubky testnet, then launches two distinct
+`paykit-server` OS processes. Signed HTTP requests exercise delayed create versus
+drain ordering, drain-first rejection, exact replay, and server-process restart
+against one durable database. It then runs the complete invoice, drain, and
+migration integration targets.
+
 The two live-adapter tests remain ignored by default because they require either a local Pubky static testnet or a recorded public Electrum fixture. See [`docs/live-adapter-smoke.md`](docs/live-adapter-smoke.md) before running them explicitly.
 
 For a complete local SDK payment without a frontend or Bitkit, run
@@ -101,7 +115,12 @@ positive decimal-sats `amount`, exact `asset: "BTC"`, and
 The Creator is derived from `lock_resource`, and `recipient_pubky` must match it.
 Exact replay is local and returns the persisted `invoice_created_at`, separate
 `proposal_expires_at`, and exact accepted `deadline`; a changed binding, a v1/v2
-handle collision, or a new request at or after its deadline returns `409`.
+handle collision, or a new request at or after its deadline returns `409`. A
+successful `POST /payment-request-drains` durably fences this canonical lock
+resource before acknowledging its immutable snapshot. Provider-v2 creates that
+won the database order are included; later new creates return `409`. Exact replay
+of an included provider-v2 invoice remains valid. Operational drain cleanup keeps
+this provider-v2 tombstone while preserving the existing v1 generation boundary.
 
 `POST /v2/invoices/status` is a pure persisted read keyed by `creator` and
 `bundle_id`. It returns BTC request/payment state, the bounded latest factual
