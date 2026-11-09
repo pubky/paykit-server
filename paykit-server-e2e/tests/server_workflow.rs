@@ -598,12 +598,7 @@ fn reserve_loopback_address() -> SocketAddr {
 }
 
 fn paykit_server_binary() -> PathBuf {
-    std::env::current_exe()
-        .unwrap()
-        .parent()
-        .and_then(|deps| deps.parent())
-        .unwrap()
-        .join(format!("paykit-server{}", std::env::consts::EXE_SUFFIX))
+    PathBuf::from(env!("CARGO_BIN_EXE_paykit-server-e2e-process"))
 }
 
 struct ServerProcess {
