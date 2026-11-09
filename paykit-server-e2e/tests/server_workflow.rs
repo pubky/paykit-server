@@ -1199,22 +1199,14 @@ async fn protocol_real_provider_v2_drain_fence_survives_process_race_and_restart
     let server_b = ServerProcess::spawn(database.database_url(), &signing_key, address_b);
     assert_ne!(server_a.id(), server_b.id());
     wait_until_listening(address_b).await;
-    let drain_while_create_uncommitted = tokio::time::timeout(Duration::from_secs(20), async {
-        send_http(
-            address_b,
-            drain_request(&signing_key, &creator_before_drain),
-        )
-        .await
-    })
-    .await
-    .expect("drain must fail closed instead of waiting indefinitely");
-    assert_eq!(
-        drain_while_create_uncommitted.status,
-        StatusCode::SERVICE_UNAVAILABLE,
-        "uncommitted-create drain response: {}",
-        String::from_utf8_lossy(&drain_while_create_uncommitted.body)
-    );
-    drop(server_b);
+    let mut drain_while_create_uncommitted = tokio::spawn({
+        let request = drain_request(&signing_key, &creator_before_drain);
+        async move { send_http(address_b, request).await }
+    });
+    let early_drain_response = tokio::select! {
+        () = wait_for_database_wait(&pool, "SELECT id, creator_lookup_hash FROM creators") => None,
+        response = &mut drain_while_create_uncommitted => Some(response.unwrap()),
+    };
     sqlx::query("SELECT pg_advisory_unlock($1)")
         .bind(8_702_603_i64)
         .execute(&mut *blocker)
@@ -1223,6 +1215,21 @@ async fn protocol_real_provider_v2_drain_fence_survives_process_race_and_restart
     drop(blocker);
 
     let create_before = create_before.await.unwrap();
+    let drain_while_create_uncommitted = match early_drain_response {
+        Some(response) => response,
+        None => tokio::time::timeout(Duration::from_secs(20), drain_while_create_uncommitted)
+            .await
+            .expect("drain must fail closed after the competing create resolves")
+            .unwrap(),
+    };
+    assert_eq!(
+        drain_while_create_uncommitted.status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "uncommitted-create drain response: {}",
+        String::from_utf8_lossy(&drain_while_create_uncommitted.body)
+    );
+    drop(server_b);
+
     assert_eq!(
         create_before.status,
         StatusCode::OK,
