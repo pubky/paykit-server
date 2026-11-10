@@ -143,8 +143,9 @@ impl AllowanceIntake {
 
     /// Starts a due read. It counts against the spacing at once, so a failed
     /// read is not retried sooner, and until it is finished it counts as a
-    /// scan that took the whole pass deadline: a read cut off by the deadline
-    /// or a panic is spaced out by ten times that.
+    /// scan that took the whole pass deadline: a read that never finishes, as
+    /// after a panic, is spaced out by ten times that. The deadline itself
+    /// never cuts a running read short; it only stops new reads starting.
     fn begin(
         &self,
         creator_id: Uuid,
