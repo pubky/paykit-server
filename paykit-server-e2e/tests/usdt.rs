@@ -766,12 +766,26 @@ async fn invoices_share_an_address_but_never_share_payment_evidence() {
                     <= 8
             );
         }
-        sqlx::query("DELETE FROM usdt_observations WHERE invoice_id = $1 AND id != $2")
-            .bind(ids[0])
-            .bind(observation_id)
-            .execute(database.pool())
+        // Receipts are never deleted; the fixture clears its extra ones with
+        // triggers off, attestations first.
+        let mut tx = database.pool().begin().await.unwrap();
+        sqlx::query("SET LOCAL session_replication_role = replica")
+            .execute(&mut *tx)
             .await
             .unwrap();
+        for statement in [
+            "DELETE FROM usdt_observation_attempts WHERE observation_id IN
+                 (SELECT id FROM usdt_observations WHERE invoice_id = $1 AND id != $2)",
+            "DELETE FROM usdt_observations WHERE invoice_id = $1 AND id != $2",
+        ] {
+            sqlx::query(statement)
+                .bind(ids[0])
+                .bind(observation_id)
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+        }
+        tx.commit().await.unwrap();
     }
     rpc.chain.lock().unwrap().reorg = false;
     // Overflowing discovery does not suppress independently owned receipt refreshes.
@@ -1191,6 +1205,50 @@ async fn finalized_usdt_evidence_verified_for_b_then_a_pays() {
 }
 
 #[tokio::test]
+async fn attempt_attestations_cannot_be_changed_or_removed() {
+    let (database, store, creator_id, creator, bundle, invoice) = two_attempt_invoice().await;
+    record_proposal_time(
+        &database,
+        0,
+        Some(invoice.invoice_created_at() + time::Duration::hours(1)),
+    )
+    .await;
+    let rpc = Rpc::start().await;
+    rpc.chain.lock().unwrap().timestamp = invoice.invoice_created_at().unix_timestamp() + 60;
+    store
+        .observe_usdt_request(
+            creator_id,
+            &creator,
+            &record(0),
+            &rpc.verifier,
+            Some(&bundle),
+        )
+        .await
+        .unwrap();
+    assert!(status(&store, &bundle).await.0);
+    // The service role can neither rewrite nor remove an attestation, directly
+    // or through its receipt.
+    for statement in [
+        "UPDATE usdt_observation_attempts SET attempt_envelope = attempt_envelope",
+        "DELETE FROM usdt_observation_attempts",
+        "TRUNCATE usdt_observation_attempts",
+        "DELETE FROM usdt_observations",
+    ] {
+        sqlx::query(statement)
+            .execute(database.pool())
+            .await
+            .expect_err(statement);
+    }
+    let attestations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM usdt_observation_attempts")
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+    assert_eq!(attestations, 1);
+    assert!(status(&store, &bundle).await.0);
+    store.scan_payment_record_integrity().await.unwrap();
+}
+
+#[tokio::test]
 async fn a_legacy_receipt_pays_only_when_its_owner_has_one_attempt() {
     let (database, store, creator_id, creator, bundle, invoice) = two_attempt_invoice().await;
     let proposal = invoice.invoice_created_at() + time::Duration::hours(1);
@@ -1215,10 +1273,7 @@ async fn a_legacy_receipt_pays_only_when_its_owner_has_one_attempt() {
     assert!(status(&store, &bundle).await.0);
     // As stored before attempts were recorded: a final receipt, never
     // re-verified, with no attempt. It pays nothing.
-    sqlx::query("DELETE FROM usdt_observation_attempts")
-        .execute(database.pool())
-        .await
-        .unwrap();
+    forget_attestations(database.pool()).await;
     assert!(!status(&store, &bundle).await.0);
     // With two attempts on its invoice it cannot be attributed.
     store.attribute_legacy_usdt_receipts().await.unwrap();
@@ -2136,4 +2191,20 @@ async fn locks_ignores_a_transfer_a_marketplace_request_already_owns() {
             1
         );
     }
+}
+
+/// Removes every attempt attestation, as a receipt stored before attestations
+/// existed has none. Only a fixture can: the table rejects deletes, so this
+/// runs with triggers off in its own transaction.
+async fn forget_attestations(pool: &sqlx::PgPool) {
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM usdt_observation_attempts")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
 }

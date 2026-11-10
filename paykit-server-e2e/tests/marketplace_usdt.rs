@@ -808,10 +808,7 @@ async fn a_receipt_pays_only_once_attributed_to_its_attempt() {
     assert_eq!(paid().await["usdt_arbitrum"]["paid_on_time"], true);
     // As stored before attempts were recorded: a final receipt, never
     // re-verified, with no attempt. It pays nothing.
-    sqlx::query("DELETE FROM usdt_observation_attempts")
-        .execute(rig.database.pool())
-        .await
-        .unwrap();
+    forget_attestations(rig.database.pool()).await;
     assert_eq!(paid().await["usdt_arbitrum"]["paid_on_time"], false);
     InvoiceStore::new(rig.database.pool(), crypto())
         .attribute_legacy_usdt_receipts()
@@ -837,10 +834,7 @@ async fn a_finalized_receipt_is_attested_when_verified_again() {
     submit(&rig, &rpc, 0).await;
     let paid = || rig.status(&request.invoice);
     assert_eq!(paid().await["usdt_arbitrum"]["paid_on_time"], true);
-    sqlx::query("DELETE FROM usdt_observation_attempts")
-        .execute(rig.database.pool())
-        .await
-        .unwrap();
+    forget_attestations(rig.database.pool()).await;
     assert_eq!(paid().await["usdt_arbitrum"]["paid_on_time"], false);
     age_receipts(&rig).await;
     submit(&rig, &rpc, 0).await;
@@ -1486,4 +1480,20 @@ async fn an_active_settlement_cannot_leave_active_during_a_pass() {
     submit(&rig, &rpc, 0).await;
     assert_eq!(rig.status(&request.invoice).await["paid_asset"], "USDT");
     rig.cleanup().await;
+}
+
+/// Removes every attempt attestation, as a receipt stored before attestations
+/// existed has none. Only a fixture can: the table rejects deletes, so this
+/// runs with triggers off in its own transaction.
+async fn forget_attestations(pool: &sqlx::PgPool) {
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM usdt_observation_attempts")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
 }
