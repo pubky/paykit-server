@@ -1,6 +1,6 @@
 use std::{
     any::Any,
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     net::IpAddr,
     sync::{
         Arc,
@@ -20,7 +20,8 @@ use crate::domain::locks::CreatorPubky;
 
 const FLOW_LIFETIME: Duration = Duration::from_secs(5 * 60);
 const DEFAULT_POLL_TIMEOUT: Duration = Duration::from_secs(15);
-const SETUP_RATE_WINDOW: Duration = Duration::from_secs(60);
+const PER_IP_RATE_WINDOW: Duration = Duration::from_secs(60);
+const MAX_CREATOR_HELD_RATE_CLIENTS: usize = 65_536;
 
 /// Opaque, secret-bearing state owned by exactly one setup flow.
 pub trait SetupAttempt: Send + 'static {
@@ -64,6 +65,10 @@ pub trait SetupCompleter: Send + Sync {
         _scope: ReconnectScope,
     ) -> Result<StartedSetup, Completion> {
         Err(Completion::DefinitiveFailure)
+    }
+    /// Reads only whether persisted creator credentials exist.
+    async fn creator_held(&self, _creator: &CreatorPubky) -> Result<bool, Completion> {
+        Err(Completion::TransientUnavailable)
     }
     /// Consumes the exact per-flow attempt after the iframe asks to complete.
     async fn complete(&self, attempt: Box<dyn SetupAttempt>) -> Completion;
@@ -138,7 +143,8 @@ struct Inner {
     max_polls_per_flow: usize,
     max_polls: usize,
     setup_capacity: Arc<Semaphore>,
-    setup_rate: Mutex<SetupRateLimiter>,
+    setup_rate: Mutex<PerIpRateLimiter>,
+    creator_held_rate: Mutex<PerIpRateLimiter>,
     state: Mutex<State>,
     active_polls: AtomicUsize,
     changed: Notify,
@@ -225,31 +231,72 @@ pub struct SetupLimits {
     pub max_polls_per_flow: usize,
     pub max_polls: usize,
     pub setup_per_ip_per_minute: usize,
+    pub creator_held_per_ip_per_minute: usize,
     pub max_pending_setup_flows: usize,
 }
 
-struct SetupRateLimiter {
-    limit: usize,
-    windows: HashMap<IpAddr, SetupRateWindow>,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CreatorHeldError {
+    RateLimited,
+    Unavailable,
 }
 
-struct SetupRateWindow {
+struct PerIpRateLimiter {
+    limit: usize,
+    max_clients: usize,
+    windows: HashMap<IpAddr, PerIpRateWindow>,
+    expirations: VecDeque<(Duration, IpAddr)>,
+}
+
+struct PerIpRateWindow {
     started_at: Duration,
     count: usize,
 }
 
-impl SetupRateLimiter {
+impl PerIpRateLimiter {
+    fn with_max_clients(limit: usize, max_clients: usize) -> Self {
+        Self {
+            limit,
+            max_clients,
+            windows: HashMap::new(),
+            expirations: VecDeque::new(),
+        }
+    }
+
     fn permit(&mut self, peer_ip: IpAddr, now: Duration) -> bool {
-        self.windows
-            .retain(|_, window| now.saturating_sub(window.started_at) < SETUP_RATE_WINDOW);
-        let window = self.windows.entry(peer_ip).or_insert(SetupRateWindow {
-            started_at: now,
-            count: 0,
-        });
-        if window.count >= self.limit {
+        while self
+            .expirations
+            .front()
+            .is_some_and(|(expires_at, _)| now >= *expires_at)
+        {
+            let (_, expired_ip) = self.expirations.pop_front().expect("front exists");
+            if self
+                .windows
+                .get(&expired_ip)
+                .is_some_and(|window| now.saturating_sub(window.started_at) >= PER_IP_RATE_WINDOW)
+            {
+                self.windows.remove(&expired_ip);
+            }
+        }
+        if let Some(window) = self.windows.get_mut(&peer_ip) {
+            if window.count >= self.limit {
+                return false;
+            }
+            window.count += 1;
+            return true;
+        }
+        if self.windows.len() >= self.max_clients {
             return false;
         }
-        window.count += 1;
+        self.windows.insert(
+            peer_ip,
+            PerIpRateWindow {
+                started_at: now,
+                count: 1,
+            },
+        );
+        self.expirations
+            .push_back((now.saturating_add(PER_IP_RATE_WINDOW), peer_ip));
         true
     }
 }
@@ -352,10 +399,14 @@ impl SetupService {
                 max_polls_per_flow: limits.max_polls_per_flow,
                 max_polls: limits.max_polls,
                 setup_capacity: Arc::new(Semaphore::new(limits.max_pending_setup_flows)),
-                setup_rate: Mutex::new(SetupRateLimiter {
-                    limit: limits.setup_per_ip_per_minute,
-                    windows: HashMap::new(),
-                }),
+                setup_rate: Mutex::new(PerIpRateLimiter::with_max_clients(
+                    limits.setup_per_ip_per_minute,
+                    usize::MAX,
+                )),
+                creator_held_rate: Mutex::new(PerIpRateLimiter::with_max_clients(
+                    limits.creator_held_per_ip_per_minute,
+                    MAX_CREATOR_HELD_RATE_CLIENTS,
+                )),
                 state: Mutex::new(State {
                     flows: HashMap::new(),
                     expired: HashMap::new(),
@@ -376,6 +427,28 @@ impl SetupService {
 
     pub fn bitcoin_network(&self) -> Option<&BitcoinNetwork> {
         self.bitcoin_network.as_ref()
+    }
+
+    pub async fn creator_held(
+        &self,
+        peer_ip: IpAddr,
+        creator: &CreatorPubky,
+    ) -> Result<bool, CreatorHeldError> {
+        let now = self.inner.clock.now();
+        if !self
+            .inner
+            .creator_held_rate
+            .lock()
+            .await
+            .permit(peer_ip, now)
+        {
+            return Err(CreatorHeldError::RateLimited);
+        }
+        self.inner
+            .completer
+            .creator_held(creator)
+            .await
+            .map_err(|_| CreatorHeldError::Unavailable)
     }
 
     pub async fn begin(
@@ -708,4 +781,26 @@ fn validated_origin(return_to: &str, allowed_origins: &[String]) -> Option<Strin
         .iter()
         .any(|allowed| allowed == "*" || allowed == &origin)
         .then_some(origin)
+}
+
+#[cfg(test)]
+mod rate_limit_tests {
+    use super::*;
+
+    #[test]
+    fn per_ip_limiter_bounds_client_state_and_evicts_expired_windows() {
+        let mut limiter = PerIpRateLimiter::with_max_clients(2, 2);
+        let first = "192.0.2.1".parse().unwrap();
+        let second = "192.0.2.2".parse().unwrap();
+        let third = "192.0.2.3".parse().unwrap();
+
+        assert!(limiter.permit(first, Duration::ZERO));
+        assert!(limiter.permit(second, Duration::ZERO));
+        assert!(!limiter.permit(third, Duration::ZERO));
+        assert!(limiter.permit(first, Duration::ZERO));
+        assert!(!limiter.permit(first, Duration::ZERO));
+
+        assert!(limiter.permit(third, PER_IP_RATE_WINDOW));
+        assert_eq!(limiter.windows.len(), 1);
+    }
 }

@@ -26,6 +26,7 @@ use crate::{
             PaymentRequestStatusError, PaymentRequestStatusOperations, PaymentRequestStatusSummary,
         },
         payment_status::PaymentStatusService,
+        provider_v2::ProviderV2Service,
         setup_status::SetupStatusService,
     },
     bitkit_setup::BitkitAuthStarter,
@@ -233,6 +234,10 @@ impl Server {
                     config.rate_limits.setup_per_ip_per_minute,
                 )
                 .expect("validated setup rate limit fits usize"),
+                creator_held_per_ip_per_minute: usize::try_from(
+                    config.rate_limits.creator_held_per_ip_per_minute,
+                )
+                .expect("validated creator-held rate limit fits usize"),
                 max_pending_setup_flows: config.rate_limits.max_pending_setup_flows(),
             },
             config.setup.log_authorization_url,
@@ -272,6 +277,17 @@ impl Server {
                     .map_err(|_| ServerBuildError::ExchangeRates)?,
             )),
         );
+        let provider_v2_service = Arc::new(ProviderV2Service::new(
+            session_validator.clone(),
+            Arc::new(PubkyAppRegistryDiscovery {
+                storage: pubky.public_storage(),
+            }),
+            Arc::new(creators.clone()),
+            invoices.clone(),
+            config.paykit.app_id.clone(),
+            config.deployment_invariants().bitcoin_network.clone(),
+            config.paykit.proposal_acceptance_window,
+        ));
         let marketplace_preparation_service = Arc::new(
             PrepareMarketplaceService::new(
                 session_validator.clone(),
@@ -356,6 +372,7 @@ impl Server {
                 .merge(http::payment_requests::payment_requests_router(
                     payment_request_status_operations,
                 ))
+                .merge(http::provider_v2::provider_v2_router(provider_v2_service))
                 .merge(http::setup_status::setup_status_router(
                     setup_status_service,
                 ))

@@ -363,6 +363,13 @@ impl PaykitAdapter {
             &self.mutation_lock,
             tokio::sync::OwnedMutexGuard::mutex(guard)
         ));
+        if store
+            .provider_v2_deadline_expired(claim)
+            .await
+            .map_err(|_| HandoffFailure::Retryable(RetryableHandoffStage::AdapterUnavailable))?
+        {
+            return Err(HandoffFailure::ProposalExpired);
+        }
         if matches!(
             intent.operation(),
             DeliveryOperationV1::PaymentRequestCancellation { .. }

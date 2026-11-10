@@ -443,6 +443,7 @@ async fn real_setup_reconnect_preserves_pending_invoices_and_hosted_state() {
             max_polls_per_flow: 2,
             max_polls: 10,
             setup_per_ip_per_minute: 30,
+            creator_held_per_ip_per_minute: 600,
             max_pending_setup_flows: 10,
         },
     );
@@ -1299,6 +1300,7 @@ signed_burst = 200
                 max_polls_per_flow: 2,
                 max_polls: 20,
                 setup_per_ip_per_minute: 20,
+                creator_held_per_ip_per_minute: 600,
                 max_pending_setup_flows: 10,
             },
         );

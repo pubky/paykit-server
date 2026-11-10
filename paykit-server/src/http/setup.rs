@@ -14,7 +14,9 @@ use url::Url;
 use crate::config::BitcoinNetwork;
 use crate::domain::locks::{CreatorPubky, parse_creator};
 use crate::http::client_ip::client_ip;
-use crate::setup::{BeginError, PollResult, ReconnectScope, SetupService, StartedFlow};
+use crate::setup::{
+    BeginError, CreatorHeldError, PollResult, ReconnectScope, SetupService, StartedFlow,
+};
 
 /// Setup routes keyed by the TCP peer, for a listener with no reverse proxy in front.
 pub fn setup_router(service: SetupService) -> Router {
@@ -30,6 +32,7 @@ pub fn setup_router_with_trusted_proxy_hops(
     Router::new()
         .route("/setup", get(begin))
         .route("/setup/reconnect", get(reconnect))
+        .route("/setup/creator-held", get(creator_held))
         .route("/setup/{flow_id}/complete", post(complete))
         .with_state(SetupRoutes {
             service,
@@ -84,6 +87,34 @@ async fn reconnect(
     )
 }
 
+async fn creator_held(
+    State(SetupRoutes {
+        service,
+        trusted_proxy_hops,
+    }): State<SetupRoutes>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+) -> Response<Body> {
+    let Some(creator) = parse_creator_held_query(query.as_deref()) else {
+        return invalid_request();
+    };
+    let client = client_ip(peer, &headers, trusted_proxy_hops);
+    match service.creator_held(client, &creator).await {
+        Ok(held) => safe_response(StatusCode::OK, json!({"held": held})),
+        Err(CreatorHeldError::RateLimited) => safe_response_with_retry(
+            StatusCode::TOO_MANY_REQUESTS,
+            json!({"error":"rate_limited"}),
+            "60",
+        ),
+        Err(CreatorHeldError::Unavailable) => safe_response_with_retry(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({"error":"unavailable"}),
+            "1",
+        ),
+    }
+}
+
 fn response_for_begin(
     result: Result<StartedFlow, BeginError>,
     bitcoin_network: Option<&BitcoinNetwork>,
@@ -136,6 +167,17 @@ fn parse_setup_query(
     Some((return_to?, state?, creator, scope.unwrap_or_default()))
 }
 
+fn parse_creator_held_query(query: Option<&str>) -> Option<CreatorPubky> {
+    let mut creator = None;
+    for (key, value) in url::form_urlencoded::parse(query?.as_bytes()) {
+        match key.as_ref() {
+            "creator" if creator.is_none() => creator = Some(parse_creator(&value).ok()?),
+            _ => return None,
+        }
+    }
+    creator
+}
+
 fn iframe_response(flow: StartedFlow, bitcoin_network: Option<&BitcoinNetwork>) -> Response<Body> {
     let flow_id = json_for_script(&flow.flow_id);
     let state = json_for_script(&flow.state);
@@ -154,8 +196,14 @@ fn iframe_response(flow: StartedFlow, bitcoin_network: Option<&BitcoinNetwork>) 
         .unwrap_or_default();
     let qr_svg = render_authorization_qr_svg(&flow.authorization_url);
     let css = SETUP_CSS;
+    // The first message, posted as soon as the shell renders, is `paykit-setup-ready`: the embedder
+    // keeps the frame hidden until it arrives, so an error body (which never posts it) is never shown.
+    // It comes first in the script, so a throw in the Bitkit or QR wiring below cannot suppress it.
+    // It is a separate type because a `paykit-setup-callback` without `error` means setup completed.
+    // A QR click copies its `data-url`. `writeText` runs before any await: Safari rejects the write
+    // once the click's activation is gone. Embedded, Chromium also needs `allow="clipboard-write"`.
     let shell = format!(
-        "<!doctype html><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><style>{css}</style><main><span class=\"qr\" data-testid=\"paykit-auth-qr\">{qr_svg}</span><a class=\"bitkit-btn\" href=\"{authorization_url}\"{android_href}{ios_href}>Continue with Bitkit</a></main><script>\nconst bitkitButton=document.querySelector('.bitkit-btn');const userAgent=navigator.userAgent;if(bitkitButton.dataset.androidHref&&/Android/i.test(userAgent)){{bitkitButton.href=bitkitButton.dataset.androidHref;}}else if(bitkitButton.dataset.iosHref&&(/iPhone|iPad|iPod/i.test(userAgent)||(/Macintosh/i.test(userAgent)&&navigator.maxTouchPoints>1))){{bitkitButton.href=bitkitButton.dataset.iosHref;bitkitButton.target='_top';}}\nconst flowId={flow_id};const state={state};const targetOrigin={origin};\nconst retryable=new Set([408,425,429,502,503,504]);let delay=500;\nasync function poll(){{try{{const response=await fetch('/setup/'+flowId+'/complete',{{method:'POST'}});if(response.status===200){{window.parent.postMessage({{type:'paykit-setup-callback',state}},targetOrigin);return;}}if(!retryable.has(response.status)){{window.parent.postMessage({{type:'paykit-setup-callback',state,error:'setup-failed'}},targetOrigin);return;}}}}catch(_error){{}}setTimeout(poll,delay);delay=Math.min(delay*2,5000);}}setTimeout(poll,delay);\n</script>"
+        "<!doctype html><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><style>{css}</style><main><div class=\"qr-wrap\"><button type=\"button\" class=\"qr\" data-testid=\"paykit-auth-qr\" data-url=\"{authorization_url}\" aria-label=\"Copy authorization link\">{qr_svg}</button><span class=\"qr-status\" role=\"status\"></span></div><a class=\"bitkit-btn\" href=\"{authorization_url}\"{android_href}{ios_href}>Continue with Bitkit</a></main><script>\nconst flowId={flow_id};const state={state};const targetOrigin={origin};\nwindow.parent.postMessage({{type:'paykit-setup-ready',state}},targetOrigin);\nconst bitkitButton=document.querySelector('.bitkit-btn');const userAgent=navigator.userAgent;if(bitkitButton.dataset.androidHref&&/Android/i.test(userAgent)){{bitkitButton.href=bitkitButton.dataset.androidHref;}}else if(bitkitButton.dataset.iosHref&&(/iPhone|iPad|iPod/i.test(userAgent)||(/Macintosh/i.test(userAgent)&&navigator.maxTouchPoints>1))){{bitkitButton.href=bitkitButton.dataset.iosHref;bitkitButton.target='_top';}}\nconst qr=document.querySelector('.qr');const qrStatus=document.querySelector('.qr-status');let qrStatusTimer;qr.addEventListener('click',async()=>{{try{{await navigator.clipboard.writeText(qr.dataset.url);qrStatus.textContent='Copied';}}catch(_error){{qrStatus.textContent='Could not copy';}}clearTimeout(qrStatusTimer);qrStatusTimer=setTimeout(()=>{{qrStatus.textContent='';}},2000);}});\nconst retryable=new Set([408,425,429,502,503,504]);let delay=500;\nasync function poll(){{try{{const response=await fetch('/setup/'+flowId+'/complete',{{method:'POST'}});if(response.status===200){{window.parent.postMessage({{type:'paykit-setup-callback',state}},targetOrigin);return;}}if(!retryable.has(response.status)){{window.parent.postMessage({{type:'paykit-setup-callback',state,error:'setup-failed'}},targetOrigin);return;}}}}catch(_error){{}}setTimeout(poll,delay);delay=Math.min(delay*2,5000);}}setTimeout(poll,delay);\n</script>"
     );
     let mut response = Response::new(Body::from(shell));
     *response.status_mut() = StatusCode::OK;
@@ -181,14 +229,20 @@ body{display:flex;align-items:center;justify-content:center;background:transpare
 /* Without this the flex item shrinks to its content, so the touch button's width:100% only
    reaches the QR panel's width instead of the frame's. */
 main{width:100%;display:flex;align-items:center;justify-content:center}
-.qr{display:flex;align-items:center;justify-content:center;box-sizing:border-box;width:192px;height:192px;padding:12px;border-radius:8px;background:#fff}
-.qr svg{display:block;width:100%;height:100%}
+.qr{display:flex;align-items:center;justify-content:center;box-sizing:border-box;width:192px;height:192px;padding:12px;border:0;border-radius:8px;background:#fff;font:inherit;cursor:pointer}
+/* Inside the QR: pubky.app sizes its frame to the QR's 192px, which cuts off a ring drawn outside. */
+.qr:focus-visible{outline-offset:-3px}
+.qr svg{display:block;width:100%;height:100%;transition:opacity .15s}.qr:hover svg{opacity:.9}.qr:active svg{opacity:.8}
+/* Screen readers skip a button's content and can miss a live region that appears with its text, so
+   the copy status sits beside the QR button and an empty one is transparent, not display:none. */
+.qr-wrap{position:relative}
+.qr-status{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);padding:6px 12px;border-radius:9999px;background:#303034;color:#d4d4db;white-space:nowrap;pointer-events:none}.qr-status:empty{opacity:0}
 .bitkit-btn{display:none}
 
 /* Touch devices cannot scan their own screen, so they get the same URL as a deep link. Keyed on the
    pointer type, not viewport width: this page renders inside a small parent iframe, which would
    always read as narrow. */
-@media (hover:none) and (pointer:coarse){.qr{display:none}.bitkit-btn{display:flex;align-items:center;justify-content:center;box-sizing:border-box;width:100%;height:60px;padding:20px 32px;border-radius:9999px;background:#303034;color:#d4d4db;text-decoration:none}}
+@media (hover:none) and (pointer:coarse){.qr-wrap{display:none}.bitkit-btn{display:flex;align-items:center;justify-content:center;box-sizing:border-box;width:100%;height:60px;padding:20px 32px;border-radius:9999px;background:#303034;color:#d4d4db;text-decoration:none}}
 "#;
 
 /// The QR a creator scans with Bitkit. High error correction so a centered brand badge added by the

@@ -197,6 +197,11 @@ impl PaymentDrainStore {
                                invoice.first_amount_matched_observed_at IS NOT NULL
                                AND invoice.first_amount_matched_observed_at <= invoice.payment_deadline
                                AND NOT invoice.usdt_credit_reconcile
+                               OR EXISTS (
+                                   SELECT 1
+                                   FROM invoice_provider_v2_first_threshold_evidence evidence
+                                   WHERE evidence.invoice_id = invoice.id
+                               )
                            )
                      ) AS accepted_count,
                      COUNT(*) FILTER (
@@ -209,6 +214,11 @@ impl PaymentDrainStore {
                                         invoice.first_amount_matched_observed_at IS NOT NULL
                                         AND invoice.first_amount_matched_observed_at <= invoice.payment_deadline
                                         AND NOT invoice.usdt_credit_reconcile
+                                    )
+                                    OR EXISTS (
+                                        SELECT 1
+                                        FROM invoice_provider_v2_first_threshold_evidence evidence
+                                        WHERE evidence.invoice_id = invoice.id
                                     )
                                 )
                             )
@@ -380,6 +390,11 @@ impl PaymentDrainStore {
                            invoice.first_amount_matched_observed_at IS NOT NULL
                            AND invoice.first_amount_matched_observed_at <= invoice.payment_deadline
                            AND NOT invoice.usdt_credit_reconcile
+                           OR EXISTS (
+                               SELECT 1
+                               FROM invoice_provider_v2_first_threshold_evidence evidence
+                               WHERE evidence.invoice_id = invoice.id
+                           )
                        )
                  ),
                  COUNT(*) FILTER (
@@ -389,6 +404,11 @@ impl PaymentDrainStore {
                             OR (invoice.first_amount_matched_observed_at IS NOT NULL
                                 AND invoice.first_amount_matched_observed_at <= invoice.payment_deadline
                                 AND NOT invoice.usdt_credit_reconcile)
+                            OR EXISTS (
+                                SELECT 1
+                                FROM invoice_provider_v2_first_threshold_evidence evidence
+                                WHERE evidence.invoice_id = invoice.id
+                            )
                         ))
                  ),
                  COUNT(*),
@@ -877,7 +897,9 @@ impl PaymentDrainStore {
         .map_err(|_| PersistenceError::Unavailable)?;
         let fenced = sqlx::query(
             "UPDATE lock_payment_generations
-             SET active_drain_id = $1, updated_at = transaction_timestamp()
+             SET active_drain_id = $1,
+                 provider_v2_drain_fenced = TRUE,
+                 updated_at = transaction_timestamp()
              WHERE creator_id = $2 AND lock_resource_lookup_hash = $3
                AND current_generation = $4 AND active_drain_id IS NULL",
         )

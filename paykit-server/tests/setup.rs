@@ -22,6 +22,7 @@ use bitcoin::{
     bip32::{ChildNumber, Xpriv, Xpub},
     secp256k1::Secp256k1,
 };
+use ed25519_dalek::SigningKey;
 use paykit_server::{
     bitkit_claim::LOCAL_DEMO_CAPABILITIES,
     bitkit_setup::append_bitkit_claim,
@@ -132,6 +133,35 @@ struct InstructionCompleter;
 
 struct ReconnectCompleter(paykit_server::domain::locks::CreatorPubky);
 
+struct PresenceCompleter {
+    result: Result<bool, Completion>,
+    presence_calls: AtomicUsize,
+    start_calls: AtomicUsize,
+}
+
+#[async_trait]
+impl SetupCompleter for PresenceCompleter {
+    async fn start(&self) -> Result<StartedSetup, Completion> {
+        self.start_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(StartedSetup::new(
+            "pubkyauth://signin?secret=presence-test".to_owned(),
+            Box::new(MockAttempt),
+        ))
+    }
+
+    async fn creator_held(
+        &self,
+        _creator: &paykit_server::domain::locks::CreatorPubky,
+    ) -> Result<bool, Completion> {
+        self.presence_calls.fetch_add(1, Ordering::SeqCst);
+        self.result
+    }
+
+    async fn complete(&self, _: Box<dyn SetupAttempt>) -> Completion {
+        Completion::DurableSuccess
+    }
+}
+
 #[async_trait]
 impl SetupCompleter for ReconnectCompleter {
     async fn start(&self) -> Result<StartedSetup, Completion> {
@@ -217,6 +247,150 @@ async fn reconnect_route_requires_one_explicit_canonical_creator() {
     )
     .unwrap();
     assert!(body.contains("x-bitkit-claim=paykit-access-v1.usdt-address-v1"));
+}
+
+#[tokio::test]
+async fn creator_held_route_returns_only_persisted_presence_without_setup_inputs_or_side_effects() {
+    let creator = "pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo";
+    let completer = Arc::new(PresenceCompleter {
+        result: Ok(true),
+        presence_calls: AtomicUsize::new(0),
+        start_calls: AtomicUsize::new(0),
+    });
+    let response = request(
+        setup_router(service(completer.clone(), Arc::new(ManualClock::default()))),
+        Method::GET,
+        &format!("/setup/creator-held?creator={creator}"),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["content-type"], "application/json");
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    assert!(
+        !response
+            .headers()
+            .contains_key("access-control-allow-origin")
+    );
+    assert!(!response.headers().contains_key("set-cookie"));
+    assert_eq!(body(response).await, r#"{"held":true}"#);
+    assert_eq!(completer.presence_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(completer.start_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn creator_held_route_distinguishes_absence_malformed_input_and_storage_failure() {
+    let creator = "pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo";
+    let absent = Arc::new(PresenceCompleter {
+        result: Ok(false),
+        presence_calls: AtomicUsize::new(0),
+        start_calls: AtomicUsize::new(0),
+    });
+    let absent_router = setup_router(service(absent.clone(), Arc::new(ManualClock::default())));
+    let response = request(
+        absent_router.clone(),
+        Method::GET,
+        &format!("/setup/creator-held?creator={creator}"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body(response).await, r#"{"held":false}"#);
+
+    let malformed = [
+        "/setup/creator-held".to_owned(),
+        "/setup/creator-held?creator=invalid".to_owned(),
+        format!("/setup/creator-held?creator={creator}&creator={creator}"),
+        format!("/setup/creator-held?creator={creator}&return_to=https://app.example"),
+        format!("/setup/creator-held?creator={creator}&state=unused"),
+    ];
+    for uri in malformed {
+        let response = request(absent_router.clone(), Method::GET, &uri).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+        assert_eq!(body(response).await, r#"{"error":"invalid_request"}"#);
+    }
+    assert_eq!(absent.presence_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(absent.start_calls.load(Ordering::SeqCst), 0);
+
+    let unavailable = Arc::new(PresenceCompleter {
+        result: Err(Completion::TransientUnavailable),
+        presence_calls: AtomicUsize::new(0),
+        start_calls: AtomicUsize::new(0),
+    });
+    let response = request(
+        setup_router(service(
+            unavailable.clone(),
+            Arc::new(ManualClock::default()),
+        )),
+        Method::GET,
+        &format!("/setup/creator-held?creator={creator}"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.headers()["retry-after"], "1");
+    assert_eq!(body(response).await, r#"{"error":"unavailable"}"#);
+    assert_eq!(unavailable.presence_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(unavailable.start_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn creator_held_reads_have_a_dedicated_budget_and_do_not_reserve_pending_setup_capacity() {
+    let completer = Arc::new(PresenceCompleter {
+        result: Ok(false),
+        presence_calls: AtomicUsize::new(0),
+        start_calls: AtomicUsize::new(0),
+    });
+    let setup = SetupService::with_poll_timeout(
+        vec!["https://app.example".to_owned()],
+        completer.clone(),
+        Arc::new(ManualClock::default()),
+        SetupLimits {
+            max_polls_per_flow: 2,
+            max_polls: 4,
+            setup_per_ip_per_minute: 1,
+            creator_held_per_ip_per_minute: 3,
+            max_pending_setup_flows: 1,
+        },
+        Duration::ZERO,
+    );
+    let router = setup_router(setup);
+
+    for seed in [1_u8, 2, 3] {
+        let signing_key = SigningKey::from_bytes(&[seed; 32]);
+        let creator = pubky::PublicKey::from(
+            pubky::pkarr::PublicKey::try_from(signing_key.verifying_key().as_bytes()).unwrap(),
+        );
+        let response = request(
+            router.clone(),
+            Method::GET,
+            &format!("/setup/creator-held?creator={creator}"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body(response).await, r#"{"held":false}"#);
+    }
+    let fourth_key = SigningKey::from_bytes(&[4; 32]);
+    let fourth = pubky::PublicKey::from(
+        pubky::pkarr::PublicKey::try_from(fourth_key.verifying_key().as_bytes()).unwrap(),
+    );
+    let limited = request(
+        router.clone(),
+        Method::GET,
+        &format!("/setup/creator-held?creator={fourth}"),
+    )
+    .await;
+    assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(limited.headers()["retry-after"], "60");
+    assert_eq!(body(limited).await, r#"{"error":"rate_limited"}"#);
+
+    let setup = request(
+        router,
+        Method::GET,
+        "/setup?return_to=https://app.example&state=real-setup",
+    )
+    .await;
+    assert_eq!(setup.status(), StatusCode::OK);
+    assert_eq!(completer.presence_calls.load(Ordering::SeqCst), 3);
+    assert_eq!(completer.start_calls.load(Ordering::SeqCst), 1);
 }
 
 #[async_trait]
@@ -393,6 +567,7 @@ fn runtime_limits(
     SetupLimits {
         max_pending_setup_flows,
         setup_per_ip_per_minute,
+        creator_held_per_ip_per_minute: 600,
         max_polls_per_flow,
         max_polls,
     }
@@ -576,7 +751,7 @@ async fn request_json(router: axum::Router, uri: &str, payload: serde_json::Valu
 
 async fn body(response: Response) -> String {
     String::from_utf8(
-        to_bytes(response.into_body(), 32 * 1024)
+        to_bytes(response.into_body(), 64 * 1024)
             .await
             .unwrap()
             .to_vec(),
@@ -1113,6 +1288,56 @@ async fn setup_policy_keys_forwarded_clients_only_behind_trusted_proxies() {
 }
 
 #[tokio::test]
+async fn creator_held_policy_uses_the_same_trusted_proxy_client_ip_semantics() {
+    let creator = "pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo";
+    let proxy = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+    for trusted_proxy_hops in [0, 1] {
+        let completer = Arc::new(PresenceCompleter {
+            result: Ok(false),
+            presence_calls: AtomicUsize::new(0),
+            start_calls: AtomicUsize::new(0),
+        });
+        let service = SetupService::with_poll_timeout(
+            vec!["https://app.example".to_owned()],
+            completer,
+            Arc::new(ManualClock::default()),
+            SetupLimits {
+                max_polls_per_flow: 2,
+                max_polls: 4,
+                setup_per_ip_per_minute: 1,
+                creator_held_per_ip_per_minute: 1,
+                max_pending_setup_flows: 1,
+            },
+            Duration::ZERO,
+        );
+        let router = setup_router_with_trusted_proxy_hops(service, trusted_proxy_hops);
+        let status = async |forwarded_for: &str| {
+            let mut request = Request::builder()
+                .method(Method::GET)
+                .uri(format!("/setup/creator-held?creator={creator}"))
+                .header("X-Forwarded-For", forwarded_for)
+                .body(Body::empty())
+                .unwrap();
+            request
+                .extensions_mut()
+                .insert(ConnectInfo(SocketAddr::new(proxy, 443)));
+            router.clone().oneshot(request).await.unwrap().status()
+        };
+
+        assert_eq!(status("198.51.100.1").await, StatusCode::OK);
+        assert_eq!(
+            status("203.0.113.2").await,
+            if trusted_proxy_hops == 0 {
+                StatusCode::TOO_MANY_REQUESTS
+            } else {
+                StatusCode::OK
+            }
+        );
+        assert_eq!(status("203.0.113.2").await, StatusCode::TOO_MANY_REQUESTS);
+    }
+}
+
+#[tokio::test]
 async fn reservation_releases_after_start_failure_terminal_completion_and_expiry() {
     let failed_start = limited_service(
         Arc::new(FailFirstStartCompleter(AtomicUsize::new(0))),
@@ -1337,7 +1562,17 @@ async fn valid_setup_preserves_polling_and_secret_free_callback_shell() {
     assert!(shell.contains(
         "postMessage({type:'paykit-setup-callback',state,error:'setup-failed'},targetOrigin)"
     ));
-    assert_eq!(shell.matches("postMessage(").count(), 2);
+    assert_eq!(shell.matches("postMessage(").count(), 3);
+    // The ready report is posted once, before the first poll is scheduled.
+    let ready = "postMessage({type:'paykit-setup-ready',state},targetOrigin)";
+    assert_eq!(shell.matches(ready).count(), 1);
+    assert!(shell.find(ready).unwrap() < shell.find("setTimeout(poll,delay)").unwrap());
+    // It is the script's first statement after the constants it reads, so a throw in the Bitkit
+    // deep-link or QR clipboard wiring cannot keep a rendered page from reporting ready.
+    let script = &shell[shell.find("<script>").unwrap()..];
+    let ready_at = script.find(ready).unwrap();
+    assert!(ready_at < script.find("const bitkitButton=").unwrap());
+    assert!(ready_at < script.find("const qr=").unwrap());
     assert!(!shell.contains("</script><img"));
     assert!(shell.contains("\\u003c/script\\u003e\\u003cimg\\u003e"));
     assert!(shell.contains(r#"data-testid="paykit-auth-qr""#));
@@ -1389,7 +1624,9 @@ async fn setup_shell_matches_the_bitkit_qr_and_touch_deep_link_shape() {
         "frame-ancestors https://app.example"
     );
     let shell = body(response).await;
-    assert!(shell.contains("<main><span class=\"qr\" data-testid=\"paykit-auth-qr\">"));
+    assert!(shell.contains(
+        "<main><div class=\"qr-wrap\"><button type=\"button\" class=\"qr\" data-testid=\"paykit-auth-qr\" data-url=\"pubkyauth://signin?secret=mock&amp;label=&lt;approve&gt;\" aria-label=\"Copy authorization link\">"
+    ));
     assert!(shell.contains(
         "<a class=\"bitkit-btn\" href=\"pubkyauth://signin?secret=mock&amp;label=&lt;approve&gt;\">Continue with Bitkit</a></main>"
     ));
@@ -1400,10 +1637,12 @@ async fn setup_shell_matches_the_bitkit_qr_and_touch_deep_link_shape() {
     assert!(!shell.contains("companion"));
     assert!(!shell.contains("authenticate-paykit"));
     assert!(!shell.contains("xpub"));
-    assert_eq!(shell.matches("pubkyauth://signin?").count(), 1);
+    // The QR's copy value and the touch link.
+    assert_eq!(shell.matches("pubkyauth://signin?").count(), 2);
     assert!(shell.contains("new Set([408,425,429,502,503,504])"));
     assert!(shell.contains("delay=500"));
     assert!(shell.contains("Math.min(delay*2,5000)"));
+    assert!(shell.contains("navigator.clipboard.writeText(qr.dataset.url)"));
     assert!(shell.contains("const state=\"opaque\";const targetOrigin=\"https://app.example\""));
     assert!(shell.contains("postMessage({type:'paykit-setup-callback',state},targetOrigin)"));
     assert!(shell.contains(
@@ -1428,8 +1667,12 @@ async fn setup_iframe_escapes_the_auth_url_and_keeps_it_out_of_the_script() {
     let (instructions, script) = shell
         .split_once("<script>")
         .expect("setup shell contains polling script");
-    // The URL reaches the page only as the touch-device deep link, HTML-escaped, and never as a
-    // value the polling script could read or forward.
+    // The URL reaches the page only in the markup, HTML-escaped, as the QR's copy value and the
+    // touch-device deep link, and never in the script source.
+    assert!(
+        instructions
+            .contains(r#"data-url="pubkyauth://signin?secret=mock&amp;label=&lt;approve&gt;""#)
+    );
     assert!(instructions.contains(
         r#"<a class="bitkit-btn" href="pubkyauth://signin?secret=mock&amp;label=&lt;approve&gt;""#
     ));
@@ -1462,9 +1705,9 @@ async fn reconnect_shell(service: SetupService, creator: &str) -> String {
 
 fn qr_markup(shell: &str) -> &str {
     let start = shell
-        .find("<span class=\"qr\"")
+        .find("<button type=\"button\" class=\"qr\"")
         .expect("setup shell contains the QR");
-    let end = shell[start..].find("</span>").expect("QR span closes") + start;
+    let end = shell[start..].find("</button>").expect("QR button closes") + start;
     &shell[start..end]
 }
 
@@ -1532,7 +1775,8 @@ async fn android_reconnect_targets_bitkit_and_keeps_the_paykit_only_qr() {
         with_network
             .matches("x-bitkit-claim=paykit-access-v1")
             .count(),
-        3
+        // The touch link, its Android and iOS variants, and the QR's copy value.
+        4
     );
     assert!(!with_network.contains("watch-only-account-v1"));
     assert_eq!(qr_markup(&with_network), qr_markup(&without_network));

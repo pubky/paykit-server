@@ -1209,16 +1209,18 @@ async fn a_held_legacy_contact_moves_to_the_buyers_next_qualifying_invoice() {
     assert!(!store.buyer_contact_is_pending(&held).await.unwrap());
 }
 
-/// Migrates to v22: every migration before 0023, from the server's own files.
-async fn migrate_to_v22(pool: &sqlx::PgPool) {
+/// Migrates a database as deployed before 0023: every other migration, 0024
+/// and later included, from the server's own files. Upgrading then applies
+/// 0023 last.
+async fn migrate_without_0023(pool: &sqlx::PgPool) {
     let source =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../paykit-server/migrations");
-    let v22 = std::env::temp_dir().join(format!("paykit-v22-{}", uuid::Uuid::new_v4()));
+    let v22 = std::env::temp_dir().join(format!("paykit-pre-0023-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&v22).unwrap();
     for entry in std::fs::read_dir(&source).unwrap() {
         let path = entry.unwrap().path();
         let name = path.file_name().unwrap().to_str().unwrap().to_owned();
-        if name.as_str() < "0023" {
+        if !name.starts_with("0023") {
             std::fs::copy(&path, v22.join(name)).unwrap();
         }
     }
@@ -1252,7 +1254,7 @@ async fn a_v22_usdt_payment_marker_is_recomputed_before_a_drain_reads_it() {
     ] {
         let bundle = parse_bundle_id(BUNDLES[0]).unwrap();
         let database = TestDatabase::create().await;
-        migrate_to_v22(database.pool()).await;
+        migrate_without_0023(database.pool()).await;
         let crypto = Arc::new(Crypto::from_master_key(&[7; 32]).unwrap());
         let creator = parse_creator(CREATOR).unwrap();
         let creator_id = CreatorStore::new(database.pool(), crypto.clone())

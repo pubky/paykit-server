@@ -13,7 +13,8 @@ pub use creators::{CreatorCredentials, CreatorSetupLock, CreatorStore, Persisted
 pub use deployment::{DeploymentStore, PersistenceError};
 pub use invoices::{
     AtomicInvoiceInput, AtomicInvoiceResult, InvoicePayloadFactory, InvoicePayloads,
-    InvoicePreflight, InvoiceStore, PendingBuyerContact,
+    InvoicePreflight, InvoiceStore, PendingBuyerContact, ProviderV2AtomicInvoiceInput,
+    ProviderV2CreateResult, ProviderV2Status,
 };
 pub(crate) use invoices::{BitcoinObservationInput, InvoicePaymentRecordV1};
 pub use marketplace_preparations::{

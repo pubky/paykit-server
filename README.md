@@ -23,6 +23,20 @@ TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres \
   cargo test --locked -p paykit-server-e2e -- --test-threads=1
 ```
 
+Provider-v2 drain fencing also has a deterministic protocol-real Compose gate:
+
+```bash
+docker compose -p paykit-provider-v2-drain \
+  -f docker-compose.provider-v2-drain-e2e.yml \
+  up --abort-on-container-exit --exit-code-from provider-v2-drain-e2e
+```
+
+The gate starts PostgreSQL plus a Pubky testnet, then launches two distinct
+`paykit-server` OS processes. Signed HTTP requests exercise delayed create versus
+drain ordering, drain-first rejection, exact replay, and server-process restart
+against one durable database. It then runs the complete invoice, drain, and
+migration integration targets.
+
 The two live-adapter tests remain ignored by default because they require either a local Pubky static testnet or a recorded public Electrum fixture. See [`docs/live-adapter-smoke.md`](docs/live-adapter-smoke.md) before running them explicitly.
 
 For a complete local SDK payment without a frontend or Bitkit, run
@@ -61,8 +75,11 @@ Business routes:
 
 - `GET /setup`
 - `GET /setup/reconnect`
+- `GET /setup/creator-held`
 - `POST /setup/{flow_id}/complete`
 - signed `POST /invoices`
+- signed `POST /v2/invoices`
+- signed `POST /v2/invoices/status`
 - signed `POST /marketplace/payment-requests/prepare`
 - signed `POST /marketplace/payment-requests/activate`
 - signed `POST /marketplace/payment-requests/void`
@@ -94,6 +111,28 @@ not payment or verification completion.
 Shared-state lock contention returns `503 dependency_unavailable`; callers can
 retry the read. Other storage or state-validation failures remain errors, not
 connection-state responses.
+
+The additive provider-v2 API is BTC-only and leaves every v1 route unchanged.
+`POST /v2/invoices` accepts one normalized payment object (`recipient_pubky`, a
+positive decimal-sats `amount`, exact `asset: "BTC"`, and
+`minimum_confirmations` from 0 through 6) plus an exact canonical UTC `deadline`.
+The Creator is derived from `lock_resource`, and `recipient_pubky` must match it.
+Exact replay is local and returns the persisted `invoice_created_at`, separate
+`proposal_expires_at`, and exact accepted `deadline`; a changed binding, a v1/v2
+handle collision, or a new request at or after its deadline returns `409`. A
+successful `POST /payment-request-drains` durably fences this canonical lock
+resource before acknowledging its immutable snapshot. Provider-v2 creates that
+won the database order are included; later new creates return `409`. Exact replay
+of an included provider-v2 invoice remains valid. Operational drain cleanup keeps
+this provider-v2 tombstone while preserving the existing v1 generation boundary.
+
+`POST /v2/invoices/status` is a pure persisted read keyed by `creator` and
+`bundle_id`. It returns BTC request/payment state, the bounded latest factual
+sample, and immutable first threshold-satisfying evidence. Threshold zero still
+requires a detected amount-matched output. Evidence observed exactly at the
+deadline is timely; later replacement, disappearance, reorg, or confirmation
+decrease may change `current_sample` but never rewrites first evidence. The
+status route performs no Pubky, Paykit SDK, registry, pricing, or Electrum call.
 
 Overlapping polls in one Server process for the same Creator and persisted Reader
 share an in-flight SDK read. Each
@@ -212,13 +251,31 @@ non-retryable `500 internal_error`, not `503 dependency_unavailable`.
 
 ### Setup iframe
 
+`GET /setup/creator-held?creator=pubky...` is a public, server-to-server,
+read-only presence lookup. It accepts exactly one canonical `creator` query
+parameter and returns only `200 {"held":true}` or `200 {"held":false}`. It needs
+no cookie, CORS permission, `return_to`, state, signed service request, Pubky
+session validation, or browser flow. Malformed input returns `400`; exhausted
+read budget returns `429`; storage failure returns `503`. Neither failure is
+reported as `held:false`.
+
+`held` means only that persisted Creator credentials exist. It does not mean
+payment readiness or reconnect eligibility. Call signed `POST /setup/status` for
+readiness. The endpoint intentionally exposes presence publicly: the previous
+public reconnect route already revealed the same fact through its 200/400 result,
+while adding credentials would create a new cross-service deployment secret.
+Pubky App caches a held answer for 2 minutes, an absent answer for 15 seconds,
+coalesces concurrent checks for the same Creator, and does not cache failures.
+
 `GET /setup` is the production Bitkit setup surface. On desktop it renders the
 normal secret-bearing Pubky Auth request as a QR code; on touch devices it
 offers the same request through a `Continue with Bitkit` deep link. On Android
 the link becomes an intent URL naming the Bitkit build for `bitcoin.network`
 (`to.bitkit`, `to.bitkit.tnet` or `to.bitkit.dev`), because Pubky Ring also
 handles `pubkyauth://` links; signet has no Bitkit build and keeps the plain
-link. The QR always carries the plain `pubkyauth://` request. Production
+link. The QR always carries the plain `pubkyauth://` request, and clicking it
+copies that request to the clipboard; in Chromium browsers the embedding iframe
+needs `allow="clipboard-write"` for the copy. Production
 has no companion handle, helper endpoint or state, helper UI, or helper in the
 production package/runtime surface.
 
@@ -234,6 +291,13 @@ through `postMessage`.
 There is no manual claim route. Completion posts only
 `{ type: "paykit-setup-callback", state }` or the same callback with a coarse
 error to the exact caller origin.
+
+As soon as it renders, before its first poll, the page also posts
+`{ type: "paykit-setup-ready", state }` once to the same origin. Embedders can keep
+the frame hidden until it arrives: an error body (`429 rate_limited`,
+`503 unavailable`, a proxy page) never sends it, so it is never shown. It is a
+separate type because a `paykit-setup-callback` without `error` means setup
+completed.
 
 Before delegation, Bitkit publishes the identity-signed Paykit Noise Key
 Authorization using `PAYKIT_AUTHORIZER_SESSION_CAPABILITIES` and
@@ -424,6 +488,15 @@ client-supplied and are never used. A value larger than the real proxy count
 selects a client-supplied entry, so any client can choose its own bucket and bypass
 the limit; only set it when the listener is reachable exclusively through those
 proxies. A smaller value keys clients by a proxy address. Values above 8 are rejected.
+
+`rate_limits.creator_held_per_ip_per_minute` is a separate fixed-window budget
+for `GET /setup/creator-held`; reads consume neither setup/reconnect starts nor
+`max_pending_setup_flows`. Its default is 600/minute (10/second aggregate), sized
+for many distinct Creators behind one App-server IP after the caching and
+coalescing above. It uses the same trusted-proxy client-IP calculation, so all
+requests resolved to one proxy or App-server IP share this read budget. Operators
+must size it for aggregate traffic, not per Creator. A refusal returns `429` with
+`Retry-After: 60`.
 
 The parser rejects the retired `[inbox]` section. The executable exposes no payer
 inbox API or worker, and the baseline schema contains no payer inbox tables.

@@ -1,26 +1,53 @@
 use std::{sync::Arc, time::Duration};
 
+use async_trait::async_trait;
+use axum::{
+    body::{Body, to_bytes},
+    extract::Extension,
+    http::{Method, Request, StatusCode},
+};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use bitcoin::hashes::{Hash, sha256};
+use ed25519_dalek::{Signer, SigningKey};
+use paykit_lib::{PaykitAppId, PaykitAppRegistry};
 use paykit_sdk::PaykitIdentitySecretKey;
 use paykit_server::{
     application::{
+        create_invoice::{
+            AppRegistryDiscovery, CreatorReceivingProvider, ReaderAuthorization, ReceivingDetails,
+            RegistryDiscoveryError, SessionValidationError, SessionValidator,
+        },
         payment_request_status::{PaymentRequestStatusOperations, PaymentState},
+        provider_v2::{
+            ProviderV2CreateRequest, ProviderV2Error, ProviderV2Service, provider_v2_request_hash,
+        },
         semantic_intent::DeliveryIntentV1,
     },
+    config::{BitcoinNetwork, Config, ConfigEnvironment},
     crypto::{Crypto, EncryptedEnvelope, EnvelopeContext},
     domain::locks::{
         CreatorPubky, ReaderPubky, parse_addressed_lock_resource, parse_bundle_id, parse_creator,
         parse_reader,
     },
+    domain::{payment::BitcoinOutpoint, provider_v2::ProviderV2Payment},
+    http::{
+        auth::{SignedServiceAuth, signature_preimage},
+        provider_v2::provider_v2_router,
+    },
     persistence::{
         AtomicInvoiceInput, CreatorCredentials, CreatorStore, InvoicePayloadFactory,
         InvoicePayloads, InvoiceStore, OutboxStore, PaymentDrainStore,
-        PaymentRequestLifecycleStore, PersistenceError, run_migrations,
+        PaymentRequestLifecycleStore, PersistenceError, ProviderV2AtomicInvoiceInput,
+        run_migrations,
     },
 };
 use paykit_server_e2e::postgres::TestDatabase;
 use sqlx::Row;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use tower::ServiceExt;
 
 const CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
+const PROVIDER_V2_BUNDLE: &str = "000G40R40M30E209185GR38E1W";
 const LOCK_RESOURCE: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/app.locks/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json";
 mod common;
 
@@ -124,6 +151,55 @@ fn second_reader() -> ReaderPubky {
     parse_reader(&second_creator().to_string()).unwrap()
 }
 
+struct PanicAdapters;
+
+#[async_trait]
+impl SessionValidator for PanicAdapters {
+    async fn validate(&self, _creator: &CreatorPubky) -> Result<(), SessionValidationError> {
+        panic!("status must not validate a session")
+    }
+}
+
+#[async_trait]
+impl AppRegistryDiscovery for PanicAdapters {
+    async fn discover(
+        &self,
+        _reader: &ReaderPubky,
+    ) -> Result<Option<PaykitAppRegistry>, RegistryDiscoveryError> {
+        panic!("status must not discover a registry")
+    }
+
+    async fn authorization(
+        &self,
+        _reader: &ReaderPubky,
+    ) -> Result<ReaderAuthorization, RegistryDiscoveryError> {
+        panic!("status must not read reader authorization")
+    }
+}
+
+#[async_trait]
+impl CreatorReceivingProvider for PanicAdapters {
+    async fn receiving(
+        &self,
+        _creator: &CreatorPubky,
+    ) -> Result<ReceivingDetails, PersistenceError> {
+        panic!("status must not load receiving adapters")
+    }
+}
+
+fn provider_v2_service_with_panicking_adapters(store: InvoiceStore) -> ProviderV2Service {
+    let adapters = Arc::new(PanicAdapters);
+    ProviderV2Service::new(
+        adapters.clone(),
+        adapters.clone(),
+        adapters,
+        store,
+        PaykitAppId::new("paykit-server").unwrap(),
+        BitcoinNetwork::Regtest,
+        Duration::from_secs(60),
+    )
+}
+
 async fn invoice_store(database: &TestDatabase) -> InvoiceStore {
     run_migrations(database.pool()).await.unwrap();
     let crypto = crypto();
@@ -184,6 +260,1079 @@ fn input<'a>(
         proposal_acceptance_seconds: 60 * 60,
         payment_window_seconds: 24 * 60 * 60,
     }
+}
+
+fn provider_v2_input<'a>(
+    creator: &'a CreatorPubky,
+    reader: &'a ReaderPubky,
+    bundle: &'a [u8],
+    request_hash: [u8; 32],
+    deadline: OffsetDateTime,
+) -> ProviderV2AtomicInvoiceInput<'a> {
+    ProviderV2AtomicInvoiceInput {
+        creator,
+        reader,
+        bundle_binding: bundle,
+        lock_resource_binding: bundle,
+        request_hash,
+        deadline,
+        minimum_confirmations: 1,
+        invoice_payloads: &TEST_PAYLOADS,
+        proposal_acceptance_seconds: 60,
+    }
+}
+
+fn provider_request(
+    reader: ReaderPubky,
+    amount: &str,
+    deadline: OffsetDateTime,
+) -> ProviderV2CreateRequest {
+    let lock_resource = parse_addressed_lock_resource(LOCK_RESOURCE).unwrap();
+    ProviderV2CreateRequest {
+        bundle_id: parse_bundle_id(PROVIDER_V2_BUNDLE).unwrap(),
+        payment: ProviderV2Payment::parse(
+            &creator().to_string(),
+            amount,
+            "BTC",
+            1,
+            lock_resource.creator(),
+        )
+        .unwrap(),
+        lock_resource,
+        reader,
+        deadline,
+    }
+}
+
+fn provider_request_hash(request: &ProviderV2CreateRequest) -> [u8; 32] {
+    provider_v2_request_hash(request).unwrap()
+}
+
+fn provider_v2_signed_auth(key: &SigningKey) -> Arc<SignedServiceAuth> {
+    let trusted_key = pubky::PublicKey::from(
+        pubky::pkarr::PublicKey::try_from(key.verifying_key().as_bytes()).unwrap(),
+    )
+    .to_string();
+    let config = Config::from_toml_and_environment(
+        &format!(
+            r#"
+[http]
+listen_addr = "127.0.0.1:8080"
+[signed_services]
+trusted_public_keys = ["{trusted_key}"]
+[setup]
+allowed_origins = ["https://app.example"]
+[paykit]
+client_id = "app.paykit.server"
+app_id = "paykit-server"
+network = "testnet"
+[bitcoin]
+network = "regtest"
+[electrum]
+endpoint = "tcp://electrum.example:50001"
+[outbox]
+poll_interval = "5s"
+[limits]
+request_body_bytes = 16384
+[rate_limits]
+signed_requests_per_second = 100
+signed_burst = 100
+"#,
+        ),
+        ConfigEnvironment {
+            database_url: Some("postgres://paykit:***@localhost/paykit".into()),
+            master_key: Some("AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE".into()),
+        },
+    )
+    .unwrap();
+    Arc::new(SignedServiceAuth::from_config(&config))
+}
+
+fn signed_provider_v2_request(key: &SigningKey, path: &str, body: &[u8]) -> Request<Body> {
+    let preimage = signature_preimage("POST", path, body);
+    Request::builder()
+        .method(Method::POST)
+        .uri(path)
+        .header(
+            "X-Paykit-Signature",
+            URL_SAFE_NO_PAD.encode(key.sign(&preimage).to_bytes()),
+        )
+        .body(Body::from(body.to_vec()))
+        .unwrap()
+}
+
+async fn exact_response_body(response: axum::response::Response) -> String {
+    assert_eq!(response.status(), StatusCode::OK);
+    String::from_utf8(
+        to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn signed_provider_v2_routes_emit_exact_create_replay_and_status_vectors() {
+    let database = TestDatabase::create().await;
+    let store = invoice_store(&database).await;
+    let deadline = OffsetDateTime::parse("2099-01-01T00:00:00Z", &Rfc3339).unwrap();
+    let request = provider_request(reader(), "1", deadline);
+    let created = store
+        .create_provider_v2_atomic(provider_v2_input(
+            &creator(),
+            &reader(),
+            PROVIDER_V2_BUNDLE.as_bytes(),
+            provider_request_hash(&request),
+            deadline,
+        ))
+        .await
+        .unwrap();
+    let mut fixed_timestamps = database.pool().begin().await.unwrap();
+    sqlx::query(
+        "UPDATE invoices
+         SET invoice_created_at = '2098-12-31T23:58:00Z',
+             proposal_expires_at = '2098-12-31T23:59:00Z',
+             payment_deadline = '2099-01-01T00:00:00Z'
+         WHERE id = $1",
+    )
+    .bind(created.invoice_id())
+    .execute(&mut *fixed_timestamps)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE invoice_provider_v2
+         SET proposal_expires_at = '2098-12-31T23:59:00Z',
+             deadline = '2099-01-01T00:00:00Z'
+         WHERE invoice_id = $1",
+    )
+    .bind(created.invoice_id())
+    .execute(&mut *fixed_timestamps)
+    .await
+    .unwrap();
+    fixed_timestamps.commit().await.unwrap();
+
+    let key = SigningKey::from_bytes(&[31; 32]);
+    let router = provider_v2_router(Arc::new(provider_v2_service_with_panicking_adapters(
+        store.clone(),
+    )))
+    .layer(Extension(provider_v2_signed_auth(&key)));
+    let create_body = serde_json_canonicalizer::to_vec(&serde_json::json!({
+        "bundle_id": PROVIDER_V2_BUNDLE,
+        "lock_resource": LOCK_RESOURCE,
+        "reader": reader().to_string(),
+        "payment": {
+            "recipient_pubky": CREATOR,
+            "amount": "1",
+            "asset": "BTC",
+            "minimum_confirmations": 1
+        },
+        "deadline": "2099-01-01T00:00:00Z"
+    }))
+    .unwrap();
+    let expected_create = r#"{"invoice_created_at":"2098-12-31T23:58:00Z","proposal_expires_at":"2098-12-31T23:59:00Z","deadline":"2099-01-01T00:00:00Z"}"#;
+    let first_create = exact_response_body(
+        router
+            .clone()
+            .oneshot(signed_provider_v2_request(
+                &key,
+                "/v2/invoices",
+                &create_body,
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(first_create, expected_create);
+    let replay = exact_response_body(
+        router
+            .clone()
+            .oneshot(signed_provider_v2_request(
+                &key,
+                "/v2/invoices",
+                &create_body,
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(replay, first_create);
+
+    let status_body = serde_json_canonicalizer::to_vec(&serde_json::json!({
+        "creator": CREATOR,
+        "bundle_id": PROVIDER_V2_BUNDLE
+    }))
+    .unwrap();
+    let absent = exact_response_body(
+        router
+            .clone()
+            .oneshot(signed_provider_v2_request(
+                &key,
+                "/v2/invoices/status",
+                &status_body,
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        absent,
+        format!(
+            r#"{{"creator":"{CREATOR}","bundle_id":"{PROVIDER_V2_BUNDLE}","request_state":"proposed","payment_state":"undetected","invoice_created_at":"2098-12-31T23:58:00Z","proposal_expires_at":"2098-12-31T23:59:00Z","deadline":"2099-01-01T00:00:00Z","asset":"BTC","minimum_confirmations":1,"current_sample":null,"first_threshold_satisfied":null}}"#
+        )
+    );
+
+    let txid = sha256::Hash::hash(b"provider-v2-http-vector").to_string();
+    let outpoint = BitcoinOutpoint::new(&txid, 7).unwrap();
+    store
+        .apply_bitcoin_observation_at(
+            "test-address-0",
+            &outpoint,
+            100,
+            1,
+            true,
+            OffsetDateTime::parse("2098-12-31T23:59:30Z", &Rfc3339).unwrap(),
+        )
+        .await
+        .unwrap();
+    let populated = exact_response_body(
+        router
+            .clone()
+            .oneshot(signed_provider_v2_request(
+                &key,
+                "/v2/invoices/status",
+                &status_body,
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let sample = format!(
+        r#"{{"observed_at":"2098-12-31T23:59:30Z","status":"confirmed","outpoint":{{"txid":"{txid}","vout":7}},"confirmations":1,"amount_matched":true}}"#
+    );
+    assert_eq!(
+        populated,
+        format!(
+            r#"{{"creator":"{CREATOR}","bundle_id":"{PROVIDER_V2_BUNDLE}","request_state":"proposed","payment_state":"confirmed","invoice_created_at":"2098-12-31T23:58:00Z","proposal_expires_at":"2098-12-31T23:59:00Z","deadline":"2099-01-01T00:00:00Z","asset":"BTC","minimum_confirmations":1,"current_sample":{sample},"first_threshold_satisfied":{sample}}}"#
+        )
+    );
+
+    assert!(
+        store
+            .observation_targets_at(deadline + time::Duration::seconds(1))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let after_deadline = exact_response_body(
+        router
+            .oneshot(signed_provider_v2_request(
+                &key,
+                "/v2/invoices/status",
+                &status_body,
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(after_deadline, populated);
+
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn provider_v2_create_is_atomic_replayable_and_cross_version_closed() {
+    let database = TestDatabase::create().await;
+    let store = invoice_store(&database).await;
+    let creator = creator();
+    let reader = reader();
+    let deadline: OffsetDateTime =
+        sqlx::query_scalar("SELECT clock_timestamp() + INTERVAL '200 milliseconds'")
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+
+    let exact_request = provider_request(reader.clone(), "1", deadline);
+    let exact_hash = provider_request_hash(&exact_request);
+
+    let created = store
+        .create_provider_v2_atomic(provider_v2_input(
+            &creator,
+            &reader,
+            PROVIDER_V2_BUNDLE.as_bytes(),
+            exact_hash,
+            deadline,
+        ))
+        .await
+        .unwrap();
+    assert!(!created.replayed());
+    let durable_outbox_id: uuid::Uuid = sqlx::query_scalar(
+        "SELECT id FROM outbox WHERE invoice_id = $1 AND intent_kind = 'payment_request_proposal'",
+    )
+    .bind(created.invoice_id())
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    let service = provider_v2_service_with_panicking_adapters(store.clone());
+    let before_deadline = service
+        .status(&creator, &parse_bundle_id(PROVIDER_V2_BUNDLE).unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(before_deadline.deadline, deadline);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let replay_after_deadline = service.create(exact_request.clone()).await.unwrap();
+    assert!(replay_after_deadline.replayed());
+    assert_eq!(replay_after_deadline.invoice_id(), created.invoice_id());
+    let replayed_outbox_id: uuid::Uuid = sqlx::query_scalar(
+        "SELECT id FROM outbox WHERE invoice_id = $1 AND intent_kind = 'payment_request_proposal'",
+    )
+    .bind(created.invoice_id())
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(replayed_outbox_id, durable_outbox_id);
+    for changed in [
+        provider_request(second_reader(), "1", deadline),
+        provider_request(reader.clone(), "2", deadline),
+        provider_request(
+            reader.clone(),
+            "1",
+            deadline + time::Duration::milliseconds(1),
+        ),
+    ] {
+        assert_eq!(
+            service.create(changed).await,
+            Err(ProviderV2Error::Conflict)
+        );
+    }
+
+    let replayed = store
+        .create_provider_v2_atomic(provider_v2_input(
+            &creator,
+            &reader,
+            PROVIDER_V2_BUNDLE.as_bytes(),
+            exact_hash,
+            deadline,
+        ))
+        .await
+        .unwrap();
+    assert!(replayed.replayed());
+    assert_eq!(replayed.invoice_id(), created.invoice_id());
+    assert_eq!(replayed.invoice_created_at(), created.invoice_created_at());
+    assert_eq!(
+        replayed.proposal_expires_at(),
+        created.proposal_expires_at()
+    );
+    assert_eq!(replayed.deadline(), created.deadline());
+
+    assert_eq!(
+        store
+            .create_provider_v2_atomic(provider_v2_input(
+                &creator,
+                &reader,
+                PROVIDER_V2_BUNDLE.as_bytes(),
+                [43; 32],
+                deadline,
+            ))
+            .await,
+        Err(PersistenceError::Conflict)
+    );
+    assert_eq!(
+        store
+            .create_atomic(input(
+                &creator,
+                &reader,
+                PROVIDER_V2_BUNDLE.as_bytes(),
+                b"v1-request",
+            ))
+            .await,
+        Err(PersistenceError::Conflict)
+    );
+
+    let counts: (i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM invoices WHERE id = $1),
+                (SELECT count(*) FROM invoice_provider_v2 WHERE invoice_id = $1),
+                (SELECT count(*) FROM outbox WHERE invoice_id = $1 AND intent_kind = 'payment_request_proposal')",
+    )
+    .bind(created.invoice_id())
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(counts, (1, 1, 1));
+
+    let status = service
+        .status(&creator, &parse_bundle_id(PROVIDER_V2_BUNDLE).unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status.request_state.as_str(), "proposed");
+    assert_eq!(status.payment_state, "undetected");
+    assert_eq!(status.deadline, deadline);
+    assert!(status.current_sample.is_none());
+    assert!(status.first_threshold_satisfied.is_none());
+    assert!(
+        service
+            .status(
+                &second_creator(),
+                &parse_bundle_id(PROVIDER_V2_BUNDLE).unwrap(),
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn provider_v2_concurrent_exact_creates_converge_on_one_invoice_and_outbox() {
+    let database = TestDatabase::create().await;
+    let store = invoice_store(&database).await;
+    let creator = creator();
+    let reader = reader();
+    let deadline: OffsetDateTime =
+        sqlx::query_scalar("SELECT clock_timestamp() + INTERVAL '1 hour'")
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+
+    let first = store.create_provider_v2_atomic(provider_v2_input(
+        &creator,
+        &reader,
+        b"provider-v2-concurrent",
+        [45; 32],
+        deadline,
+    ));
+    let second = store.create_provider_v2_atomic(provider_v2_input(
+        &creator,
+        &reader,
+        b"provider-v2-concurrent",
+        [45; 32],
+        deadline,
+    ));
+    let (first, second) = tokio::join!(first, second);
+    let first = first.unwrap();
+    let second = second.unwrap();
+
+    assert_eq!(first.invoice_id(), second.invoice_id());
+    assert_ne!(first.replayed(), second.replayed());
+    let counts: (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM invoices),
+                (SELECT count(*) FROM outbox WHERE intent_kind = 'payment_request_proposal')",
+    )
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(counts, (1, 1));
+
+    database.cleanup().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delayed_provider_v2_create_commits_before_drain_and_is_frozen_in_snapshot() {
+    let database = TestDatabase::create().await;
+    let store = invoice_store(&database).await;
+    let crypto = crypto();
+    let creator = creator();
+    let reader = reader();
+    let lock_resource = parse_addressed_lock_resource(LOCK_RESOURCE).unwrap();
+    let advisory_key = 8_702_502_i64;
+
+    sqlx::raw_sql(
+        r#"
+        CREATE FUNCTION delay_provider_v2_binding_and_seed_accepted_lifecycle()
+        RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+            PERFORM pg_advisory_xact_lock(8702502);
+            INSERT INTO payment_request_lifecycles (
+                invoice_id, sdk_payment_request_id, request_state, state_event_id,
+                last_stream_item_id, last_outbound_message_id, last_event_at
+            ) VALUES (NEW.invoice_id, '00000000-0000-4000-8000-000000000046',
+                      'accepted', 'provider-v2-race-accepted', 1, 1, clock_timestamp());
+            RETURN NEW;
+        END
+        $$;
+        CREATE TRIGGER delay_provider_v2_binding
+        BEFORE INSERT ON invoice_provider_v2
+        FOR EACH ROW EXECUTE FUNCTION delay_provider_v2_binding_and_seed_accepted_lifecycle();
+        "#,
+    )
+    .execute(database.pool())
+    .await
+    .unwrap();
+
+    let mut blocker = database.acquire_connection().await;
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(advisory_key)
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+
+    let create_store = store.clone();
+    let create_creator = creator.clone();
+    let create_reader = reader.clone();
+    let create = tokio::spawn(async move {
+        create_store
+            .create_provider_v2_atomic(ProviderV2AtomicInvoiceInput {
+                creator: &create_creator,
+                reader: &create_reader,
+                bundle_binding: b"provider-v2-delayed-before-drain",
+                lock_resource_binding: LOCK_RESOURCE.as_bytes(),
+                request_hash: [47; 32],
+                deadline: OffsetDateTime::now_utc().replace_nanosecond(0).unwrap()
+                    + time::Duration::hours(1),
+                minimum_confirmations: 1,
+                invoice_payloads: &TEST_PAYLOADS,
+                proposal_acceptance_seconds: 60,
+            })
+            .await
+    });
+    wait_for_lock_wait(&database, "INSERT INTO invoice_provider_v2").await;
+
+    let second_pool = sqlx::PgPool::connect(database.database_url())
+        .await
+        .unwrap();
+    let drain_store = PaymentDrainStore::new(&second_pool, crypto.clone());
+    let drain_lock = lock_resource.clone();
+    let drain = tokio::spawn(async move { drain_store.create(&drain_lock).await });
+    wait_for_lock_wait(&database, "FROM creators").await;
+
+    sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(advisory_key)
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+    let created = create.await.unwrap().unwrap();
+    let frozen = drain.await.unwrap().unwrap();
+
+    assert_eq!(frozen.accepted_count(), 1);
+    let frozen_invoice: uuid::Uuid =
+        sqlx::query_scalar("SELECT invoice_id FROM payment_drain_items WHERE drain_id = $1")
+            .bind(frozen.drain_id())
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(frozen_invoice, created.invoice_id());
+
+    let restarted_invoices = InvoiceStore::new(database.pool(), crypto.clone());
+    let replayed_create = restarted_invoices
+        .create_provider_v2_atomic(ProviderV2AtomicInvoiceInput {
+            creator: &creator,
+            reader: &reader,
+            bundle_binding: b"provider-v2-delayed-before-drain",
+            lock_resource_binding: LOCK_RESOURCE.as_bytes(),
+            request_hash: [47; 32],
+            deadline: created.deadline(),
+            minimum_confirmations: 1,
+            invoice_payloads: &TEST_PAYLOADS,
+            proposal_acceptance_seconds: 60,
+        })
+        .await
+        .unwrap();
+    assert!(replayed_create.replayed());
+    assert_eq!(replayed_create.invoice_id(), created.invoice_id());
+
+    let replayed_drain = PaymentDrainStore::new(database.pool(), crypto)
+        .create(&lock_resource)
+        .await
+        .unwrap();
+    assert!(replayed_drain.replayed());
+    assert_eq!(replayed_drain.drain_id(), frozen.drain_id());
+    assert_eq!(replayed_drain.accepted_count(), 1);
+    second_pool.close().await;
+    database.cleanup().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn aborted_provider_v2_create_rolls_back_before_drain_snapshot_acknowledgement() {
+    let database = TestDatabase::create().await;
+    let store = invoice_store(&database).await;
+    let crypto = crypto();
+    let creator = creator();
+    let reader = reader();
+    let lock_resource = parse_addressed_lock_resource(LOCK_RESOURCE).unwrap();
+    let advisory_key = 8_702_503_i64;
+
+    sqlx::raw_sql(
+        r#"
+        CREATE FUNCTION delay_aborted_provider_v2_binding()
+        RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+            PERFORM pg_advisory_xact_lock(8702503);
+            RETURN NEW;
+        END
+        $$;
+        CREATE TRIGGER delay_aborted_provider_v2_binding
+        BEFORE INSERT ON invoice_provider_v2
+        FOR EACH ROW EXECUTE FUNCTION delay_aborted_provider_v2_binding();
+        "#,
+    )
+    .execute(database.pool())
+    .await
+    .unwrap();
+    let mut blocker = database.acquire_connection().await;
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(advisory_key)
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+
+    let create_creator = creator.clone();
+    let create_reader = reader.clone();
+    let create = tokio::spawn(async move {
+        store
+            .create_provider_v2_atomic(ProviderV2AtomicInvoiceInput {
+                creator: &create_creator,
+                reader: &create_reader,
+                bundle_binding: b"provider-v2-aborted-before-commit",
+                lock_resource_binding: LOCK_RESOURCE.as_bytes(),
+                request_hash: [51; 32],
+                deadline: OffsetDateTime::now_utc().replace_nanosecond(0).unwrap()
+                    + time::Duration::hours(1),
+                minimum_confirmations: 1,
+                invoice_payloads: &TEST_PAYLOADS,
+                proposal_acceptance_seconds: 60,
+            })
+            .await
+    });
+    wait_for_lock_wait(&database, "INSERT INTO invoice_provider_v2").await;
+    create.abort();
+    assert!(create.await.unwrap_err().is_cancelled());
+    sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(advisory_key)
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+
+    let drain = tokio::time::timeout(
+        Duration::from_secs(5),
+        PaymentDrainStore::new(database.pool(), crypto.clone()).create(&lock_resource),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(drain.completed());
+    assert_eq!(drain.accepted_count(), 0);
+    let invoice_count: i64 = sqlx::query_scalar("SELECT count(*) FROM invoices")
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+    assert_eq!(invoice_count, 0);
+
+    let rejected = InvoiceStore::new(database.pool(), crypto)
+        .create_provider_v2_atomic(ProviderV2AtomicInvoiceInput {
+            creator: &creator,
+            reader: &reader,
+            bundle_binding: b"provider-v2-aborted-before-commit",
+            lock_resource_binding: LOCK_RESOURCE.as_bytes(),
+            request_hash: [51; 32],
+            deadline: OffsetDateTime::now_utc().replace_nanosecond(0).unwrap()
+                + time::Duration::hours(1),
+            minimum_confirmations: 1,
+            invoice_payloads: &TEST_PAYLOADS,
+            proposal_acceptance_seconds: 60,
+        })
+        .await;
+    assert_eq!(rejected, Err(PersistenceError::Conflict));
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn aborted_drain_commit_rolls_back_fence_and_snapshot_before_restart_retry() {
+    let database = TestDatabase::create().await;
+    let store = invoice_store(&database).await;
+    let crypto = crypto();
+    let creator = creator();
+    let reader = reader();
+    let lock_resource = parse_addressed_lock_resource(LOCK_RESOURCE).unwrap();
+    let created = store
+        .create_provider_v2_atomic(ProviderV2AtomicInvoiceInput {
+            creator: &creator,
+            reader: &reader,
+            bundle_binding: b"provider-v2-before-aborted-drain",
+            lock_resource_binding: LOCK_RESOURCE.as_bytes(),
+            request_hash: [52; 32],
+            deadline: OffsetDateTime::now_utc().replace_nanosecond(0).unwrap()
+                + time::Duration::hours(1),
+            minimum_confirmations: 1,
+            invoice_payloads: &TEST_PAYLOADS,
+            proposal_acceptance_seconds: 60,
+        })
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO payment_request_lifecycles (
+             invoice_id, sdk_payment_request_id, request_state, state_event_id,
+             last_stream_item_id, last_outbound_message_id, last_event_at
+         ) VALUES ($1, '00000000-0000-4000-8000-000000000052', 'accepted',
+                   'provider-v2-aborted-drain-accepted', 1, 1, clock_timestamp())",
+    )
+    .bind(created.invoice_id())
+    .execute(database.pool())
+    .await
+    .unwrap();
+    sqlx::raw_sql(
+        r#"
+        CREATE FUNCTION abort_drain_after_snapshot_item()
+        RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+            RAISE EXCEPTION 'deterministic drain pre-commit crash';
+        END
+        $$;
+        CREATE TRIGGER abort_drain_after_snapshot_item
+        AFTER INSERT ON payment_drain_items
+        FOR EACH ROW EXECUTE FUNCTION abort_drain_after_snapshot_item();
+        "#,
+    )
+    .execute(database.pool())
+    .await
+    .unwrap();
+
+    assert_eq!(
+        PaymentDrainStore::new(database.pool(), crypto.clone())
+            .create(&lock_resource)
+            .await,
+        Err(PersistenceError::Unavailable)
+    );
+    let rollback_state: (i64, i64, bool, Option<uuid::Uuid>) = sqlx::query_as(
+        "SELECT
+             (SELECT COUNT(*) FROM payment_drains),
+             (SELECT COUNT(*) FROM payment_drain_items),
+             generation.provider_v2_drain_fenced,
+             generation.active_drain_id
+         FROM lock_payment_generations generation",
+    )
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(rollback_state, (0, 0, false, None));
+
+    sqlx::raw_sql(
+        "DROP TRIGGER abort_drain_after_snapshot_item ON payment_drain_items;
+         DROP FUNCTION abort_drain_after_snapshot_item();",
+    )
+    .execute(database.pool())
+    .await
+    .unwrap();
+    let restarted_pool = sqlx::PgPool::connect(database.database_url())
+        .await
+        .unwrap();
+    let restarted_drains = PaymentDrainStore::new(&restarted_pool, crypto.clone());
+    let frozen = restarted_drains.create(&lock_resource).await.unwrap();
+    assert_eq!(frozen.accepted_count(), 1);
+    let frozen_invoice: uuid::Uuid =
+        sqlx::query_scalar("SELECT invoice_id FROM payment_drain_items WHERE drain_id = $1")
+            .bind(frozen.drain_id())
+            .fetch_one(&restarted_pool)
+            .await
+            .unwrap();
+    assert_eq!(frozen_invoice, created.invoice_id());
+    let replay = restarted_drains.create(&lock_resource).await.unwrap();
+    assert!(replay.replayed());
+    assert_eq!(replay.drain_id(), frozen.drain_id());
+
+    let rejected = InvoiceStore::new(&restarted_pool, crypto)
+        .create_provider_v2_atomic(ProviderV2AtomicInvoiceInput {
+            creator: &creator,
+            reader: &reader,
+            bundle_binding: b"provider-v2-after-retried-drain",
+            lock_resource_binding: LOCK_RESOURCE.as_bytes(),
+            request_hash: [53; 32],
+            deadline: OffsetDateTime::now_utc().replace_nanosecond(0).unwrap()
+                + time::Duration::hours(1),
+            minimum_confirmations: 1,
+            invoice_payloads: &TEST_PAYLOADS,
+            proposal_acceptance_seconds: 60,
+        })
+        .await;
+    assert_eq!(rejected, Err(PersistenceError::Conflict));
+    restarted_pool.close().await;
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn drain_first_blocks_new_provider_v2_create_across_store_instances() {
+    let database = TestDatabase::create().await;
+    let store = invoice_store(&database).await;
+    let crypto = crypto();
+    let lock_resource = parse_addressed_lock_resource(LOCK_RESOURCE).unwrap();
+    let second_pool = sqlx::PgPool::connect(database.database_url())
+        .await
+        .unwrap();
+    let drain = PaymentDrainStore::new(&second_pool, crypto.clone())
+        .create(&lock_resource)
+        .await
+        .unwrap();
+    assert!(drain.completed());
+
+    let restarted_store = InvoiceStore::new(database.pool(), crypto);
+    let creator = creator();
+    let reader = reader();
+    let result = restarted_store
+        .create_provider_v2_atomic(ProviderV2AtomicInvoiceInput {
+            creator: &creator,
+            reader: &reader,
+            bundle_binding: PROVIDER_V2_BUNDLE.as_bytes(),
+            lock_resource_binding: LOCK_RESOURCE.as_bytes(),
+            request_hash: [48; 32],
+            deadline: OffsetDateTime::now_utc().replace_nanosecond(0).unwrap()
+                + time::Duration::hours(1),
+            minimum_confirmations: 1,
+            invoice_payloads: &TEST_PAYLOADS,
+            proposal_acceptance_seconds: 60,
+        })
+        .await;
+
+    assert_eq!(result, Err(PersistenceError::Conflict));
+    assert!(
+        store
+            .provider_v2_status(&creator, &parse_bundle_id(PROVIDER_V2_BUNDLE).unwrap())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    second_pool.close().await;
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn completed_drain_cleanup_keeps_provider_v2_creation_fenced() {
+    let database = TestDatabase::create().await;
+    let store = invoice_store(&database).await;
+    let crypto = crypto();
+    let lock_resource = parse_addressed_lock_resource(LOCK_RESOURCE).unwrap();
+    let drains = PaymentDrainStore::new(database.pool(), crypto.clone());
+
+    let drain = drains.create(&lock_resource).await.unwrap();
+    assert!(drain.completed());
+    let cleanup_token = crypto.payment_drain_cleanup_token(drain.drain_id());
+    drains
+        .cleanup_completed(&lock_resource, cleanup_token.as_bytes())
+        .await
+        .unwrap();
+
+    let creator = creator();
+    let reader = reader();
+    let result = store
+        .create_provider_v2_atomic(ProviderV2AtomicInvoiceInput {
+            creator: &creator,
+            reader: &reader,
+            bundle_binding: b"provider-v2-after-cleanup",
+            lock_resource_binding: LOCK_RESOURCE.as_bytes(),
+            request_hash: [46; 32],
+            deadline: OffsetDateTime::now_utc().replace_nanosecond(0).unwrap()
+                + time::Duration::hours(1),
+            minimum_confirmations: 1,
+            invoice_payloads: &TEST_PAYLOADS,
+            proposal_acceptance_seconds: 60,
+        })
+        .await;
+
+    assert_eq!(result, Err(PersistenceError::Conflict));
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn cleanup_preserves_included_provider_v2_replay_but_rejects_new_create() {
+    let database = TestDatabase::create().await;
+    let store = invoice_store(&database).await;
+    let crypto = crypto();
+    let creator = creator();
+    let reader = reader();
+    let lock_resource = parse_addressed_lock_resource(LOCK_RESOURCE).unwrap();
+    let deadline =
+        OffsetDateTime::now_utc().replace_nanosecond(0).unwrap() + time::Duration::hours(1);
+    let request = provider_request(reader.clone(), "1", deadline);
+    let request_hash = provider_request_hash(&request);
+    let created = store
+        .create_provider_v2_atomic(ProviderV2AtomicInvoiceInput {
+            creator: &creator,
+            reader: &reader,
+            bundle_binding: PROVIDER_V2_BUNDLE.as_bytes(),
+            lock_resource_binding: LOCK_RESOURCE.as_bytes(),
+            request_hash,
+            deadline,
+            minimum_confirmations: 1,
+            invoice_payloads: &TEST_PAYLOADS,
+            proposal_acceptance_seconds: 60,
+        })
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE outbox
+         SET status = 'delivered', sdk_outbound_message_id = '1',
+             sdk_event_id = 'provider-v2-cleanup-proposed',
+             sdk_payment_request_id = '00000000-0000-4000-8000-000000000049'
+         WHERE invoice_id = $1 AND intent_kind = 'payment_request_proposal'",
+    )
+    .bind(created.invoice_id())
+    .execute(database.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO payment_request_lifecycles (
+             invoice_id, sdk_payment_request_id, request_state, state_event_id,
+             last_stream_item_id, last_outbound_message_id, last_event_at
+         ) VALUES ($1, '00000000-0000-4000-8000-000000000049', 'proposed',
+                   'provider-v2-cleanup-proposed', 1, 1, clock_timestamp())",
+    )
+    .bind(created.invoice_id())
+    .execute(database.pool())
+    .await
+    .unwrap();
+
+    let drains = PaymentDrainStore::new(database.pool(), crypto.clone());
+    let drain = drains.create(&lock_resource).await.unwrap();
+    assert!(drain.completed());
+    assert_eq!(drain.cancellation_enqueued_count(), 1);
+    let cleanup_token = crypto.payment_drain_cleanup_token(drain.drain_id());
+    drains
+        .cleanup_completed(&lock_resource, cleanup_token.as_bytes())
+        .await
+        .unwrap();
+
+    let key = SigningKey::from_bytes(&[32; 32]);
+    let router = provider_v2_router(Arc::new(provider_v2_service_with_panicking_adapters(
+        store.clone(),
+    )))
+    .layer(Extension(provider_v2_signed_auth(&key)));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let running = tokio::spawn(async move {
+        axum::serve(listener, router)
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+    });
+    let create_body = serde_json_canonicalizer::to_vec(&serde_json::json!({
+        "bundle_id": PROVIDER_V2_BUNDLE,
+        "lock_resource": LOCK_RESOURCE,
+        "reader": reader.to_string(),
+        "payment": {
+            "recipient_pubky": CREATOR,
+            "amount": "1",
+            "asset": "BTC",
+            "minimum_confirmations": 1
+        },
+        "deadline": deadline.format(&Rfc3339).unwrap()
+    }))
+    .unwrap();
+    let signature = URL_SAFE_NO_PAD.encode(
+        key.sign(&signature_preimage("POST", "/v2/invoices", &create_body))
+            .to_bytes(),
+    );
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+    let head = format!(
+        "POST /v2/invoices HTTP/1.1\r\nHost: {address}\r\nX-Paykit-Signature: {signature}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        create_body.len()
+    );
+    stream.write_all(head.as_bytes()).await.unwrap();
+    stream.write_all(&create_body).await.unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.unwrap();
+    let response = String::from_utf8(response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+    shutdown_tx.send(()).unwrap();
+    running.await.unwrap().unwrap();
+
+    let replayed = InvoiceStore::new(database.pool(), crypto.clone())
+        .create_provider_v2_atomic(ProviderV2AtomicInvoiceInput {
+            creator: &creator,
+            reader: &reader,
+            bundle_binding: PROVIDER_V2_BUNDLE.as_bytes(),
+            lock_resource_binding: LOCK_RESOURCE.as_bytes(),
+            request_hash,
+            deadline,
+            minimum_confirmations: 1,
+            invoice_payloads: &TEST_PAYLOADS,
+            proposal_acceptance_seconds: 60,
+        })
+        .await
+        .unwrap();
+    assert!(replayed.replayed());
+    assert_eq!(replayed.invoice_id(), created.invoice_id());
+
+    let new_result = InvoiceStore::new(database.pool(), crypto)
+        .create_provider_v2_atomic(ProviderV2AtomicInvoiceInput {
+            creator: &creator,
+            reader: &reader,
+            bundle_binding: b"provider-v2-new-after-cleanup",
+            lock_resource_binding: LOCK_RESOURCE.as_bytes(),
+            request_hash: [50; 32],
+            deadline,
+            minimum_confirmations: 1,
+            invoice_payloads: &TEST_PAYLOADS,
+            proposal_acceptance_seconds: 60,
+        })
+        .await;
+    assert_eq!(new_result, Err(PersistenceError::Conflict));
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn provider_v2_deadline_gate_resamples_after_creator_row_lock_wait() {
+    let database = TestDatabase::create().await;
+    let store = invoice_store(&database).await;
+    let creator = creator();
+    let mut blocker = database.pool().begin().await.unwrap();
+    sqlx::query("SELECT id FROM creators FOR UPDATE")
+        .fetch_one(&mut *blocker)
+        .await
+        .unwrap();
+    let deadline: OffsetDateTime =
+        sqlx::query_scalar("SELECT clock_timestamp() + INTERVAL '200 milliseconds'")
+            .fetch_one(&mut *blocker)
+            .await
+            .unwrap();
+    let task =
+        tokio::spawn(async move { store.provider_v2_deadline_gate(&creator, deadline).await });
+    wait_for_lock_wait(&database, "SELECT id FROM creators").await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    blocker.commit().await.unwrap();
+    assert!(!task.await.unwrap().unwrap());
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn provider_v2_fresh_create_uses_database_deadline_fence() {
+    let database = TestDatabase::create().await;
+    let store = invoice_store(&database).await;
+    let creator = creator();
+    let reader = reader();
+    let elapsed: OffsetDateTime = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+
+    assert!(
+        !store
+            .provider_v2_deadline_gate(&creator, elapsed)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .create_provider_v2_atomic(provider_v2_input(
+                &creator,
+                &reader,
+                b"elapsed-provider-v2",
+                [44; 32],
+                elapsed,
+            ))
+            .await,
+        Err(PersistenceError::DeadlineElapsed)
+    );
+    let invoice_count: i64 = sqlx::query_scalar("SELECT count(*) FROM invoices")
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+    assert_eq!(invoice_count, 0);
+
+    database.cleanup().await;
 }
 
 #[tokio::test]
@@ -1526,6 +2675,64 @@ async fn atomic_store_rejects_empty_address_and_wrong_reader_before_any_insert()
     .unwrap();
     assert_eq!(counts, (0, 0, 0));
 
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn provider_v2_invoice_binding_and_outbox_roll_back_together() {
+    let database = TestDatabase::create().await;
+    let store = invoice_store(&database).await;
+    let creator = creator();
+    let reader = reader();
+    sqlx::query(
+        "CREATE FUNCTION fail_provider_v2_outbox_insert() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN IF NEW.invoice_id IS NOT NULL THEN RAISE EXCEPTION 'forced provider-v2 outbox failure'; END IF; RETURN NEW; END; $$",
+    )
+    .execute(database.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER fail_provider_v2_outbox_insert BEFORE INSERT ON outbox \
+         FOR EACH ROW EXECUTE FUNCTION fail_provider_v2_outbox_insert()",
+    )
+    .execute(database.pool())
+    .await
+    .unwrap();
+    let deadline: OffsetDateTime =
+        sqlx::query_scalar("SELECT clock_timestamp() + INTERVAL '1 hour'")
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+
+    assert!(
+        store
+            .create_provider_v2_atomic(provider_v2_input(
+                &creator,
+                &reader,
+                b"provider-v2-rollback",
+                [93; 32],
+                deadline,
+            ))
+            .await
+            .is_err()
+    );
+    let counts: (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM reader_assignments),
+                (SELECT COUNT(*) FROM invoices),
+                (SELECT COUNT(*) FROM invoice_provider_v2),
+                (SELECT COUNT(*) FROM outbox)",
+    )
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(counts, (0, 0, 0, 0));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT next_child_index FROM creators")
+            .fetch_one(database.pool())
+            .await
+            .unwrap(),
+        0
+    );
     database.cleanup().await;
 }
 

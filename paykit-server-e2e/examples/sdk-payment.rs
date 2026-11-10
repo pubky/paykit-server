@@ -198,6 +198,7 @@ async fn authorize_server(
             max_polls_per_flow: 2,
             max_polls: 10,
             setup_per_ip_per_minute: 20,
+            creator_held_per_ip_per_minute: 600,
             max_pending_setup_flows: 10,
         },
     );
