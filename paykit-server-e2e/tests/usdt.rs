@@ -1209,9 +1209,9 @@ async fn a_held_legacy_contact_moves_to_the_buyers_next_qualifying_invoice() {
     assert!(!store.buyer_contact_is_pending(&held).await.unwrap());
 }
 
-/// Migrates a database as deployed before 0023: every other migration, 0024
-/// and later included, from the server's own files. Upgrading then applies
-/// 0023 last.
+/// Migrates a database as deployed before this release: every migration
+/// through 0025 except 0023, from the server's own files. Upgrading then
+/// applies 0023 and the later ones.
 async fn migrate_without_0023(pool: &sqlx::PgPool) {
     let source =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../paykit-server/migrations");
@@ -1220,7 +1220,7 @@ async fn migrate_without_0023(pool: &sqlx::PgPool) {
     for entry in std::fs::read_dir(&source).unwrap() {
         let path = entry.unwrap().path();
         let name = path.file_name().unwrap().to_str().unwrap().to_owned();
-        if !name.starts_with("0023") {
+        if !name.starts_with("0023") && name.as_str() < "0026" {
             std::fs::copy(&path, v22.join(name)).unwrap();
         }
     }
@@ -1382,6 +1382,116 @@ async fn a_v22_usdt_payment_marker_is_recomputed_before_a_drain_reads_it() {
             "{label}: expiry after the deadline"
         );
     }
+}
+
+#[tokio::test]
+async fn a_retained_pre_upgrade_drain_reopens_and_then_completes() {
+    const LOCK: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/app.locks/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json";
+    const PROPOSAL_TIME_MIGRATION: &str = include_str!(
+        "../../paykit-server/migrations/0023_payment_request_proposal_recorded_at.sql"
+    );
+    const DRAIN_RECOUNT_MIGRATION: &str =
+        include_str!("../../paykit-server/migrations/0026_payment_drain_usdt_credit_recount.sql");
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(&[7; 32]).unwrap());
+    let creator = parse_creator(CREATOR).unwrap();
+    CreatorStore::new(database.pool(), crypto.clone())
+        .create(&CreatorCredentials::new(
+            creator.clone(),
+            "test-session".into(),
+            PaykitIdentitySecretKey::new([9; 32], 1).unwrap(),
+            None,
+            Some(UsdtAddress::try_from(RECIPIENT.to_owned()).unwrap()),
+        ))
+        .await
+        .unwrap();
+    let store = InvoiceStore::new(database.pool(), crypto.clone());
+    let invoice = store
+        .create_atomic(AtomicInvoiceInput {
+            creator: &creator,
+            reader: &parse_reader(CREATOR).unwrap(),
+            bundle_binding: BUNDLES[0].as_bytes(),
+            lock_resource_binding: LOCK.as_bytes(),
+            payment_request_binding: BUNDLES[0].as_bytes(),
+            invoice_payloads: &Payload { index: 0 },
+            proposal_acceptance_seconds: 3600,
+            payment_window_seconds: 3 * 86400,
+        })
+        .await
+        .unwrap();
+    let created = invoice.invoice_created_at();
+    let paid_at = (created + time::Duration::seconds(10))
+        .replace_nanosecond(0)
+        .unwrap();
+    // v22 state: an accepted request whose payment marker v22 code set from a
+    // USDT transfer, and a drain v22 completed and retained on that marker.
+    // Unflagged, the marker counts exactly as v22 counted it.
+    sqlx::query("INSERT INTO payment_request_lifecycles (invoice_id,sdk_payment_request_id,request_state,last_event_at,last_stream_item_id) VALUES ($1,$2,'accepted',NOW(),1)")
+        .bind(invoice.invoice_id()).bind(record(0).payment_request_id)
+        .execute(database.pool()).await.unwrap();
+    sqlx::query("UPDATE invoices SET first_amount_matched_observed_at = $2 WHERE id = $1")
+        .bind(invoice.invoice_id())
+        .bind(paid_at)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    let drains = PaymentDrainStore::new(database.pool(), crypto.clone());
+    let lock = parse_addressed_lock_resource(LOCK).unwrap();
+    let drain = drains.create(&lock).await.unwrap();
+    let replay = drains.exact_replay(&lock).await.unwrap().unwrap();
+    assert!(replay.completed());
+    assert_eq!(replay.terminal_count(), 1);
+
+    // The upgrade: 0023's backfill flags the marker. On its own that leaves
+    // the retained summary at odds with the canonical counts.
+    let backfill =
+        &PROPOSAL_TIME_MIGRATION[PROPOSAL_TIME_MIGRATION.find("UPDATE invoices").unwrap()..];
+    sqlx::raw_sql(backfill)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    assert!(drains.exact_replay(&lock).await.is_err());
+    // 0026 recounts the drain, which reopens with the request open.
+    sqlx::raw_sql(DRAIN_RECOUNT_MIGRATION)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    let replay = drains.exact_replay(&lock).await.unwrap().unwrap();
+    assert_eq!(replay.drain_id(), drain.drain_id());
+    assert_eq!(replay.accepted_count(), 1);
+    assert_eq!(replay.terminal_count(), 0);
+    assert!(!replay.completed());
+
+    // The proposal time then proves the transfer stale: the marker clears and
+    // the request stays open until its deadline expires it.
+    sqlx::query("UPDATE payment_request_lifecycles SET proposal_recorded_at = $1")
+        .bind(created + time::Duration::days(2))
+        .execute(database.pool())
+        .await
+        .unwrap();
+    let replay = drains.exact_replay(&lock).await.unwrap().unwrap();
+    assert_eq!(replay.accepted_count(), 1);
+    assert!(!replay.completed());
+    let cleanup_token = crypto.payment_drain_cleanup_token(drain.drain_id());
+    assert!(
+        drains
+            .cleanup_completed(&lock, cleanup_token.as_bytes())
+            .await
+            .is_err()
+    );
+    store
+        .observation_targets_at(created + time::Duration::days(4))
+        .await
+        .unwrap();
+    let replay = drains.exact_replay(&lock).await.unwrap().unwrap();
+    assert_eq!(replay.accepted_count(), 0);
+    assert_eq!(replay.terminal_count(), 1);
+    assert!(replay.completed());
+    drains
+        .cleanup_completed(&lock, cleanup_token.as_bytes())
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
