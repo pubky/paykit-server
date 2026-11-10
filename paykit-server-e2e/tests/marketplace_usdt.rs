@@ -808,7 +808,7 @@ async fn a_receipt_pays_only_once_attributed_to_its_attempt() {
     assert_eq!(paid().await["usdt_arbitrum"]["paid_on_time"], true);
     // As stored before attempts were recorded: a final receipt, never
     // re-verified, with no attempt. It pays nothing.
-    sqlx::query("UPDATE usdt_observations SET request_attempt_envelope = NULL")
+    sqlx::query("DELETE FROM usdt_observation_attempts")
         .execute(rig.database.pool())
         .await
         .unwrap();
@@ -818,6 +818,38 @@ async fn a_receipt_pays_only_once_attributed_to_its_attempt() {
         .await
         .unwrap();
     assert_eq!(paid().await["usdt_arbitrum"]["paid_on_time"], true);
+    rig.store.scan_observation_integrity().await.unwrap();
+    rig.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_finalized_receipt_is_attested_when_verified_again() {
+    // A final receipt with no attestation is verified again for the request's
+    // attempt and gains it, without being rewritten.
+    let rig = rig(BOTH_RAILS, true).await;
+    let rpc = Rpc::start().await;
+    let request = offered(&rig, 0, &[]).await;
+    chain(&rpc, |chain| {
+        transfer(chain, REQUIRED_USDT);
+        chain.timestamp = request.at(10);
+        chain.finalized = true;
+    });
+    submit(&rig, &rpc, 0).await;
+    let paid = || rig.status(&request.invoice);
+    assert_eq!(paid().await["usdt_arbitrum"]["paid_on_time"], true);
+    sqlx::query("DELETE FROM usdt_observation_attempts")
+        .execute(rig.database.pool())
+        .await
+        .unwrap();
+    assert_eq!(paid().await["usdt_arbitrum"]["paid_on_time"], false);
+    age_receipts(&rig).await;
+    submit(&rig, &rpc, 0).await;
+    assert_eq!(paid().await["usdt_arbitrum"]["paid_on_time"], true);
+    let attestations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM usdt_observation_attempts")
+        .fetch_one(rig.database.pool())
+        .await
+        .unwrap();
+    assert_eq!(attestations, 1);
     rig.store.scan_observation_integrity().await.unwrap();
     rig.cleanup().await;
 }
@@ -1234,8 +1266,8 @@ async fn insert_receipt(
     sqlx::query(
         "INSERT INTO usdt_observations
          (id, marketplace_preparation_id, transfer_lookup_hash, observation_envelope,
-          confirmations, present, finalized, request_attempt_envelope)
-         VALUES ($1, $2, $3, $4, $5, TRUE, $6, $7)",
+          confirmations, present, finalized)
+         VALUES ($1, $2, $3, $4, $5, TRUE, $6)",
     )
     .bind(id)
     .bind(preparation)
@@ -1248,6 +1280,17 @@ async fn insert_receipt(
     .bind(envelope.as_bytes())
     .bind(confirmations)
     .bind(finalized)
+    .execute(rig.database.pool())
+    .await
+    .unwrap();
+    let mut attempt_logical = b"usdt-observation-attempt\0".to_vec();
+    attempt_logical.extend_from_slice(record(0).payment_request_id.as_bytes());
+    sqlx::query(
+        "INSERT INTO usdt_observation_attempts (observation_id, attempt_lookup_hash, attempt_envelope)
+         VALUES ($1, $2, $3)",
+    )
+    .bind(id)
+    .bind(crypto.lookup_hash(&attempt_logical).as_bytes().as_slice())
     .bind(attempt.as_bytes())
     .execute(rig.database.pool())
     .await

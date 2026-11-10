@@ -1099,8 +1099,8 @@ fn attempt_bound(proposal_recorded_at: OffsetDateTime) -> i64 {
 async fn usdt_evidence_is_bounded_by_its_own_attempt_not_the_earliest() {
     let (database, store, creator_id, creator, bundle, invoice) = two_attempt_invoice().await;
     let created = invoice.invoice_created_at();
-    let first = created + time::Duration::days(1);
-    let second = created + time::Duration::days(2);
+    let first = created + time::Duration::days(2);
+    let second = created + time::Duration::days(3);
     let rpc = Rpc::start().await;
     let second_attempt = record(3);
     let observe = |timestamp: i64| {
@@ -1128,6 +1128,68 @@ async fn usdt_evidence_is_bounded_by_its_own_attempt_not_the_earliest() {
     assert!(status(&store, &bundle).await.0);
 }
 
+/// One transfer proven for attempts A (fixture 0) and B (fixture 3), in the
+/// given order, at a time only A's earlier window accepts. It pays once A has
+/// verified it, whichever attempt came first and whether or not it is final.
+async fn assert_any_attested_attempt_pays(order: [usize; 2], finalized: bool) {
+    let (database, store, creator_id, creator, bundle, invoice) = two_attempt_invoice().await;
+    let created = invoice.invoice_created_at();
+    let a = created + time::Duration::days(2);
+    let b = created + time::Duration::days(3);
+    record_proposal_time(&database, 0, Some(a)).await;
+    record_proposal_time(&database, 3, Some(b)).await;
+    let rpc = Rpc::start().await;
+    {
+        let mut chain = rpc.chain.lock().unwrap();
+        chain.timestamp = attempt_bound(a);
+        chain.finalized = finalized;
+    }
+    for (step, index) in order.into_iter().enumerate() {
+        store
+            .observe_usdt_request(
+                creator_id,
+                &creator,
+                &record(index),
+                &rpc.verifier,
+                Some(&bundle),
+            )
+            .await
+            .unwrap();
+        let a_seen = order[..=step].contains(&0);
+        assert_eq!(
+            status(&store, &bundle).await.0,
+            a_seen,
+            "order={order:?} finalized={finalized} step={step}"
+        );
+    }
+    let attestations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM usdt_observation_attempts")
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+    assert_eq!(attestations, 2);
+    store.scan_payment_record_integrity().await.unwrap();
+}
+
+#[tokio::test]
+async fn usdt_evidence_verified_for_a_then_b_pays() {
+    assert_any_attested_attempt_pays([0, 3], false).await;
+}
+
+#[tokio::test]
+async fn usdt_evidence_verified_for_b_then_a_pays() {
+    assert_any_attested_attempt_pays([3, 0], false).await;
+}
+
+#[tokio::test]
+async fn finalized_usdt_evidence_verified_for_a_then_b_pays() {
+    assert_any_attested_attempt_pays([0, 3], true).await;
+}
+
+#[tokio::test]
+async fn finalized_usdt_evidence_verified_for_b_then_a_pays() {
+    assert_any_attested_attempt_pays([3, 0], true).await;
+}
+
 #[tokio::test]
 async fn a_legacy_receipt_pays_only_when_its_owner_has_one_attempt() {
     let (database, store, creator_id, creator, bundle, invoice) = two_attempt_invoice().await;
@@ -1153,7 +1215,7 @@ async fn a_legacy_receipt_pays_only_when_its_owner_has_one_attempt() {
     assert!(status(&store, &bundle).await.0);
     // As stored before attempts were recorded: a final receipt, never
     // re-verified, with no attempt. It pays nothing.
-    sqlx::query("UPDATE usdt_observations SET request_attempt_envelope = NULL")
+    sqlx::query("DELETE FROM usdt_observation_attempts")
         .execute(database.pool())
         .await
         .unwrap();
