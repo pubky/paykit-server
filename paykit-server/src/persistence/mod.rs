@@ -8,6 +8,7 @@ mod migrations;
 mod outbox;
 mod payment_drains;
 mod payment_request_lifecycles;
+mod usdt_attempts;
 
 pub use creators::{CreatorCredentials, CreatorSetupLock, CreatorStore, PersistedCreator};
 pub use deployment::{DeploymentStore, PersistenceError};

@@ -3,6 +3,7 @@
 use paykit_sdk::{PaymentRequestLocalRole, PaymentRequestRecord};
 
 use super::*;
+use crate::persistence::usdt_attempts::{self, ProposalTimes, ReceiptOwner};
 use crate::{
     application::marketplace_status::MarketplaceUsdtStatus,
     domain::receiving::USDT_CHAIN_ID,
@@ -37,6 +38,7 @@ struct UsdtObservationRow {
     transfer_lookup_hash: Vec<u8>,
     confirmations: i32,
     finalized: bool,
+    request_attempt_envelope: Option<Vec<u8>>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -48,6 +50,7 @@ struct ScannedReceipt {
     transfer_lookup_hash: Vec<u8>,
     confirmations: i32,
     finalized: bool,
+    request_attempt_envelope: Option<Vec<u8>>,
 }
 
 impl MarketplacePreparationStore {
@@ -174,8 +177,13 @@ impl MarketplacePreparationStore {
             match verified {
                 Some(transfer) => {
                     observed += usize::from(
-                        self.apply_usdt_transfer(&target, creator_hash, transfer)
-                            .await?,
+                        self.apply_usdt_transfer(
+                            &target,
+                            creator_hash,
+                            transfer,
+                            &record.payment_request_id,
+                        )
+                        .await?,
                     );
                 }
                 None => {
@@ -201,7 +209,8 @@ impl MarketplacePreparationStore {
         creator_hash: LookupHash,
     ) -> Result<Vec<PaymentCandidate>, PersistenceError> {
         let observations: Vec<UsdtObservationRow> = sqlx::query_as(
-            "SELECT id, observation_envelope, transfer_lookup_hash, confirmations, finalized
+            "SELECT id, observation_envelope, transfer_lookup_hash, confirmations, finalized,
+                    request_attempt_envelope
              FROM usdt_observations WHERE marketplace_preparation_id = $1 AND NOT finalized
                AND (checked_at > NOW() OR checked_at <= NOW() -
                  CASE WHEN present THEN INTERVAL '1 minute' ELSE INTERVAL '15 seconds' END)
@@ -254,6 +263,7 @@ impl MarketplacePreparationStore {
         target: &UsdtTarget,
         creator_hash: LookupHash,
         transfer: VerifiedTransfer,
+        payment_request_id: &str,
     ) -> Result<bool, PersistenceError> {
         let transfer_hash = self
             .crypto
@@ -297,14 +307,23 @@ impl MarketplacePreparationStore {
                     .map_err(|_| PersistenceError::CorruptOrMissing)?,
             )
             .map_err(|_| PersistenceError::CorruptOrMissing)?;
+        // The attempt it was verified for; a receipt keeps its first attempt.
+        let attempt = usdt_attempts::seal(
+            &self.crypto,
+            creator_hash,
+            id,
+            ReceiptOwner::Preparation(target.preparation_id),
+            payment_request_id,
+        )?;
         let confirmations =
             i32::try_from(transfer.confirmations).map_err(|_| PersistenceError::InvalidInput)?;
         let owner: Option<Uuid> = sqlx::query_scalar(
             "INSERT INTO usdt_observations
                  (id, marketplace_preparation_id, transfer_lookup_hash, observation_envelope,
-                  confirmations, present, finalized)
-             VALUES ($1, $2, $3, $4, $5, TRUE, $6)
+                  confirmations, present, finalized, request_attempt_envelope)
+             VALUES ($1, $2, $3, $4, $5, TRUE, $6, $7)
              ON CONFLICT (transfer_lookup_hash) DO UPDATE SET
+                request_attempt_envelope = CASE WHEN usdt_observations.marketplace_preparation_id = EXCLUDED.marketplace_preparation_id THEN COALESCE(usdt_observations.request_attempt_envelope, EXCLUDED.request_attempt_envelope) ELSE usdt_observations.request_attempt_envelope END,
                 observation_envelope = CASE WHEN usdt_observations.marketplace_preparation_id = EXCLUDED.marketplace_preparation_id THEN EXCLUDED.observation_envelope ELSE usdt_observations.observation_envelope END,
                 confirmations = CASE WHEN usdt_observations.marketplace_preparation_id = EXCLUDED.marketplace_preparation_id THEN EXCLUDED.confirmations ELSE usdt_observations.confirmations END,
                 present = CASE WHEN usdt_observations.marketplace_preparation_id = EXCLUDED.marketplace_preparation_id THEN TRUE ELSE usdt_observations.present END,
@@ -318,6 +337,7 @@ impl MarketplacePreparationStore {
         .bind(envelope.as_bytes())
         .bind(confirmations)
         .bind(transfer.finalized)
+        .bind(attempt)
         .fetch_one(&mut *tx)
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
@@ -399,7 +419,7 @@ impl MarketplacePreparationStore {
                     creators.creator_lookup_hash,
                     observation.id, observation.observation_envelope,
                     observation.transfer_lookup_hash, observation.confirmations,
-                    observation.finalized
+                    observation.finalized, observation.request_attempt_envelope
              FROM usdt_observations observation
              JOIN marketplace_settlements settlement
                ON settlement.preparation_id = observation.marketplace_preparation_id
@@ -410,8 +430,18 @@ impl MarketplacePreparationStore {
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
         for row in rows {
+            let creator_hash = stored_hash(&row.creator_lookup_hash)?;
+            if let Some(attempt) = row.request_attempt_envelope.clone() {
+                usdt_attempts::open(
+                    &self.crypto,
+                    creator_hash,
+                    row.id,
+                    ReceiptOwner::Preparation(row.preparation_id),
+                    attempt,
+                )?;
+            }
             self.usdt_facts(
-                stored_hash(&row.creator_lookup_hash)?,
+                creator_hash,
                 row.preparation_id,
                 &UsdtObservationRow {
                     id: row.id,
@@ -419,6 +449,7 @@ impl MarketplacePreparationStore {
                     transfer_lookup_hash: row.transfer_lookup_hash,
                     confirmations: row.confirmations,
                     finalized: row.finalized,
+                    request_attempt_envelope: row.request_attempt_envelope,
                 },
             )?;
         }
@@ -439,7 +470,8 @@ impl MarketplacePreparationStore {
         payment_deadline: OffsetDateTime,
     ) -> Result<Option<(MarketplaceUsdtStatus, Option<OffsetDateTime>)>, PersistenceError> {
         let rows: Vec<UsdtObservationRow> = sqlx::query_as(
-            "SELECT id, observation_envelope, transfer_lookup_hash, confirmations, finalized
+            "SELECT id, observation_envelope, transfer_lookup_hash, confirmations, finalized,
+                    request_attempt_envelope
              FROM usdt_observations
              WHERE marketplace_preparation_id = $1 AND present
              ORDER BY id",
@@ -456,22 +488,26 @@ impl MarketplacePreparationStore {
             };
         }
         let required = payment.usdt_required_amount()?;
-        // The window opens at activation, or later at the server's proposal record
-        // time less the chain's timestamp tolerance, and stays shut until that time
-        // is recorded, as for Locks invoices.
-        let proposal_recorded_at: Option<OffsetDateTime> = sqlx::query_scalar(
-            "SELECT MIN(proposal_recorded_at) FROM payment_request_lifecycles
-             WHERE marketplace_preparation_id = $1",
-        )
-        .bind(preparation_id)
-        .fetch_one(&mut **tx)
-        .await
-        .map_err(|_| PersistenceError::Unavailable)?;
-        let window_start = crate::usdt::payment_window_start(activated_at, proposal_recorded_at);
+        // Each receipt's window opens at activation, or later at the proposal record
+        // time of the attempt it was verified for less the chain's timestamp
+        // tolerance, and stays shut until that time is recorded, as for Locks
+        // invoices. A receipt with no attempt never pays.
+        let owner = ReceiptOwner::Preparation(preparation_id);
+        let mut proposal_times = ProposalTimes::new(owner);
         let mut selected: Option<((bool, bool, bool, u32), MarketplaceUsdtStatus)> = None;
         let mut first_qualifying_at: Option<OffsetDateTime> = None;
         for row in rows {
             let (facts, _) = self.usdt_facts(creator_hash, preparation_id, &row)?;
+            let proposal_recorded_at = match row.request_attempt_envelope.clone() {
+                Some(attempt) => {
+                    let attempt =
+                        usdt_attempts::open(&self.crypto, creator_hash, row.id, owner, attempt)?;
+                    proposal_times.of(tx, &attempt).await?
+                }
+                None => None,
+            };
+            let window_start =
+                crate::usdt::payment_window_start(activated_at, proposal_recorded_at);
             let confirmations =
                 u32::try_from(row.confirmations).map_err(|_| PersistenceError::CorruptOrMissing)?;
             let amount_matched = facts.amount >= required;

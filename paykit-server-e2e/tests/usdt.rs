@@ -32,10 +32,11 @@ use paykit_server::{
         receiving::{USDT_ENDPOINT, UsdtAddress},
     },
     persistence::{
-        AtomicInvoiceInput, CreatorCredentials, CreatorStore, InvoicePayloadFactory,
-        InvoicePayloads, InvoiceStore, MarketplaceActivationInput, MarketplacePreparationInput,
-        MarketplacePreparationPayloadFactory, MarketplacePreparationPayloads,
-        MarketplacePreparationStore, PaymentDrainStore, PersistenceError, run_migrations,
+        AtomicInvoiceInput, AtomicInvoiceResult, CreatorCredentials, CreatorStore,
+        InvoicePayloadFactory, InvoicePayloads, InvoiceStore, MarketplaceActivationInput,
+        MarketplacePreparationInput, MarketplacePreparationPayloadFactory,
+        MarketplacePreparationPayloads, MarketplacePreparationStore, PaymentDrainStore,
+        PersistenceError, run_migrations,
     },
     usdt::{ArbitrumVerifier, PaymentContext, VerificationError},
 };
@@ -1024,6 +1025,151 @@ async fn usdt_older_than_the_recorded_proposal_less_tolerance_does_not_pay_an_in
             "timestamp={timestamp}"
         );
     }
+}
+
+/// An invoice whose reader sent the request twice: attempt A on proof fixture
+/// 0 and attempt B on fixture 3, which proves the same transfer under the same
+/// payment reference.
+async fn two_attempt_invoice() -> (
+    TestDatabase,
+    InvoiceStore,
+    uuid::Uuid,
+    CreatorPubky,
+    BundleId,
+    AtomicInvoiceResult,
+) {
+    let bundle = parse_bundle_id(BUNDLES[0]).unwrap();
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(&[7; 32]).unwrap());
+    let creator = parse_creator(CREATOR).unwrap();
+    let creator_id = CreatorStore::new(database.pool(), crypto.clone())
+        .create(&CreatorCredentials::new(
+            creator.clone(),
+            "test-session".into(),
+            PaykitIdentitySecretKey::new([9; 32], 1).unwrap(),
+            None,
+            Some(UsdtAddress::try_from(RECIPIENT.to_owned()).unwrap()),
+        ))
+        .await
+        .unwrap()
+        .id();
+    let store = InvoiceStore::new(database.pool(), crypto.clone());
+    let invoice = store
+        .create_atomic(AtomicInvoiceInput {
+            creator: &creator,
+            reader: &parse_reader(CREATOR).unwrap(),
+            bundle_binding: BUNDLES[0].as_bytes(),
+            lock_resource_binding: b"lock",
+            payment_request_binding: BUNDLES[0].as_bytes(),
+            invoice_payloads: &Payload { index: 0 },
+            proposal_acceptance_seconds: 3600,
+            payment_window_seconds: 3 * 86400,
+        })
+        .await
+        .unwrap();
+    for index in [0, 3] {
+        sqlx::query("INSERT INTO payment_request_lifecycles (invoice_id,sdk_payment_request_id,request_state,last_event_at,last_stream_item_id) VALUES ($1,$2,'proof_submitted',NOW(),1)")
+            .bind(invoice.invoice_id()).bind(record(index).payment_request_id)
+            .execute(database.pool()).await.unwrap();
+    }
+    (database, store, creator_id, creator, bundle, invoice)
+}
+
+async fn record_proposal_time(database: &TestDatabase, index: usize, at: Option<OffsetDateTime>) {
+    sqlx::query(
+        "UPDATE payment_request_lifecycles SET proposal_recorded_at = $2
+         WHERE sdk_payment_request_id = $1",
+    )
+    .bind(record(index).payment_request_id)
+    .bind(at)
+    .execute(database.pool())
+    .await
+    .unwrap();
+}
+
+fn attempt_bound(proposal_recorded_at: OffsetDateTime) -> i64 {
+    (proposal_recorded_at - paykit_server::usdt::PROPOSAL_TIME_TOLERANCE)
+        .replace_nanosecond(0)
+        .unwrap()
+        .unix_timestamp()
+}
+
+#[tokio::test]
+async fn usdt_evidence_is_bounded_by_its_own_attempt_not_the_earliest() {
+    let (database, store, creator_id, creator, bundle, invoice) = two_attempt_invoice().await;
+    let created = invoice.invoice_created_at();
+    let first = created + time::Duration::days(1);
+    let second = created + time::Duration::days(2);
+    let rpc = Rpc::start().await;
+    let second_attempt = record(3);
+    let observe = |timestamp: i64| {
+        rpc.chain.lock().unwrap().timestamp = timestamp;
+        store.observe_usdt_request(
+            creator_id,
+            &creator,
+            &second_attempt,
+            &rpc.verifier,
+            Some(&bundle),
+        )
+    };
+    // A's proposal time is known and B's is not: evidence verified for B
+    // pays nothing, though A's window would accept it.
+    record_proposal_time(&database, 0, Some(first)).await;
+    observe(attempt_bound(first)).await.unwrap();
+    assert!(!status(&store, &bundle).await.0);
+    // With B's time recorded, a transfer inside A's window but before B's
+    // bound still pays nothing,
+    record_proposal_time(&database, 3, Some(second)).await;
+    observe(attempt_bound(second) - 1).await.unwrap();
+    assert!(!status(&store, &bundle).await.0);
+    // and one at B's bound pays.
+    observe(attempt_bound(second)).await.unwrap();
+    assert!(status(&store, &bundle).await.0);
+}
+
+#[tokio::test]
+async fn a_legacy_receipt_pays_only_when_its_owner_has_one_attempt() {
+    let (database, store, creator_id, creator, bundle, invoice) = two_attempt_invoice().await;
+    let proposal = invoice.invoice_created_at() + time::Duration::hours(1);
+    record_proposal_time(&database, 0, Some(proposal)).await;
+    record_proposal_time(&database, 3, Some(proposal)).await;
+    let rpc = Rpc::start().await;
+    {
+        let mut chain = rpc.chain.lock().unwrap();
+        chain.timestamp = invoice.invoice_created_at().unix_timestamp() + 60;
+        chain.finalized = true;
+    }
+    store
+        .observe_usdt_request(
+            creator_id,
+            &creator,
+            &record(0),
+            &rpc.verifier,
+            Some(&bundle),
+        )
+        .await
+        .unwrap();
+    assert!(status(&store, &bundle).await.0);
+    // As stored before attempts were recorded: a final receipt, never
+    // re-verified, with no attempt. It pays nothing.
+    sqlx::query("UPDATE usdt_observations SET request_attempt_envelope = NULL")
+        .execute(database.pool())
+        .await
+        .unwrap();
+    assert!(!status(&store, &bundle).await.0);
+    // With two attempts on its invoice it cannot be attributed.
+    store.attribute_legacy_usdt_receipts().await.unwrap();
+    assert!(!status(&store, &bundle).await.0);
+    // With one, that attempt is the one it was verified for.
+    sqlx::query("DELETE FROM payment_request_lifecycles WHERE sdk_payment_request_id = $1")
+        .bind(record(3).payment_request_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    store.attribute_legacy_usdt_receipts().await.unwrap();
+    assert!(status(&store, &bundle).await.0);
+    store.scan_payment_record_integrity().await.unwrap();
 }
 
 #[tokio::test]

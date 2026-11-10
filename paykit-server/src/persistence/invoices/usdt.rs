@@ -1,6 +1,7 @@
 //! Invoice attribution for authenticated Paykit USDT evidence.
 
 use super::*;
+use crate::persistence::usdt_attempts::{self, ProposalTimes, ReceiptOwner};
 use crate::usdt::{
     ArbitrumVerifier, MAX_SCAN_CANDIDATES, PaymentCandidate, PaymentContext, VerificationError,
     VerifiedTransfer,
@@ -21,6 +22,7 @@ struct UsdtObservationRow {
     transfer_lookup_hash: Vec<u8>,
     confirmations: i32,
     finalized: bool,
+    request_attempt_envelope: Option<Vec<u8>>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -35,13 +37,23 @@ pub(super) struct UsdtInvoiceRow {
 
 impl InvoiceStore {
     pub(super) async fn scan_usdt_observation_integrity(&self) -> Result<(), PersistenceError> {
-        let rows = sqlx::query_as::<_, (Uuid, Uuid, Vec<u8>, Vec<u8>, Vec<u8>)>(
-            "SELECT o.id, o.invoice_id, c.creator_lookup_hash, o.observation_envelope, o.transfer_lookup_hash
+        let rows = sqlx::query_as::<_, (Uuid, Uuid, Vec<u8>, Vec<u8>, Vec<u8>, Option<Vec<u8>>)>(
+            "SELECT o.id, o.invoice_id, c.creator_lookup_hash, o.observation_envelope, o.transfer_lookup_hash,
+                    o.request_attempt_envelope
              FROM usdt_observations o JOIN invoices i ON i.id=o.invoice_id JOIN creators c ON c.id=i.creator_id")
             .fetch_all(&self.pool).await.map_err(|_| PersistenceError::Unavailable)?;
-        for (id, invoice, creator_hash, envelope, identity_hash) in rows {
+        for (id, invoice, creator_hash, envelope, identity_hash, attempt) in rows {
             let creator_hash = lookup_hash(&creator_hash)?;
             self.transfer_facts(id, invoice, creator_hash, envelope, identity_hash)?;
+            if let Some(attempt) = attempt {
+                usdt_attempts::open(
+                    &self.crypto,
+                    creator_hash,
+                    id,
+                    ReceiptOwner::Invoice(invoice),
+                    attempt,
+                )?;
+            }
         }
         Ok(())
     }
@@ -231,7 +243,13 @@ impl InvoiceStore {
             match verified {
                 Some(transfer) => {
                     if self
-                        .apply_usdt_transfer(&row, creator_hash, &payment, transfer)
+                        .apply_usdt_transfer(
+                            &row,
+                            creator_hash,
+                            &payment,
+                            transfer,
+                            &record.payment_request_id,
+                        )
                         .await?
                     {
                         observed.insert(identity.as_str());
@@ -318,7 +336,8 @@ impl InvoiceStore {
             None
         };
         let observations: Vec<UsdtObservationRow> = sqlx::query_as(
-            "SELECT id, observation_envelope, transfer_lookup_hash, confirmations, finalized
+            "SELECT id, observation_envelope, transfer_lookup_hash, confirmations, finalized,
+                    request_attempt_envelope
              FROM usdt_observations WHERE invoice_id = $1 AND NOT finalized
                AND ($2 OR checked_at > NOW() OR checked_at <= NOW() -
                  CASE WHEN present THEN INTERVAL '1 minute' ELSE INTERVAL '15 seconds' END)
@@ -405,6 +424,7 @@ impl InvoiceStore {
         creator_hash: LookupHash,
         payment: &InvoicePaymentRecordV1,
         transfer: VerifiedTransfer,
+        payment_request_id: &str,
     ) -> Result<bool, PersistenceError> {
         let transfer_hash = self
             .crypto
@@ -445,13 +465,22 @@ impl InvoiceStore {
                     .map_err(|_| PersistenceError::CorruptOrMissing)?,
             )
             .map_err(|_| PersistenceError::CorruptOrMissing)?;
+        // The attempt it was verified for; a receipt keeps its first attempt.
+        let attempt = usdt_attempts::seal(
+            &self.crypto,
+            creator_hash,
+            id,
+            ReceiptOwner::Invoice(row.id),
+            payment_request_id,
+        )?;
         let confirmations =
             i32::try_from(transfer.confirmations).map_err(|_| PersistenceError::InvalidInput)?;
         // The unique transfer identity also fences simultaneous proofs for different invoices.
         let owner: Option<Uuid> = sqlx::query_scalar(
-            "INSERT INTO usdt_observations (id, invoice_id, transfer_lookup_hash, observation_envelope, confirmations, present, finalized)
-             VALUES ($1,$2,$3,$4,$5,TRUE,$6)
+            "INSERT INTO usdt_observations (id, invoice_id, transfer_lookup_hash, observation_envelope, confirmations, present, finalized, request_attempt_envelope)
+             VALUES ($1,$2,$3,$4,$5,TRUE,$6,$7)
              ON CONFLICT (transfer_lookup_hash) DO UPDATE SET
+                request_attempt_envelope = CASE WHEN usdt_observations.invoice_id = EXCLUDED.invoice_id THEN COALESCE(usdt_observations.request_attempt_envelope, EXCLUDED.request_attempt_envelope) ELSE usdt_observations.request_attempt_envelope END,
                 observation_envelope = CASE WHEN usdt_observations.invoice_id = EXCLUDED.invoice_id THEN EXCLUDED.observation_envelope ELSE usdt_observations.observation_envelope END,
                 confirmations = CASE WHEN usdt_observations.invoice_id = EXCLUDED.invoice_id THEN EXCLUDED.confirmations ELSE usdt_observations.confirmations END,
                 present = CASE WHEN usdt_observations.invoice_id = EXCLUDED.invoice_id THEN TRUE ELSE usdt_observations.present END,
@@ -459,7 +488,7 @@ impl InvoiceStore {
                 finalized = CASE WHEN usdt_observations.invoice_id = EXCLUDED.invoice_id THEN EXCLUDED.finalized ELSE usdt_observations.finalized END
              RETURNING invoice_id")
             .bind(id).bind(row.id).bind(transfer_hash.as_bytes().as_slice()).bind(envelope.as_bytes())
-            .bind(confirmations).bind(transfer.finalized).fetch_one(&mut *tx).await.map_err(|_| PersistenceError::Unavailable)?;
+            .bind(confirmations).bind(transfer.finalized).bind(attempt).fetch_one(&mut *tx).await.map_err(|_| PersistenceError::Unavailable)?;
         if owner != Some(row.id) {
             return Ok(false);
         }
@@ -485,19 +514,35 @@ impl InvoiceStore {
         required: u64,
     ) -> Result<Option<(String, super::settlement::ObservedPayment)>, PersistenceError> {
         let observations: Vec<UsdtObservationRow> = sqlx::query_as(
-            "SELECT id, observation_envelope, transfer_lookup_hash, confirmations, finalized FROM usdt_observations WHERE invoice_id = $1 AND present")
-            .bind(row.id).fetch_all(&mut **tx).await.map_err(|_| PersistenceError::Unavailable)?;
-        let proposal_recorded_at: Option<OffsetDateTime> = sqlx::query_scalar(
-            "SELECT MIN(proposal_recorded_at) FROM payment_request_lifecycles WHERE invoice_id = $1",
+            "SELECT id, observation_envelope, transfer_lookup_hash, confirmations, finalized,
+                    request_attempt_envelope
+             FROM usdt_observations WHERE invoice_id = $1 AND present",
         )
         .bind(row.id)
-        .fetch_one(&mut **tx)
+        .fetch_all(&mut **tx)
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
-        let window_start =
-            crate::usdt::payment_window_start(row.invoice_created_at, proposal_recorded_at);
+        let owner = ReceiptOwner::Invoice(row.id);
+        let mut proposal_times = ProposalTimes::new(owner);
         let mut selected: Option<(String, super::settlement::ObservedPayment)> = None;
         for observation in observations {
+            // Each receipt is bounded by the proposal time of the attempt it
+            // was verified for; one with no attempt never pays.
+            let proposal_recorded_at = match observation.request_attempt_envelope {
+                Some(attempt) => {
+                    let attempt = usdt_attempts::open(
+                        &self.crypto,
+                        creator_hash,
+                        observation.id,
+                        owner,
+                        attempt,
+                    )?;
+                    proposal_times.of(tx, &attempt).await?
+                }
+                None => None,
+            };
+            let window_start =
+                crate::usdt::payment_window_start(row.invoice_created_at, proposal_recorded_at);
             let (facts, _) = self.transfer_facts(
                 observation.id,
                 row.id,
@@ -603,7 +648,11 @@ impl InvoiceStore {
         .fetch_one(&mut *tx)
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
-        if !due {
+        if !due
+            || self
+                .usdt_attempt_time_pending(&mut tx, row, creator_hash)
+                .await?
+        {
             return Ok(());
         }
         sqlx::query(
@@ -629,6 +678,34 @@ impl InvoiceStore {
         self.project_payments(&mut tx, row.id, creator_hash, payment, now)
             .await?;
         tx.commit().await.map_err(|_| PersistenceError::Unavailable)
+    }
+
+    /// Whether a present receipt of the invoice was verified for an attempt
+    /// whose proposal time is not recorded yet. Reconciliation waits for it,
+    /// so a receipt that may still qualify does not clear the marker.
+    async fn usdt_attempt_time_pending(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        row: &UsdtInvoiceRow,
+        creator_hash: LookupHash,
+    ) -> Result<bool, PersistenceError> {
+        let attempts: Vec<(Uuid, Vec<u8>)> = sqlx::query_as(
+            "SELECT id, request_attempt_envelope FROM usdt_observations
+             WHERE invoice_id = $1 AND present AND request_attempt_envelope IS NOT NULL",
+        )
+        .bind(row.id)
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        let owner = ReceiptOwner::Invoice(row.id);
+        let mut proposal_times = ProposalTimes::new(owner);
+        for (id, attempt) in attempts {
+            let attempt = usdt_attempts::open(&self.crypto, creator_hash, id, owner, attempt)?;
+            if proposal_times.of(tx, &attempt).await?.is_none() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     pub(super) async fn usdt_payment_status(

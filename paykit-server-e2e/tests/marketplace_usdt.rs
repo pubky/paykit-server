@@ -6,8 +6,8 @@ use std::sync::atomic::Ordering;
 
 use axum::http::StatusCode;
 use paykit_server::{
-    bitcoin::ObservedOutput, config::BitcoinNetwork, crypto::Crypto, usdt::ArbitrumVerifier,
-    workers::observer::observe_marketplace_once_at,
+    bitcoin::ObservedOutput, config::BitcoinNetwork, crypto::Crypto, persistence::InvoiceStore,
+    usdt::ArbitrumVerifier, workers::observer::observe_marketplace_once_at,
 };
 use serde_json::{Value, json};
 use time::OffsetDateTime;
@@ -792,6 +792,37 @@ async fn usdt_older_than_the_recorded_proposal_less_tolerance_is_not_paid_on_tim
 }
 
 #[tokio::test]
+async fn a_receipt_pays_only_once_attributed_to_its_attempt() {
+    // A preparation has one Payment Request attempt, so a receipt stored
+    // before attempts were recorded is attributed to it at startup.
+    let rig = rig(BOTH_RAILS, true).await;
+    let rpc = Rpc::start().await;
+    let request = offered(&rig, 0, &[]).await;
+    chain(&rpc, |chain| {
+        transfer(chain, REQUIRED_USDT);
+        chain.timestamp = request.at(10);
+        chain.finalized = true;
+    });
+    submit(&rig, &rpc, 0).await;
+    let paid = || rig.status(&request.invoice);
+    assert_eq!(paid().await["usdt_arbitrum"]["paid_on_time"], true);
+    // As stored before attempts were recorded: a final receipt, never
+    // re-verified, with no attempt. It pays nothing.
+    sqlx::query("UPDATE usdt_observations SET request_attempt_envelope = NULL")
+        .execute(rig.database.pool())
+        .await
+        .unwrap();
+    assert_eq!(paid().await["usdt_arbitrum"]["paid_on_time"], false);
+    InvoiceStore::new(rig.database.pool(), crypto())
+        .attribute_legacy_usdt_receipts()
+        .await
+        .unwrap();
+    assert_eq!(paid().await["usdt_arbitrum"]["paid_on_time"], true);
+    rig.store.scan_observation_integrity().await.unwrap();
+    rig.cleanup().await;
+}
+
+#[tokio::test]
 async fn bitcoin_payment_on_a_dual_asset_request_leaves_usdt_null() {
     let rig = rig(BOTH_RAILS, true).await;
     let request = offered(&rig, 0, &[]).await;
@@ -1189,11 +1220,22 @@ async fn insert_receipt(
             .unwrap(),
         )
         .unwrap();
+    // Verified for the request's one attempt, proof fixture 0.
+    let attempt = crypto
+        .encrypt(
+            &EnvelopeContext::usdt_observation_attempt(
+                crypto.lookup_hash(creator().to_string().as_bytes()),
+                id,
+                preparation,
+            ),
+            record(0).payment_request_id.as_bytes(),
+        )
+        .unwrap();
     sqlx::query(
         "INSERT INTO usdt_observations
          (id, marketplace_preparation_id, transfer_lookup_hash, observation_envelope,
-          confirmations, present, finalized)
-         VALUES ($1, $2, $3, $4, $5, TRUE, $6)",
+          confirmations, present, finalized, request_attempt_envelope)
+         VALUES ($1, $2, $3, $4, $5, TRUE, $6, $7)",
     )
     .bind(id)
     .bind(preparation)
@@ -1206,6 +1248,7 @@ async fn insert_receipt(
     .bind(envelope.as_bytes())
     .bind(confirmations)
     .bind(finalized)
+    .bind(attempt.as_bytes())
     .execute(rig.database.pool())
     .await
     .unwrap();
