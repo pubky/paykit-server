@@ -1,5 +1,5 @@
 {
-  "generator": "viem 2; public secp256k1 test key 1",
+  "generator": "viem 2 (proofs 0-2), alloy-sol-types and secp256k1 (proof 3: a second request on proof 0's reference); public secp256k1 test key 1",
   "sender": "0x7e5f4552091a69125d5dfcb7b8c2659029395bdf",
   "recipient": "0x2222222222222222222222222222222222222222",
   "proofs": [
@@ -61,6 +61,26 @@
         "transaction_hash": "0x1111111111111111111111111111111111111111111111111111111111111111",
         "receipt_log_index": "1",
         "signature": "0xa7f210d36bd1921f4bc0561473c174fec902850f88003a04b9ba6987c10028050c4edb75361328a8c8a3504945f4b5ab52882785c32adb82d581140bca761de21c"
+      }
+    },
+    {
+      "binding": {
+        "payer": "tkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+        "payee": "tkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+        "paymentAppId": "paykit-server",
+        "paymentRequestId": "00000000-0000-4000-8000-000000000004",
+        "paymentReference": "10000000-0000-4000-8000-000000000001",
+        "paymentEndpointIdentifier": "usdt-arbitrum-address",
+        "periodStartsAt": "",
+        "periodEndsAt": "",
+        "conversionQuoteId": ""
+      },
+      "proof": {
+        "type": "erc20-transfer-eip712",
+        "chain_id": "42161",
+        "transaction_hash": "0x1111111111111111111111111111111111111111111111111111111111111111",
+        "receipt_log_index": "1",
+        "signature": "0xda6144ff1651a9995f631f52722e470dfbf1e6f22b6b2a8e9199f379664b0e4938b8a108de134aac978562d6bf1fb429fb6cb024bcb701794e14ba4bcae983791b"
       }
     }
   ]

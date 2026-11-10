@@ -338,7 +338,7 @@ fn requires_a_nonempty_paykit_client_id() {
 }
 
 #[test]
-fn allowance_intake_is_off_by_default_and_cannot_be_enabled_yet() {
+fn allowance_intake_is_off_by_default_and_can_be_enabled() {
     let config = Config::from_toml_and_environment(&valid_toml(), environment()).unwrap();
     assert!(!config.paykit.allowance_intake);
 
@@ -347,14 +347,8 @@ fn allowance_intake_is_off_by_default_and_cannot_be_enabled_yet() {
         "network = \"testnet\"\nallowance_intake = true\n\n[bitcoin]",
     );
     assert!(enabled.contains("allowance_intake = true"));
-    let result = Config::from_toml_and_environment(&enabled, environment());
-    #[cfg(not(feature = "test-utils"))]
-    assert!(matches!(
-        result,
-        Err(ConfigError::AllowanceIntakeUnavailable)
-    ));
-    #[cfg(feature = "test-utils")]
-    assert!(result.unwrap().paykit.allowance_intake);
+    let config = Config::from_toml_and_environment(&enabled, environment()).unwrap();
+    assert!(config.paykit.allowance_intake);
 }
 
 #[test]

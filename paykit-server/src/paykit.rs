@@ -1020,14 +1020,14 @@ fn lifecycle_projection(
     let last_event_at = record
         .last_event_at
         .ok_or(LifecycleSyncError::InvalidProjection)?;
-    let seconds = i128::from(last_event_at.timestamp());
-    let nanos = i128::from(last_event_at.timestamp_subsec_nanos());
-    let timestamp_nanos = seconds
-        .checked_mul(1_000_000_000)
-        .and_then(|value| value.checked_add(nanos))
-        .ok_or(LifecycleSyncError::InvalidProjection)?;
-    let last_event_at = time::OffsetDateTime::from_unix_timestamp_nanos(timestamp_nanos)
-        .map_err(|_| LifecycleSyncError::InvalidProjection)?;
+    let last_event_at = offset_date_time(
+        last_event_at.timestamp(),
+        last_event_at.timestamp_subsec_nanos(),
+    )?;
+    let proposal_recorded_at = record
+        .proposal_recorded_at
+        .map(|at| offset_date_time(at.timestamp(), at.timestamp_subsec_nanos()))
+        .transpose()?;
     Ok(PaymentRequestLifecycleProjection {
         payment_request_id: record.payment_request_id.clone(),
         proposal: ProposalCorrelation {
@@ -1071,7 +1071,19 @@ fn lifecycle_projection(
         last_stream_item_id: record.last_stream_item_id,
         last_outbound_message_id: record.last_outbound_message_id,
         last_event_at,
+        proposal_recorded_at,
     })
+}
+
+fn offset_date_time(seconds: i64, nanos: u32) -> Result<time::OffsetDateTime, LifecycleSyncError> {
+    let seconds = i128::from(seconds);
+    let nanos = i128::from(nanos);
+    let timestamp_nanos = seconds
+        .checked_mul(1_000_000_000)
+        .and_then(|value| value.checked_add(nanos))
+        .ok_or(LifecycleSyncError::InvalidProjection)?;
+    time::OffsetDateTime::from_unix_timestamp_nanos(timestamp_nanos)
+        .map_err(|_| LifecycleSyncError::InvalidProjection)
 }
 
 fn lifecycle_projections(
@@ -1494,6 +1506,8 @@ mod tests {
             proposal_outbound_message_id: None,
             proposal_outbound_status: None,
             proposal_event_id: Some(Uuid::new_v4().to_string()),
+            proposal_recorded_at: None,
+            acceptance_recorded_at: None,
             terms: Some(PaymentRequestTermsRecord {
                 amount: AmountRecord {
                     asset: "BTC".into(),
@@ -2070,6 +2084,7 @@ mod tests {
             last_stream_item_id: Some(index),
             last_outbound_message_id: None,
             last_event_at: time::OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap(),
+            proposal_recorded_at: None,
         }
     }
 

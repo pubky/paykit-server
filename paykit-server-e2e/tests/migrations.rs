@@ -267,9 +267,19 @@ async fn migrations_create_the_required_schema_and_are_restart_safe() {
             .fetch_all(pool)
             .await
             .unwrap();
-    let mut expected_versions = (1..=22).collect::<Vec<_>>();
-    expected_versions.extend([24, 25]);
-    assert_eq!(applied_versions, expected_versions);
+    assert_eq!(applied_versions, (1..=27).collect::<Vec<_>>());
+
+    let proposal_recorded_at: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM information_schema.columns
+         WHERE table_schema = 'public'
+           AND table_name = 'payment_request_lifecycles'
+           AND column_name = 'proposal_recorded_at'
+           AND is_nullable = 'YES'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(proposal_recorded_at, 1);
 
     let rotation_columns: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM information_schema.columns

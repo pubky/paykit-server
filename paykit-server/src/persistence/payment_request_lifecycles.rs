@@ -59,6 +59,7 @@ struct LifecycleRow {
     last_stream_item_id: Option<i64>,
     last_outbound_message_id: Option<i64>,
     last_event_at: time::OffsetDateTime,
+    proposal_recorded_at: Option<time::OffsetDateTime>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -440,6 +441,10 @@ impl PaymentRequestLifecycleStore {
         let stream_cursor = optional_cursor(projection.last_stream_item_id)?;
         let outbound_cursor = optional_cursor(projection.last_outbound_message_id)?;
         let last_event_at = postgres_timestamp(projection.last_event_at)?;
+        let proposal_recorded_at = projection
+            .proposal_recorded_at
+            .map(postgres_timestamp)
+            .transpose()?;
         let mut transaction = self
             .pool
             .begin()
@@ -524,7 +529,7 @@ impl PaymentRequestLifecycleStore {
         let existing = sqlx::query_as::<_, LifecycleRow>(
             "SELECT invoice_id, marketplace_preparation_id, sdk_payment_request_id,
                     request_state, state_event_id, last_stream_item_id,
-                    last_outbound_message_id, last_event_at
+                    last_outbound_message_id, last_event_at, proposal_recorded_at
              FROM payment_request_lifecycles
              WHERE sdk_payment_request_id = $1
              FOR UPDATE",
@@ -535,6 +540,21 @@ impl PaymentRequestLifecycleStore {
         .map_err(|_| PersistenceError::Unavailable)?;
 
         if let Some(existing) = existing {
+            // The proposal time never changes once recorded. A row stored
+            // before the server kept it takes it from the next projection,
+            // even an exact replay.
+            if existing.proposal_recorded_at.is_none() && proposal_recorded_at.is_some() {
+                sqlx::query(
+                    "UPDATE payment_request_lifecycles
+                     SET proposal_recorded_at = $1
+                     WHERE sdk_payment_request_id = $2 AND proposal_recorded_at IS NULL",
+                )
+                .bind(proposal_recorded_at)
+                .bind(&projection.payment_request_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|_| PersistenceError::Unavailable)?;
+            }
             if exact_replay(
                 &existing,
                 projection,
@@ -587,9 +607,10 @@ impl PaymentRequestLifecycleStore {
                 LifecycleOwner::Invoice(invoice_id) => sqlx::query(
                     "INSERT INTO payment_request_lifecycles (
                          invoice_id, sdk_payment_request_id, request_state, state_event_id,
-                         last_stream_item_id, last_outbound_message_id, last_event_at
+                         last_stream_item_id, last_outbound_message_id, last_event_at,
+                         proposal_recorded_at
                      )
-                     SELECT $1, $2, $3, $4, $5, $6, $7
+                     SELECT $1, $2, $3, $4, $5, $6, $7, $8
                      WHERE EXISTS (
                          SELECT 1
                          FROM invoices invoice
@@ -607,15 +628,16 @@ impl PaymentRequestLifecycleStore {
                 .bind(stream_cursor)
                 .bind(outbound_cursor)
                 .bind(last_event_at)
+                .bind(proposal_recorded_at)
                 .execute(&mut *transaction)
                 .await,
                 LifecycleOwner::Marketplace(preparation_id) => sqlx::query(
                     "INSERT INTO payment_request_lifecycles (
                          marketplace_preparation_id, sdk_payment_request_id,
                          request_state, state_event_id, last_stream_item_id,
-                         last_outbound_message_id, last_event_at
+                         last_outbound_message_id, last_event_at, proposal_recorded_at
                      )
-                     SELECT $1, $2, $3, $4, $5, $6, $7
+                     SELECT $1, $2, $3, $4, $5, $6, $7, $8
                      WHERE EXISTS (
                          SELECT 1
                          FROM marketplace_settlements settlement
@@ -633,6 +655,7 @@ impl PaymentRequestLifecycleStore {
                 .bind(stream_cursor)
                 .bind(outbound_cursor)
                 .bind(last_event_at)
+                .bind(proposal_recorded_at)
                 .execute(&mut *transaction)
                 .await,
             }
