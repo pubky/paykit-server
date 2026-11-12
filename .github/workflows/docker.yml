@@ -31,12 +31,11 @@ jobs:
           registry: registry-1.docker.io/synonymsoft
           context: .
           push: true
-          latest: true
+          # Prerelease tags (with a '-' suffix, e.g. v0.1.1-rc3) do not move :latest.
+          latest: ${{ !contains(github.ref_name, '-') }}
           tags: |
             type=ref,event=tag
           platforms: |
             linux/arm64
             linux/amd64
           image: paykit-server
-          cache_from: type=gha
-          cache_to: type=gha,mode=max
