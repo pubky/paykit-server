@@ -1,6 +1,6 @@
 use axum::{
     Json,
-    http::{StatusCode, header},
+    http::{HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
 use serde::Serialize;
@@ -254,10 +254,9 @@ impl IntoResponse for ApiError {
         if self == Self::RequestBodyTimeout {
             // RFC 9110 section 15.5.9: close after 408 instead of reusing a
             // connection whose request body was left unread.
-            response.headers_mut().insert(
-                header::CONNECTION,
-                "close".parse().expect("static header value"),
-            );
+            response
+                .headers_mut()
+                .insert(header::CONNECTION, HeaderValue::from_static("close"));
         }
         super::request_diagnostics::annotate(
             &mut response,

@@ -741,7 +741,11 @@ async fn stalled_signed_body_times_out_and_releases_the_only_capacity_slot() {
     // it, a probe takes the free slot and succeeds. The test runtime is
     // single-threaded and a probe's in-memory request finishes in one poll,
     // so the server cannot try to admit the stalled request mid-probe.
-    let poll_deadline = Instant::now() + Duration::from_secs(1);
+    // Admission can be slow on a loaded runner, so the probe window is
+    // independent of the read timeout. The read timeout starts at admission
+    // and is far longer than the 10ms probe interval, so the next probe
+    // still sees the held slot.
+    let poll_deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let probe = app
             .clone()
@@ -788,6 +792,48 @@ async fn stalled_signed_body_times_out_and_releases_the_only_capacity_slot() {
     assert_eq!(response_body(response).await, r#"{"value":1}"#);
 
     drop(stalled);
+    server.abort();
+}
+
+#[tokio::test]
+async fn oversized_declared_signed_body_is_rejected_before_the_timed_read() {
+    let key = SigningKey::from_bytes(&[7; 32]);
+    let mut config = config_for(&key, 100, 200, 16 * 1024);
+    let read_timeout = Duration::from_secs(5);
+    config.limits.request_body_read_timeout = read_timeout;
+    let auth = Arc::new(SignedServiceAuth::from_config(&config));
+    let runtime = Arc::new(Runtime::new(Arc::new(ReadyDependency), 1));
+    let app = operational_router(
+        Router::new()
+            .route("/test", post(test_endpoint))
+            .layer(Extension(auth)),
+        runtime.clone(),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve(listener, app, runtime));
+
+    // Declare a body far over the limit and send none of it.
+    let mut stream = TcpStream::connect(address).await.unwrap();
+    let started = Instant::now();
+    stream
+        .write_all(b"POST /test HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1000000\r\n\r\n")
+        .await
+        .unwrap();
+
+    let response = read_raw_http_response(&mut stream).await;
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert!(
+        response.starts_with("HTTP/1.1 413 Payload Too Large\r\n"),
+        "{response}"
+    );
+    assert!(
+        response.ends_with(
+            r#"{"error":{"code":"payload_too_large","message":"request body is too large"}}"#
+        ),
+        "{response}"
+    );
+
     server.abort();
 }
 

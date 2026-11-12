@@ -5,7 +5,7 @@ use std::{
 };
 
 use axum::{
-    body::to_bytes,
+    body::{HttpBody, to_bytes},
     extract::{FromRequest, Request},
     http::header::HeaderName,
 };
@@ -182,6 +182,11 @@ where
             return Err(ApiError::InvalidRequest);
         }
         let limit = auth.request_body_bytes;
+        // A declared Content-Length over the limit is rejected before any
+        // read, so it cannot hold a capacity slot until the deadline.
+        if body.size_hint().lower() > u64::try_from(limit).unwrap_or(u64::MAX) {
+            return Err(ApiError::PayloadTooLarge);
+        }
         // One total deadline for the whole unauthenticated body read.
         let raw_body = tokio::time::timeout(
             auth.request_body_read_timeout,
