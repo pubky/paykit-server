@@ -66,13 +66,7 @@ fn rendered_key(key: &SigningKey) -> String {
     .to_string()
 }
 
-fn config_for_keys(
-    keys: &[&SigningKey],
-    rate: u64,
-    burst: u64,
-    request_body_bytes: u64,
-    request_body_read_timeout: &str,
-) -> Config {
+fn config_for_keys(keys: &[&SigningKey], rate: u64, burst: u64, request_body_bytes: u64) -> Config {
     let keys = keys
         .iter()
         .map(|key| format!("\"{}\"", rendered_key(key)))
@@ -99,7 +93,6 @@ endpoint = "ssl://electrum.example:50002"
 poll_interval = "5s"
 [limits]
 request_body_bytes = {request_body_bytes}
-request_body_read_timeout = "{request_body_read_timeout}"
 [rate_limits]
 signed_requests_per_second = {rate}
 signed_burst = {burst}
@@ -114,7 +107,7 @@ signed_burst = {burst}
 }
 
 fn config_for(key: &SigningKey, rate: u64, burst: u64, request_body_bytes: u64) -> Config {
-    config_for_keys(&[key], rate, burst, request_body_bytes, "10s")
+    config_for_keys(&[key], rate, burst, request_body_bytes)
 }
 
 fn router(key: &SigningKey, rate: u64, burst: u64) -> Router {
@@ -169,7 +162,7 @@ async fn every_signed_business_path_accepts_each_trusted_service_key() {
     let first = SigningKey::from_bytes(&[7; 32]);
     let second = SigningKey::from_bytes(&[8; 32]);
     let unlisted = SigningKey::from_bytes(&[9; 32]);
-    let config = config_for_keys(&[&first, &second], 100, 200, 16 * 1024, "10s");
+    let config = config_for_keys(&[&first, &second], 100, 200, 16 * 1024);
     let pool = sqlx::postgres::PgPoolOptions::new()
         .connect_lazy("postgres://127.0.0.1:1/paykit")
         .unwrap();
@@ -721,13 +714,9 @@ async fn raw_http_exchange(stream: &mut TcpStream, request: &[u8]) -> String {
 #[tokio::test]
 async fn stalled_signed_body_times_out_and_releases_the_only_capacity_slot() {
     let key = SigningKey::from_bytes(&[7; 32]);
-    let auth = Arc::new(SignedServiceAuth::from_config(&config_for_keys(
-        &[&key],
-        100,
-        200,
-        16 * 1024,
-        "200ms",
-    )));
+    let mut config = config_for(&key, 100, 200, 16 * 1024);
+    config.limits.request_body_read_timeout = Duration::from_millis(200);
+    let auth = Arc::new(SignedServiceAuth::from_config(&config));
     let runtime = Arc::new(Runtime::new(Arc::new(ReadyDependency), 1));
     let app = operational_router(
         Router::new()
@@ -737,7 +726,7 @@ async fn stalled_signed_body_times_out_and_releases_the_only_capacity_slot() {
     );
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
-    let server = tokio::spawn(serve(listener, app, runtime));
+    let server = tokio::spawn(serve(listener, app.clone(), runtime));
 
     // Announce 100 body bytes, send four, then stall while holding the
     // server's single capacity permit.
@@ -760,20 +749,14 @@ async fn stalled_signed_body_times_out_and_releases_the_only_capacity_slot() {
         "{response}"
     );
 
-    let body = br#"{"value":1}"#;
-    let preimage = paykit_server::http::auth::signature_preimage("POST", "/test", body);
-    let signature = URL_SAFE_NO_PAD.encode(key.sign(&preimage).to_bytes());
-    let mut request = format!(
-        "POST /test HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\
-         X-Paykit-Signature: {signature}\r\nContent-Length: {}\r\n\r\n",
-        body.len()
-    )
-    .into_bytes();
-    request.extend_from_slice(body);
-    let mut fresh = TcpStream::connect(address).await.unwrap();
-    let response = raw_http_exchange(&mut fresh, &request).await;
-    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
-    assert!(response.ends_with(r#"{"value":1}"#), "{response}");
+    // The capacity permit lives in the shared runtime, so a signed request
+    // through the same app proves the stalled request released it.
+    let response = app
+        .oneshot(signed_request(&key, br#"{"value":1}"#.as_slice()))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response_body(response).await, r#"{"value":1}"#);
 
     drop(stalled);
     server.abort();
@@ -783,13 +766,8 @@ async fn stalled_signed_body_times_out_and_releases_the_only_capacity_slot() {
 fn authentication_state_debug_redacts_every_trusted_public_key() {
     let first = SigningKey::from_bytes(&[7; 32]);
     let second = SigningKey::from_bytes(&[8; 32]);
-    let auth = SignedServiceAuth::from_config(&config_for_keys(
-        &[&first, &second],
-        100,
-        200,
-        16 * 1024,
-        "10s",
-    ));
+    let auth =
+        SignedServiceAuth::from_config(&config_for_keys(&[&first, &second], 100, 200, 16 * 1024));
     let rendered = format!("{auth:?}");
 
     assert!(!rendered.contains(&rendered_key(&first)));

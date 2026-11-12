@@ -182,9 +182,7 @@ where
             return Err(ApiError::InvalidRequest);
         }
         let limit = auth.request_body_bytes;
-        // One total deadline for the whole unauthenticated body read: the
-        // byte limit bounds size, this bounds how long a slow or stalled
-        // client can hold the request's capacity slot.
+        // One total deadline for the whole unauthenticated body read.
         let raw_body = tokio::time::timeout(
             auth.request_body_read_timeout,
             to_bytes(body, limit.saturating_add(1)),
