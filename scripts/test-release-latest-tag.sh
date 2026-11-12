@@ -9,6 +9,9 @@ script="$root/scripts/release-latest-tag.sh"
 workflow="$root/.github/workflows/docker.yml"
 tmp=$(mktemp -d "${TMPDIR:-.}/paykit-release-latest.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+# Without TMPDIR the path is relative, and expect() runs the script from
+# inside a throwaway repo, so make every derived path absolute.
+tmp=$(CDPATH='' cd -- "$tmp" && pwd)
 
 fail() {
     echo "FAIL: $*" >&2
