@@ -34,11 +34,13 @@ jobs:
           if [[ "$TAG" =~ $stable ]]; then
             newest="$(gh api --paginate "repos/$REPO/git/matching-refs/tags/v" --jq '.[].ref' \
               | sed 's#^refs/tags/##' \
-              | grep -E "$stable" \
+              | { grep -E "$stable" || true; } \
               | sort -V \
               | tail -n1)"
             if [[ "$TAG" == "$newest" ]]; then
               latest=true
+            else
+              echo "::warning::$TAG is not the newest stable tag ('${newest:-none found}'), so :latest was left unchanged"
             fi
           fi
           echo "latest=$latest" >> "$GITHUB_OUTPUT"
@@ -56,10 +58,12 @@ jobs:
           registry: registry-1.docker.io/synonymsoft
           context: .
           push: true
-          # Only the newest stable vX.Y.Z tag moves :latest.
+          # Only the newest stable vX.Y.Z tag moves :latest. The version tag is
+          # emitted as type=raw because type=ref,event=tag would add :latest on
+          # every tag under metadata-action's default latest=auto flavor.
           latest: ${{ steps.latest.outputs.latest }}
           tags: |
-            type=ref,event=tag
+            type=raw,value={{tag}}
           platforms: |
             linux/arm64
             linux/amd64
