@@ -45,7 +45,9 @@ impl Clock for SystemClock {
 
 pub struct SignedServiceAuth {
     trusted_keys: Vec<VerifyingKey>,
-    request_body_bytes: usize,
+    request_body_bytes: u64,
+    /// `request_body_bytes` as the `usize` that body collection takes.
+    request_body_limit: usize,
     request_body_read_timeout: Duration,
     limiter: Mutex<TokenBucket>,
     clock: Arc<dyn Clock>,
@@ -94,7 +96,8 @@ impl SignedServiceAuth {
                 .iter()
                 .map(|key| key.verifying_key())
                 .collect(),
-            request_body_bytes: usize::try_from(config.limits.request_body_bytes)
+            request_body_bytes: config.limits.request_body_bytes,
+            request_body_limit: usize::try_from(config.limits.request_body_bytes)
                 .expect("validated request body limit fits usize"),
             request_body_read_timeout: config.limits.request_body_read_timeout,
             limiter: Mutex::new(TokenBucket::new(
@@ -181,12 +184,12 @@ where
         if parts.uri.query().is_some() {
             return Err(ApiError::InvalidRequest);
         }
-        let limit = auth.request_body_bytes;
         // A declared Content-Length over the limit is rejected before any
         // read, so it cannot hold a capacity slot until the deadline.
-        if body.size_hint().lower() > u64::try_from(limit).unwrap_or(u64::MAX) {
+        if body.size_hint().lower() > auth.request_body_bytes {
             return Err(ApiError::PayloadTooLarge);
         }
+        let limit = auth.request_body_limit;
         // One total deadline for the whole unauthenticated body read.
         let raw_body = tokio::time::timeout(
             auth.request_body_read_timeout,

@@ -1,4 +1,6 @@
 use std::{
+    io::ErrorKind,
+    net::SocketAddr,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -9,8 +11,10 @@ use std::{
 use axum::{
     Json, Router,
     body::{Body, to_bytes},
-    extract::Extension,
+    extract::{Extension, State},
     http::{Method, Request, StatusCode},
+    middleware::{self, Next},
+    response::Response,
     routing::post,
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -23,8 +27,10 @@ use paykit_server::{
 };
 use serde::Deserialize;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
+    sync::Notify,
+    task::JoinHandle,
 };
 use tower::ServiceExt;
 
@@ -700,68 +706,107 @@ async fn operational_capacity_rejects_before_signature_verification() {
 }
 
 /// Reads until the server closes the connection, failing instead of hanging
-/// when no complete answer arrives.
-async fn read_raw_http_response(stream: &mut TcpStream) -> String {
+/// when no complete answer arrives. A reset after the answer is accepted: a
+/// server that closes with request bytes still unread resets the connection.
+async fn read_raw_http_response(stream: &mut (impl AsyncRead + Unpin)) -> String {
     let mut response = Vec::new();
-    tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut response))
+    let read_until_closed = async {
+        let mut chunk = [0; 1024];
+        loop {
+            match stream.read(&mut chunk).await {
+                Ok(0) => return,
+                Ok(read) => response.extend_from_slice(&chunk[..read]),
+                Err(error)
+                    if error.kind() == ErrorKind::ConnectionReset && !response.is_empty() =>
+                {
+                    return;
+                }
+                Err(error) => panic!("reading the response failed: {error}"),
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), read_until_closed)
         .await
-        .expect("server answers and closes the connection in time")
-        .unwrap();
+        .expect("server answers and closes the connection in time");
     String::from_utf8(response).unwrap()
 }
 
-#[tokio::test]
-async fn stalled_signed_body_times_out_and_releases_the_only_capacity_slot() {
-    let key = SigningKey::from_bytes(&[7; 32]);
-    let mut config = config_for(&key, 100, 200, 16 * 1024);
-    let read_timeout = Duration::from_secs(1);
+/// A signed `/test` app with one capacity slot, served over loopback TCP.
+struct SignedTcpApp {
+    app: Router,
+    address: SocketAddr,
+    /// Notified each time a request takes the capacity slot.
+    admitted: Arc<Notify>,
+    server: JoinHandle<std::io::Result<()>>,
+}
+
+async fn spawn_signed_tcp_app(key: &SigningKey, read_timeout: Duration) -> SignedTcpApp {
+    let mut config = config_for(key, 100, 200, 16 * 1024);
     config.limits.request_body_read_timeout = read_timeout;
     let auth = Arc::new(SignedServiceAuth::from_config(&config));
     let runtime = Arc::new(Runtime::new(Arc::new(ReadyDependency), 1));
+    let admitted = Arc::new(Notify::new());
     let app = operational_router(
         Router::new()
             .route("/test", post(test_endpoint))
-            .layer(Extension(auth)),
+            .layer(Extension(auth))
+            .layer(middleware::from_fn_with_state(
+                admitted.clone(),
+                notify_admitted,
+            )),
         runtime.clone(),
     );
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(serve(listener, app.clone(), runtime));
+    SignedTcpApp {
+        app,
+        address,
+        admitted,
+        server,
+    }
+}
+
+/// Test layer on the public routes. `operational_router` wraps them in the
+/// capacity middleware, so this runs only for requests holding a permit.
+async fn notify_admitted(
+    State(admitted): State<Arc<Notify>>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    admitted.notify_one();
+    next.run(request).await
+}
+
+#[tokio::test]
+async fn stalled_signed_body_times_out_and_releases_the_only_capacity_slot() {
+    let key = SigningKey::from_bytes(&[7; 32]);
+    let read_timeout = Duration::from_secs(1);
+    let tcp = spawn_signed_tcp_app(&key, read_timeout).await;
 
     // Announce 100 body bytes, send four, then stall while holding the
     // server's single capacity permit.
-    let mut stalled = TcpStream::connect(address).await.unwrap();
+    let mut stalled = TcpStream::connect(tcp.address).await.unwrap();
     let started = Instant::now();
     stalled
         .write_all(b"POST /test HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\n\r\n{\"va")
         .await
         .unwrap();
 
-    // Prove the stalled request holds the only slot. Until the server admits
-    // it, a probe takes the free slot and succeeds. The test runtime is
-    // single-threaded and a probe's in-memory request finishes in one poll,
-    // so the server cannot try to admit the stalled request mid-probe.
-    // Admission can be slow on a loaded runner, so the probe window is
-    // independent of the read timeout. The read timeout starts at admission
-    // and is far longer than the 10ms probe interval, so the next probe
-    // still sees the held slot.
-    let poll_deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let probe = app
-            .clone()
-            .oneshot(signed_request(&key, br#"{"value":1}"#.as_slice()))
-            .await
-            .unwrap();
-        if probe.status() == StatusCode::SERVICE_UNAVAILABLE {
-            break;
-        }
-        assert_eq!(probe.status(), StatusCode::OK);
-        assert!(
-            Instant::now() < poll_deadline,
-            "stalled request never took the capacity slot"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    // Wait for the admission signal instead of probing on a timer. The test
+    // runtime is single-threaded and the in-memory probe finishes in one
+    // poll, so the stalled request cannot reach its read deadline and free
+    // the slot between the signal and the probe, however late the test runs.
+    tokio::time::timeout(Duration::from_secs(10), tcp.admitted.notified())
+        .await
+        .expect("stalled request takes the capacity slot");
+    let probe = tcp
+        .app
+        .clone()
+        .oneshot(signed_request(&key, br#"{"value":1}"#.as_slice()))
+        .await
+        .unwrap();
+    assert_eq!(probe.status(), StatusCode::SERVICE_UNAVAILABLE);
 
     let response = read_raw_http_response(&mut stalled).await;
     assert!(started.elapsed() >= read_timeout);
@@ -784,7 +829,8 @@ async fn stalled_signed_body_times_out_and_releases_the_only_capacity_slot() {
 
     // The capacity permit lives in the shared runtime, so a signed request
     // through the same app proves the stalled request released it.
-    let response = app
+    let response = tcp
+        .app
         .oneshot(signed_request(&key, br#"{"value":1}"#.as_slice()))
         .await
         .unwrap();
@@ -792,37 +838,75 @@ async fn stalled_signed_body_times_out_and_releases_the_only_capacity_slot() {
     assert_eq!(response_body(response).await, r#"{"value":1}"#);
 
     drop(stalled);
-    server.abort();
+    tcp.server.abort();
+}
+
+#[tokio::test]
+async fn dripping_signed_body_times_out_at_the_total_deadline() {
+    let key = SigningKey::from_bytes(&[7; 32]);
+    let read_timeout = Duration::from_millis(500);
+    let drip_interval = Duration::from_millis(100);
+    let drip_bytes = 30;
+    let drip_duration = drip_interval * drip_bytes;
+    let tcp = spawn_signed_tcp_app(&key, read_timeout).await;
+
+    // Announce more bytes than will ever be sent, within the size limit.
+    let (mut reader, mut writer) = TcpStream::connect(tcp.address).await.unwrap().into_split();
+    let started = Instant::now();
+    writer
+        .write_all(b"POST /test HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1000\r\n\r\n")
+        .await
+        .unwrap();
+    // Send one byte per interval, far shorter than the read timeout, for far
+    // longer than it. A timer that restarts on each chunk would not fire
+    // before the drip stops; the connection then stays open and silent.
+    let drip = tokio::spawn(async move {
+        for _ in 0..drip_bytes {
+            tokio::time::sleep(drip_interval).await;
+            if writer.write_all(b" ").await.is_err() {
+                break;
+            }
+        }
+        std::future::pending::<()>().await;
+    });
+
+    let response = read_raw_http_response(&mut reader).await;
+    let elapsed = started.elapsed();
+    drip.abort();
+    assert!(elapsed >= read_timeout, "answered after {elapsed:?}");
+    assert!(
+        elapsed < drip_duration,
+        "answered after {elapsed:?}, so the deadline restarted on each chunk"
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 408 Request Timeout\r\n"),
+        "{response}"
+    );
+    assert!(
+        response.ends_with(
+            r#"{"error":{"code":"request_timeout","message":"request body was not received in time"}}"#
+        ),
+        "{response}"
+    );
+
+    tcp.server.abort();
 }
 
 #[tokio::test]
 async fn oversized_declared_signed_body_is_rejected_before_the_timed_read() {
     let key = SigningKey::from_bytes(&[7; 32]);
-    let mut config = config_for(&key, 100, 200, 16 * 1024);
-    let read_timeout = Duration::from_secs(5);
-    config.limits.request_body_read_timeout = read_timeout;
-    let auth = Arc::new(SignedServiceAuth::from_config(&config));
-    let runtime = Arc::new(Runtime::new(Arc::new(ReadyDependency), 1));
-    let app = operational_router(
-        Router::new()
-            .route("/test", post(test_endpoint))
-            .layer(Extension(auth)),
-        runtime.clone(),
-    );
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let server = tokio::spawn(serve(listener, app, runtime));
+    // The read deadline is far beyond the 5s response guard, so only the
+    // early size check can answer in time.
+    let tcp = spawn_signed_tcp_app(&key, Duration::from_secs(60)).await;
 
     // Declare a body far over the limit and send none of it.
-    let mut stream = TcpStream::connect(address).await.unwrap();
-    let started = Instant::now();
+    let mut stream = TcpStream::connect(tcp.address).await.unwrap();
     stream
         .write_all(b"POST /test HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1000000\r\n\r\n")
         .await
         .unwrap();
 
     let response = read_raw_http_response(&mut stream).await;
-    assert!(started.elapsed() < Duration::from_secs(1));
     assert!(
         response.starts_with("HTTP/1.1 413 Payload Too Large\r\n"),
         "{response}"
@@ -834,7 +918,7 @@ async fn oversized_declared_signed_body_is_rejected_before_the_timed_read() {
         "{response}"
     );
 
-    server.abort();
+    tcp.server.abort();
 }
 
 #[test]
