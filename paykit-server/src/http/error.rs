@@ -251,6 +251,14 @@ impl IntoResponse for ApiError {
                 "1".parse().expect("static header value"),
             );
         }
+        if self == Self::RequestBodyTimeout {
+            // RFC 9110 section 15.5.9: close after 408 instead of reusing a
+            // connection whose request body was left unread.
+            response.headers_mut().insert(
+                header::CONNECTION,
+                "close".parse().expect("static header value"),
+            );
+        }
         super::request_diagnostics::annotate(
             &mut response,
             super::request_diagnostics::OutcomeFailureClass::api(self),

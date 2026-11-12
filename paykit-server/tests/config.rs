@@ -546,7 +546,7 @@ fn parses_accepted_durations_and_uses_ledger_defaults() {
     assert_eq!(config.limits.lock_fetch_timeout, Duration::from_secs(10));
     assert_eq!(
         config.limits.request_body_read_timeout,
-        Duration::from_secs(10)
+        Duration::from_secs(5)
     );
     assert_eq!(config.rate_limits.signed_requests_per_second, 100);
     assert_eq!(config.rate_limits.signed_burst, 200);

@@ -506,7 +506,8 @@ pub struct LimitsConfig {
     pub lock_fetch_timeout: Duration,
     /// Total time allowed to receive a signed request body before its
     /// signature is verified. Bounds how long an unauthenticated client can
-    /// hold a capacity slot.
+    /// hold a capacity slot. The 5s default is generous: signed bodies are at
+    /// most `request_body_bytes` and normally arrive in milliseconds.
     pub request_body_read_timeout: Duration,
 }
 
@@ -1029,7 +1030,7 @@ const fn default_lock_fetch_timeout() -> Duration {
     Duration::from_secs(10)
 }
 const fn default_request_body_read_timeout() -> Duration {
-    Duration::from_secs(10)
+    Duration::from_secs(5)
 }
 const fn default_signed_requests_per_second() -> u64 {
     100

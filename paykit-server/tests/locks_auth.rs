@@ -699,10 +699,9 @@ async fn operational_capacity_rejects_before_signature_verification() {
     assert_eq!(first.await.unwrap().status(), StatusCode::OK);
 }
 
-/// Writes `request` and reads until the server closes the connection, failing
-/// instead of hanging when no complete answer arrives.
-async fn raw_http_exchange(stream: &mut TcpStream, request: &[u8]) -> String {
-    stream.write_all(request).await.unwrap();
+/// Reads until the server closes the connection, failing instead of hanging
+/// when no complete answer arrives.
+async fn read_raw_http_response(stream: &mut TcpStream) -> String {
     let mut response = Vec::new();
     tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut response))
         .await
@@ -715,7 +714,8 @@ async fn raw_http_exchange(stream: &mut TcpStream, request: &[u8]) -> String {
 async fn stalled_signed_body_times_out_and_releases_the_only_capacity_slot() {
     let key = SigningKey::from_bytes(&[7; 32]);
     let mut config = config_for(&key, 100, 200, 16 * 1024);
-    config.limits.request_body_read_timeout = Duration::from_millis(200);
+    let read_timeout = Duration::from_secs(1);
+    config.limits.request_body_read_timeout = read_timeout;
     let auth = Arc::new(SignedServiceAuth::from_config(&config));
     let runtime = Arc::new(Runtime::new(Arc::new(ReadyDependency), 1));
     let app = operational_router(
@@ -732,14 +732,43 @@ async fn stalled_signed_body_times_out_and_releases_the_only_capacity_slot() {
     // server's single capacity permit.
     let mut stalled = TcpStream::connect(address).await.unwrap();
     let started = Instant::now();
-    let response = raw_http_exchange(
-        &mut stalled,
-        b"POST /test HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\n\r\n{\"va",
-    )
-    .await;
-    assert!(started.elapsed() >= Duration::from_millis(200));
+    stalled
+        .write_all(b"POST /test HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\n\r\n{\"va")
+        .await
+        .unwrap();
+
+    // Prove the stalled request holds the only slot. Until the server admits
+    // it, a probe takes the free slot and succeeds. The test runtime is
+    // single-threaded and a probe's in-memory request finishes in one poll,
+    // so the server cannot try to admit the stalled request mid-probe.
+    let poll_deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        let probe = app
+            .clone()
+            .oneshot(signed_request(&key, br#"{"value":1}"#.as_slice()))
+            .await
+            .unwrap();
+        if probe.status() == StatusCode::SERVICE_UNAVAILABLE {
+            break;
+        }
+        assert_eq!(probe.status(), StatusCode::OK);
+        assert!(
+            Instant::now() < poll_deadline,
+            "stalled request never took the capacity slot"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let response = read_raw_http_response(&mut stalled).await;
+    assert!(started.elapsed() >= read_timeout);
     assert!(
         response.starts_with("HTTP/1.1 408 Request Timeout\r\n"),
+        "{response}"
+    );
+    assert!(
+        response
+            .lines()
+            .any(|line| line.eq_ignore_ascii_case("connection: close")),
         "{response}"
     );
     assert!(
