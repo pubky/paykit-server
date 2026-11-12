@@ -8,6 +8,13 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  # One release publish at a time. Runs queue (never cancelled), so each run
+  # decides :latest only after every earlier release has pushed.
+  group: docker-publish
+  cancel-in-progress: false
+  queue: max
+
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
@@ -25,22 +32,8 @@ jobs:
         shell: bash
         env:
           TAG: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-          stable='^v[0-9]+\.[0-9]+\.[0-9]+$'
-          newest=''
-          latest=false
-          if [[ "$TAG" =~ $stable ]]; then
-            # fetch-depth: 0 fetches every tag, so the local list is complete.
-            newest="$(git tag -l 'v*' | { grep -E "$stable" || true; } | sort -V | tail -n1)"
-            if [[ "$TAG" == "$newest" ]]; then
-              latest=true
-            else
-              echo "::warning::$TAG is not the newest stable tag ('${newest:-none found}'), so :latest was left unchanged"
-            fi
-          fi
-          echo "latest=$latest" >> "$GITHUB_OUTPUT"
-          echo "Tag $TAG: newest stable tag=${newest:-n/a}, latest=$latest"
+        # fetch-depth: 0 fetches every tag, so the local list is complete.
+        run: sh scripts/release-latest-tag.sh "$TAG"
 
       - name: Log in to Docker Hub
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
