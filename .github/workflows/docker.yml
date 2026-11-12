@@ -18,43 +18,25 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
+          fetch-depth: 0
 
       - name: Decide whether this tag is the newest stable release
         id: latest
         shell: bash
         env:
           TAG: ${{ github.ref_name }}
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           stable='^v[0-9]+\.[0-9]+\.[0-9]+$'
           newest=''
           latest=false
           if [[ "$TAG" =~ $stable ]]; then
-            # Only the :latest decision needs the tag list, so if it cannot be
-            # read, keep latest=false and still publish the version tags.
-            listed=false
-            for attempt in 1 2 3; do
-              if refs="$(gh api --paginate "repos/$REPO/git/matching-refs/tags/v" --jq '.[].ref')"; then
-                listed=true
-                break
-              fi
-              if (( attempt < 3 )); then sleep 5; fi
-            done
-            if [[ "$listed" != true ]]; then
-              echo "::warning::Could not read the tag list, so :latest was left unchanged for $TAG"
+            # fetch-depth: 0 fetches every tag, so the local list is complete.
+            newest="$(git tag -l 'v*' | { grep -E "$stable" || true; } | sort -V | tail -n1)"
+            if [[ "$TAG" == "$newest" ]]; then
+              latest=true
             else
-              newest="$(printf '%s\n' "$refs" \
-                | sed 's#^refs/tags/##' \
-                | { grep -E "$stable" || true; } \
-                | sort -V \
-                | tail -n1)"
-              if [[ "$TAG" == "$newest" ]]; then
-                latest=true
-              else
-                echo "::warning::$TAG is not the newest stable tag ('${newest:-none found}'), so :latest was left unchanged"
-              fi
+              echo "::warning::$TAG is not the newest stable tag ('${newest:-none found}'), so :latest was left unchanged"
             fi
           fi
           echo "latest=$latest" >> "$GITHUB_OUTPUT"
