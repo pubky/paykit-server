@@ -1,6 +1,9 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::{Duration, Instant},
 };
 
 use axum::{
@@ -16,9 +19,13 @@ use paykit_server::{
     Server,
     config::{Config, ConfigEnvironment},
     http::auth::{AuthProcessingObserver, AuthenticatedJson, SignedServiceAuth},
-    runtime::{DependencyCheck, Runtime, operational_router},
+    runtime::{DependencyCheck, Runtime, operational_router, serve},
 };
 use serde::Deserialize;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+};
 use tower::ServiceExt;
 
 #[derive(Default)]
@@ -59,7 +66,13 @@ fn rendered_key(key: &SigningKey) -> String {
     .to_string()
 }
 
-fn config_for_keys(keys: &[&SigningKey], rate: u64, burst: u64, request_body_bytes: u64) -> Config {
+fn config_for_keys(
+    keys: &[&SigningKey],
+    rate: u64,
+    burst: u64,
+    request_body_bytes: u64,
+    request_body_read_timeout: &str,
+) -> Config {
     let keys = keys
         .iter()
         .map(|key| format!("\"{}\"", rendered_key(key)))
@@ -86,6 +99,7 @@ endpoint = "ssl://electrum.example:50002"
 poll_interval = "5s"
 [limits]
 request_body_bytes = {request_body_bytes}
+request_body_read_timeout = "{request_body_read_timeout}"
 [rate_limits]
 signed_requests_per_second = {rate}
 signed_burst = {burst}
@@ -100,7 +114,7 @@ signed_burst = {burst}
 }
 
 fn config_for(key: &SigningKey, rate: u64, burst: u64, request_body_bytes: u64) -> Config {
-    config_for_keys(&[key], rate, burst, request_body_bytes)
+    config_for_keys(&[key], rate, burst, request_body_bytes, "10s")
 }
 
 fn router(key: &SigningKey, rate: u64, burst: u64) -> Router {
@@ -155,7 +169,7 @@ async fn every_signed_business_path_accepts_each_trusted_service_key() {
     let first = SigningKey::from_bytes(&[7; 32]);
     let second = SigningKey::from_bytes(&[8; 32]);
     let unlisted = SigningKey::from_bytes(&[9; 32]);
-    let config = config_for_keys(&[&first, &second], 100, 200, 16 * 1024);
+    let config = config_for_keys(&[&first, &second], 100, 200, 16 * 1024, "10s");
     let pool = sqlx::postgres::PgPoolOptions::new()
         .connect_lazy("postgres://127.0.0.1:1/paykit")
         .unwrap();
@@ -692,12 +706,90 @@ async fn operational_capacity_rejects_before_signature_verification() {
     assert_eq!(first.await.unwrap().status(), StatusCode::OK);
 }
 
+/// Writes `request` and reads until the server closes the connection, failing
+/// instead of hanging when no complete answer arrives.
+async fn raw_http_exchange(stream: &mut TcpStream, request: &[u8]) -> String {
+    stream.write_all(request).await.unwrap();
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut response))
+        .await
+        .expect("server answers and closes the connection in time")
+        .unwrap();
+    String::from_utf8(response).unwrap()
+}
+
+#[tokio::test]
+async fn stalled_signed_body_times_out_and_releases_the_only_capacity_slot() {
+    let key = SigningKey::from_bytes(&[7; 32]);
+    let auth = Arc::new(SignedServiceAuth::from_config(&config_for_keys(
+        &[&key],
+        100,
+        200,
+        16 * 1024,
+        "200ms",
+    )));
+    let runtime = Arc::new(Runtime::new(Arc::new(ReadyDependency), 1));
+    let app = operational_router(
+        Router::new()
+            .route("/test", post(test_endpoint))
+            .layer(Extension(auth)),
+        runtime.clone(),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve(listener, app, runtime));
+
+    // Announce 100 body bytes, send four, then stall while holding the
+    // server's single capacity permit.
+    let mut stalled = TcpStream::connect(address).await.unwrap();
+    let started = Instant::now();
+    let response = raw_http_exchange(
+        &mut stalled,
+        b"POST /test HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\n\r\n{\"va",
+    )
+    .await;
+    assert!(started.elapsed() >= Duration::from_millis(200));
+    assert!(
+        response.starts_with("HTTP/1.1 408 Request Timeout\r\n"),
+        "{response}"
+    );
+    assert!(
+        response.ends_with(
+            r#"{"error":{"code":"request_timeout","message":"request body was not received in time"}}"#
+        ),
+        "{response}"
+    );
+
+    let body = br#"{"value":1}"#;
+    let preimage = paykit_server::http::auth::signature_preimage("POST", "/test", body);
+    let signature = URL_SAFE_NO_PAD.encode(key.sign(&preimage).to_bytes());
+    let mut request = format!(
+        "POST /test HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\
+         X-Paykit-Signature: {signature}\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    request.extend_from_slice(body);
+    let mut fresh = TcpStream::connect(address).await.unwrap();
+    let response = raw_http_exchange(&mut fresh, &request).await;
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+    assert!(response.ends_with(r#"{"value":1}"#), "{response}");
+
+    drop(stalled);
+    server.abort();
+}
+
 #[test]
 fn authentication_state_debug_redacts_every_trusted_public_key() {
     let first = SigningKey::from_bytes(&[7; 32]);
     let second = SigningKey::from_bytes(&[8; 32]);
-    let auth =
-        SignedServiceAuth::from_config(&config_for_keys(&[&first, &second], 100, 200, 16 * 1024));
+    let auth = SignedServiceAuth::from_config(&config_for_keys(
+        &[&first, &second],
+        100,
+        200,
+        16 * 1024,
+        "10s",
+    ));
     let rendered = format!("{auth:?}");
 
     assert!(!rendered.contains(&rendered_key(&first)));

@@ -1,7 +1,7 @@
 use std::{
     fmt,
     sync::{Arc, Mutex},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use axum::{
@@ -46,6 +46,7 @@ impl Clock for SystemClock {
 pub struct SignedServiceAuth {
     trusted_keys: Vec<VerifyingKey>,
     request_body_bytes: usize,
+    request_body_read_timeout: Duration,
     limiter: Mutex<TokenBucket>,
     clock: Arc<dyn Clock>,
     observer: Arc<dyn AuthProcessingObserver>,
@@ -57,6 +58,7 @@ impl fmt::Debug for SignedServiceAuth {
             .debug_struct("SignedServiceAuth")
             .field("trusted_keys", &"<redacted>")
             .field("request_body_bytes", &self.request_body_bytes)
+            .field("request_body_read_timeout", &self.request_body_read_timeout)
             .finish_non_exhaustive()
     }
 }
@@ -94,6 +96,7 @@ impl SignedServiceAuth {
                 .collect(),
             request_body_bytes: usize::try_from(config.limits.request_body_bytes)
                 .expect("validated request body limit fits usize"),
+            request_body_read_timeout: config.limits.request_body_read_timeout,
             limiter: Mutex::new(TokenBucket::new(
                 config.rate_limits.signed_requests_per_second,
                 config.rate_limits.signed_burst,
@@ -179,9 +182,16 @@ where
             return Err(ApiError::InvalidRequest);
         }
         let limit = auth.request_body_bytes;
-        let raw_body = to_bytes(body, limit.saturating_add(1))
-            .await
-            .map_err(|_| ApiError::PayloadTooLarge)?;
+        // One total deadline for the whole unauthenticated body read: the
+        // byte limit bounds size, this bounds how long a slow or stalled
+        // client can hold the request's capacity slot.
+        let raw_body = tokio::time::timeout(
+            auth.request_body_read_timeout,
+            to_bytes(body, limit.saturating_add(1)),
+        )
+        .await
+        .map_err(|_| ApiError::RequestBodyTimeout)?
+        .map_err(|_| ApiError::PayloadTooLarge)?;
         if raw_body.len() > limit {
             return Err(ApiError::PayloadTooLarge);
         }

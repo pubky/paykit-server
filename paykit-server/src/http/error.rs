@@ -10,6 +10,7 @@ pub enum ApiError {
     InvalidRequest,
     InvalidSignature,
     PayloadTooLarge,
+    RequestBodyTimeout,
     RateLimited,
     CreatorSessionInvalid,
     CreatorSessionUnavailable,
@@ -74,6 +75,11 @@ impl ApiError {
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "payload_too_large",
                 "request body is too large",
+            ),
+            Self::RequestBodyTimeout => (
+                StatusCode::REQUEST_TIMEOUT,
+                "request_timeout",
+                "request body was not received in time",
             ),
             Self::RateLimited => (
                 StatusCode::TOO_MANY_REQUESTS,
