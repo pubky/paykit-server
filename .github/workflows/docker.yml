@@ -15,7 +15,9 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Log in to Docker Hub
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
@@ -24,7 +26,7 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Build and push Docker image
-        uses: pubky/ci-workflows/.github/actions/docker/build_and_push@a57f2ae6382a8519ba4aa09d58b706f6b68a4426 # main as of 2026-09-17
+        uses: pubky/ci-workflows/.github/actions/docker/build_and_push@5faaf004d36bb93a204b58cf7190ffe7fbcce16f # v1.0.2
         with:
           registry: registry-1.docker.io/synonymsoft
           context: .
