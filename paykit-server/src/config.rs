@@ -149,6 +149,10 @@ impl Config {
                 self.outbox.rapid_link_retry_interval,
             ),
             ("limits.lock_fetch_timeout", self.limits.lock_fetch_timeout),
+            (
+                "limits.request_body_read_timeout",
+                self.limits.request_body_read_timeout,
+            ),
             ("shutdown.drain_timeout", self.shutdown.drain_timeout),
         ] {
             if value.is_zero() {
@@ -500,6 +504,11 @@ pub struct LimitsConfig {
     pub request_body_bytes: u64,
     pub lock_resource_bytes: u64,
     pub lock_fetch_timeout: Duration,
+    /// Total time allowed to receive a signed request body before its
+    /// signature is verified. Bounds how long an unauthenticated client can
+    /// hold a capacity slot. The 5s default is generous: signed bodies are at
+    /// most `request_body_bytes` and normally arrive in milliseconds.
+    pub request_body_read_timeout: Duration,
 }
 
 #[derive(Debug)]
@@ -877,6 +886,11 @@ struct RawLimitsConfig {
     lock_resource_bytes: u64,
     #[serde(default = "default_lock_fetch_timeout", with = "humantime_serde")]
     lock_fetch_timeout: Duration,
+    #[serde(
+        default = "default_request_body_read_timeout",
+        with = "humantime_serde"
+    )]
+    request_body_read_timeout: Duration,
 }
 
 #[derive(Deserialize)]
@@ -911,6 +925,7 @@ impl Default for RawLimitsConfig {
             request_body_bytes: default_request_body_bytes(),
             lock_resource_bytes: default_lock_resource_bytes(),
             lock_fetch_timeout: default_lock_fetch_timeout(),
+            request_body_read_timeout: default_request_body_read_timeout(),
         }
     }
 }
@@ -959,6 +974,7 @@ impl From<RawLimitsConfig> for LimitsConfig {
             request_body_bytes: value.request_body_bytes,
             lock_resource_bytes: value.lock_resource_bytes,
             lock_fetch_timeout: value.lock_fetch_timeout,
+            request_body_read_timeout: value.request_body_read_timeout,
         }
     }
 }
@@ -1012,6 +1028,9 @@ const fn default_lock_resource_bytes() -> u64 {
 }
 const fn default_lock_fetch_timeout() -> Duration {
     Duration::from_secs(10)
+}
+const fn default_request_body_read_timeout() -> Duration {
+    Duration::from_secs(5)
 }
 const fn default_signed_requests_per_second() -> u64 {
     100

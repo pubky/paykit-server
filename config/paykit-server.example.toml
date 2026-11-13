@@ -77,6 +77,9 @@ rapid_link_retry_interval_ms = 1000
 request_body_bytes = 16384
 lock_resource_bytes = 262144
 lock_fetch_timeout = "10s"
+# Total time to receive a signed request body before signature verification.
+# Applies before authentication; on expiry the request's capacity slot is released.
+request_body_read_timeout = "5s"
 
 [rate_limits]
 signed_requests_per_second = 100
