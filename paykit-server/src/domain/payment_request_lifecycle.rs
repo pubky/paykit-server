@@ -76,10 +76,10 @@ pub(crate) fn cursor_stable_transition_allowed(
 /// Paykit `v0.1.1-rc3` and later no longer mark a payee's request invalid when it
 /// stores an otherwise-valid Acceptance at or after the proposal expiry, such
 /// as an in-time Acceptance fetched late. It derives those requests from the
-/// same stored events as `accepted`, or `proof_submitted` once a Payment Proof
-/// arrived. That is the only change that leaves `invalid_conflict` without a
-/// new source event, so the projection must carry the Acceptance's local
-/// record time and that time must not be earlier than the proposal expiry.
+/// same stored events as `accepted`, `proof_submitted` once a Payment Proof
+/// arrived, or `canceled` when the Acceptance crossed a payee Cancellation.
+/// The projection must carry the Acceptance's local record time and that time
+/// must not be earlier than the proposal expiry.
 pub(crate) fn late_acceptance_rederivation_allowed(
     existing: PaymentRequestLifecycleState,
     incoming: &PaymentRequestLifecycleProjection,
@@ -93,7 +93,9 @@ pub(crate) fn late_acceptance_rederivation_allowed(
     existing == PaymentRequestLifecycleState::InvalidConflict
         && matches!(
             incoming.request_state,
-            PaymentRequestLifecycleState::Accepted | PaymentRequestLifecycleState::ProofSubmitted
+            PaymentRequestLifecycleState::Accepted
+                | PaymentRequestLifecycleState::ProofSubmitted
+                | PaymentRequestLifecycleState::Canceled
         )
         && incoming
             .acceptance_recorded_at

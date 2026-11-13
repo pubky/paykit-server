@@ -678,9 +678,10 @@ are never combined across rails.
 
 A request that Paykit before `v0.1.1-rc3` recorded as invalid only because the
 server fetched an in-time Acceptance after the proposal expiry is no longer
-invalid. Paykit now derives `accepted` for it, or `proof_submitted` once a Payment
-Proof arrived, and the server stores that state. A status read that answered with
-a `409` conflict for such a request reports that lifecycle after the upgrade.
+invalid. Paykit now derives `accepted` for it, `proof_submitted` once a Payment
+Proof arrived, or `canceled` if the Acceptance crossed a payee Cancellation.
+The server stores that state. A status read that answered with a `409` conflict
+for such a request reports that lifecycle after the upgrade.
 
 `payment_state: confirmed` means a payment is included in a block, not that it
 meets Locks' settlement policy. Locks must check the request lifecycle, then

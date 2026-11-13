@@ -55,6 +55,7 @@ fn an_acceptance_fetched_after_proposal_expiry_leaves_invalid_conflict() {
         for incoming in [
             PaymentRequestLifecycleState::Accepted,
             PaymentRequestLifecycleState::ProofSubmitted,
+            PaymentRequestLifecycleState::Canceled,
         ] {
             assert!(late_acceptance_rederivation_allowed(
                 PaymentRequestLifecycleState::InvalidConflict,
@@ -72,10 +73,16 @@ fn invalid_conflict_stays_without_a_late_fetched_acceptance() {
     // The Acceptance was stored before the proposal expiry, or not at all:
     // Paykit never marked that request invalid for a late fetch.
     for recorded_at in [in_time, None] {
-        assert!(!late_acceptance_rederivation_allowed(
-            PaymentRequestLifecycleState::InvalidConflict,
-            &rederived(PaymentRequestLifecycleState::Accepted, recorded_at),
-        ));
+        for incoming in [
+            PaymentRequestLifecycleState::Accepted,
+            PaymentRequestLifecycleState::ProofSubmitted,
+            PaymentRequestLifecycleState::Canceled,
+        ] {
+            assert!(!late_acceptance_rederivation_allowed(
+                PaymentRequestLifecycleState::InvalidConflict,
+                &rederived(incoming, recorded_at),
+            ));
+        }
     }
 
     // Terms without a proposal expiry, or with one that does not parse.
@@ -93,7 +100,6 @@ fn invalid_conflict_stays_without_a_late_fetched_acceptance() {
         PaymentRequestLifecycleState::Proposed,
         PaymentRequestLifecycleState::ProposalExpired,
         PaymentRequestLifecycleState::Rejected,
-        PaymentRequestLifecycleState::Canceled,
         PaymentRequestLifecycleState::ActiveRecurring,
         PaymentRequestLifecycleState::RecoveryRequired,
         PaymentRequestLifecycleState::InvalidConflict,

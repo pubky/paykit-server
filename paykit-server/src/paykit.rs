@@ -1206,6 +1206,15 @@ pub async fn acquire_creator_mutation_guard(creator_id: Uuid) -> tokio::sync::Ow
     creator_mutation_lock(creator_id).lock_owned().await
 }
 
+/// Projects a canonical SDK record for persistence integration fixtures.
+#[cfg(feature = "test-utils")]
+#[doc(hidden)]
+pub fn project_payment_request_record(
+    record: &PaymentRequestRecord,
+) -> Result<PaymentRequestLifecycleProjection, LifecycleSyncError> {
+    lifecycle_projection(record)
+}
+
 fn parse_peer(reader: &str) -> Result<PubkyPublicKey, HandoffError> {
     PubkyPublicKey::from_raw_or_app_key(reader).map_err(|_| HandoffError::Permanent)
 }
