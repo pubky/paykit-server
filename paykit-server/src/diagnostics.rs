@@ -80,14 +80,25 @@ pub(crate) fn timing(
     let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let outcome = outcome.label();
     if outcome == "failed" {
-        tracing::warn!(
-            event = "paykit_task_timing",
-            operation,
-            stage,
-            outcome,
-            elapsed_ms,
-            "Paykit task timing"
-        );
+        if operation == "worker" && matches!(stage, "shared_transport" | "observer") {
+            tracing::debug!(
+                event = "paykit_task_timing",
+                operation,
+                stage,
+                outcome,
+                elapsed_ms,
+                "Paykit task timing"
+            );
+        } else {
+            tracing::warn!(
+                event = "paykit_task_timing",
+                operation,
+                stage,
+                outcome,
+                elapsed_ms,
+                "Paykit task timing"
+            );
+        }
     } else {
         tracing::info!(
             event = "paykit_task_timing",
@@ -200,5 +211,41 @@ mod tests {
                 )
             }));
         }
+    }
+
+    #[test]
+    fn expected_retry_worker_timings_are_debug_but_other_failures_remain_warn() {
+        let capture = EventCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+
+        tracing::subscriber::with_default(subscriber, || {
+            for stage in ["shared_transport", "observer"] {
+                timing(
+                    "worker",
+                    stage,
+                    TimingOutcome::Failed,
+                    std::time::Instant::now(),
+                );
+            }
+            timing(
+                "worker",
+                "outbox_enqueue",
+                TimingOutcome::Failed,
+                std::time::Instant::now(),
+            );
+            timing(
+                "invoice_create",
+                "observer",
+                TimingOutcome::Failed,
+                std::time::Instant::now(),
+            );
+        });
+
+        let events = capture.0.lock().unwrap();
+        assert_eq!(events.len(), 4);
+        assert_eq!(events[0].level, Level::DEBUG);
+        assert_eq!(events[1].level, Level::DEBUG);
+        assert_eq!(events[2].level, Level::WARN);
+        assert_eq!(events[3].level, Level::WARN);
     }
 }

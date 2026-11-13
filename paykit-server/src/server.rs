@@ -777,6 +777,24 @@ enum TransportMaintenance {
     },
 }
 
+fn log_transport_maintenance_failure(step: &'static str, category: &'static str) {
+    if step == "maintain_transport" && matches!(category, "transport" | "storage") {
+        tracing::debug!(
+            stage = "shared_transport",
+            step,
+            category,
+            "Paykit transport maintenance failed"
+        );
+    } else {
+        tracing::warn!(
+            stage = "shared_transport",
+            step,
+            category,
+            "Paykit transport maintenance failed"
+        );
+    }
+}
+
 fn record_shared_transport_timing(
     full_scan: bool,
     outcome: &TransportMaintenance,
@@ -825,12 +843,9 @@ where
             TransportMaintenance::Complete => {}
             TransportMaintenance::Deferred => deferred = true,
             // One Creator's failure must not withdraw every Creator's rail.
-            TransportMaintenance::Failed { step, category } => tracing::warn!(
-                stage = "shared_transport",
-                step,
-                category,
-                "Paykit transport maintenance failed"
-            ),
+            TransportMaintenance::Failed { step, category } => {
+                log_transport_maintenance_failure(step, category);
+            }
         }
     }
     deferred
@@ -1579,6 +1594,24 @@ fn start_lifecycle_passes<Pass, PassFuture>(
 
 /// One Creator's receive/projection error is retried without withdrawing every
 /// Creator's rail; durable delivery failures retain their separate readiness owner.
+fn log_lifecycle_reconciliation_deferred(step: &'static str, category: &'static str) {
+    if step == "receive_and_project" && matches!(category, "sdk" | "partial_receive") {
+        tracing::debug!(
+            stage = "lifecycle_reconciliation",
+            step,
+            category,
+            "Creator payment request reconciliation deferred"
+        );
+    } else {
+        tracing::warn!(
+            stage = "lifecycle_reconciliation",
+            step,
+            category,
+            "Creator payment request reconciliation deferred"
+        );
+    }
+}
+
 async fn reconcile_creator_lifecycle(workers: Arc<WorkerComponents>, creator: Uuid) {
     let result = async {
         let adapter = creator_adapter(&workers, creator)
@@ -1591,12 +1624,7 @@ async fn reconcile_creator_lifecycle(workers: Arc<WorkerComponents>, creator: Uu
     }
     .await;
     if let Err((step, category)) = result {
-        tracing::warn!(
-            stage = "lifecycle_reconciliation",
-            step,
-            category,
-            "Creator payment request reconciliation deferred"
-        );
+        log_lifecycle_reconciliation_deferred(step, category);
     }
 }
 
@@ -1618,6 +1646,35 @@ enum ElectrumTick {
 struct ElectrumReadiness {
     last_success: Option<tokio::time::Instant>,
     consecutive_failures: u32,
+}
+
+fn log_electrum_observation_failure(
+    step: &'static str,
+    category: &'static str,
+    consecutive_failures: u32,
+    degraded: bool,
+) {
+    if matches!(step, "invoice_observation" | "marketplace_observation")
+        && category == "unavailable"
+    {
+        tracing::debug!(
+            stage = "electrum_observation",
+            step,
+            category,
+            consecutive_failures,
+            degraded,
+            "Electrum observation tick failed"
+        );
+    } else {
+        tracing::warn!(
+            stage = "electrum_observation",
+            step,
+            category,
+            consecutive_failures,
+            degraded,
+            "Electrum observation tick failed"
+        );
+    }
 }
 
 impl ElectrumReadiness {
@@ -1708,13 +1765,11 @@ async fn observer_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtime>) {
         let now = tokio::time::Instant::now();
         let available = readiness.record(tick, now);
         if let Some((step, category)) = failure {
-            tracing::warn!(
-                stage = "electrum_observation",
+            log_electrum_observation_failure(
                 step,
                 category,
-                consecutive_failures = readiness.consecutive_failures,
-                degraded = !available,
-                "Electrum observation tick failed"
+                readiness.consecutive_failures,
+                !available,
             );
         }
         if tick == ElectrumTick::Succeeded {
@@ -2099,7 +2154,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_transport_failure_is_warn_under_production_filter() {
+    fn shared_transport_failure_is_quiet_under_production_filter() {
         assert_eq!(
             captured_shared_transport_timing(
                 true,
@@ -2108,7 +2163,58 @@ mod tests {
                     category: "adapter_unavailable",
                 },
             ),
-            vec![Level::WARN]
+            Vec::<Level>::new()
+        );
+    }
+
+    #[test]
+    fn expected_worker_retry_events_are_debug_but_other_failures_remain_warn() {
+        let capture = TimingCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            log_transport_maintenance_failure("maintain_transport", "transport");
+            log_transport_maintenance_failure("maintain_transport", "storage");
+            log_transport_maintenance_failure("adapter_build", "adapter_unavailable");
+            log_transport_maintenance_failure("adapter_build", "transport");
+            log_transport_maintenance_failure("maintain_transport", "protocol");
+
+            log_lifecycle_reconciliation_deferred("receive_and_project", "sdk");
+            log_lifecycle_reconciliation_deferred("receive_and_project", "partial_receive");
+            log_lifecycle_reconciliation_deferred("adapter_build", "adapter_unavailable");
+            log_lifecycle_reconciliation_deferred("adapter_build", "sdk");
+            log_lifecycle_reconciliation_deferred("receive_and_project", "persistence");
+
+            log_electrum_observation_failure("invoice_observation", "unavailable", 1, false);
+            log_electrum_observation_failure("marketplace_observation", "unavailable", 1, false);
+            log_electrum_observation_failure("invoice_targets_load", "storage", 1, false);
+            log_electrum_observation_failure("invoice_targets_load", "unavailable", 1, false);
+            log_electrum_observation_failure(
+                "invoice_observation",
+                "invalid_observation",
+                1,
+                false,
+            );
+        });
+
+        assert_eq!(
+            *capture.0.lock().unwrap(),
+            vec![
+                Level::DEBUG,
+                Level::DEBUG,
+                Level::WARN,
+                Level::WARN,
+                Level::WARN,
+                Level::DEBUG,
+                Level::DEBUG,
+                Level::WARN,
+                Level::WARN,
+                Level::WARN,
+                Level::DEBUG,
+                Level::DEBUG,
+                Level::WARN,
+                Level::WARN,
+                Level::WARN,
+            ]
         );
     }
 
