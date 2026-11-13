@@ -1654,9 +1654,7 @@ fn log_electrum_observation_failure(
     consecutive_failures: u32,
     degraded: bool,
 ) {
-    if matches!(step, "invoice_observation" | "marketplace_observation")
-        && category == "unavailable"
-    {
+    if is_routine_electrum_observation_failure(step, category) {
         tracing::debug!(
             stage = "electrum_observation",
             step,
@@ -1674,6 +1672,24 @@ fn log_electrum_observation_failure(
             degraded,
             "Electrum observation tick failed"
         );
+    }
+}
+
+fn is_routine_electrum_observation_failure(step: &str, category: &str) -> bool {
+    matches!(step, "invoice_observation" | "marketplace_observation") && category == "unavailable"
+}
+
+fn record_electrum_observation_failure(
+    failure: &mut Option<(&'static str, &'static str)>,
+    step: &'static str,
+    category: &'static str,
+) {
+    // Retain the first failure unless a later one must remain visible at INFO.
+    if failure.is_none_or(|(existing_step, existing_category)| {
+        is_routine_electrum_observation_failure(existing_step, existing_category)
+            && !is_routine_electrum_observation_failure(step, category)
+    }) {
+        *failure = Some((step, category));
     }
 }
 
@@ -1730,12 +1746,20 @@ async fn observer_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtime>) {
                 )
                 .await
                 {
-                    failure.get_or_insert(("invoice_observation", error.diagnostic_label()));
+                    record_electrum_observation_failure(
+                        &mut failure,
+                        "invoice_observation",
+                        error.diagnostic_label(),
+                    );
                 }
             }
             Ok(_) => {}
             Err(error) => {
-                failure.get_or_insert(("invoice_targets_load", error.diagnostic_label()));
+                record_electrum_observation_failure(
+                    &mut failure,
+                    "invoice_targets_load",
+                    error.diagnostic_label(),
+                );
             }
         }
         match workers.marketplace_preparations.observation_targets().await {
@@ -1749,12 +1773,20 @@ async fn observer_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtime>) {
                 )
                 .await
                 {
-                    failure.get_or_insert(("marketplace_observation", error.diagnostic_label()));
+                    record_electrum_observation_failure(
+                        &mut failure,
+                        "marketplace_observation",
+                        error.diagnostic_label(),
+                    );
                 }
             }
             Ok(_) => {}
             Err(error) => {
-                failure.get_or_insert(("marketplace_targets_load", error.diagnostic_label()));
+                record_electrum_observation_failure(
+                    &mut failure,
+                    "marketplace_targets_load",
+                    error.diagnostic_label(),
+                );
             }
         }
         let tick = match (failure, observed) {
@@ -2165,6 +2197,28 @@ mod tests {
             ),
             Vec::<Level>::new()
         );
+    }
+
+    #[test]
+    fn mixed_observer_failure_keeps_non_allowlisted_warn_under_production_filter() {
+        let capture = TimingCapture::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(EnvFilter::new("off,paykit_server=info"))
+            .with(capture.clone());
+
+        tracing::subscriber::with_default(subscriber, || {
+            let mut failure = None;
+            record_electrum_observation_failure(&mut failure, "invoice_observation", "unavailable");
+            record_electrum_observation_failure(
+                &mut failure,
+                "marketplace_targets_load",
+                "storage",
+            );
+            let (step, category) = failure.expect("mixed tick must retain a failure");
+            log_electrum_observation_failure(step, category, 1, false);
+        });
+
+        assert_eq!(*capture.0.lock().unwrap(), vec![Level::WARN]);
     }
 
     #[test]
