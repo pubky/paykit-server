@@ -36,7 +36,8 @@ use crate::{
     http::{self, auth::SignedServiceAuth},
     paykit::{
         ALLOWANCE_INTAKE_COOLDOWN, ALLOWANCE_INTAKE_PASS_DEADLINE, AllowanceIntake,
-        CreatorSessions, IntakeTurns, PaykitAdapter, creator_mutation_lock, sdk_error_label,
+        CreatorSessions, IntakeTurns, PaykitAdapter, TransportMaintenanceError,
+        creator_mutation_lock, sdk_error_label,
     },
     persistence::{
         CreatorStore, InvoiceStore, MarketplacePreparationStore, OutboxRetryClass, OutboxStore,
@@ -777,6 +778,19 @@ enum TransportMaintenance {
     },
 }
 
+fn transport_maintenance_outcome(
+    result: Result<(), TransportMaintenanceError>,
+) -> TransportMaintenance {
+    match result {
+        Ok(()) => TransportMaintenance::Complete,
+        Err(TransportMaintenanceError::Deferred) => TransportMaintenance::Deferred,
+        Err(TransportMaintenanceError::Failed(category)) => TransportMaintenance::Failed {
+            step: "maintain_transport",
+            category: category.label(),
+        },
+    }
+}
+
 fn log_transport_maintenance_failure(step: &'static str, category: &'static str) {
     if step == "maintain_transport" && matches!(category, "transport" | "storage") {
         tracing::debug!(
@@ -869,21 +883,12 @@ async fn maintain_creator_transport(
         }
     };
     let result = if full_scan {
-        adapter.maintain_transport().await
+        adapter.maintain_transport_classified().await
     } else {
         // Handoff hints concern work already queued in the SDK.
-        adapter.maintain_outbound_transport().await
+        adapter.maintain_outbound_transport_classified().await
     };
-    let outcome = match result {
-        Ok(()) => TransportMaintenance::Complete,
-        Err(PaykitSdkError::ConcurrentUpdate { .. } | PaykitSdkError::SharedStateBusy { .. }) => {
-            TransportMaintenance::Deferred
-        }
-        Err(error) => TransportMaintenance::Failed {
-            step: "maintain_transport",
-            category: sdk_error_label(&error),
-        },
-    };
+    let outcome = transport_maintenance_outcome(result);
     record_shared_transport_timing(full_scan, &outcome, started);
     outcome
 }
@@ -2219,6 +2224,170 @@ mod tests {
         });
 
         assert_eq!(*capture.0.lock().unwrap(), vec![Level::WARN]);
+    }
+
+    #[tokio::test]
+    async fn adapter_transport_categories_reach_production_filter() {
+        use paykit_sdk::{
+            OutboundPrivateSendReport, RecoveryMarkerPublishFailure, ReservationCleanupFailure,
+        };
+
+        type Fixture = crate::paykit::TransportOperationFixture;
+
+        async fn observe(fixture: Fixture) -> (Option<&'static str>, bool, Vec<Level>) {
+            let adapter = PaykitAdapter::for_transport_fixture(fixture);
+            let outcome =
+                transport_maintenance_outcome(adapter.maintain_transport_classified().await);
+            let category = match &outcome {
+                TransportMaintenance::Failed { category, .. } => Some(*category),
+                _ => None,
+            };
+            let deferred = matches!(outcome, TransportMaintenance::Deferred);
+            let capture = TimingCapture::default();
+            let subscriber = tracing_subscriber::registry()
+                .with(EnvFilter::new("off,paykit_server=info"))
+                .with(capture.clone());
+            tracing::subscriber::with_default(subscriber, || {
+                if let TransportMaintenance::Failed { step, category } = outcome {
+                    log_transport_maintenance_failure(step, category);
+                }
+            });
+            let levels = capture.0.lock().unwrap().clone();
+            (category, deferred, levels)
+        }
+
+        let private = "private-transport-details";
+        let scenarios = vec![
+            (
+                "routine then policy",
+                Fixture::new(
+                    vec![
+                        Err(PaykitSdkError::Transport {
+                            context: private.into(),
+                            source: None,
+                        }),
+                        Err(PaykitSdkError::Policy {
+                            context: private.into(),
+                            source: None,
+                        }),
+                    ],
+                    Vec::new(),
+                ),
+                Some("policy"),
+                false,
+                vec![Level::WARN],
+            ),
+            (
+                "policy then routine",
+                Fixture::new(
+                    vec![
+                        Err(PaykitSdkError::Policy {
+                            context: private.into(),
+                            source: None,
+                        }),
+                        Err(PaykitSdkError::Storage {
+                            context: private.into(),
+                            source: None,
+                        }),
+                    ],
+                    Vec::new(),
+                ),
+                Some("policy"),
+                false,
+                vec![Level::WARN],
+            ),
+            (
+                "reservation cleanup",
+                Fixture::new(
+                    Vec::new(),
+                    vec![Ok(OutboundPrivateSendReport {
+                        reservation_cleanup_failures: vec![ReservationCleanupFailure {
+                            reservation_id: Some("private-reservation".into()),
+                            error: private.into(),
+                        }],
+                        ..Default::default()
+                    })],
+                ),
+                Some("reservation_cleanup"),
+                false,
+                vec![Level::WARN],
+            ),
+            (
+                "recovery marker",
+                Fixture::new(
+                    Vec::new(),
+                    vec![Ok(OutboundPrivateSendReport {
+                        recovery_marker_failures: vec![RecoveryMarkerPublishFailure {
+                            outbound_message_id: Some(7),
+                            error: private.into(),
+                        }],
+                        ..Default::default()
+                    })],
+                ),
+                Some("recovery_marker"),
+                false,
+                vec![Level::WARN],
+            ),
+            (
+                "protocol",
+                Fixture::new(
+                    vec![Err(PaykitSdkError::Protocol {
+                        context: private.into(),
+                        source: None,
+                    })],
+                    Vec::new(),
+                ),
+                Some("protocol"),
+                false,
+                vec![Level::WARN],
+            ),
+            (
+                "routine transport",
+                Fixture::new(
+                    vec![Err(PaykitSdkError::Transport {
+                        context: private.into(),
+                        source: None,
+                    })],
+                    Vec::new(),
+                ),
+                Some("transport"),
+                false,
+                Vec::new(),
+            ),
+            (
+                "routine storage",
+                Fixture::new(
+                    vec![Err(PaykitSdkError::Storage {
+                        context: private.into(),
+                        source: None,
+                    })],
+                    Vec::new(),
+                ),
+                Some("storage"),
+                false,
+                Vec::new(),
+            ),
+            (
+                "deferred contention",
+                Fixture::new(
+                    vec![Err(PaykitSdkError::SharedStateBusy {
+                        context: private.into(),
+                        source: None,
+                    })],
+                    Vec::new(),
+                ),
+                None,
+                true,
+                Vec::new(),
+            ),
+        ];
+
+        for (name, fixture, expected_category, expected_deferred, expected_levels) in scenarios {
+            let (category, deferred, levels) = observe(fixture).await;
+            assert_eq!(category, expected_category, "{name}");
+            assert_eq!(deferred, expected_deferred, "{name}");
+            assert_eq!(levels, expected_levels, "{name}");
+        }
     }
 
     #[test]
