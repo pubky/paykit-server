@@ -64,6 +64,10 @@ pub async fn initialize_database(config: &Config) -> Result<PgPool, StartupError
         .map_err(|_| StartupError::CreatorIntegrity)?;
     let invoices = InvoiceStore::new(&pool, crypto.clone());
     invoices
+        .attribute_legacy_usdt_receipts()
+        .await
+        .map_err(|_| StartupError::PaymentRecordIntegrity)?;
+    invoices
         .scan_payment_record_integrity()
         .await
         .map_err(|_| StartupError::PaymentRecordIntegrity)?;

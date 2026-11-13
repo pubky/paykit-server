@@ -120,12 +120,27 @@ impl PaymentDrainStore {
         }
     }
 
+    /// Drains read invoice payment markers directly, so every drain read
+    /// first reconciles the Creator's flagged pre-upgrade USDT credit whose
+    /// proposal time is known, whatever the server's USDT configuration. A
+    /// marker still flagged, because its proposal time is not yet known, never
+    /// counts as payment, so a drain waits for it rather than completing.
+    async fn reconcile_usdt_credits(
+        &self,
+        lock_resource: &PubkyLockResource,
+    ) -> Result<(), PersistenceError> {
+        super::InvoiceStore::new(&self.pool, self.crypto.clone())
+            .reconcile_usdt_credits(lock_resource.creator())
+            .await
+    }
+
     /// Returns an authenticated immutable replay without performing SDK or
     /// classification work. `None` means this lock has not been drained.
     pub async fn exact_replay(
         &self,
         lock_resource: &PubkyLockResource,
     ) -> Result<Option<PaymentDrainSnapshot>, PersistenceError> {
+        self.reconcile_usdt_credits(lock_resource).await?;
         let canonical_lock = lock_resource.to_string();
         let creator_hash = self
             .crypto
@@ -181,6 +196,7 @@ impl PaymentDrainStore {
                            AND NOT (
                                invoice.first_amount_matched_observed_at IS NOT NULL
                                AND invoice.first_amount_matched_observed_at <= invoice.payment_deadline
+                               AND NOT invoice.usdt_credit_reconcile
                                OR EXISTS (
                                    SELECT 1
                                    FROM invoice_provider_v2_first_threshold_evidence evidence
@@ -197,6 +213,7 @@ impl PaymentDrainStore {
                                     OR (
                                         invoice.first_amount_matched_observed_at IS NOT NULL
                                         AND invoice.first_amount_matched_observed_at <= invoice.payment_deadline
+                                        AND NOT invoice.usdt_credit_reconcile
                                     )
                                     OR EXISTS (
                                         SELECT 1
@@ -254,6 +271,7 @@ impl PaymentDrainStore {
         lock_resource: &PubkyLockResource,
         cleanup_token: &[u8; 32],
     ) -> Result<(), PersistenceError> {
+        self.reconcile_usdt_credits(lock_resource).await?;
         let canonical_lock = lock_resource.to_string();
         let creator_hash = self
             .crypto
@@ -371,6 +389,7 @@ impl PaymentDrainStore {
                        AND NOT (
                            invoice.first_amount_matched_observed_at IS NOT NULL
                            AND invoice.first_amount_matched_observed_at <= invoice.payment_deadline
+                           AND NOT invoice.usdt_credit_reconcile
                            OR EXISTS (
                                SELECT 1
                                FROM invoice_provider_v2_first_threshold_evidence evidence
@@ -383,7 +402,8 @@ impl PaymentDrainStore {
                         OR (item.classification = 'accepted' AND (
                             invoice.payment_expired_at IS NOT NULL
                             OR (invoice.first_amount_matched_observed_at IS NOT NULL
-                                AND invoice.first_amount_matched_observed_at <= invoice.payment_deadline)
+                                AND invoice.first_amount_matched_observed_at <= invoice.payment_deadline
+                                AND NOT invoice.usdt_credit_reconcile)
                             OR EXISTS (
                                 SELECT 1
                                 FROM invoice_provider_v2_first_threshold_evidence evidence
@@ -467,6 +487,7 @@ impl PaymentDrainStore {
         lock_resource: &PubkyLockResource,
         receive_evidence: Option<(&PaymentRequestLifecycleStore, &[RequiredReceiveTarget])>,
     ) -> Result<PaymentDrainSnapshot, PersistenceError> {
+        self.reconcile_usdt_credits(lock_resource).await?;
         let canonical_lock = lock_resource.to_string();
         let creator_hash = self
             .crypto
@@ -876,7 +897,9 @@ impl PaymentDrainStore {
         .map_err(|_| PersistenceError::Unavailable)?;
         let fenced = sqlx::query(
             "UPDATE lock_payment_generations
-             SET active_drain_id = $1, updated_at = transaction_timestamp()
+             SET active_drain_id = $1,
+                 provider_v2_drain_fenced = TRUE,
+                 updated_at = transaction_timestamp()
              WHERE creator_id = $2 AND lock_resource_lookup_hash = $3
                AND current_generation = $4 AND active_drain_id IS NULL",
         )

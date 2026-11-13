@@ -73,7 +73,7 @@ pub(crate) fn cursor_stable_transition_allowed(
 /// Whether a row stored as `invalid_conflict` may take the incoming state at
 /// equal source cursors.
 ///
-/// Paykit `v0.1.1-rc6` no longer marks a payee's request invalid when it
+/// Paykit `v0.1.1-rc3` and later no longer mark a payee's request invalid when it
 /// stores an otherwise-valid Acceptance at or after the proposal expiry, such
 /// as an in-time Acceptance fetched late. It derives those requests from the
 /// same stored events as `accepted`, or `proof_submitted` once a Payment Proof
@@ -111,6 +111,8 @@ pub struct PaymentRequestLifecycleProjection {
     pub last_stream_item_id: Option<u64>,
     pub last_outbound_message_id: Option<u64>,
     pub last_event_at: OffsetDateTime,
+    /// When the SDK recorded this server's proposal, by the server's clock.
+    pub proposal_recorded_at: Option<OffsetDateTime>,
     /// Local time the SDK stored the recorded Acceptance, if any. For the
     /// server this is when it fetched the Acceptance, not when the reader
     /// accepted.

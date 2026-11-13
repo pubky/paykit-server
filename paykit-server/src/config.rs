@@ -67,12 +67,6 @@ impl Config {
         if client_id.as_str() != PAYKIT_CLIENT_ID {
             return Err(ConfigError::UnsupportedPaykitClientId);
         }
-        // Withheld until Paykit can read a reader's actionable proposals
-        // without deriving their whole Allowance history; only test builds
-        // may run the intake.
-        if raw.paykit.allowance_intake && !cfg!(feature = "test-utils") {
-            return Err(ConfigError::AllowanceIntakeUnavailable);
-        }
         let bitcoin_network = BitcoinNetwork::parse(&raw.bitcoin.network)?;
 
         let listen_addr = raw
@@ -155,6 +149,10 @@ impl Config {
                 self.outbox.rapid_link_retry_interval,
             ),
             ("limits.lock_fetch_timeout", self.limits.lock_fetch_timeout),
+            (
+                "limits.request_body_read_timeout",
+                self.limits.request_body_read_timeout,
+            ),
             ("shutdown.drain_timeout", self.shutdown.drain_timeout),
         ] {
             if value.is_zero() {
@@ -455,10 +453,8 @@ pub struct PaykitConfig {
     pub conversion_payment_window: Duration,
     pub marketplace_prepare_ttl: Duration,
     /// Whether the server accepts the Allowance proposals its invoiced readers
-    /// send. Each read derives a reader's whole Allowance history
-    /// synchronously in the SDK, which nothing in the server can bound, so the
-    /// intake stays off, and only test builds may turn it on, until Paykit
-    /// offers an operation that reads only actionable proposals.
+    /// send. Off by default. Each read is one SDK call whose work is bounded
+    /// by a per-link record cap.
     pub allowance_intake: bool,
 }
 
@@ -508,6 +504,11 @@ pub struct LimitsConfig {
     pub request_body_bytes: u64,
     pub lock_resource_bytes: u64,
     pub lock_fetch_timeout: Duration,
+    /// Total time allowed to receive a signed request body before its
+    /// signature is verified. Bounds how long an unauthenticated client can
+    /// hold a capacity slot. The 5s default is generous: signed bodies are at
+    /// most `request_body_bytes` and normally arrive in milliseconds.
+    pub request_body_read_timeout: Duration,
 }
 
 #[derive(Debug)]
@@ -660,10 +661,6 @@ pub enum ConfigError {
     UnsupportedPaykitClientId,
     #[error("paykit.network must be mainnet or testnet")]
     InvalidPaykitNetwork,
-    #[error(
-        "paykit.allowance_intake is not available yet: it needs a bounded Paykit Allowance operation"
-    )]
-    AllowanceIntakeUnavailable,
     #[error("paykit.receiver_path_priority entries must be canonical Paykit receiver app segments")]
     InvalidReceiverPathPriority,
     #[error("paykit.receiver_path_priority must not be empty")]
@@ -889,6 +886,11 @@ struct RawLimitsConfig {
     lock_resource_bytes: u64,
     #[serde(default = "default_lock_fetch_timeout", with = "humantime_serde")]
     lock_fetch_timeout: Duration,
+    #[serde(
+        default = "default_request_body_read_timeout",
+        with = "humantime_serde"
+    )]
+    request_body_read_timeout: Duration,
 }
 
 #[derive(Deserialize)]
@@ -923,6 +925,7 @@ impl Default for RawLimitsConfig {
             request_body_bytes: default_request_body_bytes(),
             lock_resource_bytes: default_lock_resource_bytes(),
             lock_fetch_timeout: default_lock_fetch_timeout(),
+            request_body_read_timeout: default_request_body_read_timeout(),
         }
     }
 }
@@ -971,6 +974,7 @@ impl From<RawLimitsConfig> for LimitsConfig {
             request_body_bytes: value.request_body_bytes,
             lock_resource_bytes: value.lock_resource_bytes,
             lock_fetch_timeout: value.lock_fetch_timeout,
+            request_body_read_timeout: value.request_body_read_timeout,
         }
     }
 }
@@ -1024,6 +1028,9 @@ const fn default_lock_resource_bytes() -> u64 {
 }
 const fn default_lock_fetch_timeout() -> Duration {
     Duration::from_secs(10)
+}
+const fn default_request_body_read_timeout() -> Duration {
+    Duration::from_secs(5)
 }
 const fn default_signed_requests_per_second() -> u64 {
     100

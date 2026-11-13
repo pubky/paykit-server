@@ -3,6 +3,7 @@
 use paykit_sdk::{PaymentRequestLocalRole, PaymentRequestRecord};
 
 use super::*;
+use crate::persistence::usdt_attempts::{self, ProposalTimes, ReceiptOwner};
 use crate::{
     application::marketplace_status::MarketplaceUsdtStatus,
     domain::receiving::USDT_CHAIN_ID,
@@ -130,19 +131,27 @@ impl MarketplacePreparationStore {
                 &owned_candidates
             }
         };
+        let attempt_hash = usdt_attempts::attempt_hash(&self.crypto, &record.payment_request_id);
         let mut observed = 0;
         for candidate in candidates {
             let identity = &candidate.identity;
             let identity_hash = self.crypto.usdt_transfer_lookup_hash(identity.as_bytes());
+            // A receipt not yet attested for this request is verified for it,
+            // final or not.
             let existing: Option<(bool, bool, bool)> = sqlx::query_as(
-                "SELECT COALESCE(finalized OR ($3 AND marketplace_preparation_id = $2 AND present
-                    AND checked_at <= NOW() AND checked_at > NOW() - INTERVAL '1 minute'), FALSE),
+                "SELECT COALESCE(attested AND (finalized OR ($3 AND marketplace_preparation_id = $2 AND present
+                    AND checked_at <= NOW() AND checked_at > NOW() - INTERVAL '1 minute')), FALSE),
                     present, COALESCE(marketplace_preparation_id = $2, FALSE)
-                 FROM usdt_observations WHERE transfer_lookup_hash = $1",
+                 FROM (SELECT *, EXISTS (
+                           SELECT 1 FROM usdt_observation_attempts attempt
+                           WHERE attempt.observation_id = usdt_observations.id
+                             AND attempt.attempt_lookup_hash = $4) AS attested
+                       FROM usdt_observations WHERE transfer_lookup_hash = $1) observation",
             )
             .bind(identity_hash.as_bytes().as_slice())
             .bind(target.preparation_id)
             .bind(scan.is_some())
+            .bind(attempt_hash.as_bytes().as_slice())
             .fetch_optional(&self.pool)
             .await
             .map_err(|_| PersistenceError::Unavailable)?;
@@ -157,10 +166,15 @@ impl MarketplacePreparationStore {
                 // Reserve before RPC so failures and restarts retain the refresh interval.
                 let reserved = sqlx::query(
                     "UPDATE usdt_observations SET checked_at = NOW()
-                     WHERE marketplace_preparation_id = $1 AND transfer_lookup_hash = $2 AND NOT finalized
+                     WHERE marketplace_preparation_id = $1 AND transfer_lookup_hash = $2
+                       AND (NOT finalized OR NOT EXISTS (
+                           SELECT 1 FROM usdt_observation_attempts attempt
+                           WHERE attempt.observation_id = usdt_observations.id
+                             AND attempt.attempt_lookup_hash = $3))
                        AND (checked_at > NOW() OR checked_at <= NOW() -
                          CASE WHEN present THEN INTERVAL '1 minute' ELSE INTERVAL '15 seconds' END)")
                     .bind(target.preparation_id).bind(identity_hash.as_bytes().as_slice())
+                    .bind(attempt_hash.as_bytes().as_slice())
                     .execute(&self.pool).await.map_err(|_| PersistenceError::Unavailable)?;
                 if reserved.rows_affected() == 0 {
                     continue;
@@ -174,8 +188,13 @@ impl MarketplacePreparationStore {
             match verified {
                 Some(transfer) => {
                     observed += usize::from(
-                        self.apply_usdt_transfer(&target, creator_hash, transfer)
-                            .await?,
+                        self.apply_usdt_transfer(
+                            &target,
+                            creator_hash,
+                            transfer,
+                            &record.payment_request_id,
+                        )
+                        .await?,
                     );
                 }
                 None => {
@@ -254,6 +273,7 @@ impl MarketplacePreparationStore {
         target: &UsdtTarget,
         creator_hash: LookupHash,
         transfer: VerifiedTransfer,
+        payment_request_id: &str,
     ) -> Result<bool, PersistenceError> {
         let transfer_hash = self
             .crypto
@@ -272,11 +292,26 @@ impl MarketplacePreparationStore {
         .fetch_optional(&mut *tx)
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
-        if let Some((_, owner, finalized)) = existing {
+        if let Some((id, owner, finalized)) = existing {
             // The unique transfer identity fences a receipt owned elsewhere, and a
-            // finalized receipt is never rewritten.
-            if owner != Some(target.preparation_id) || finalized {
-                return Ok(owner == Some(target.preparation_id));
+            // finalized receipt is never rewritten: it only gains this attempt.
+            if owner != Some(target.preparation_id) {
+                return Ok(false);
+            }
+            if finalized {
+                usdt_attempts::attest(
+                    &mut tx,
+                    &self.crypto,
+                    creator_hash,
+                    id,
+                    ReceiptOwner::Preparation(target.preparation_id),
+                    payment_request_id,
+                )
+                .await?;
+                tx.commit()
+                    .await
+                    .map_err(|_| PersistenceError::Unavailable)?;
+                return Ok(true);
             }
         }
         let id = existing.map_or_else(Uuid::new_v4, |(id, _, _)| id);
@@ -324,6 +359,15 @@ impl MarketplacePreparationStore {
         if owner != Some(target.preparation_id) {
             return Ok(false);
         }
+        usdt_attempts::attest(
+            &mut tx,
+            &self.crypto,
+            creator_hash,
+            id,
+            ReceiptOwner::Preparation(target.preparation_id),
+            payment_request_id,
+        )
+        .await?;
         tx.commit()
             .await
             .map_err(|_| PersistenceError::Unavailable)?;
@@ -410,8 +454,9 @@ impl MarketplacePreparationStore {
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
         for row in rows {
+            let creator_hash = stored_hash(&row.creator_lookup_hash)?;
             self.usdt_facts(
-                stored_hash(&row.creator_lookup_hash)?,
+                creator_hash,
                 row.preparation_id,
                 &UsdtObservationRow {
                     id: row.id,
@@ -456,20 +501,26 @@ impl MarketplacePreparationStore {
             };
         }
         let required = payment.usdt_required_amount()?;
-        // Chain time has one-second resolution; the window opens at the whole second
-        // of activation, as for Locks invoices.
-        let window_start = activated_at
-            .replace_nanosecond(0)
-            .map_err(|_| PersistenceError::CorruptOrMissing)?;
+        // Each receipt's window opens at activation, or later at the earliest
+        // proposal record time among the attempts it was verified for less the
+        // chain's timestamp tolerance, and stays shut until one is recorded, as for
+        // Locks invoices. A receipt with no attested attempt never pays.
+        let mut proposal_times = ProposalTimes::new(ReceiptOwner::Preparation(preparation_id));
         let mut selected: Option<((bool, bool, bool, u32), MarketplaceUsdtStatus)> = None;
         let mut first_qualifying_at: Option<OffsetDateTime> = None;
         for row in rows {
             let (facts, _) = self.usdt_facts(creator_hash, preparation_id, &row)?;
+            let proposal_recorded_at = proposal_times
+                .bound(tx, &self.crypto, creator_hash, row.id)
+                .await?
+                .proposal_recorded_at;
+            let window_start =
+                crate::usdt::payment_window_start(activated_at, proposal_recorded_at);
             let confirmations =
                 u32::try_from(row.confirmations).map_err(|_| PersistenceError::CorruptOrMissing)?;
             let amount_matched = facts.amount >= required;
             let paid_on_time = amount_matched
-                && facts.timestamp >= window_start
+                && window_start.is_some_and(|start| facts.timestamp >= start)
                 && facts.timestamp <= payment_deadline;
             if paid_on_time {
                 first_qualifying_at = Some(

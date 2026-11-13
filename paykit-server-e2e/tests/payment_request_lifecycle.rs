@@ -295,6 +295,7 @@ fn projection(
         last_stream_item_id: Some(cursor),
         last_outbound_message_id: Some(1),
         last_event_at: recorded_at,
+        proposal_recorded_at: None,
         acceptance_recorded_at: None,
     }
 }
@@ -868,7 +869,7 @@ fn expiring_proposal_intent(payment_reference: &str) -> DeliveryIntentV1 {
     intent
 }
 
-/// What Paykit before `v0.1.1-rc6` stored for an Acceptance the server fetched
+/// What Paykit before `v0.1.1-rc3` stored for an Acceptance the server fetched
 /// at `fetched_at`, at or after the proposal expiry, and the state `rederived`
 /// that Paykit now derives from the same stored events.
 fn late_acceptance(

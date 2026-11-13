@@ -1,6 +1,6 @@
 [package]
 name = "paykit-server-e2e"
-version = "0.1.1-rc2"
+version = "0.1.1-rc3"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -9,14 +9,22 @@ readme.workspace = true
 description = "End-to-end test support for Paykit Server"
 publish = false
 
+[[bin]]
+name = "paykit-server-e2e-process"
+path = "../paykit-server/src/main.rs"
+test = false
+
 [dependencies]
+anyhow.workspace = true
+paykit-server = { path = "../paykit-server", features = ["test-utils"] }
 sqlx.workspace = true
 tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
 url.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-anyhow.workspace = true
 async-trait.workspace = true
 axum.workspace = true
 base64.workspace = true
@@ -26,7 +34,6 @@ ed25519-dalek.workspace = true
 locks-core.workspace = true
 paykit-lib.workspace = true
 paykit-sdk.workspace = true
-paykit-server = { path = "../paykit-server", features = ["test-utils"] }
 pubky.workspace = true
 pubky-testnet.workspace = true
 postcard.workspace = true
@@ -34,6 +41,5 @@ serde.workspace = true
 serde_json.workspace = true
 serde_json_canonicalizer.workspace = true
 time.workspace = true
-tracing-subscriber.workspace = true
 tower = { version = "0.5", features = ["util"] }
 http-relay = { version = "0.7", default-features = false, features = ["server"] }

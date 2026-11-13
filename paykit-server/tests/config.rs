@@ -338,7 +338,7 @@ fn requires_a_nonempty_paykit_client_id() {
 }
 
 #[test]
-fn allowance_intake_is_off_by_default_and_cannot_be_enabled_yet() {
+fn allowance_intake_is_off_by_default_and_can_be_enabled() {
     let config = Config::from_toml_and_environment(&valid_toml(), environment()).unwrap();
     assert!(!config.paykit.allowance_intake);
 
@@ -347,14 +347,8 @@ fn allowance_intake_is_off_by_default_and_cannot_be_enabled_yet() {
         "network = \"testnet\"\nallowance_intake = true\n\n[bitcoin]",
     );
     assert!(enabled.contains("allowance_intake = true"));
-    let result = Config::from_toml_and_environment(&enabled, environment());
-    #[cfg(not(feature = "test-utils"))]
-    assert!(matches!(
-        result,
-        Err(ConfigError::AllowanceIntakeUnavailable)
-    ));
-    #[cfg(feature = "test-utils")]
-    assert!(result.unwrap().paykit.allowance_intake);
+    let config = Config::from_toml_and_environment(&enabled, environment()).unwrap();
+    assert!(config.paykit.allowance_intake);
 }
 
 #[test]
@@ -550,6 +544,10 @@ fn parses_accepted_durations_and_uses_ledger_defaults() {
     assert_eq!(config.limits.request_body_bytes, 16 * 1024);
     assert_eq!(config.limits.lock_resource_bytes, 256 * 1024);
     assert_eq!(config.limits.lock_fetch_timeout, Duration::from_secs(10));
+    assert_eq!(
+        config.limits.request_body_read_timeout,
+        Duration::from_secs(5)
+    );
     assert_eq!(config.rate_limits.signed_requests_per_second, 100);
     assert_eq!(config.rate_limits.signed_burst, 200);
     assert_eq!(config.rate_limits.setup_per_ip_per_minute, 10);
@@ -583,6 +581,28 @@ fn creator_held_read_budget_is_configurable_and_must_be_positive() {
     assert_eq!(
         Config::from_toml_and_environment(&zero, environment()).unwrap_err(),
         ConfigError::ZeroValue("rate_limits.creator_held_per_ip_per_minute")
+    );
+}
+
+#[test]
+fn request_body_read_timeout_is_configurable_and_must_be_positive() {
+    let configured = format!(
+        "{}\n[limits]\nrequest_body_read_timeout = \"250ms\"\n",
+        valid_toml()
+    );
+    let config = Config::from_toml_and_environment(&configured, environment()).unwrap();
+    assert_eq!(
+        config.limits.request_body_read_timeout,
+        Duration::from_millis(250)
+    );
+
+    let zero = configured.replace(
+        "request_body_read_timeout = \"250ms\"",
+        "request_body_read_timeout = \"0s\"",
+    );
+    assert_eq!(
+        Config::from_toml_and_environment(&zero, environment()).unwrap_err(),
+        ConfigError::ZeroDuration("limits.request_body_read_timeout")
     );
 }
 

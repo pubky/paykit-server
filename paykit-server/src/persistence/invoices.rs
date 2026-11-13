@@ -338,6 +338,12 @@ impl InvoiceStore {
     }
 
     /// Authenticates encrypted payment records and observations against their keyed lookup hashes.
+    /// Attributes USDT receipts stored before attempts were recorded to their
+    /// owner's single Payment Request attempt; see `usdt_attempts`.
+    pub async fn attribute_legacy_usdt_receipts(&self) -> Result<(), PersistenceError> {
+        super::usdt_attempts::attribute_legacy_receipts(&self.pool, &self.crypto).await
+    }
+
     pub async fn scan_payment_record_integrity(&self) -> Result<(), PersistenceError> {
         let invoices = sqlx::query_as::<_, (Uuid, Vec<u8>, Vec<u8>, Option<Vec<u8>>, Vec<u8>)>(
             "SELECT invoices.id, creators.creator_lookup_hash,

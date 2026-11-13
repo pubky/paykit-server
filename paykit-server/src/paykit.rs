@@ -1020,18 +1020,17 @@ fn lifecycle_projection(
     let last_event_at = record
         .last_event_at
         .ok_or(LifecycleSyncError::InvalidProjection)?;
-    let last_event_at = record_time(
+    let last_event_at = offset_date_time(
         last_event_at.timestamp(),
         last_event_at.timestamp_subsec_nanos(),
     )?;
+    let proposal_recorded_at = record
+        .proposal_recorded_at
+        .map(|at| offset_date_time(at.timestamp(), at.timestamp_subsec_nanos()))
+        .transpose()?;
     let acceptance_recorded_at = record
         .acceptance_recorded_at
-        .map(|recorded_at| {
-            record_time(
-                recorded_at.timestamp(),
-                recorded_at.timestamp_subsec_nanos(),
-            )
-        })
+        .map(|at| offset_date_time(at.timestamp(), at.timestamp_subsec_nanos()))
         .transpose()?;
     Ok(PaymentRequestLifecycleProjection {
         payment_request_id: record.payment_request_id.clone(),
@@ -1076,15 +1075,17 @@ fn lifecycle_projection(
         last_stream_item_id: record.last_stream_item_id,
         last_outbound_message_id: record.last_outbound_message_id,
         last_event_at,
+        proposal_recorded_at,
         acceptance_recorded_at,
     })
 }
 
-/// Converts an SDK record time, given as Unix seconds and subsecond nanos.
-fn record_time(seconds: i64, nanos: u32) -> Result<time::OffsetDateTime, LifecycleSyncError> {
-    let timestamp_nanos = i128::from(seconds)
+fn offset_date_time(seconds: i64, nanos: u32) -> Result<time::OffsetDateTime, LifecycleSyncError> {
+    let seconds = i128::from(seconds);
+    let nanos = i128::from(nanos);
+    let timestamp_nanos = seconds
         .checked_mul(1_000_000_000)
-        .and_then(|value| value.checked_add(i128::from(nanos)))
+        .and_then(|value| value.checked_add(nanos))
         .ok_or(LifecycleSyncError::InvalidProjection)?;
     time::OffsetDateTime::from_unix_timestamp_nanos(timestamp_nanos)
         .map_err(|_| LifecycleSyncError::InvalidProjection)
@@ -1505,7 +1506,6 @@ mod tests {
         PaymentRequestRecord {
             counterparty: PubkyPublicKey::from_raw_or_app_key(CREATOR).unwrap(),
             proposal_app_id: Some(server_app_id()),
-            proposal_recorded_at: None,
             payer_app_id: None,
             execution_claim_app_id: None,
             conversion_quotes: Vec::new(),
@@ -1516,6 +1516,8 @@ mod tests {
             proposal_outbound_message_id: None,
             proposal_outbound_status: None,
             proposal_event_id: Some(Uuid::new_v4().to_string()),
+            proposal_recorded_at: None,
+            acceptance_recorded_at: None,
             terms: Some(PaymentRequestTermsRecord {
                 amount: AmountRecord {
                     asset: "BTC".into(),
@@ -1536,7 +1538,6 @@ mod tests {
             }),
             accepted_event_id: None,
             accepted_outbound_status: None,
-            acceptance_recorded_at: None,
             rejected_event_id: None,
             rejected_outbound_status: None,
             canceled_event_id: None,
@@ -1614,13 +1615,23 @@ mod tests {
     }
 
     #[test]
-    fn projection_carries_the_acceptance_record_time() {
-        let accepted = record_time_at(1_800_000_000, 250);
+    fn projection_carries_proposal_and_acceptance_record_times() {
+        let mut accepted = record_time_at(1_800_000_000, 250);
+        accepted.proposal_recorded_at = Some(
+            (std::time::SystemTime::UNIX_EPOCH + std::time::Duration::new(1_799_999_000, 500))
+                .into(),
+        );
         let projection = lifecycle_projection(&accepted).unwrap();
         assert_eq!(
             projection.acceptance_recorded_at,
             Some(
                 time::OffsetDateTime::from_unix_timestamp_nanos(1_800_000_000_000_000_250).unwrap()
+            )
+        );
+        assert_eq!(
+            projection.proposal_recorded_at,
+            Some(
+                time::OffsetDateTime::from_unix_timestamp_nanos(1_799_999_000_000_000_500).unwrap()
             )
         );
         assert_eq!(projection.state_event_id, accepted.accepted_event_id);
@@ -2196,6 +2207,7 @@ mod tests {
             last_stream_item_id: Some(index),
             last_outbound_message_id: None,
             last_event_at: time::OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap(),
+            proposal_recorded_at: None,
             acceptance_recorded_at: None,
         }
     }

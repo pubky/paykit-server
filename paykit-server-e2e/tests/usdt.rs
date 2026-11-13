@@ -32,10 +32,11 @@ use paykit_server::{
         receiving::{USDT_ENDPOINT, UsdtAddress},
     },
     persistence::{
-        AtomicInvoiceInput, CreatorCredentials, CreatorStore, InvoicePayloadFactory,
-        InvoicePayloads, InvoiceStore, MarketplaceActivationInput, MarketplacePreparationInput,
-        MarketplacePreparationPayloadFactory, MarketplacePreparationPayloads,
-        MarketplacePreparationStore, PaymentDrainStore, PersistenceError, run_migrations,
+        AtomicInvoiceInput, AtomicInvoiceResult, CreatorCredentials, CreatorStore,
+        InvoicePayloadFactory, InvoicePayloads, InvoiceStore, MarketplaceActivationInput,
+        MarketplacePreparationInput, MarketplacePreparationPayloadFactory,
+        MarketplacePreparationPayloads, MarketplacePreparationStore, PaymentDrainStore,
+        PersistenceError, run_migrations,
     },
     usdt::{ArbitrumVerifier, PaymentContext, VerificationError},
 };
@@ -319,7 +320,7 @@ async fn invoices_share_an_address_but_never_share_payment_evidence() {
         let id = invoice.invoice_id();
         ids.push(id);
         // Establish the same durable attribution produced by the SDK lifecycle projection.
-        sqlx::query("INSERT INTO payment_request_lifecycles (invoice_id,sdk_payment_request_id,request_state,last_event_at,last_stream_item_id) VALUES ($1,$2,'proof_submitted',NOW(),1)").bind(id).bind(record(index).payment_request_id).execute(database.pool()).await.unwrap();
+        sqlx::query("INSERT INTO payment_request_lifecycles (invoice_id,sdk_payment_request_id,request_state,last_event_at,last_stream_item_id,proposal_recorded_at) VALUES ($1,$2,'proof_submitted',NOW(),1,NOW())").bind(id).bind(record(index).payment_request_id).execute(database.pool()).await.unwrap();
     }
     let rpc = Rpc::start().await;
     let paid_at = rpc.chain.lock().unwrap().timestamp;
@@ -765,12 +766,26 @@ async fn invoices_share_an_address_but_never_share_payment_evidence() {
                     <= 8
             );
         }
-        sqlx::query("DELETE FROM usdt_observations WHERE invoice_id = $1 AND id != $2")
-            .bind(ids[0])
-            .bind(observation_id)
-            .execute(database.pool())
+        // Receipts are never deleted; the fixture clears its extra ones with
+        // triggers off, attestations first.
+        let mut tx = database.pool().begin().await.unwrap();
+        sqlx::query("SET LOCAL session_replication_role = replica")
+            .execute(&mut *tx)
             .await
             .unwrap();
+        for statement in [
+            "DELETE FROM usdt_observation_attempts WHERE observation_id IN
+                 (SELECT id FROM usdt_observations WHERE invoice_id = $1 AND id != $2)",
+            "DELETE FROM usdt_observations WHERE invoice_id = $1 AND id != $2",
+        ] {
+            sqlx::query(statement)
+                .bind(ids[0])
+                .bind(observation_id)
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+        }
+        tx.commit().await.unwrap();
     }
     rpc.chain.lock().unwrap().reorg = false;
     // Overflowing discovery does not suppress independently owned receipt refreshes.
@@ -942,6 +957,807 @@ async fn status(store: &InvoiceStore, bundle: &BundleId) -> (bool, u32) {
 }
 
 #[tokio::test]
+async fn usdt_older_than_the_recorded_proposal_less_tolerance_does_not_pay_an_invoice() {
+    let bundle = parse_bundle_id(BUNDLES[0]).unwrap();
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(&[7; 32]).unwrap());
+    let creator = parse_creator(CREATOR).unwrap();
+    let creator_id = CreatorStore::new(database.pool(), crypto.clone())
+        .create(&CreatorCredentials::new(
+            creator.clone(),
+            "test-session".into(),
+            PaykitIdentitySecretKey::new([9; 32], 1).unwrap(),
+            None,
+            Some(UsdtAddress::try_from(RECIPIENT.to_owned()).unwrap()),
+        ))
+        .await
+        .unwrap()
+        .id();
+    let store = InvoiceStore::new(database.pool(), crypto.clone());
+    let invoice = store
+        .create_atomic(AtomicInvoiceInput {
+            creator: &creator,
+            reader: &parse_reader(CREATOR).unwrap(),
+            bundle_binding: BUNDLES[0].as_bytes(),
+            lock_resource_binding: b"lock",
+            payment_request_binding: BUNDLES[0].as_bytes(),
+            invoice_payloads: &Payload { index: 0 },
+            proposal_acceptance_seconds: 3600,
+            payment_window_seconds: 3 * 86400,
+        })
+        .await
+        .unwrap();
+    // A lifecycle row from before the server kept the proposal time, as after
+    // the upgrade.
+    sqlx::query("INSERT INTO payment_request_lifecycles (invoice_id,sdk_payment_request_id,request_state,last_event_at,last_stream_item_id) VALUES ($1,$2,'proof_submitted',NOW(),1)")
+        .bind(invoice.invoice_id()).bind(record(0).payment_request_id)
+        .execute(database.pool()).await.unwrap();
+    // The proposal reached the SDK two days after the invoice, as after a long
+    // handoff delay, so the invoice window no longer bounds the evidence.
+    let proposal_recorded_at = invoice.invoice_created_at() + time::Duration::days(2);
+    let bound = (proposal_recorded_at - paykit_server::usdt::PROPOSAL_TIME_TOLERANCE)
+        .replace_nanosecond(0)
+        .unwrap()
+        .unix_timestamp();
+    let rpc = Rpc::start().await;
+    // Until the proposal time is known, even a transfer at the bound pays
+    // nothing, and its receipt is kept.
+    rpc.chain.lock().unwrap().timestamp = bound;
+    store
+        .observe_usdt_request(
+            creator_id,
+            &creator,
+            &record(0),
+            &rpc.verifier,
+            Some(&bundle),
+        )
+        .await
+        .unwrap();
+    assert_eq!(status(&store, &bundle).await, (false, 2));
+    assert!(store.claim_buyer_contact().await.unwrap().is_none());
+    sqlx::query("UPDATE payment_request_lifecycles SET proposal_recorded_at = $1")
+        .bind(proposal_recorded_at)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    for (timestamp, paid) in [(bound - 1, false), (bound, true)] {
+        rpc.chain.lock().unwrap().timestamp = timestamp;
+        store
+            .observe_usdt_request(
+                creator_id,
+                &creator,
+                &record(0),
+                &rpc.verifier,
+                Some(&bundle),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            status(&store, &bundle).await.0,
+            paid,
+            "timestamp={timestamp}"
+        );
+    }
+}
+
+/// An invoice whose reader sent the request twice: attempt A on proof fixture
+/// 0 and attempt B on fixture 3, which proves the same transfer under the same
+/// payment reference.
+async fn two_attempt_invoice() -> (
+    TestDatabase,
+    InvoiceStore,
+    uuid::Uuid,
+    CreatorPubky,
+    BundleId,
+    AtomicInvoiceResult,
+) {
+    let bundle = parse_bundle_id(BUNDLES[0]).unwrap();
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(&[7; 32]).unwrap());
+    let creator = parse_creator(CREATOR).unwrap();
+    let creator_id = CreatorStore::new(database.pool(), crypto.clone())
+        .create(&CreatorCredentials::new(
+            creator.clone(),
+            "test-session".into(),
+            PaykitIdentitySecretKey::new([9; 32], 1).unwrap(),
+            None,
+            Some(UsdtAddress::try_from(RECIPIENT.to_owned()).unwrap()),
+        ))
+        .await
+        .unwrap()
+        .id();
+    let store = InvoiceStore::new(database.pool(), crypto.clone());
+    let invoice = store
+        .create_atomic(AtomicInvoiceInput {
+            creator: &creator,
+            reader: &parse_reader(CREATOR).unwrap(),
+            bundle_binding: BUNDLES[0].as_bytes(),
+            lock_resource_binding: b"lock",
+            payment_request_binding: BUNDLES[0].as_bytes(),
+            invoice_payloads: &Payload { index: 0 },
+            proposal_acceptance_seconds: 3600,
+            payment_window_seconds: 3 * 86400,
+        })
+        .await
+        .unwrap();
+    for index in [0, 3] {
+        sqlx::query("INSERT INTO payment_request_lifecycles (invoice_id,sdk_payment_request_id,request_state,last_event_at,last_stream_item_id) VALUES ($1,$2,'proof_submitted',NOW(),1)")
+            .bind(invoice.invoice_id()).bind(record(index).payment_request_id)
+            .execute(database.pool()).await.unwrap();
+    }
+    (database, store, creator_id, creator, bundle, invoice)
+}
+
+async fn record_proposal_time(database: &TestDatabase, index: usize, at: Option<OffsetDateTime>) {
+    sqlx::query(
+        "UPDATE payment_request_lifecycles SET proposal_recorded_at = $2
+         WHERE sdk_payment_request_id = $1",
+    )
+    .bind(record(index).payment_request_id)
+    .bind(at)
+    .execute(database.pool())
+    .await
+    .unwrap();
+}
+
+fn attempt_bound(proposal_recorded_at: OffsetDateTime) -> i64 {
+    (proposal_recorded_at - paykit_server::usdt::PROPOSAL_TIME_TOLERANCE)
+        .replace_nanosecond(0)
+        .unwrap()
+        .unix_timestamp()
+}
+
+#[tokio::test]
+async fn usdt_evidence_is_bounded_by_its_own_attempt_not_the_earliest() {
+    let (database, store, creator_id, creator, bundle, invoice) = two_attempt_invoice().await;
+    let created = invoice.invoice_created_at();
+    let first = created + time::Duration::days(2);
+    let second = created + time::Duration::days(3);
+    let rpc = Rpc::start().await;
+    let second_attempt = record(3);
+    let observe = |timestamp: i64| {
+        rpc.chain.lock().unwrap().timestamp = timestamp;
+        store.observe_usdt_request(
+            creator_id,
+            &creator,
+            &second_attempt,
+            &rpc.verifier,
+            Some(&bundle),
+        )
+    };
+    // A's proposal time is known and B's is not: evidence verified for B
+    // pays nothing, though A's window would accept it.
+    record_proposal_time(&database, 0, Some(first)).await;
+    observe(attempt_bound(first)).await.unwrap();
+    assert!(!status(&store, &bundle).await.0);
+    // With B's time recorded, a transfer inside A's window but before B's
+    // bound still pays nothing,
+    record_proposal_time(&database, 3, Some(second)).await;
+    observe(attempt_bound(second) - 1).await.unwrap();
+    assert!(!status(&store, &bundle).await.0);
+    // and one at B's bound pays.
+    observe(attempt_bound(second)).await.unwrap();
+    assert!(status(&store, &bundle).await.0);
+}
+
+/// One transfer proven for attempts A (fixture 0) and B (fixture 3), in the
+/// given order, at a time only A's earlier window accepts. It pays once A has
+/// verified it, whichever attempt came first and whether or not it is final.
+async fn assert_any_attested_attempt_pays(order: [usize; 2], finalized: bool) {
+    let (database, store, creator_id, creator, bundle, invoice) = two_attempt_invoice().await;
+    let created = invoice.invoice_created_at();
+    let a = created + time::Duration::days(2);
+    let b = created + time::Duration::days(3);
+    record_proposal_time(&database, 0, Some(a)).await;
+    record_proposal_time(&database, 3, Some(b)).await;
+    let rpc = Rpc::start().await;
+    {
+        let mut chain = rpc.chain.lock().unwrap();
+        chain.timestamp = attempt_bound(a);
+        chain.finalized = finalized;
+    }
+    for (step, index) in order.into_iter().enumerate() {
+        store
+            .observe_usdt_request(
+                creator_id,
+                &creator,
+                &record(index),
+                &rpc.verifier,
+                Some(&bundle),
+            )
+            .await
+            .unwrap();
+        let a_seen = order[..=step].contains(&0);
+        assert_eq!(
+            status(&store, &bundle).await.0,
+            a_seen,
+            "order={order:?} finalized={finalized} step={step}"
+        );
+    }
+    let attestations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM usdt_observation_attempts")
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+    assert_eq!(attestations, 2);
+    store.scan_payment_record_integrity().await.unwrap();
+}
+
+#[tokio::test]
+async fn usdt_evidence_verified_for_a_then_b_pays() {
+    assert_any_attested_attempt_pays([0, 3], false).await;
+}
+
+#[tokio::test]
+async fn usdt_evidence_verified_for_b_then_a_pays() {
+    assert_any_attested_attempt_pays([3, 0], false).await;
+}
+
+#[tokio::test]
+async fn finalized_usdt_evidence_verified_for_a_then_b_pays() {
+    assert_any_attested_attempt_pays([0, 3], true).await;
+}
+
+#[tokio::test]
+async fn finalized_usdt_evidence_verified_for_b_then_a_pays() {
+    assert_any_attested_attempt_pays([3, 0], true).await;
+}
+
+#[tokio::test]
+async fn attempt_attestations_cannot_be_changed_or_removed() {
+    let (database, store, creator_id, creator, bundle, invoice) = two_attempt_invoice().await;
+    record_proposal_time(
+        &database,
+        0,
+        Some(invoice.invoice_created_at() + time::Duration::hours(1)),
+    )
+    .await;
+    let rpc = Rpc::start().await;
+    rpc.chain.lock().unwrap().timestamp = invoice.invoice_created_at().unix_timestamp() + 60;
+    store
+        .observe_usdt_request(
+            creator_id,
+            &creator,
+            &record(0),
+            &rpc.verifier,
+            Some(&bundle),
+        )
+        .await
+        .unwrap();
+    assert!(status(&store, &bundle).await.0);
+    // The service role can neither rewrite nor remove an attestation, directly
+    // or through its receipt.
+    for statement in [
+        "UPDATE usdt_observation_attempts SET attempt_envelope = attempt_envelope",
+        "DELETE FROM usdt_observation_attempts",
+        "TRUNCATE usdt_observation_attempts",
+        "DELETE FROM usdt_observations",
+    ] {
+        sqlx::query(statement)
+            .execute(database.pool())
+            .await
+            .expect_err(statement);
+    }
+    let attestations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM usdt_observation_attempts")
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+    assert_eq!(attestations, 1);
+    assert!(status(&store, &bundle).await.0);
+    store.scan_payment_record_integrity().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_legacy_receipt_pays_only_when_its_owner_has_one_attempt() {
+    let (database, store, creator_id, creator, bundle, invoice) = two_attempt_invoice().await;
+    let proposal = invoice.invoice_created_at() + time::Duration::hours(1);
+    record_proposal_time(&database, 0, Some(proposal)).await;
+    record_proposal_time(&database, 3, Some(proposal)).await;
+    let rpc = Rpc::start().await;
+    {
+        let mut chain = rpc.chain.lock().unwrap();
+        chain.timestamp = invoice.invoice_created_at().unix_timestamp() + 60;
+        chain.finalized = true;
+    }
+    store
+        .observe_usdt_request(
+            creator_id,
+            &creator,
+            &record(0),
+            &rpc.verifier,
+            Some(&bundle),
+        )
+        .await
+        .unwrap();
+    assert!(status(&store, &bundle).await.0);
+    // As stored before attempts were recorded: a final receipt, never
+    // re-verified, with no attempt. It pays nothing.
+    forget_attestations(database.pool()).await;
+    assert!(!status(&store, &bundle).await.0);
+    // With two attempts on its invoice it cannot be attributed.
+    store.attribute_legacy_usdt_receipts().await.unwrap();
+    assert!(!status(&store, &bundle).await.0);
+    // With one, that attempt is the one it was verified for.
+    sqlx::query("DELETE FROM payment_request_lifecycles WHERE sdk_payment_request_id = $1")
+        .bind(record(3).payment_request_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    store.attribute_legacy_usdt_receipts().await.unwrap();
+    assert!(status(&store, &bundle).await.0);
+    store.scan_payment_record_integrity().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_pre_upgrade_usdt_buyer_contact_waits_for_a_payment_the_current_window_accepts() {
+    let bundle = parse_bundle_id(BUNDLES[0]).unwrap();
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(&[7; 32]).unwrap());
+    let creator = parse_creator(CREATOR).unwrap();
+    let creator_id = CreatorStore::new(database.pool(), crypto.clone())
+        .create(&CreatorCredentials::new(
+            creator.clone(),
+            "test-session".into(),
+            PaykitIdentitySecretKey::new([9; 32], 1).unwrap(),
+            None,
+            Some(UsdtAddress::try_from(RECIPIENT.to_owned()).unwrap()),
+        ))
+        .await
+        .unwrap()
+        .id();
+    let store = InvoiceStore::new(database.pool(), crypto.clone());
+    let invoice = store
+        .create_atomic(AtomicInvoiceInput {
+            creator: &creator,
+            reader: &parse_reader(CREATOR).unwrap(),
+            bundle_binding: BUNDLES[0].as_bytes(),
+            lock_resource_binding: b"lock",
+            payment_request_binding: BUNDLES[0].as_bytes(),
+            invoice_payloads: &Payload { index: 0 },
+            proposal_acceptance_seconds: 3600,
+            payment_window_seconds: 3 * 86400,
+        })
+        .await
+        .unwrap();
+    // A database upgraded from v22: migration 0023 adds the proposal time as
+    // NULL, and v22 code already queued a contact for a USDT transfer that only
+    // its invoice window accepted.
+    sqlx::query("INSERT INTO payment_request_lifecycles (invoice_id,sdk_payment_request_id,request_state,last_event_at,last_stream_item_id) VALUES ($1,$2,'proof_submitted',NOW(),1)")
+        .bind(invoice.invoice_id()).bind(record(0).payment_request_id)
+        .execute(database.pool()).await.unwrap();
+    let proposal_recorded_at = invoice.invoice_created_at() + time::Duration::days(2);
+    let bound = (proposal_recorded_at - paykit_server::usdt::PROPOSAL_TIME_TOLERANCE)
+        .replace_nanosecond(0)
+        .unwrap()
+        .unix_timestamp();
+    let rpc = Rpc::start().await;
+    let request = record(0);
+    let observe = |timestamp: i64| {
+        rpc.chain.lock().unwrap().timestamp = timestamp;
+        store.observe_usdt_request(creator_id, &creator, &request, &rpc.verifier, Some(&bundle))
+    };
+    observe(bound - 1).await.unwrap();
+    sqlx::query(
+        "INSERT INTO buyer_contacts (invoice_id, creator_id, reader_lookup_hash)
+         SELECT id, creator_id, reader_lookup_hash FROM invoices WHERE id = $1",
+    )
+    .bind(invoice.invoice_id())
+    .execute(database.pool())
+    .await
+    .unwrap();
+    let pending = store.claim_buyer_contact().await.unwrap().unwrap();
+
+    // Held while the proposal time is unknown.
+    assert!(!store.buyer_contact_is_pending(&pending).await.unwrap());
+    // A timely Bitcoin payment backs a contact independently of USDT.
+    sqlx::query("INSERT INTO invoice_timely_amount_matched_outpoints (invoice_id, outpoint_lookup_hash) VALUES ($1, $2)")
+        .bind(invoice.invoice_id()).bind([3u8; 32].as_slice())
+        .execute(database.pool()).await.unwrap();
+    assert!(store.buyer_contact_is_pending(&pending).await.unwrap());
+    sqlx::query("DELETE FROM invoice_timely_amount_matched_outpoints WHERE invoice_id = $1")
+        .bind(invoice.invoice_id())
+        .execute(database.pool())
+        .await
+        .unwrap();
+
+    // Once the time is recorded, a transfer before the bound still holds it,
+    sqlx::query("UPDATE payment_request_lifecycles SET proposal_recorded_at = $1")
+        .bind(proposal_recorded_at)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    assert!(!store.buyer_contact_is_pending(&pending).await.unwrap());
+    // and a transfer the current window accepts releases it.
+    observe(bound).await.unwrap();
+    assert!(store.buyer_contact_is_pending(&pending).await.unwrap());
+}
+
+#[tokio::test]
+async fn a_held_legacy_contact_moves_to_the_buyers_next_qualifying_invoice() {
+    let bundles = BUNDLES.map(|value| parse_bundle_id(value).unwrap());
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(&[7; 32]).unwrap());
+    let creator = parse_creator(CREATOR).unwrap();
+    let creator_id = CreatorStore::new(database.pool(), crypto.clone())
+        .create(&CreatorCredentials::new(
+            creator.clone(),
+            "test-session".into(),
+            PaykitIdentitySecretKey::new([9; 32], 1).unwrap(),
+            None,
+            Some(UsdtAddress::try_from(RECIPIENT.to_owned()).unwrap()),
+        ))
+        .await
+        .unwrap()
+        .id();
+    let store = InvoiceStore::new(database.pool(), crypto.clone());
+    let mut ids = Vec::new();
+    for (index, binding) in BUNDLES.iter().enumerate().take(2) {
+        let invoice = store
+            .create_atomic(AtomicInvoiceInput {
+                creator: &creator,
+                reader: &parse_reader(CREATOR).unwrap(),
+                bundle_binding: binding.as_bytes(),
+                lock_resource_binding: b"lock",
+                payment_request_binding: binding.as_bytes(),
+                invoice_payloads: &Payload { index },
+                proposal_acceptance_seconds: 3600,
+                payment_window_seconds: 86400,
+            })
+            .await
+            .unwrap();
+        ids.push(invoice.invoice_id());
+    }
+    // Upgraded from v22: the first invoice's lifecycle row has no proposal
+    // time, and v22 code queued a contact for it that the current rule holds.
+    sqlx::query("INSERT INTO payment_request_lifecycles (invoice_id,sdk_payment_request_id,request_state,last_event_at,last_stream_item_id) VALUES ($1,$2,'proof_submitted',NOW(),1)")
+        .bind(ids[0]).bind(record(0).payment_request_id)
+        .execute(database.pool()).await.unwrap();
+    sqlx::query(
+        "INSERT INTO buyer_contacts (invoice_id, creator_id, reader_lookup_hash)
+         SELECT id, creator_id, reader_lookup_hash FROM invoices WHERE id = $1",
+    )
+    .bind(ids[0])
+    .execute(database.pool())
+    .await
+    .unwrap();
+    let held = store.claim_buyer_contact().await.unwrap().unwrap();
+    assert!(!store.buyer_contact_is_pending(&held).await.unwrap());
+
+    // The same buyer then pays a second invoice under the current rule.
+    sqlx::query("INSERT INTO payment_request_lifecycles (invoice_id,sdk_payment_request_id,request_state,last_event_at,last_stream_item_id,proposal_recorded_at) VALUES ($1,$2,'proof_submitted',NOW(),1,NOW())")
+        .bind(ids[1]).bind(record(1).payment_request_id)
+        .execute(database.pool()).await.unwrap();
+    let rpc = Rpc::start().await;
+    let second = record(1);
+    let observe_second = || {
+        store.observe_usdt_request(
+            creator_id,
+            &creator,
+            &second,
+            &rpc.verifier,
+            Some(&bundles[1]),
+        )
+    };
+    // While the first invoice still qualifies, through a timely Bitcoin
+    // payment, the contact stays on it.
+    sqlx::query("INSERT INTO invoice_timely_amount_matched_outpoints (invoice_id, outpoint_lookup_hash) VALUES ($1, $2)")
+        .bind(ids[0]).bind([3u8; 32].as_slice())
+        .execute(database.pool()).await.unwrap();
+    observe_second().await.unwrap();
+    assert!(status(&store, &bundles[1]).await.0);
+    let contact_invoice: uuid::Uuid = sqlx::query_scalar("SELECT invoice_id FROM buyer_contacts")
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+    assert_eq!(contact_invoice, ids[0]);
+    sqlx::query("DELETE FROM invoice_timely_amount_matched_outpoints WHERE invoice_id = $1")
+        .bind(ids[0])
+        .execute(database.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE usdt_observations SET checked_at = NOW() - INTERVAL '1 minute'")
+        .execute(database.pool())
+        .await
+        .unwrap();
+    observe_second().await.unwrap();
+
+    // Once it no longer does, the open contact moves to the qualifying
+    // invoice and is due now.
+    let moved = store.claim_buyer_contact().await.unwrap().unwrap();
+    assert_eq!(moved.invoice_id, ids[1]);
+    assert!(store.buyer_contact_is_pending(&moved).await.unwrap());
+    assert!(!store.buyer_contact_is_pending(&held).await.unwrap());
+}
+
+/// Migrates a database as deployed before this release: every migration
+/// through 0025 except 0023, from the server's own files. Upgrading then
+/// applies 0023 and the later ones.
+async fn migrate_without_0023(pool: &sqlx::PgPool) {
+    let source =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../paykit-server/migrations");
+    let v22 = std::env::temp_dir().join(format!("paykit-pre-0023-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&v22).unwrap();
+    for entry in std::fs::read_dir(&source).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path.file_name().unwrap().to_str().unwrap().to_owned();
+        if !name.starts_with("0023") && name.as_str() < "0026" {
+            std::fs::copy(&path, v22.join(name)).unwrap();
+        }
+    }
+    sqlx::migrate::Migrator::new(v22.as_path())
+        .await
+        .unwrap()
+        .run(pool)
+        .await
+        .unwrap();
+    std::fs::remove_dir_all(v22).unwrap();
+}
+
+#[tokio::test]
+async fn a_v22_usdt_payment_marker_is_recomputed_before_a_drain_reads_it() {
+    const LOCK: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/app.locks/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json";
+    // (proposal recorded after invoice creation, marker kept)
+    for (label, proposal_after, late_bitcoin, kept) in [
+        // The transfer predates the proposal time less the tolerance.
+        ("stale", Some(time::Duration::days(2)), false, false),
+        // A late amount-matched Bitcoin output is not settlement evidence.
+        (
+            "stale with late Bitcoin",
+            Some(time::Duration::days(2)),
+            true,
+            false,
+        ),
+        // The transfer qualifies under the current rule.
+        ("legitimate", Some(time::Duration::hours(1)), false, true),
+        // Attribution is undecided: the marker stands.
+        ("undecided", None, false, true),
+    ] {
+        let bundle = parse_bundle_id(BUNDLES[0]).unwrap();
+        let database = TestDatabase::create().await;
+        migrate_without_0023(database.pool()).await;
+        let crypto = Arc::new(Crypto::from_master_key(&[7; 32]).unwrap());
+        let creator = parse_creator(CREATOR).unwrap();
+        let creator_id = CreatorStore::new(database.pool(), crypto.clone())
+            .create(&CreatorCredentials::new(
+                creator.clone(),
+                "test-session".into(),
+                PaykitIdentitySecretKey::new([9; 32], 1).unwrap(),
+                None,
+                Some(UsdtAddress::try_from(RECIPIENT.to_owned()).unwrap()),
+            ))
+            .await
+            .unwrap()
+            .id();
+        let store = InvoiceStore::new(database.pool(), crypto.clone());
+        let invoice = store
+            .create_atomic(AtomicInvoiceInput {
+                creator: &creator,
+                reader: &parse_reader(CREATOR).unwrap(),
+                bundle_binding: BUNDLES[0].as_bytes(),
+                lock_resource_binding: LOCK.as_bytes(),
+                payment_request_binding: BUNDLES[0].as_bytes(),
+                invoice_payloads: &Payload { index: 0 },
+                proposal_acceptance_seconds: 3600,
+                payment_window_seconds: 3 * 86400,
+            })
+            .await
+            .unwrap();
+        let created = invoice.invoice_created_at();
+        let paid_at = (created + time::Duration::seconds(10))
+            .replace_nanosecond(0)
+            .unwrap();
+        // v22 state: the accepted lifecycle row, and the payment marker v22
+        // code set from a USDT transfer under the invoice-time window.
+        sqlx::query("INSERT INTO payment_request_lifecycles (invoice_id,sdk_payment_request_id,request_state,last_event_at,last_stream_item_id) VALUES ($1,$2,'accepted',NOW(),1)")
+            .bind(invoice.invoice_id()).bind(record(0).payment_request_id)
+            .execute(database.pool()).await.unwrap();
+        sqlx::query("UPDATE invoices SET first_amount_matched_observed_at = $2 WHERE id = $1")
+            .bind(invoice.invoice_id())
+            .bind(paid_at)
+            .execute(database.pool())
+            .await
+            .unwrap();
+        if late_bitcoin {
+            // v22 records the outpoint of every amount-matched output, also
+            // one seen after the deadline, which is not timely.
+            sqlx::query(
+                "UPDATE invoices SET first_amount_matched_outpoint_lookup_hash = $2 WHERE id = $1",
+            )
+            .bind(invoice.invoice_id())
+            .bind([4u8; 32].as_slice())
+            .execute(database.pool())
+            .await
+            .unwrap();
+        }
+
+        run_migrations(database.pool()).await.unwrap();
+        // The receipt is observed while the proposal time is unknown: nothing
+        // is reconciled yet.
+        let rpc = Rpc::start().await;
+        rpc.chain.lock().unwrap().timestamp = paid_at.unix_timestamp();
+        store
+            .observe_usdt_request(
+                creator_id,
+                &creator,
+                &record(0),
+                &rpc.verifier,
+                Some(&bundle),
+            )
+            .await
+            .unwrap();
+        // A lifecycle refresh then records the proposal time, and the drain
+        // reads markers next, without the observer: the drain store itself
+        // reconciles first, whatever the USDT configuration.
+        if let Some(after) = proposal_after {
+            sqlx::query("UPDATE payment_request_lifecycles SET proposal_recorded_at = $1")
+                .bind(created + after)
+                .execute(database.pool())
+                .await
+                .unwrap();
+        }
+        let drains = PaymentDrainStore::new(database.pool(), crypto.clone());
+        let lock = parse_addressed_lock_resource(LOCK).unwrap();
+        let drain = drains.create(&lock).await.unwrap();
+        assert_eq!(drain.accepted_count(), 1, "{label}");
+        // Replay reads the payment marker: a paid invoice is terminal and
+        // completes the drain, a stale one stays an open accepted request.
+        // Only a reconciled marker pays: an undecided one keeps the request
+        // open, so the drain cannot complete on evidence that may turn stale.
+        let paid = kept && proposal_after.is_some();
+        let replay = drains.exact_replay(&lock).await.unwrap().unwrap();
+        assert_eq!(replay.terminal_count(), u64::from(paid), "{label}");
+        assert_eq!(replay.accepted_count(), u64::from(!paid), "{label}");
+        assert_eq!(replay.completed(), paid, "{label}");
+        if proposal_after.is_none() {
+            // The proposal time recorded after that replay proves the transfer
+            // stale: the drain still has not completed, and it stays open.
+            sqlx::query("UPDATE payment_request_lifecycles SET proposal_recorded_at = $1")
+                .bind(created + time::Duration::days(2))
+                .execute(database.pool())
+                .await
+                .unwrap();
+            let replay = drains.exact_replay(&lock).await.unwrap().unwrap();
+            assert_eq!(replay.terminal_count(), 0, "{label}: after backfill");
+            assert!(!replay.completed(), "{label}: after backfill");
+            continue;
+        }
+
+        let expired = || async {
+            sqlx::query_scalar::<_, Option<OffsetDateTime>>(
+                "SELECT payment_expired_at FROM invoices WHERE id = $1",
+            )
+            .bind(invoice.invoice_id())
+            .fetch_one(database.pool())
+            .await
+            .unwrap()
+        };
+        assert!(expired().await.is_none(), "{label}");
+        store
+            .observation_targets_at(created + time::Duration::days(4))
+            .await
+            .unwrap();
+        assert_eq!(
+            expired().await.is_some(),
+            !kept,
+            "{label}: expiry after the deadline"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_retained_pre_upgrade_drain_reopens_and_then_completes() {
+    const LOCK: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/app.locks/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json";
+    const PROPOSAL_TIME_MIGRATION: &str = include_str!(
+        "../../paykit-server/migrations/0023_payment_request_proposal_recorded_at.sql"
+    );
+    const DRAIN_RECOUNT_MIGRATION: &str =
+        include_str!("../../paykit-server/migrations/0026_payment_drain_usdt_credit_recount.sql");
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(&[7; 32]).unwrap());
+    let creator = parse_creator(CREATOR).unwrap();
+    CreatorStore::new(database.pool(), crypto.clone())
+        .create(&CreatorCredentials::new(
+            creator.clone(),
+            "test-session".into(),
+            PaykitIdentitySecretKey::new([9; 32], 1).unwrap(),
+            None,
+            Some(UsdtAddress::try_from(RECIPIENT.to_owned()).unwrap()),
+        ))
+        .await
+        .unwrap();
+    let store = InvoiceStore::new(database.pool(), crypto.clone());
+    let invoice = store
+        .create_atomic(AtomicInvoiceInput {
+            creator: &creator,
+            reader: &parse_reader(CREATOR).unwrap(),
+            bundle_binding: BUNDLES[0].as_bytes(),
+            lock_resource_binding: LOCK.as_bytes(),
+            payment_request_binding: BUNDLES[0].as_bytes(),
+            invoice_payloads: &Payload { index: 0 },
+            proposal_acceptance_seconds: 3600,
+            payment_window_seconds: 3 * 86400,
+        })
+        .await
+        .unwrap();
+    let created = invoice.invoice_created_at();
+    let paid_at = (created + time::Duration::seconds(10))
+        .replace_nanosecond(0)
+        .unwrap();
+    // v22 state: an accepted request whose payment marker v22 code set from a
+    // USDT transfer, and a drain v22 completed and retained on that marker.
+    // Unflagged, the marker counts exactly as v22 counted it.
+    sqlx::query("INSERT INTO payment_request_lifecycles (invoice_id,sdk_payment_request_id,request_state,last_event_at,last_stream_item_id) VALUES ($1,$2,'accepted',NOW(),1)")
+        .bind(invoice.invoice_id()).bind(record(0).payment_request_id)
+        .execute(database.pool()).await.unwrap();
+    sqlx::query("UPDATE invoices SET first_amount_matched_observed_at = $2 WHERE id = $1")
+        .bind(invoice.invoice_id())
+        .bind(paid_at)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    let drains = PaymentDrainStore::new(database.pool(), crypto.clone());
+    let lock = parse_addressed_lock_resource(LOCK).unwrap();
+    let drain = drains.create(&lock).await.unwrap();
+    let replay = drains.exact_replay(&lock).await.unwrap().unwrap();
+    assert!(replay.completed());
+    assert_eq!(replay.terminal_count(), 1);
+
+    // The upgrade: 0023's backfill flags the marker. On its own that leaves
+    // the retained summary at odds with the canonical counts.
+    let backfill =
+        &PROPOSAL_TIME_MIGRATION[PROPOSAL_TIME_MIGRATION.find("UPDATE invoices").unwrap()..];
+    sqlx::raw_sql(backfill)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    assert!(drains.exact_replay(&lock).await.is_err());
+    // 0026 recounts the drain, which reopens with the request open.
+    sqlx::raw_sql(DRAIN_RECOUNT_MIGRATION)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    let replay = drains.exact_replay(&lock).await.unwrap().unwrap();
+    assert_eq!(replay.drain_id(), drain.drain_id());
+    assert_eq!(replay.accepted_count(), 1);
+    assert_eq!(replay.terminal_count(), 0);
+    assert!(!replay.completed());
+
+    // The proposal time then proves the transfer stale: the marker clears and
+    // the request stays open until its deadline expires it.
+    sqlx::query("UPDATE payment_request_lifecycles SET proposal_recorded_at = $1")
+        .bind(created + time::Duration::days(2))
+        .execute(database.pool())
+        .await
+        .unwrap();
+    let replay = drains.exact_replay(&lock).await.unwrap().unwrap();
+    assert_eq!(replay.accepted_count(), 1);
+    assert!(!replay.completed());
+    let cleanup_token = crypto.payment_drain_cleanup_token(drain.drain_id());
+    assert!(
+        drains
+            .cleanup_completed(&lock, cleanup_token.as_bytes())
+            .await
+            .is_err()
+    );
+    store
+        .observation_targets_at(created + time::Duration::days(4))
+        .await
+        .unwrap();
+    let replay = drains.exact_replay(&lock).await.unwrap().unwrap();
+    assert_eq!(replay.accepted_count(), 0);
+    assert_eq!(replay.terminal_count(), 1);
+    assert!(replay.completed());
+    drains
+        .cleanup_completed(&lock, cleanup_token.as_bytes())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn either_quoted_payment_can_settle_without_overwriting_the_other() {
     let bundle = parse_bundle_id(BUNDLES[0]).unwrap();
     let database = TestDatabase::create().await;
@@ -978,7 +1794,7 @@ async fn either_quoted_payment_can_settle_without_overwriting_the_other() {
         invoice.invoice_id()
     );
     let id = invoice.invoice_id();
-    sqlx::query("INSERT INTO payment_request_lifecycles (invoice_id,sdk_payment_request_id,request_state,last_event_at,last_stream_item_id) VALUES ($1,$2,'proof_submitted',NOW(),1)")
+    sqlx::query("INSERT INTO payment_request_lifecycles (invoice_id,sdk_payment_request_id,request_state,last_event_at,last_stream_item_id,proposal_recorded_at) VALUES ($1,$2,'proof_submitted',NOW(),1,NOW())")
         .bind(id).bind(record(0).payment_request_id).execute(database.pool()).await.unwrap();
     let rpc = Rpc::start().await;
     let outpoint =
@@ -1139,7 +1955,7 @@ async fn timely_usdt_payment_remains_verifiable_after_drain_cleanup() {
         })
         .await
         .unwrap();
-    sqlx::query("INSERT INTO payment_request_lifecycles (invoice_id,sdk_payment_request_id,request_state,last_event_at,last_stream_item_id) VALUES ($1,$2,'proof_submitted',NOW(),1)")
+    sqlx::query("INSERT INTO payment_request_lifecycles (invoice_id,sdk_payment_request_id,request_state,last_event_at,last_stream_item_id,proposal_recorded_at) VALUES ($1,$2,'proof_submitted',NOW(),1,NOW())")
         .bind(invoice.invoice_id()).bind(record(0).payment_request_id).execute(database.pool()).await.unwrap();
     let drains = PaymentDrainStore::new(database.pool(), crypto.clone());
     let active = drains.create(&lock).await.unwrap();
@@ -1273,7 +2089,7 @@ async fn locks_ignores_a_transfer_a_marketplace_request_already_owns() {
         .await
         .unwrap()
         .invoice_id();
-    sqlx::query("INSERT INTO payment_request_lifecycles (invoice_id,sdk_payment_request_id,request_state,last_event_at,last_stream_item_id) VALUES ($1,$2,'proof_submitted',NOW(),1)")
+    sqlx::query("INSERT INTO payment_request_lifecycles (invoice_id,sdk_payment_request_id,request_state,last_event_at,last_stream_item_id,proposal_recorded_at) VALUES ($1,$2,'proof_submitted',NOW(),1,NOW())")
         .bind(locks_invoice)
         .bind(record(0).payment_request_id)
         .execute(database.pool())
@@ -1308,7 +2124,7 @@ async fn locks_ignores_a_transfer_a_marketplace_request_already_owns() {
         .await
         .unwrap()
         .unwrap();
-    sqlx::query("INSERT INTO payment_request_lifecycles (marketplace_preparation_id,sdk_payment_request_id,request_state,last_event_at,last_stream_item_id,state_event_id) VALUES ($1,$2,'proof_submitted',NOW(),1,'event')")
+    sqlx::query("INSERT INTO payment_request_lifecycles (marketplace_preparation_id,sdk_payment_request_id,request_state,last_event_at,last_stream_item_id,state_event_id,proposal_recorded_at) VALUES ($1,$2,'proof_submitted',NOW(),1,'event',NOW())")
         .bind(prepared.invoice_id())
         .bind(record(2).payment_request_id)
         .execute(database.pool())
@@ -1375,4 +2191,20 @@ async fn locks_ignores_a_transfer_a_marketplace_request_already_owns() {
             1
         );
     }
+}
+
+/// Removes every attempt attestation, as a receipt stored before attestations
+/// existed has none. Only a fixture can: the table rejects deletes, so this
+/// runs with triggers off in its own transaction.
+async fn forget_attestations(pool: &sqlx::PgPool) {
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM usdt_observation_attempts")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
 }

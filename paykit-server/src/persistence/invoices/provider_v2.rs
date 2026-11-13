@@ -300,8 +300,9 @@ impl InvoiceStore {
         .execute(&mut *tx)
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
-        let (generation, active_drain): (i64, Option<Uuid>) = sqlx::query_as(
-            "SELECT current_generation, active_drain_id FROM lock_payment_generations
+        let (generation, active_drain, drain_fenced): (i64, Option<Uuid>, bool) = sqlx::query_as(
+            "SELECT current_generation, active_drain_id, provider_v2_drain_fenced
+             FROM lock_payment_generations
              WHERE creator_id = $1 AND lock_resource_lookup_hash = $2 FOR UPDATE",
         )
         .bind(creator.id)
@@ -309,7 +310,7 @@ impl InvoiceStore {
         .fetch_one(&mut *tx)
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
-        if generation < 0 || active_drain.is_some() {
+        if generation < 0 || active_drain.is_some() || drain_fenced {
             return Err(PersistenceError::Conflict);
         }
 

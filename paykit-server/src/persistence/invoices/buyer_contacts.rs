@@ -77,14 +77,25 @@ impl InvoiceStore {
 
     /// Checks that a claimed attempt still needs saving. Call under the Creator's
     /// shared-state lock and retain that lock through saving and completion.
+    ///
+    /// A contact backed by a timely Bitcoin payment is always due. One created
+    /// from USDT alone is due only while that payment still qualifies under the
+    /// current window, so a contact queued before the proposal-time bound
+    /// existed waits until its proposal time is recorded, and stays held if its
+    /// transfer predates the bound. It is held, not deleted.
     pub async fn buyer_contact_is_pending(
         &self,
         pending: &PendingBuyerContact,
     ) -> Result<bool, PersistenceError> {
-        sqlx::query_scalar(
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        let open: bool = sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM buyer_contacts
-             WHERE invoice_id = $1 AND creator_id = $2 AND reader_lookup_hash = $3
-                 AND completed_at IS NULL)",
+                    WHERE invoice_id = $1 AND creator_id = $2 AND reader_lookup_hash = $3
+                        AND completed_at IS NULL)",
         )
         .bind(pending.invoice_id)
         .bind(pending.creator_id)
@@ -94,9 +105,38 @@ impl InvoiceStore {
                 .as_bytes()
                 .as_slice(),
         )
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await
-        .map_err(|_| PersistenceError::Unavailable)
+        .map_err(|_| PersistenceError::Unavailable)?;
+        Ok(open
+            && self
+                .contact_payment_qualifies(&mut tx, pending.invoice_id)
+                .await?)
+    }
+
+    /// Whether `invoice`'s payment backs a buyer contact now: a timely Bitcoin
+    /// payment always does, and a USDT one only while it qualifies under the
+    /// current window.
+    pub(super) async fn contact_payment_qualifies(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        invoice: Uuid,
+    ) -> Result<bool, PersistenceError> {
+        let bitcoin_backed: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM invoice_timely_amount_matched_outpoints
+             WHERE invoice_id = $1)",
+        )
+        .bind(invoice)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        if bitcoin_backed {
+            return Ok(true);
+        }
+        Ok(self
+            .usdt_payment_status(tx, invoice)
+            .await?
+            .is_some_and(|usdt| usdt.paid_on_time))
     }
 
     /// Retains a terminal record while the caller still holds the shared-state lock.

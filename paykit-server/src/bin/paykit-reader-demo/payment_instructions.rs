@@ -222,7 +222,6 @@ mod tests {
             )
             .unwrap(),
             proposal_app_id: Some(PaykitAppId::new("paykit-server").unwrap()),
-            proposal_recorded_at: None,
             payer_app_id: None,
             execution_claim_app_id: None,
             conversion_quotes: Vec::new(),
@@ -233,6 +232,8 @@ mod tests {
             proposal_outbound_message_id: None,
             proposal_outbound_status: None,
             proposal_event_id: Some("8a0d8b4c-913f-4e31-9f2c-2a6f5bb4d101".into()),
+            proposal_recorded_at: None,
+            acceptance_recorded_at: None,
             terms: Some(PaymentRequestTermsRecord {
                 amount: AmountRecord {
                     asset: "btc".into(),
@@ -253,7 +254,6 @@ mod tests {
             }),
             accepted_event_id: None,
             accepted_outbound_status: None,
-            acceptance_recorded_at: None,
             rejected_event_id: None,
             rejected_outbound_status: None,
             canceled_event_id: None,

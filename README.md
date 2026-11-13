@@ -23,6 +23,20 @@ TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres \
   cargo test --locked -p paykit-server-e2e -- --test-threads=1
 ```
 
+Provider-v2 drain fencing also has a deterministic protocol-real Compose gate:
+
+```bash
+docker compose -p paykit-provider-v2-drain \
+  -f docker-compose.provider-v2-drain-e2e.yml \
+  up --abort-on-container-exit --exit-code-from provider-v2-drain-e2e
+```
+
+The gate starts PostgreSQL plus a Pubky testnet, then launches two distinct
+`paykit-server` OS processes. Signed HTTP requests exercise delayed create versus
+drain ordering, drain-first rejection, exact replay, and server-process restart
+against one durable database. It then runs the complete invoice, drain, and
+migration integration targets.
+
 The two live-adapter tests remain ignored by default because they require either a local Pubky static testnet or a recorded public Electrum fixture. See [`docs/live-adapter-smoke.md`](docs/live-adapter-smoke.md) before running them explicitly.
 
 For a complete local SDK payment without a frontend or Bitkit, run
@@ -34,20 +48,23 @@ Before submitting changes, read [`CONTRIBUTING.md`](CONTRIBUTING.md). Report sec
 
 The [architecture contract](docs/architecture.md) describes shared identity,
 credential ownership, and immutable invoice attribution. Rust dependencies pin
-`paykit-lib` and `paykit-sdk` to the paykit-rs `v0.1.1-rc6` release tag in
+`paykit-lib` and `paykit-sdk` to the paykit-rs `v0.1.1-rc8` release tag in
 `Cargo.toml`, and `Cargo.lock` records its commit
-`9919198a8a810652945f7366defacae8c3135632`. Paykit release candidates are
-published as Git tags, not on crates.io. Direct `pubky` and `pubky-testnet`
-dependencies are pinned to `0.16.2`.
+`adbe24aca6b326d28312abb7e73e8aa6a0392882`. Paykit release candidates are
+published as Git tags, not on crates.io. The server does not count payment
+evidence earlier than its own Payment Request proposal record time, less a
+payment-method tolerance, as paying the request
+([Payment time and attribution](https://github.com/pubky/paykit-rs/blob/v0.1.1-rc8/specs/payment-requests.md#payment-time-and-attribution)).
+Direct `pubky` and `pubky-testnet` dependencies are pinned to `0.16.2`.
 
 Shared-state recovery requires Homeserver `0.16.2` or newer with the required GCS
 behavior on every serving instance. Drain older writes and coordinate all
 writers before adopting this release; updating the dependency does not deploy
 Homeservers or establish operational readiness. See the
 [Paykit 0.1.0 integration requirements](https://github.com/pubky/paykit-rs/releases/tag/v0.1.0)
-and the [Paykit v0.1.1-rc6 release](https://github.com/pubky/paykit-rs/releases/tag/v0.1.1-rc6).
+and the [Paykit v0.1.1-rc8 release](https://github.com/pubky/paykit-rs/releases/tag/v0.1.1-rc8).
 Before deploying this release, read [Persistence, startup, and upgrades](#persistence-startup-and-upgrades):
-Paykit `v0.1.1-rc6` stores hosted state in a format earlier Paykit releases cannot read.
+Paykit `v0.1.1-rc6` and later store hosted state in a format earlier Paykit releases cannot read.
 
 ## Executable boundary
 
@@ -107,7 +124,12 @@ positive decimal-sats `amount`, exact `asset: "BTC"`, and
 The Creator is derived from `lock_resource`, and `recipient_pubky` must match it.
 Exact replay is local and returns the persisted `invoice_created_at`, separate
 `proposal_expires_at`, and exact accepted `deadline`; a changed binding, a v1/v2
-handle collision, or a new request at or after its deadline returns `409`.
+handle collision, or a new request at or after its deadline returns `409`. A
+successful `POST /payment-request-drains` durably fences this canonical lock
+resource before acknowledging its immutable snapshot. Provider-v2 creates that
+won the database order are included; later new creates return `409`. Exact replay
+of an included provider-v2 invoice remains valid. Operational drain cleanup keeps
+this provider-v2 tombstone while preserving the existing v1 generation boundary.
 
 `POST /v2/invoices/status` is a pure persisted read keyed by `creator` and
 `bundle_id`. It returns BTC request/payment state, the bounded latest factual
@@ -375,13 +397,16 @@ Different Creators may use the same numeric child index because their xpubs and 
 
 PostgreSQL stores server credentials, address allocation, invoices, and delivery intents. The Paykit SDK stores encrypted identity-wide state on the Creator's homeserver under WebDAV locks; it is not cached as an authoritative PostgreSQL SDK blob. Other authorized apps can advance the same links and delivery queue. A background worker receives private messages by polling each linked peer and processes outbound work without executing wallet payments. The [architecture contract](docs/architecture.md#state-ownership) explains why the server does not use Paykit's SSE-assisted private intake.
 
-Paykit `v0.1.1-rc6` stores that identity-wide state as SDK state blob version 4. The
+Paykit `v0.1.1-rc6` and later store that identity-wide state as SDK state blob version 4. The
 server reads state written by earlier Paykit releases, and its first write to a
 Creator's hosted state stores it in the new format. Paykit releases before
 `v0.1.1-rc6` cannot read version 4 and fail every operation on that state, and
 there is no way back to the old format. Before deploying, confirm that every other
 app that uses a Creator's hosted state, such as that Creator's Bitkit, runs a Paykit
-build from `v0.1.1-rc6` or later. Updating the server does not update those apps.
+build from `v0.1.1-rc6` or later. For Bitkit, this requires **3.1.1 or later** on
+both iOS and Android. Bitkit 3.1.1 includes Paykit rc8; Bitkit 3.1.0 and older
+include Paykit releases that cannot read version 4. Updating the server does not
+update those apps.
 
 Shared hosted-state deployments require Pubky Homeserver **0.16.2 or newer**
 with the required GCS behavior on every serving instance.
@@ -572,7 +597,7 @@ and persistence distinctions without formatting their source errors. Pubky's
 URL-bearing AUTH relay targets are disabled at every log level; application-owned
 setup stages provide the safe replacement diagnostics.
 
-On SIGTERM or SIGINT, readiness changes first, normal admission and new worker claims stop, and admitted work drains for at most `shutdown.drain_timeout`. Remaining work is cancelled at the deadline. Durable leases can be reclaimed after restart; pending memory-only setup flows are lost.
+On SIGTERM or SIGINT, readiness changes first, normal admission and new worker claims stop, and admitted work drains for at most `shutdown.drain_timeout`. Remaining work is cancelled at the deadline, except Allowance intake: it starts no new read once shutdown begins, but a read already running is an SDK mutation and is awaited past the deadline. Each Creator has at most one read running; it waits at most 20 seconds for the Creator lock, its work is bounded by the SDK's per-link record cap, and each of its Pubky requests times out after 30 seconds. Durable leases can be reclaimed after restart; pending memory-only setup flows are lost.
 
 ## Invoice and delivery semantics
 
@@ -651,7 +676,7 @@ payment window. Arbitrum additionally reports `finalized` from the verified
 canonical receipt and the RPC finalized block. Amounts and confirmation counts
 are never combined across rails.
 
-A request that Paykit before `v0.1.1-rc6` recorded as invalid only because the
+A request that Paykit before `v0.1.1-rc3` recorded as invalid only because the
 server fetched an in-time Acceptance after the proposal expiry is no longer
 invalid. Paykit now derives `accepted` for it, or `proof_submitted` once a Payment
 Proof arrived, and the server stores that state. A status read that answered with
