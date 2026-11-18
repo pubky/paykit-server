@@ -8,8 +8,8 @@ trap 'rm -rf "$tmp"' EXIT HUP INT TERM
 cat >"$tmp/Cargo.toml" <<'EOF'
 [workspace.dependencies]
 locks-core = { git = "https://github.com/pubky/locks.git", tag = "v0.1.1-rc2" }
-paykit-lib = { git = "https://github.com/pubky/paykit-rs.git", tag = "v0.1.1-rc8" }
-paykit-sdk = { git = "https://github.com/pubky/paykit-rs.git", tag = "v0.1.1-rc8" }
+paykit-lib = { git = "https://github.com/pubky/paykit-rs.git", tag = "v0.1.1-rc9" }
+paykit-sdk = { git = "https://github.com/pubky/paykit-rs.git", tag = "v0.1.1-rc9" }
 EOF
 
 cat >"$tmp/Cargo.lock" <<'EOF'
@@ -20,13 +20,13 @@ source = "git+https://github.com/pubky/locks.git?tag=v0.1.1-rc2#3013d8c181a2cf7a
 
 [[package]]
 name = "paykit-lib"
-version = "0.1.1-rc8"
-source = "git+https://github.com/pubky/paykit-rs.git?tag=v0.1.1-rc8#adbe24aca6b326d28312abb7e73e8aa6a0392882"
+version = "0.1.1-rc9"
+source = "git+https://github.com/pubky/paykit-rs.git?tag=v0.1.1-rc9#0b9c63d25dbd0cd5e7cf6ec577bc170732d350be"
 
 [[package]]
 name = "paykit-sdk"
-version = "0.1.1-rc8"
-source = "git+https://github.com/pubky/paykit-rs.git?tag=v0.1.1-rc8#adbe24aca6b326d28312abb7e73e8aa6a0392882"
+version = "0.1.1-rc9"
+source = "git+https://github.com/pubky/paykit-rs.git?tag=v0.1.1-rc9#0b9c63d25dbd0cd5e7cf6ec577bc170732d350be"
 EOF
 
 sh "$root/scripts/prepare-local-docker-sources.sh" \
