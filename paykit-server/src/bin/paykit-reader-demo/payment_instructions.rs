@@ -232,6 +232,8 @@ mod tests {
             proposal_outbound_message_id: None,
             proposal_outbound_status: None,
             proposal_event_id: Some("8a0d8b4c-913f-4e31-9f2c-2a6f5bb4d101".into()),
+            proposal_recorded_at: None,
+            acceptance_recorded_at: None,
             terms: Some(PaymentRequestTermsRecord {
                 amount: AmountRecord {
                     asset: "btc".into(),

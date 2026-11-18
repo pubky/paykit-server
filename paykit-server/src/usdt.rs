@@ -86,6 +86,27 @@ pub struct ArbitrumVerifier {
 
 const CHAIN_TIP_TTL: Duration = Duration::from_secs(5);
 
+/// How much earlier than the server's proposal record time a transfer's block
+/// timestamp can be and still pay the request. Arbitrum allows block timestamps
+/// up to 24 hours behind the current time
+/// (<https://docs.arbitrum.io/build-decentralized-apps/arbitrum-vs-ethereum/block-numbers-and-time>);
+/// five more minutes cover this server's clock skew.
+pub const PROPOSAL_TIME_TOLERANCE: time::Duration = time::Duration::minutes(24 * 60 + 5);
+
+/// The earliest block time that pays a Payment Request: `window_start`, or the
+/// server's earliest record of its proposal less [`PROPOSAL_TIME_TOLERANCE`]
+/// when that is later. Chain time has whole-second resolution, so the result is
+/// too. `None` until the proposal time is recorded, as for a lifecycle row from
+/// before the server kept it: no evidence pays the request until then, though
+/// its receipts are still kept.
+pub fn payment_window_start(
+    window_start: OffsetDateTime,
+    proposal_recorded_at: Option<OffsetDateTime>,
+) -> Option<OffsetDateTime> {
+    let bound = proposal_recorded_at?.checked_sub(PROPOSAL_TIME_TOLERANCE)?;
+    window_start.max(bound).replace_nanosecond(0).ok()
+}
+
 #[derive(Clone, Copy)]
 struct ChainTip {
     head: u64,
@@ -670,6 +691,63 @@ fn quantity(value: &Value) -> Result<u64, VerificationError> {
 mod tests {
     use super::*;
 
+    /// Byte length of the largest Payment Proof a reader's wallet can send for
+    /// this server's USDT method, as `submit_payment_proof` would queue it.
+    /// Variable fields take their longest values: the reader's App ID, the
+    /// Allowance ID an automatic payment may add, the transaction hash and
+    /// signature lengths of the ERC-20 profile, and the 78 digits of the
+    /// largest uint256 receipt log index.
+    fn largest_usdt_payment_proof_len(payment_reference: &str) -> usize {
+        let proof = json!({
+            "type": "erc20-transfer-eip712",
+            "chain_id": USDT_CHAIN_ID,
+            "transaction_hash": format!("0x{}", "f".repeat(64)),
+            "receipt_log_index": U256::MAX.to_string(),
+            "signature": format!("0x{}", "f".repeat(130)),
+        });
+        let Value::Object(proof) = proof else {
+            unreachable!("the proof is a JSON object")
+        };
+        paykit_sdk::payment_proof_event_len(
+            &paykit_lib::PaykitAppId::new("a".repeat(64)).unwrap(),
+            &paykit_lib::PaymentReference::new(payment_reference.to_owned()).unwrap(),
+            paykit_sdk::PaymentProofSubmission {
+                billing_period: None,
+                payment_app_id: paykit_lib::PaykitAppId::new(crate::config::PAYKIT_APP_ID).unwrap(),
+                payment_endpoint_identifier: paykit_lib::PaymentEndpointIdentifier::new(
+                    USDT_ENDPOINT,
+                )
+                .unwrap(),
+                conversion_quote_id: None,
+                proof,
+                allowance_id: Some(paykit_lib::AllowanceId::new_v4()),
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn the_largest_usdt_payment_proof_fits_one_private_message() {
+        // The server's Payment References are hyphenated UUIDs.
+        let reference = uuid::Uuid::new_v4().hyphenated().to_string();
+        let len = largest_usdt_payment_proof_len(&reference);
+        assert!(
+            len <= paykit_lib::pubky_noise::snow_crypto::PUBKY_NOISE_MSG_LEN,
+            "{len} bytes"
+        );
+        assert_eq!(U256::MAX.to_string().len(), 78);
+    }
+
+    #[test]
+    fn the_usdt_payment_proof_budget_catches_a_proof_that_does_not_fit() {
+        let longest_reference = "r".repeat(paykit_lib::PAYMENT_REFERENCE_MAX_LEN);
+        let len = largest_usdt_payment_proof_len(&longest_reference);
+        assert!(
+            len > paykit_lib::pubky_noise::snow_crypto::PUBKY_NOISE_MSG_LEN,
+            "{len} bytes"
+        );
+    }
+
     fn recoverable_proof() -> PaymentProofRecord {
         let signature = Secp256k1::new().sign_ecdsa_recoverable(
             &Message::from_digest([1; 32]),
@@ -886,6 +964,30 @@ mod tests {
         assert_eq!(
             verifier.scans.lock().await.requests.len(),
             MAX_SCAN_REQUESTS
+        );
+    }
+
+    #[test]
+    fn the_payment_window_opens_no_earlier_than_the_proposal_less_tolerance() {
+        let start = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap()
+            + time::Duration::milliseconds(400);
+        let floored = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        // No recorded proposal: nothing pays the request yet.
+        assert_eq!(payment_window_start(start, None), None);
+        // A proposal recorded within the tolerance leaves the window as it was.
+        assert_eq!(
+            payment_window_start(start, Some(start + time::Duration::hours(1))),
+            Some(floored)
+        );
+        // A proposal recorded later moves it to that time less the tolerance.
+        let late = start + time::Duration::days(2);
+        assert_eq!(
+            payment_window_start(start, Some(late)),
+            Some(
+                (late - PROPOSAL_TIME_TOLERANCE)
+                    .replace_nanosecond(0)
+                    .unwrap()
+            )
         );
     }
 }

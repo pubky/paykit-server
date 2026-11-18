@@ -1,12 +1,12 @@
 //! Allowance intake: the server accepts, as the Allowee, the Allowance
 //! proposals its invoiced readers leave on their links.
 //!
-//! The SDK derives a link's whole Allowance history for every read and every
-//! acceptance, and the reader decides how large that history is. The intake
-//! therefore runs on its own worker, never in an outbox handoff or the shared
-//! transport loop, one task per Creator, and bounds how often and for how long
-//! it reads each reader. It only queues acceptances; the transport worker
-//! delivers them.
+//! Each read is one SDK call that accepts a bounded number of a reader's
+//! pending proposals in one transaction, with work bounded by a per-link
+//! record cap rather than the reader's history. The intake still runs on its
+//! own worker, never in an outbox handoff or the shared transport loop, one
+//! task per Creator, and bounds how often and for how long it reads each
+//! reader. It only queues acceptances; the transport worker delivers them.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -15,10 +15,9 @@ use std::{
 };
 
 use async_trait::async_trait;
-use paykit_lib::AllowanceId;
 use paykit_sdk::{
-    AllowanceFilter, AllowanceHistoryStatus, AllowanceLifecycleState, AllowanceLocalRole,
-    AllowanceRecord, LinkedPeerState, PaykitSdkError, PubkyPublicKey, StorageAdapter,
+    LinkedPeerState, MAX_PENDING_ALLOWANCE_LINK_RECORDS, PaykitSdkError,
+    PendingAllowanceAcceptance, PubkyPublicKey, StorageAdapter,
 };
 use tokio::sync::Mutex as TokioMutex;
 use tracing::{info, warn};
@@ -35,26 +34,36 @@ use crate::{
 /// later read accepts the rest.
 const MAX_ALLOWANCE_ACCEPTANCES_PER_READ: usize = 4;
 
+/// Records one Acceptance adds to its link: the outbound Acceptance and the
+/// reader's Delivery Confirmation of it.
+const RECORDS_PER_ACCEPTANCE: usize = 2;
+
+/// Acceptances one read may queue on a link holding `records` records: never
+/// so many that the server's own Acceptances, and their confirmations, take
+/// the link past the SDK's record cap, where automatic acceptance stops and
+/// the proposals left are for manual acceptance.
+fn acceptance_limit(records: usize) -> usize {
+    (MAX_PENDING_ALLOWANCE_LINK_RECORDS.saturating_sub(records) / RECORDS_PER_ACCEPTANCE)
+        .min(MAX_ALLOWANCE_ACCEPTANCES_PER_READ)
+}
+
 /// Least time between two reads of one reader's Allowances.
 pub const ALLOWANCE_INTAKE_COOLDOWN: Duration = Duration::from_secs(10);
 
-/// A reader whose Allowance scan took `d` is read again no sooner than `d`
-/// times this after that read began, so the intake spends at most about a
-/// tenth of the time deriving any one reader's history, however large it grows.
-/// Only the scan counts: acceptances and sends are bounded per read.
+/// A reader whose read took `d` is read again no sooner than `d` times this
+/// after that read began, so the intake spends at most about a tenth of its
+/// time on any one reader.
 const ALLOWANCE_INTAKE_SPACING_FACTOR: u32 = 10;
 
 /// Longest wait for the Creator lock before one acceptance. Giving up starts
 /// no SDK call, so the read ends as a failure with nothing to clean up.
 const ALLOWANCE_INTAKE_LOCK_WAIT: Duration = Duration::from_secs(20);
 
-/// Backstop for a hung intake pass, far above any pass that makes progress.
-/// SDK calls are otherwise never cut short: cancelling one mid-flight skips
-/// its homeserver unlock and leaves the identity's shared-state lease held
-/// until it expires, up to 60 s, which fails every other shared-state
-/// operation on the identity meanwhile. A call that hangs, for example on an
-/// HTTP request with no timeout, keeps renewing that lease, so cancelling it
-/// shortens how long the identity stays locked.
+/// A pass starts no new read this long after it began, far above any pass
+/// that makes progress. A read already started is never cut short: each one
+/// is an SDK mutation, and dropping it mid-flight would skip its homeserver
+/// unlock and leave state unconfirmed. The server's Pubky request timeout
+/// bounds a read on a stalled homeserver instead.
 pub const ALLOWANCE_INTAKE_PASS_DEADLINE: Duration = Duration::from_secs(600);
 
 /// A Creator's pass starts no new read after this much time spent reading;
@@ -134,8 +143,9 @@ impl AllowanceIntake {
 
     /// Starts a due read. It counts against the spacing at once, so a failed
     /// read is not retried sooner, and until it is finished it counts as a
-    /// scan that took the whole pass deadline: a read cut off by the deadline
-    /// or a panic is spaced out by ten times that.
+    /// scan that took the whole pass deadline: a read that never finishes, as
+    /// after a panic, is spaced out by ten times that. The deadline itself
+    /// never cuts a running read short; it only stops new reads starting.
     fn begin(
         &self,
         creator_id: Uuid,
@@ -252,14 +262,14 @@ impl PaykitAdapter {
         if eligible.is_empty() {
             return Ok(0);
         }
-        let newest = self.newest_stream_items(&eligible).await?;
+        let activity = self.link_activity(&eligible).await?;
         let readers = eligible
             .into_iter()
             .filter_map(|peer| {
-                let newest = newest.get(&peer).copied();
+                let (newest, limit) = *activity.get(&peer)?;
                 intake
-                    .is_due(self.creator_id, &peer, newest, now)
-                    .then_some((peer, newest?))
+                    .is_due(self.creator_id, &peer, Some(newest), now)
+                    .then_some((peer, newest, limit))
             })
             .collect::<Vec<_>>();
         if readers.is_empty() {
@@ -280,22 +290,32 @@ impl PaykitAdapter {
         .await)
     }
 
-    async fn newest_stream_items(
+    /// Each link's newest stream item, and how many acceptances a read of it
+    /// may queue under the SDK's record cap. The cap count visits no record,
+    /// and a link with no headroom is left out before its items are read, so
+    /// the items read per link are bounded by the cap.
+    async fn link_activity(
         &self,
         linked: &[PubkyPublicKey],
-    ) -> paykit_sdk::Result<HashMap<PubkyPublicKey, u64>> {
+    ) -> paykit_sdk::Result<HashMap<PubkyPublicKey, (u64, usize)>> {
         let linked = linked.to_vec();
         self.storage
             .transaction(move |transaction| {
                 Ok(linked
                     .into_iter()
                     .filter_map(|peer| {
+                        let records = transaction
+                            .link_record_count_up_to(&peer, MAX_PENDING_ALLOWANCE_LINK_RECORDS + 1);
+                        let limit = acceptance_limit(records);
+                        if limit == 0 {
+                            return None;
+                        }
                         let newest = transaction
                             .private_stream_items(&peer)
                             .iter()
                             .map(|item| item.stream_item_id)
                             .max()?;
-                        Some((peer, newest))
+                        Some((peer, (newest, limit)))
                     })
                     .collect())
             })
@@ -312,30 +332,32 @@ fn reader_of(peer: &PubkyPublicKey) -> Option<ReaderPubky> {
 /// What the intake does on one reader's link.
 #[async_trait]
 trait AllowanceLink: Send + Sync {
-    /// Proposals awaiting acceptance, each with the stream item that carried
-    /// it, at most one more than a read accepts. The SDK derives the link's
-    /// whole history for this, so it must not run under the Creator mutation
-    /// lock.
-    async fn pending_proposals(
-        &self,
-        reader: &PubkyPublicKey,
-    ) -> paykit_sdk::Result<Vec<(AllowanceId, u64)>>;
+    /// Records the reader's link holds, up to one past the SDK's cap. The
+    /// count visits no record.
+    async fn link_records(&self, reader: &PubkyPublicKey) -> paykit_sdk::Result<usize>;
 
-    /// Queues one acceptance of the proposal carried by `stream_item_id`. The
-    /// SDK derives the link's history again, and the caller serializes it with
-    /// the Creator's other mutations.
-    async fn accept(
+    /// Queues acceptances of up to `limit` of the reader's pending proposals,
+    /// oldest first, in one SDK transaction. The caller serializes it with the
+    /// Creator's other mutations.
+    async fn accept_pending(
         &self,
         reader: &PubkyPublicKey,
-        id: &AllowanceId,
-        stream_item_id: u64,
-    ) -> paykit_sdk::Result<()>;
+        limit: usize,
+    ) -> paykit_sdk::Result<LinkAcceptance>;
+}
+
+/// What one bounded acceptance call did on a reader's link.
+#[derive(Debug, PartialEq, Eq)]
+struct LinkAcceptance {
+    accepted: usize,
+    /// Whether pending proposals remain beyond the limit.
+    more_pending: bool,
 }
 
 struct IntakeRead {
     accepted: usize,
-    /// How long reading the pending proposals took, up to its failure if it
-    /// failed. It spaces out the next read on every outcome.
+    /// How long the acceptance call took, up to its failure if it failed. It
+    /// spaces out the next read on every outcome.
     scan: Duration,
     /// Whether no proposal is left waiting behind the per-read limit, or why
     /// the read stopped.
@@ -350,7 +372,7 @@ struct ReadLimits {
     lock_wait: Duration,
 }
 
-/// Reads the due readers, `(reader, newest stream item)`, least recently read
+/// Reads the due readers, `(reader, newest stream item, acceptance limit)`, least recently read
 /// first, until `budget` has passed since the first read started; the first
 /// read always starts. A reader left with proposals behind the per-read limit
 /// therefore goes behind the others next pass. No read starts once
@@ -361,15 +383,15 @@ async fn read_readers<L: AllowanceLink + ?Sized>(
     mutation_lock: &TokioMutex<()>,
     intake: &AllowanceIntake,
     creator_id: Uuid,
-    mut readers: Vec<(PubkyPublicKey, u64)>,
+    mut readers: Vec<(PubkyPublicKey, u64, usize)>,
     limits: ReadLimits,
     keep_reading: &(dyn Fn() -> bool + Sync),
 ) -> usize {
     let ReadLimits { budget, lock_wait } = limits;
-    readers.sort_by_key(|(peer, _)| intake.last_started(creator_id, peer));
+    readers.sort_by_key(|(peer, _, _)| intake.last_started(creator_id, peer));
     let mut reading_since = None::<Instant>;
     let mut queued = 0;
-    for (peer, newest) in readers {
+    for (peer, newest, limit) in readers {
         if !keep_reading() || reading_since.is_some_and(|since| since.elapsed() >= budget) {
             break;
         }
@@ -378,7 +400,7 @@ async fn read_readers<L: AllowanceLink + ?Sized>(
             continue;
         };
         reading_since.get_or_insert(now);
-        let read = accept_proposals(link, mutation_lock, &peer, lock_wait).await;
+        let read = accept_proposals(link, mutation_lock, &peer, limit, lock_wait).await;
         if read.accepted > 0 {
             info!(
                 accepted = read.accepted,
@@ -402,95 +424,132 @@ async fn read_readers<L: AllowanceLink + ?Sized>(
     queued
 }
 
-/// Accepts up to [`MAX_ALLOWANCE_ACCEPTANCES_PER_READ`] pending proposals.
-/// The Creator mutation lock is held for one acceptance at a time, never for
-/// the scan, so other Creator work interleaves with a reader's large history.
+/// Accepts up to `limit` pending proposals in one SDK call, under the Creator
+/// mutation lock. The call's work is bounded by the SDK's per-link record cap,
+/// so other Creator work waits at most that long. The link's headroom is
+/// counted again under the lock, since another mutation may have added
+/// records while this read waited for it. Giving up on the lock starts no SDK
+/// call, and neither does a link at the cap: its proposals are left for
+/// manual acceptance and it counts as read.
 async fn accept_proposals<L: AllowanceLink + ?Sized>(
     link: &L,
     mutation_lock: &TokioMutex<()>,
     reader: &PubkyPublicKey,
+    limit: usize,
     lock_wait: Duration,
 ) -> IntakeRead {
-    let started = Instant::now();
-    let pending = link.pending_proposals(reader).await;
-    let mut read = IntakeRead {
-        accepted: 0,
-        scan: started.elapsed(),
-        result: Ok(true),
-    };
-    let pending = match pending {
-        Ok(pending) => pending,
-        Err(error) => {
-            read.result = Err(error);
-            return read;
+    let at_cap = || {
+        warn!(
+            stage = "allowance_intake",
+            cause = "link_history_at_cap",
+            "Paykit Allowance link at the record cap; not accepted automatically"
+        );
+        IntakeRead {
+            accepted: 0,
+            scan: Duration::ZERO,
+            result: Ok(true),
         }
     };
-    for (id, stream_item_id) in pending.iter().take(MAX_ALLOWANCE_ACCEPTANCES_PER_READ) {
-        let Ok(_guard) = tokio::time::timeout(lock_wait, mutation_lock.lock()).await else {
-            read.result = Err(PaykitSdkError::Transport {
+    if limit == 0 {
+        return at_cap();
+    }
+    let Ok(_guard) = tokio::time::timeout(lock_wait, mutation_lock.lock()).await else {
+        return IntakeRead {
+            accepted: 0,
+            scan: Duration::ZERO,
+            result: Err(PaykitSdkError::Transport {
                 context: "Creator lock wait timed out".into(),
                 source: None,
-            });
-            return read;
+            }),
         };
-        if let Err(error) = link.accept(reader, id, *stream_item_id).await {
-            read.result = Err(error);
-            return read;
+    };
+    let started = Instant::now();
+    let limit = match link.link_records(reader).await {
+        Ok(records) => limit.min(acceptance_limit(records)),
+        Err(error) => {
+            return IntakeRead {
+                accepted: 0,
+                scan: started.elapsed(),
+                result: Err(error),
+            };
         }
-        read.accepted += 1;
+    };
+    if limit == 0 {
+        return at_cap();
     }
-    read.result = Ok(pending.len() <= MAX_ALLOWANCE_ACCEPTANCES_PER_READ);
-    read
+    let outcome = link.accept_pending(reader, limit).await;
+    let scan = started.elapsed();
+    match outcome {
+        Ok(LinkAcceptance {
+            accepted,
+            more_pending,
+        }) => IntakeRead {
+            accepted,
+            scan,
+            result: Ok(!more_pending),
+        },
+        Err(error) => IntakeRead {
+            accepted: 0,
+            scan,
+            result: Err(error),
+        },
+    }
 }
 
 #[async_trait]
 impl AllowanceLink for PaykitAdapter {
-    async fn pending_proposals(
-        &self,
-        reader: &PubkyPublicKey,
-    ) -> paykit_sdk::Result<Vec<(AllowanceId, u64)>> {
-        Ok(self
-            .sdk
-            .list_allowances(AllowanceFilter {
-                counterparty: Some(reader.clone()),
-                local_role: Some(AllowanceLocalRole::Allowee),
-                states: vec![AllowanceLifecycleState::Proposed],
+    async fn link_records(&self, reader: &PubkyPublicKey) -> paykit_sdk::Result<usize> {
+        let reader = reader.clone();
+        self.storage
+            .transaction(move |transaction| {
+                Ok(transaction
+                    .link_record_count_up_to(&reader, MAX_PENDING_ALLOWANCE_LINK_RECORDS + 1))
             })
-            .await?
-            .iter()
-            .filter_map(awaiting_allowee_acceptance)
-            .take(MAX_ALLOWANCE_ACCEPTANCES_PER_READ + 1)
-            .collect())
+            .await
     }
 
-    async fn accept(
+    async fn accept_pending(
         &self,
         reader: &PubkyPublicKey,
-        id: &AllowanceId,
-        stream_item_id: u64,
-    ) -> paykit_sdk::Result<()> {
-        self.sdk
-            .accept_allowance(reader.clone(), id, stream_item_id)
-            .await
-            .map(|_| ())
+        limit: usize,
+    ) -> paykit_sdk::Result<LinkAcceptance> {
+        let outcome = self
+            .sdk
+            .accept_pending_allowance_proposals(reader.clone(), limit)
+            .await?;
+        link_acceptance(outcome)
     }
 }
 
-/// An Allowance proposal the reader sent, naming this identity as the Allowee,
-/// with consistent history and no response yet: its ID and the stream item
-/// that carried it.
-fn awaiting_allowee_acceptance(record: &AllowanceRecord) -> Option<(AllowanceId, u64)> {
-    if record.local_role != Some(AllowanceLocalRole::Allowee)
-        || record.state != AllowanceLifecycleState::Proposed
-        || record.history_status != AllowanceHistoryStatus::Consistent
-        || record.proposal_outbound_message_id.is_some()
-    {
-        return None;
+/// A link over the SDK's record cap is left alone: nothing on it is accepted
+/// automatically, and it counts as read until new items arrive. An outcome
+/// this server does not know fails the read, so the link stays due and is
+/// retried after the spacing.
+fn link_acceptance(outcome: PendingAllowanceAcceptance) -> paykit_sdk::Result<LinkAcceptance> {
+    match outcome {
+        PendingAllowanceAcceptance::Accepted {
+            records,
+            more_pending,
+        } => Ok(LinkAcceptance {
+            accepted: records.len(),
+            more_pending,
+        }),
+        PendingAllowanceAcceptance::LinkHistoryTooLarge { .. } => {
+            warn!(
+                stage = "allowance_intake",
+                cause = "link_history_too_large",
+                "Paykit Allowance link over the record cap; not accepted automatically"
+            );
+            Ok(LinkAcceptance {
+                accepted: 0,
+                more_pending: false,
+            })
+        }
+        _ => Err(PaykitSdkError::Protocol {
+            context: "unknown Allowance acceptance outcome".into(),
+            source: None,
+        }),
     }
-    Some((
-        AllowanceId::new(record.allowance_id.clone()).ok()?,
-        record.proposal_stream_item_id?,
-    ))
 }
 
 #[cfg(test)]
@@ -511,34 +570,6 @@ mod tests {
             "pubky5jsjx1o6fzu6aeeo697r3i5rx15zq41kikcye8wtwdqm4nb4tryo",
         )
         .unwrap()
-    }
-
-    fn received_allowee_proposal() -> AllowanceRecord {
-        AllowanceRecord {
-            counterparty: reader(),
-            allowance_id: "b7f9c2a1-6d43-4b0e-a8d4-0fe2c712ab44".into(),
-            local_role: Some(AllowanceLocalRole::Allowee),
-            state: AllowanceLifecycleState::Proposed,
-            history_status: AllowanceHistoryStatus::Consistent,
-            proposal_event_id: Some("8a0d8b4c-913f-4e31-9f2c-2a6f5bb4d201".into()),
-            terms: None,
-            proposal_stream_item_id: Some(7),
-            proposal_outbound_message_id: None,
-            proposal_outbound_status: None,
-            acceptance_event_id: None,
-            acceptance_outbound_status: None,
-            rejection_event_id: None,
-            rejection_outbound_status: None,
-            end_event_id: None,
-            end_outbound_status: None,
-            pending_causal_event_ids: Vec::new(),
-            conflict_event_ids: Vec::new(),
-            last_stream_item_id: Some(7),
-            last_outbound_message_id: None,
-            last_outbound_status: None,
-            last_event_at: None,
-            invalid_reason: None,
-        }
     }
 
     #[test]
@@ -604,7 +635,7 @@ mod tests {
         let creator = Uuid::new_v4();
         let start = Instant::now();
 
-        // Scanning a large history takes 4 s: the next read waits 40 s.
+        // A read that takes 4 s: the next read waits 40 s.
         let ticket = intake.begin(creator, &reader(), Some(1), start).unwrap();
         intake.finish(ticket, true, Duration::from_secs(4));
         let early = start + Duration::from_secs(39);
@@ -700,7 +731,10 @@ mod tests {
         let intake = AllowanceIntake::new(Duration::from_secs(10));
         let creator = Uuid::new_v4();
         let link = ReadyLink::default();
-        let readers = vec![(reader(), 1), (other_reader(), 1)];
+        let readers = vec![
+            (reader(), 1, MAX_ALLOWANCE_ACCEPTANCES_PER_READ),
+            (other_reader(), 1, MAX_ALLOWANCE_ACCEPTANCES_PER_READ),
+        ];
 
         // However long finding the due readers took, a pass reads one reader;
         // with no budget, only one. The next pass reads the other.
@@ -751,7 +785,10 @@ mod tests {
             backlog: HashMap::from([(reader(), MAX_ALLOWANCE_ACCEPTANCES_PER_READ * 3)]),
             ..ReadyLink::default()
         };
-        let readers = vec![(reader(), 1), (other_reader(), 1)];
+        let readers = vec![
+            (reader(), 1, MAX_ALLOWANCE_ACCEPTANCES_PER_READ),
+            (other_reader(), 1, MAX_ALLOWANCE_ACCEPTANCES_PER_READ),
+        ];
 
         // One read per pass. The backlogged reader is read first, is not
         // drained, and the next pass reads the other reader before it again.
@@ -781,20 +818,26 @@ mod tests {
         const SHORT: Duration = Duration::from_millis(100);
         let lock = Arc::new(TokioMutex::new(()));
         let link = SlowLink::new(&lock, 1);
-        link.scan_release.notify_one();
+        link.call_release.notify_one();
         let held = lock.clone().lock_owned().await;
 
         let read = tokio::time::timeout(
             Duration::from_secs(5),
-            accept_proposals(&link, &lock, &reader(), SHORT),
+            accept_proposals(
+                &link,
+                &lock,
+                &reader(),
+                MAX_ALLOWANCE_ACCEPTANCES_PER_READ,
+                SHORT,
+            ),
         )
         .await
         .expect("the held lock held the read");
 
         assert!(matches!(read.result, Err(PaykitSdkError::Transport { .. })));
         assert_eq!(read.accepted, 0);
-        // No SDK acceptance started, so none was cut short.
-        assert!(link.lock_held_during_accepts.lock().unwrap().is_empty());
+        // No SDK call started, so none was cut short.
+        assert!(link.lock_held_during_calls.lock().unwrap().is_empty());
         drop(held);
     }
 
@@ -824,7 +867,7 @@ mod tests {
             &lock,
             &intake,
             Uuid::new_v4(),
-            vec![(reader(), 1)],
+            vec![(reader(), 1, MAX_ALLOWANCE_ACCEPTANCES_PER_READ)],
             ReadLimits {
                 budget: Duration::from_secs(5),
                 lock_wait: LOCK_WAIT,
@@ -847,40 +890,34 @@ mod tests {
 
     #[async_trait]
     impl AllowanceLink for ReadyLink {
-        async fn pending_proposals(
-            &self,
-            reader: &PubkyPublicKey,
-        ) -> paykit_sdk::Result<Vec<(AllowanceId, u64)>> {
-            self.scans.lock().unwrap().push(reader.clone());
-            let pending = self.backlog.get(reader).copied().unwrap_or(1);
-            Ok((0..pending as u64)
-                .map(|item| (AllowanceId::new(Uuid::new_v4().to_string()).unwrap(), item))
-                .collect())
+        async fn link_records(&self, _reader: &PubkyPublicKey) -> paykit_sdk::Result<usize> {
+            Ok(0)
         }
 
-        async fn accept(
+        async fn accept_pending(
             &self,
-            _reader: &PubkyPublicKey,
-            _id: &AllowanceId,
-            _stream_item_id: u64,
-        ) -> paykit_sdk::Result<()> {
-            Ok(())
+            reader: &PubkyPublicKey,
+            limit: usize,
+        ) -> paykit_sdk::Result<LinkAcceptance> {
+            self.scans.lock().unwrap().push(reader.clone());
+            let pending = self.backlog.get(reader).copied().unwrap_or(1);
+            Ok(LinkAcceptance {
+                accepted: pending.min(limit),
+                more_pending: pending > limit,
+            })
         }
     }
 
-    /// A link whose scan can be held in flight, like the derivation of a
-    /// large Allowance history, and that reports whether the Creator mutation
-    /// lock was held at each step.
+    /// A link whose acceptance call can be held in flight and that reports
+    /// whether the Creator mutation lock was held during each call.
     struct SlowLink {
         lock: Arc<TokioMutex<()>>,
         pending: usize,
-        scan_entered: tokio::sync::Notify,
-        scan_release: tokio::sync::Notify,
-        lock_held_during_accepts: StdMutex<Vec<bool>>,
-        lock_held_during_scan: StdMutex<Option<bool>>,
-        scan_takes: Duration,
-        fail_scan: bool,
-        fail_accept: bool,
+        call_entered: tokio::sync::Notify,
+        call_release: tokio::sync::Notify,
+        lock_held_during_calls: StdMutex<Vec<bool>>,
+        call_takes: Duration,
+        fail: bool,
     }
 
     impl SlowLink {
@@ -888,86 +925,72 @@ mod tests {
             Self {
                 lock: lock.clone(),
                 pending,
-                scan_entered: tokio::sync::Notify::new(),
-                scan_release: tokio::sync::Notify::new(),
-                lock_held_during_accepts: StdMutex::new(Vec::new()),
-                lock_held_during_scan: StdMutex::new(None),
-                scan_takes: Duration::ZERO,
-                fail_scan: false,
-                fail_accept: false,
+                call_entered: tokio::sync::Notify::new(),
+                call_release: tokio::sync::Notify::new(),
+                lock_held_during_calls: StdMutex::new(Vec::new()),
+                call_takes: Duration::ZERO,
+                fail: false,
             }
         }
     }
 
     #[async_trait]
     impl AllowanceLink for SlowLink {
-        async fn pending_proposals(
-            &self,
-            _reader: &PubkyPublicKey,
-        ) -> paykit_sdk::Result<Vec<(AllowanceId, u64)>> {
-            *self.lock_held_during_scan.lock().unwrap() = Some(self.lock.try_lock().is_err());
-            self.scan_entered.notify_one();
-            self.scan_release.notified().await;
-            tokio::time::sleep(self.scan_takes).await;
-            if self.fail_scan {
-                return Err(PaykitSdkError::Transport {
-                    context: "history not read".into(),
-                    source: None,
-                });
-            }
-            Ok((0..self.pending as u64)
-                .map(|item| (AllowanceId::new(Uuid::new_v4().to_string()).unwrap(), item))
-                .collect())
+        async fn link_records(&self, _reader: &PubkyPublicKey) -> paykit_sdk::Result<usize> {
+            Ok(0)
         }
 
-        async fn accept(
+        async fn accept_pending(
             &self,
             _reader: &PubkyPublicKey,
-            _id: &AllowanceId,
-            _stream_item_id: u64,
-        ) -> paykit_sdk::Result<()> {
-            self.lock_held_during_accepts
+            limit: usize,
+        ) -> paykit_sdk::Result<LinkAcceptance> {
+            self.lock_held_during_calls
                 .lock()
                 .unwrap()
                 .push(self.lock.try_lock().is_err());
-            if self.fail_accept {
+            self.call_entered.notify_one();
+            self.call_release.notified().await;
+            tokio::time::sleep(self.call_takes).await;
+            if self.fail {
                 return Err(PaykitSdkError::Transport {
-                    context: "acceptance not stored".into(),
+                    context: "acceptances not stored".into(),
                     source: None,
                 });
             }
-            Ok(())
+            Ok(LinkAcceptance {
+                accepted: self.pending.min(limit),
+                more_pending: self.pending > limit,
+            })
         }
     }
 
     #[tokio::test]
-    async fn a_large_allowance_history_does_not_hold_the_creator_lock_while_it_is_read() {
+    async fn one_bounded_call_holds_the_creator_lock_and_frees_it_after() {
         let lock = Arc::new(TokioMutex::new(()));
         let link = Arc::new(SlowLink::new(&lock, 1_000));
         let intake = tokio::spawn({
             let (link, lock) = (link.clone(), lock.clone());
-            async move { accept_proposals(link.as_ref(), &lock, &reader(), LOCK_WAIT).await }
+            async move {
+                accept_proposals(
+                    link.as_ref(),
+                    &lock,
+                    &reader(),
+                    MAX_ALLOWANCE_ACCEPTANCES_PER_READ,
+                    LOCK_WAIT,
+                )
+                .await
+            }
         });
 
-        // The scan is in flight, as for a reader with a very large history.
-        // Every other Creator operation takes this lock, and none waits for it.
-        link.scan_entered.notified().await;
-        let other_creator_work = tokio::time::timeout(Duration::from_secs(5), lock.lock()).await;
-        assert!(
-            other_creator_work.is_ok(),
-            "another operation waited for the reader's scan"
-        );
-        drop(other_creator_work);
+        // The call mutates the Creator's state, so it runs under the lock.
+        link.call_entered.notified().await;
+        assert!(lock.try_lock().is_err());
 
-        link.scan_release.notify_one();
+        link.call_release.notify_one();
         let outcome = intake.await.unwrap();
 
-        assert_eq!(*link.lock_held_during_scan.lock().unwrap(), Some(false));
-        // Each acceptance runs under the lock, and the lock is free between them.
-        assert_eq!(
-            *link.lock_held_during_accepts.lock().unwrap(),
-            [true; MAX_ALLOWANCE_ACCEPTANCES_PER_READ]
-        );
+        assert_eq!(*link.lock_held_during_calls.lock().unwrap(), [true]);
         assert_eq!(outcome.accepted, MAX_ALLOWANCE_ACCEPTANCES_PER_READ);
         assert!(!outcome.result.unwrap());
         assert!(lock.try_lock().is_ok());
@@ -991,9 +1014,16 @@ mod tests {
         ] {
             let lock = Arc::new(TokioMutex::new(()));
             let link = SlowLink::new(&lock, pending);
-            link.scan_release.notify_one();
+            link.call_release.notify_one();
 
-            let outcome = accept_proposals(&link, &lock, &reader(), LOCK_WAIT).await;
+            let outcome = accept_proposals(
+                &link,
+                &lock,
+                &reader(),
+                MAX_ALLOWANCE_ACCEPTANCES_PER_READ,
+                LOCK_WAIT,
+            )
+            .await;
 
             assert_eq!(
                 (outcome.accepted, outcome.result.unwrap()),
@@ -1006,77 +1036,170 @@ mod tests {
     async fn a_failed_acceptance_ends_the_read_and_frees_the_lock() {
         let lock = Arc::new(TokioMutex::new(()));
         let mut link = SlowLink::new(&lock, 3);
-        link.fail_accept = true;
-        link.scan_release.notify_one();
+        link.fail = true;
+        link.call_release.notify_one();
 
-        let read = accept_proposals(&link, &lock, &reader(), LOCK_WAIT).await;
+        let read = accept_proposals(
+            &link,
+            &lock,
+            &reader(),
+            MAX_ALLOWANCE_ACCEPTANCES_PER_READ,
+            LOCK_WAIT,
+        )
+        .await;
 
         assert!(matches!(read.result, Err(PaykitSdkError::Transport { .. })));
         assert_eq!(read.accepted, 0);
-        assert_eq!(link.lock_held_during_accepts.lock().unwrap().len(), 1);
+        assert_eq!(link.lock_held_during_calls.lock().unwrap().len(), 1);
         assert!(lock.try_lock().is_ok());
     }
 
     #[tokio::test]
-    async fn a_failed_read_is_spaced_out_by_the_time_its_scan_took() {
-        const SCAN: Duration = Duration::from_millis(200);
-        // A scan that fails after deriving a large history, and a scan that
-        // succeeds before an acceptance fails.
-        for (fail_scan, fail_accept) in [(true, false), (false, true)] {
-            let lock = Arc::new(TokioMutex::new(()));
-            let mut link = SlowLink::new(&lock, 3);
-            link.scan_takes = SCAN;
-            link.fail_scan = fail_scan;
-            link.fail_accept = fail_accept;
-            link.scan_release.notify_one();
-            let intake = AllowanceIntake::new(Duration::ZERO);
-            let creator = Uuid::new_v4();
-            let start = Instant::now();
-            let ticket = intake.begin(creator, &reader(), Some(1), start).unwrap();
+    async fn a_failed_read_is_spaced_out_by_the_time_its_call_took() {
+        const CALL: Duration = Duration::from_millis(200);
+        let lock = Arc::new(TokioMutex::new(()));
+        let mut link = SlowLink::new(&lock, 3);
+        link.call_takes = CALL;
+        link.fail = true;
+        link.call_release.notify_one();
+        let intake = AllowanceIntake::new(Duration::ZERO);
+        let creator = Uuid::new_v4();
+        let start = Instant::now();
+        let ticket = intake.begin(creator, &reader(), Some(1), start).unwrap();
 
-            let read = accept_proposals(&link, &lock, &reader(), LOCK_WAIT).await;
-            assert!(read.result.is_err());
-            assert!(read.scan >= SCAN, "{:?}", read.scan);
-            intake.finish(ticket, false, read.scan);
+        let read = accept_proposals(
+            &link,
+            &lock,
+            &reader(),
+            MAX_ALLOWANCE_ACCEPTANCES_PER_READ,
+            LOCK_WAIT,
+        )
+        .await;
+        assert!(read.result.is_err());
+        assert!(read.scan >= CALL, "{:?}", read.scan);
+        intake.finish(ticket, false, read.scan);
 
-            let spacing = read.scan * ALLOWANCE_INTAKE_SPACING_FACTOR;
-            let early = start + spacing - Duration::from_millis(1);
-            assert!(intake.begin(creator, &reader(), Some(1), early).is_none());
-            assert!(
-                intake
-                    .begin(creator, &reader(), Some(1), start + spacing)
-                    .is_some()
-            );
+        let spacing = read.scan * ALLOWANCE_INTAKE_SPACING_FACTOR;
+        let early = start + spacing - Duration::from_millis(1);
+        assert!(intake.begin(creator, &reader(), Some(1), early).is_none());
+        assert!(
+            intake
+                .begin(creator, &reader(), Some(1), start + spacing)
+                .is_some()
+        );
+    }
+
+    /// A link that refuses, as the SDK does, once it holds more records than
+    /// the cap, and that counts the Acceptances it appends.
+    struct CappedLink {
+        records: StdMutex<usize>,
+        calls: StdMutex<usize>,
+    }
+
+    #[async_trait]
+    impl AllowanceLink for CappedLink {
+        async fn link_records(&self, _reader: &PubkyPublicKey) -> paykit_sdk::Result<usize> {
+            Ok(*self.records.lock().unwrap())
+        }
+
+        async fn accept_pending(
+            &self,
+            _reader: &PubkyPublicKey,
+            limit: usize,
+        ) -> paykit_sdk::Result<LinkAcceptance> {
+            *self.calls.lock().unwrap() += 1;
+            let mut records = self.records.lock().unwrap();
+            if *records > MAX_PENDING_ALLOWANCE_LINK_RECORDS {
+                return Ok(LinkAcceptance {
+                    accepted: 0,
+                    more_pending: false,
+                });
+            }
+            // Far more proposals are pending than any read accepts; each
+            // Acceptance comes back with its Delivery Confirmation.
+            *records += limit * RECORDS_PER_ACCEPTANCE;
+            Ok(LinkAcceptance {
+                accepted: limit,
+                more_pending: true,
+            })
         }
     }
 
-    #[test]
-    fn only_received_consistent_allowee_proposals_are_accepted() {
-        let (id, stream_item_id) =
-            awaiting_allowee_acceptance(&received_allowee_proposal()).unwrap();
-        assert_eq!(id.as_str(), "b7f9c2a1-6d43-4b0e-a8d4-0fe2c712ab44");
-        assert_eq!(stream_item_id, 7);
+    #[tokio::test]
+    async fn intake_never_takes_a_link_past_the_record_cap() {
+        let lock = Arc::new(TokioMutex::new(()));
+        let link = CappedLink {
+            records: StdMutex::new(MAX_PENDING_ALLOWANCE_LINK_RECORDS - 3),
+            calls: StdMutex::new(0),
+        };
 
-        let rejected: [fn(&mut AllowanceRecord); 7] = [
-            // The receiver would be the payer.
-            |record| record.local_role = Some(AllowanceLocalRole::Allower),
-            |record| record.local_role = None,
-            // Already answered, ended or colliding.
-            |record| record.state = AllowanceLifecycleState::Accepted,
-            |record| record.state = AllowanceLifecycleState::Conflicted,
-            // Evidence that needs review or recovery first.
-            |record| record.history_status = AllowanceHistoryStatus::Invalid,
-            |record| record.history_status = AllowanceHistoryStatus::UnresolvedReferences,
-            // A proposal this receiver sent is not its to accept.
-            |record| {
-                record.proposal_stream_item_id = None;
-                record.proposal_outbound_message_id = Some(3);
-            },
-        ];
-        for change in rejected {
-            let mut record = received_allowee_proposal();
-            change(&mut record);
-            assert!(awaiting_allowee_acceptance(&record).is_none());
-        }
+        // Headroom for one Acceptance and its confirmation; more stay pending.
+        let limit = acceptance_limit(*link.records.lock().unwrap());
+        let first = accept_proposals(&link, &lock, &reader(), limit, LOCK_WAIT).await;
+        assert_eq!(first.accepted, 1);
+        assert!(!first.result.unwrap());
+
+        // One record left: no SDK call, so the server's own Acceptances never cross it.
+        let limit = acceptance_limit(*link.records.lock().unwrap());
+        let second = accept_proposals(&link, &lock, &reader(), limit, LOCK_WAIT).await;
+        assert_eq!(second.accepted, 0);
+        assert!(second.result.unwrap());
+        assert_eq!(
+            *link.records.lock().unwrap(),
+            MAX_PENDING_ALLOWANCE_LINK_RECORDS - 1
+        );
+        assert_eq!(*link.calls.lock().unwrap(), 1);
+
+        assert_eq!(acceptance_limit(0), MAX_ALLOWANCE_ACCEPTANCES_PER_READ);
+        assert_eq!(acceptance_limit(MAX_PENDING_ALLOWANCE_LINK_RECORDS + 1), 0);
+    }
+
+    #[tokio::test]
+    async fn headroom_is_counted_again_after_waiting_for_the_creator_lock() {
+        let lock = Arc::new(TokioMutex::new(()));
+        let link = Arc::new(CappedLink {
+            records: StdMutex::new(MAX_PENDING_ALLOWANCE_LINK_RECORDS - 3),
+            calls: StdMutex::new(0),
+        });
+        // The pass counted headroom for one Acceptance.
+        let limit = acceptance_limit(*link.records.lock().unwrap());
+        assert_eq!(limit, 1);
+
+        // Another Creator mutation holds the lock and uses that headroom.
+        let held = lock.clone().lock_owned().await;
+        let read = tokio::spawn({
+            let (link, lock) = (link.clone(), lock.clone());
+            async move { accept_proposals(link.as_ref(), &lock, &reader(), limit, LOCK_WAIT).await }
+        });
+        *link.records.lock().unwrap() += 2;
+        drop(held);
+        let read = read.await.unwrap();
+
+        assert_eq!(read.accepted, 0);
+        assert_eq!(*link.calls.lock().unwrap(), 0);
+        assert!(*link.records.lock().unwrap() <= MAX_PENDING_ALLOWANCE_LINK_RECORDS);
+    }
+
+    #[test]
+    fn a_link_over_the_record_cap_is_read_and_left_alone() {
+        assert_eq!(
+            link_acceptance(PendingAllowanceAcceptance::LinkHistoryTooLarge { record_cap: 16_384 })
+                .unwrap(),
+            LinkAcceptance {
+                accepted: 0,
+                more_pending: false,
+            }
+        );
+        assert_eq!(
+            link_acceptance(PendingAllowanceAcceptance::Accepted {
+                records: Vec::new(),
+                more_pending: true,
+            })
+            .unwrap(),
+            LinkAcceptance {
+                accepted: 0,
+                more_pending: true,
+            }
+        );
     }
 }

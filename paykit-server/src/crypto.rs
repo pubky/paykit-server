@@ -196,6 +196,8 @@ pub enum EnvelopeType {
     UsdtObservation,
     /// Marketplace-owned encrypted USDT receipt facts.
     MarketplaceUsdtObservation,
+    /// The Payment Request attempt a USDT receipt was verified for.
+    UsdtObservationAttempt,
     /// Versioned server-owned semantic inputs for an outbound SDK handoff.
     OutboxSemanticIntent,
     /// Canonical addressed lock resource bound to one operational drain.
@@ -217,6 +219,7 @@ impl EnvelopeType {
             Self::MarketplaceBitcoinObservation => b"marketplace-bitcoin-observation",
             Self::UsdtObservation => b"usdt-observation",
             Self::MarketplaceUsdtObservation => b"marketplace-usdt-observation",
+            Self::UsdtObservationAttempt => b"usdt-observation-attempt",
             Self::OutboxSemanticIntent => b"outbox-semantic-intent",
             Self::PaymentDrain => b"payment-drain",
             Self::MarketplacePreparation => b"marketplace-preparation",
@@ -323,6 +326,21 @@ impl EnvelopeContext {
             row_id,
         );
         context.parent_row_id = Some(marketplace_preparation_id);
+        context
+    }
+    /// Binds the Payment Request attempt of one USDT receipt row to that row
+    /// and its owning invoice or Marketplace preparation.
+    pub fn usdt_observation_attempt(
+        creator_lookup_hash: LookupHash,
+        row_id: Uuid,
+        owner_id: Uuid,
+    ) -> Self {
+        let mut context = Self::new(
+            EnvelopeType::UsdtObservationAttempt,
+            creator_lookup_hash,
+            row_id,
+        );
+        context.parent_row_id = Some(owner_id);
         context
     }
     /// Creates the binding context for an outbox semantic intent.

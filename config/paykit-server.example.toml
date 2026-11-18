@@ -39,6 +39,10 @@ payment_window = "24h"
 conversion_payment_window = "1h"
 # Unpublished Marketplace preparations may activate only within this DB-clock TTL.
 marketplace_prepare_ttl = "15m"
+# Accept the Allowance proposals invoiced readers send. Off by default; turn it
+# on where readers send Allowances. Each read is one SDK call bounded by the
+# per-link record cap, run under the Creator mutation lock.
+allowance_intake = false
 # "testnet" targets the pinned Pubky client's fixed localhost testnet ports.
 # Run the Pubky static testnet; this is not a hosted public network.
 network = "testnet"
@@ -73,6 +77,9 @@ rapid_link_retry_interval_ms = 1000
 request_body_bytes = 16384
 lock_resource_bytes = 262144
 lock_fetch_timeout = "10s"
+# Total time to receive a signed request body before signature verification.
+# Applies before authentication; on expiry the request's capacity slot is released.
+request_body_read_timeout = "5s"
 
 [rate_limits]
 signed_requests_per_second = 100

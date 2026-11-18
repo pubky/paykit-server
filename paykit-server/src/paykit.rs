@@ -1147,14 +1147,18 @@ fn lifecycle_projection(
     let last_event_at = record
         .last_event_at
         .ok_or(LifecycleSyncError::InvalidProjection)?;
-    let seconds = i128::from(last_event_at.timestamp());
-    let nanos = i128::from(last_event_at.timestamp_subsec_nanos());
-    let timestamp_nanos = seconds
-        .checked_mul(1_000_000_000)
-        .and_then(|value| value.checked_add(nanos))
-        .ok_or(LifecycleSyncError::InvalidProjection)?;
-    let last_event_at = time::OffsetDateTime::from_unix_timestamp_nanos(timestamp_nanos)
-        .map_err(|_| LifecycleSyncError::InvalidProjection)?;
+    let last_event_at = offset_date_time(
+        last_event_at.timestamp(),
+        last_event_at.timestamp_subsec_nanos(),
+    )?;
+    let proposal_recorded_at = record
+        .proposal_recorded_at
+        .map(|at| offset_date_time(at.timestamp(), at.timestamp_subsec_nanos()))
+        .transpose()?;
+    let acceptance_recorded_at = record
+        .acceptance_recorded_at
+        .map(|at| offset_date_time(at.timestamp(), at.timestamp_subsec_nanos()))
+        .transpose()?;
     Ok(PaymentRequestLifecycleProjection {
         payment_request_id: record.payment_request_id.clone(),
         proposal: ProposalCorrelation {
@@ -1198,7 +1202,20 @@ fn lifecycle_projection(
         last_stream_item_id: record.last_stream_item_id,
         last_outbound_message_id: record.last_outbound_message_id,
         last_event_at,
+        proposal_recorded_at,
+        acceptance_recorded_at,
     })
+}
+
+fn offset_date_time(seconds: i64, nanos: u32) -> Result<time::OffsetDateTime, LifecycleSyncError> {
+    let seconds = i128::from(seconds);
+    let nanos = i128::from(nanos);
+    let timestamp_nanos = seconds
+        .checked_mul(1_000_000_000)
+        .and_then(|value| value.checked_add(nanos))
+        .ok_or(LifecycleSyncError::InvalidProjection)?;
+    time::OffsetDateTime::from_unix_timestamp_nanos(timestamp_nanos)
+        .map_err(|_| LifecycleSyncError::InvalidProjection)
 }
 
 fn lifecycle_projections(
@@ -1418,6 +1435,15 @@ pub async fn acquire_creator_mutation_guard(creator_id: Uuid) -> tokio::sync::Ow
     creator_mutation_lock(creator_id).lock_owned().await
 }
 
+/// Projects a canonical SDK record for persistence integration fixtures.
+#[cfg(feature = "test-utils")]
+#[doc(hidden)]
+pub fn project_payment_request_record(
+    record: &PaymentRequestRecord,
+) -> Result<PaymentRequestLifecycleProjection, LifecycleSyncError> {
+    lifecycle_projection(record)
+}
+
 fn parse_peer(reader: &str) -> Result<PubkyPublicKey, HandoffError> {
     PubkyPublicKey::from_raw_or_app_key(reader).map_err(|_| HandoffError::Permanent)
 }
@@ -1436,6 +1462,10 @@ pub(crate) const fn sdk_error_label(error: &PaykitSdkError) -> &'static str {
         PaykitSdkError::Policy { .. } => "policy",
         PaykitSdkError::PaymentAdapter { .. } => "payment_adapter",
         PaykitSdkError::RecoveryRequired { .. } => "recovery_required",
+        // The server receives by polling. Another runtime that runs Paykit's
+        // SSE-assisted intake over the same identity state owns its peers,
+        // and polling them fails until that runtime drains and stops.
+        PaykitSdkError::PrivateIntakeModeConflict { .. } => "private_intake_mode_conflict",
         _ => "other",
     }
 }
@@ -1660,6 +1690,7 @@ fn require_linked(state: LinkedPeerState) -> Result<(), HandoffError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::payment_request_lifecycle::late_acceptance_rederivation_allowed;
     use paykit_sdk::{
         AmountRecord, OutboundPrivateSendFailure, PaymentRequestTermsRecord,
         RecoveryMarkerPublishFailure, ReservationCleanupFailure,
@@ -1723,6 +1754,8 @@ mod tests {
             proposal_outbound_message_id: None,
             proposal_outbound_status: None,
             proposal_event_id: Some(Uuid::new_v4().to_string()),
+            proposal_recorded_at: None,
+            acceptance_recorded_at: None,
             terms: Some(PaymentRequestTermsRecord {
                 amount: AmountRecord {
                     asset: "BTC".into(),
@@ -1807,6 +1840,71 @@ mod tests {
                 vec![Err(LifecycleSyncError::InvalidProjection)]
             );
         }
+    }
+
+    fn record_time_at(seconds: u64, nanos: u32) -> paykit_sdk::PaymentRequestRecord {
+        let mut record = canonical_record(Some(PaymentRequestLocalRole::Payee));
+        record.state = SdkPaymentRequestLifecycleState::Accepted;
+        record.accepted_event_id = Some(Uuid::new_v4().to_string());
+        record.acceptance_recorded_at = Some(
+            (std::time::SystemTime::UNIX_EPOCH + std::time::Duration::new(seconds, nanos)).into(),
+        );
+        record
+    }
+
+    #[test]
+    fn projection_carries_proposal_and_acceptance_record_times() {
+        let mut accepted = record_time_at(1_800_000_000, 250);
+        accepted.proposal_recorded_at = Some(
+            (std::time::SystemTime::UNIX_EPOCH + std::time::Duration::new(1_799_999_000, 500))
+                .into(),
+        );
+        let projection = lifecycle_projection(&accepted).unwrap();
+        assert_eq!(
+            projection.acceptance_recorded_at,
+            Some(
+                time::OffsetDateTime::from_unix_timestamp_nanos(1_800_000_000_000_000_250).unwrap()
+            )
+        );
+        assert_eq!(
+            projection.proposal_recorded_at,
+            Some(
+                time::OffsetDateTime::from_unix_timestamp_nanos(1_799_999_000_000_000_500).unwrap()
+            )
+        );
+        assert_eq!(projection.state_event_id, accepted.accepted_event_id);
+
+        let proposed = canonical_record(Some(PaymentRequestLocalRole::Payee));
+        assert_eq!(
+            lifecycle_projection(&proposed)
+                .unwrap()
+                .acceptance_recorded_at,
+            None
+        );
+    }
+
+    #[test]
+    fn only_an_acceptance_fetched_after_expiry_moves_a_stored_invalid_request() {
+        // canonical_record's proposal expires at 2027-01-15T08:00:00Z.
+        let expires_at = 1_800_000_000;
+        assert_eq!(
+            time::OffsetDateTime::from_unix_timestamp(expires_at as i64)
+                .unwrap()
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap(),
+            "2027-01-15T08:00:00Z"
+        );
+        let fetched_late = lifecycle_projection(&record_time_at(expires_at + 60, 0)).unwrap();
+        assert!(late_acceptance_rederivation_allowed(
+            PersistedPaymentRequestLifecycleState::InvalidConflict,
+            &fetched_late,
+        ));
+
+        let fetched_in_time = lifecycle_projection(&record_time_at(expires_at - 60, 0)).unwrap();
+        assert!(!late_acceptance_rederivation_allowed(
+            PersistedPaymentRequestLifecycleState::InvalidConflict,
+            &fetched_in_time,
+        ));
     }
 
     fn receive_target(counterparty: &str) -> ReceiveTarget {
@@ -2070,6 +2168,56 @@ mod tests {
         );
     }
 
+    fn private_intake_mode_conflict() -> PaykitSdkError {
+        PaykitSdkError::PrivateIntakeModeConflict {
+            counterparty: PubkyPublicKey::from_raw_or_app_key(CREATOR).unwrap(),
+        }
+    }
+
+    #[test]
+    fn a_peer_owned_by_sse_intake_is_a_named_receive_failure() {
+        let error = private_intake_mode_conflict();
+        assert_eq!(sdk_error_label(&error), "private_intake_mode_conflict");
+        assert_eq!(
+            sdk_error_label(&PaykitSdkError::Transport {
+                context: "read failed".into(),
+                source: None,
+            }),
+            "transport"
+        );
+    }
+
+    #[test]
+    fn a_peer_owned_by_sse_intake_is_neither_contention_nor_an_empty_inbox() {
+        // Contention defers to the next pass; an intake mode conflict does not
+        // clear on its own, so it fails the pass.
+        assert_eq!(
+            check_transport_results(&[Err(TransportMaintenanceError::Deferred)]),
+            Err(TransportMaintenanceError::Deferred)
+        );
+        assert_eq!(
+            check_transport_results(&[
+                Ok(()),
+                classify_transport_result(Err(private_intake_mode_conflict())),
+            ]),
+            Err(TransportMaintenanceError::Failed(
+                TransportFailureCategory::Other
+            ))
+        );
+
+        // A refused receive never proves the reader sent nothing.
+        let target = receive_target(CREATOR);
+        let refused = PrivateStreamCounterpartyIntakeReport {
+            counterparty: target.counterparty.clone(),
+            error: Some(private_intake_mode_conflict().to_string()),
+            report: None,
+        };
+        assert_eq!(
+            receive_health_for_required_targets(&[refused], &[target]),
+            ReceiveHealth::Unavailable
+        );
+    }
+
     #[test]
     fn handoff_diagnostic_causes_use_closed_secret_free_labels() {
         assert_eq!(RetryableHandoffCause::Storage.diagnostic_label(), "storage");
@@ -2312,6 +2460,8 @@ mod tests {
             last_stream_item_id: Some(index),
             last_outbound_message_id: None,
             last_event_at: time::OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap(),
+            proposal_recorded_at: None,
+            acceptance_recorded_at: None,
         }
     }
 
