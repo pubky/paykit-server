@@ -1001,11 +1001,11 @@ where
             }
         }
     }
-    if receive_health == ReceiveHealth::Unavailable {
-        return Err(LifecycleSyncError::PartialReceive);
-    }
     match first_error {
         Some(error) => Err(error),
+        None if receive_health == ReceiveHealth::Unavailable => {
+            Err(LifecycleSyncError::PartialReceive)
+        }
         None => Ok(()),
     }
 }
@@ -2498,6 +2498,21 @@ mod tests {
                 PersistedPaymentRequestLifecycleState::Accepted,
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn mixed_receive_and_persistence_failure_preserves_persistence_category() {
+        let result = project_lifecycles_after_receive(
+            vec![Ok(projection(
+                1,
+                PersistedPaymentRequestLifecycleState::Proposed,
+            ))],
+            ReceiveHealth::Unavailable,
+            |_| std::future::ready(Err(LifecycleSyncError::Persistence)),
+        )
+        .await;
+
+        assert_eq!(result, Err(LifecycleSyncError::Persistence));
     }
 
     #[tokio::test]

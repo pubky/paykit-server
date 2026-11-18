@@ -2246,6 +2246,21 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_categories_keep_only_nonroutine_warn_under_production_filter() {
+        let capture = TimingCapture::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(EnvFilter::new("off,paykit_server=info"))
+            .with(capture.clone());
+
+        tracing::subscriber::with_default(subscriber, || {
+            log_lifecycle_reconciliation_deferred("receive_and_project", "partial_receive");
+            log_lifecycle_reconciliation_deferred("receive_and_project", "persistence");
+        });
+
+        assert_eq!(*capture.0.lock().unwrap(), vec![Level::WARN]);
+    }
+
+    #[test]
     fn mixed_observer_failure_keeps_non_allowlisted_warn_under_production_filter() {
         let capture = TimingCapture::default();
         let subscriber = tracing_subscriber::registry()
