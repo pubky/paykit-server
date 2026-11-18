@@ -823,6 +823,11 @@ fn record_shared_transport_timing(
         match outcome {
             TransportMaintenance::Complete => crate::diagnostics::TimingOutcome::Completed,
             TransportMaintenance::Deferred => crate::diagnostics::TimingOutcome::Deferred,
+            TransportMaintenance::Failed { category, .. }
+                if matches!(*category, "transport" | "storage") =>
+            {
+                crate::diagnostics::TimingOutcome::RoutineFailure
+            }
             TransportMaintenance::Failed { .. } => crate::diagnostics::TimingOutcome::Failed,
         },
         started,
@@ -1819,7 +1824,7 @@ async fn observer_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtime>) {
                 if tick == ElectrumTick::Succeeded {
                     crate::diagnostics::TimingOutcome::Completed
                 } else {
-                    crate::diagnostics::TimingOutcome::Failed
+                    crate::diagnostics::TimingOutcome::RoutineFailure
                 },
                 started,
             );
@@ -2191,13 +2196,13 @@ mod tests {
     }
 
     #[test]
-    fn shared_transport_failure_is_quiet_under_production_filter() {
+    fn routine_shared_transport_failure_is_quiet_under_production_filter() {
         assert_eq!(
             captured_shared_transport_timing(
                 true,
                 TransportMaintenance::Failed {
-                    step: "adapter_build",
-                    category: "adapter_unavailable",
+                    step: "maintain_transport",
+                    category: "transport",
                 },
             ),
             Vec::<Level>::new()
@@ -2388,6 +2393,39 @@ mod tests {
             assert_eq!(deferred, expected_deferred, "{name}");
             assert_eq!(levels, expected_levels, "{name}");
         }
+    }
+
+    #[tokio::test]
+    async fn nested_send_failure_remains_warn_visible_through_adapter() {
+        use paykit_sdk::{OutboundPrivateSendFailure, OutboundPrivateSendReport};
+
+        let adapter =
+            PaykitAdapter::for_transport_fixture(crate::paykit::TransportOperationFixture::new(
+                Vec::new(),
+                vec![Ok(OutboundPrivateSendReport {
+                    failed: vec![OutboundPrivateSendFailure {
+                        outbound_message_id: 7,
+                        error: "private-transport-details".into(),
+                    }],
+                    ..Default::default()
+                })],
+            ));
+        let outcome = transport_maintenance_outcome(adapter.maintain_transport_classified().await);
+        let capture = TimingCapture::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(EnvFilter::new("off,paykit_server=info"))
+            .with(capture.clone());
+
+        tracing::subscriber::with_default(subscriber, || {
+            let TransportMaintenance::Failed { step, category } = &outcome else {
+                panic!("nested send failure must fail transport maintenance");
+            };
+            assert_eq!(*category, "other");
+            log_transport_maintenance_failure(step, category);
+            record_shared_transport_timing(true, &outcome, Instant::now());
+        });
+
+        assert_eq!(*capture.0.lock().unwrap(), vec![Level::WARN, Level::WARN]);
     }
 
     #[test]

@@ -58,6 +58,7 @@ pub(crate) fn failure(_operation: &'static str, stage: &'static str, category: &
 pub(crate) enum TimingOutcome {
     Completed,
     Deferred,
+    RoutineFailure,
     Failed,
 }
 
@@ -66,6 +67,7 @@ impl TimingOutcome {
         match self {
             Self::Completed => "completed",
             Self::Deferred => "deferred",
+            Self::RoutineFailure => "failed",
             Self::Failed => "failed",
         }
     }
@@ -78,9 +80,10 @@ pub(crate) fn timing(
     started: Instant,
 ) {
     let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let routine_failure = outcome == TimingOutcome::RoutineFailure;
     let outcome = outcome.label();
     if outcome == "failed" {
-        if operation == "worker" && matches!(stage, "shared_transport" | "observer") {
+        if routine_failure {
             tracing::debug!(
                 event = "paykit_task_timing",
                 operation,
@@ -223,7 +226,7 @@ mod tests {
                 timing(
                     "worker",
                     stage,
-                    TimingOutcome::Failed,
+                    TimingOutcome::RoutineFailure,
                     std::time::Instant::now(),
                 );
             }

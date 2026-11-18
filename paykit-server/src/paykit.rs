@@ -1360,7 +1360,7 @@ pub(crate) fn check_send_report(
     }
     if !report.failed.is_empty() {
         return Err(TransportMaintenanceError::Failed(
-            TransportFailureCategory::Transport,
+            TransportFailureCategory::Other,
         ));
     }
     Ok(())
@@ -2004,7 +2004,7 @@ mod tests {
                     }],
                     ..Default::default()
                 },
-                TransportFailureCategory::Transport,
+                TransportFailureCategory::Other,
             ),
             (
                 OutboundPrivateSendReport {
