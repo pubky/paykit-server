@@ -8,12 +8,21 @@ use uuid::Uuid;
 use crate::config::BitcoinNetwork;
 
 /// One invoice address whose direct outputs should be observed.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct ObservationTarget {
     address: String,
     current: Option<TrackedOutput>,
     correlation: Option<ObservationCorrelation>,
 }
+
+// Correlation enriches diagnostics but is not part of the observer input's logical value.
+impl PartialEq for ObservationTarget {
+    fn eq(&self, other: &Self) -> bool {
+        self.address == other.address && self.current == other.current
+    }
+}
+
+impl Eq for ObservationTarget {}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ObservationCorrelation {
@@ -233,4 +242,57 @@ pub enum ObservationAction {
     Update,
     Replace,
     Ignore,
+}
+
+#[cfg(test)]
+mod tests {
+    use bitcoin::{OutPoint, Txid, hashes::Hash};
+
+    use super::{ObservationTarget, TrackedOutput};
+    use uuid::Uuid;
+
+    fn tracked(vout: u32, sats: u64) -> TrackedOutput {
+        TrackedOutput::new(
+            OutPoint {
+                txid: Txid::all_zeros(),
+                vout,
+            },
+            sats,
+        )
+    }
+
+    #[test]
+    fn observation_target_equality_ignores_operational_correlation() {
+        let logical = ObservationTarget::new("address", Some(tracked(1, 42)));
+        let correlated = ObservationTarget::with_correlation(
+            "address",
+            Some(tracked(1, 42)),
+            Uuid::from_u128(1),
+            "invoice",
+            Uuid::from_u128(2),
+        );
+        let differently_correlated = ObservationTarget::with_correlation(
+            "address",
+            Some(tracked(1, 42)),
+            Uuid::from_u128(3),
+            "marketplace_preparation",
+            Uuid::from_u128(4),
+        );
+
+        assert_eq!(logical, correlated);
+        assert_eq!(correlated, differently_correlated);
+        assert_ne!(
+            logical,
+            ObservationTarget::new("other", Some(tracked(1, 42)))
+        );
+        assert_ne!(logical, ObservationTarget::new("address", None));
+        assert_ne!(
+            logical,
+            ObservationTarget::new("address", Some(tracked(2, 42)))
+        );
+        assert_ne!(
+            logical,
+            ObservationTarget::new("address", Some(tracked(1, 43)))
+        );
+    }
 }
