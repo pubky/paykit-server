@@ -437,6 +437,7 @@ struct LifecycleRow {
 #[derive(sqlx::FromRow)]
 struct MarketplaceObservationTargetRow {
     preparation_id: Uuid,
+    creator_id: Uuid,
     creator_lookup_hash: Vec<u8>,
     payment_record_envelope: Vec<u8>,
     bitcoin_address_lookup_hash: Vec<u8>,
@@ -609,7 +610,7 @@ impl MarketplacePreparationStore {
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
         let rows = sqlx::query_as::<_, MarketplaceObservationTargetRow>(
-            "SELECT settlement.preparation_id, creators.creator_lookup_hash,
+            "SELECT settlement.preparation_id, settlement.creator_id, creators.creator_lookup_hash,
                     settlement.payment_record_envelope,
                     settlement.bitcoin_address_lookup_hash,
                     settlement.derivation_index_lookup_hash,
@@ -712,7 +713,13 @@ impl MarketplacePreparationStore {
                     }
                     _ => return Err(PersistenceError::CorruptOrMissing),
                 };
-                Ok(Some(ObservationTarget::new(address, current)))
+                Ok(Some(ObservationTarget::with_correlation(
+                    address,
+                    current,
+                    row.creator_id,
+                    "marketplace_preparation",
+                    row.preparation_id,
+                )))
             })
             .collect::<Result<Vec<_>, _>>()
             .map(|targets| targets.into_iter().flatten().collect())

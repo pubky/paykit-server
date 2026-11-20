@@ -3,6 +3,7 @@
 use std::fmt;
 
 use bitcoin::OutPoint;
+use uuid::Uuid;
 
 use crate::config::BitcoinNetwork;
 
@@ -11,6 +12,14 @@ use crate::config::BitcoinNetwork;
 pub struct ObservationTarget {
     address: String,
     current: Option<TrackedOutput>,
+    correlation: Option<ObservationCorrelation>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ObservationCorrelation {
+    pub creator_id: Uuid,
+    pub entity_kind: &'static str,
+    pub entity_id: Uuid,
 }
 
 impl ObservationTarget {
@@ -18,6 +27,25 @@ impl ObservationTarget {
         Self {
             address: address.into(),
             current,
+            correlation: None,
+        }
+    }
+
+    pub(crate) fn with_correlation(
+        address: impl Into<String>,
+        current: Option<TrackedOutput>,
+        creator_id: Uuid,
+        entity_kind: &'static str,
+        entity_id: Uuid,
+    ) -> Self {
+        Self {
+            address: address.into(),
+            current,
+            correlation: Some(ObservationCorrelation {
+                creator_id,
+                entity_kind,
+                entity_id,
+            }),
         }
     }
 
@@ -28,6 +56,10 @@ impl ObservationTarget {
     pub fn current(&self) -> Option<&TrackedOutput> {
         self.current.as_ref()
     }
+
+    pub(crate) fn correlation(&self) -> Option<ObservationCorrelation> {
+        self.correlation
+    }
 }
 
 impl fmt::Debug for ObservationTarget {
@@ -36,6 +68,7 @@ impl fmt::Debug for ObservationTarget {
             .debug_struct("ObservationTarget")
             .field("address", &"<redacted>")
             .field("has_current", &self.current.is_some())
+            .field("has_correlation", &self.correlation.is_some())
             .finish()
     }
 }

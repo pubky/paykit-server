@@ -1,4 +1,4 @@
-//! Request-scoped, identifier-free failure diagnostics.
+//! Request-scoped diagnostics with bounded safe correlation IDs.
 
 use std::{cell::Cell, future::Future, time::Instant};
 
@@ -6,8 +6,10 @@ use uuid::Uuid;
 
 struct RequestContext {
     request_id: Uuid,
+    request_instance_id: Uuid,
     operation: &'static str,
     failure_emitted: Cell<bool>,
+    setup_trace_link: Cell<Option<Uuid>>,
 }
 
 tokio::task_local! {
@@ -16,6 +18,7 @@ tokio::task_local! {
 
 pub(crate) async fn scope<T>(
     request_id: Uuid,
+    request_instance_id: Uuid,
     operation: &'static str,
     future: impl Future<Output = T>,
 ) -> (T, bool) {
@@ -23,8 +26,10 @@ pub(crate) async fn scope<T>(
         .scope(
             RequestContext {
                 request_id,
+                request_instance_id,
                 operation,
                 failure_emitted: Cell::new(false),
+                setup_trace_link: Cell::new(None),
             },
             async {
                 let output = future.await;
@@ -33,6 +38,25 @@ pub(crate) async fn scope<T>(
             },
         )
         .await
+}
+
+/// Links one server-owned HTTP invocation to a safe setup workflow ID. The
+/// bearer flow token is deliberately never recorded.
+pub(crate) fn link_setup_trace(setup_trace_id: Uuid) {
+    let _ = REQUEST_CONTEXT.try_with(|context| {
+        if context.setup_trace_link.get() == Some(setup_trace_id) {
+            return;
+        }
+        context.setup_trace_link.set(Some(setup_trace_id));
+        tracing::info!(
+            event = "paykit_setup_request_link",
+            operation = context.operation,
+            request_id = %context.request_id.hyphenated(),
+            request_instance_id = %context.request_instance_id.hyphenated(),
+            setup_trace_id = %setup_trace_id.hyphenated(),
+            "Paykit setup request linked to workflow"
+        );
+    });
 }
 
 /// Emits at most one failure event for one request. Call at the narrowest point
@@ -50,6 +74,24 @@ pub(crate) fn failure(_operation: &'static str, stage: &'static str, category: &
             category,
             request_id = %context.request_id.hyphenated(),
             "Paykit request failed"
+        );
+    });
+}
+
+/// Emits validated server-owned IDs only after the atomic invoice commit returns.
+/// Request IDs remain transport correlation; these IDs identify durable domain work.
+pub(crate) fn invoice_persisted(invoice_id: Uuid, outbox_job_id: Uuid, replayed: bool) {
+    let _ = REQUEST_CONTEXT.try_with(|context| {
+        tracing::info!(
+            event = "paykit_invoice_persisted",
+            operation = context.operation,
+            stage = "db_commit",
+            outcome = if replayed { "replayed" } else { "created" },
+            truth = "persisted",
+            request_id = %context.request_id.hyphenated(),
+            invoice_id = %invoice_id.hyphenated(),
+            outbox_job_id = %outbox_job_id.hyphenated(),
+            "Paykit invoice persisted"
         );
     });
 }

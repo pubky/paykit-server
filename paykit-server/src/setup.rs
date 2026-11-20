@@ -13,7 +13,9 @@ use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand::{TryRng, rngs::SysRng};
 use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore};
+use tracing::instrument::WithSubscriber;
 use url::Url;
+use uuid::Uuid;
 
 use crate::config::BitcoinNetwork;
 use crate::domain::locks::CreatorPubky;
@@ -92,6 +94,47 @@ pub enum Completion {
     TransientUnavailable,
 }
 
+impl Completion {
+    const fn failure_class(self) -> &'static str {
+        match self {
+            Self::DurableSuccess => "none",
+            Self::DefinitiveFailure => "definitive",
+            Self::TransientOverload => "overload",
+            Self::TransientUnavailable => "unavailable",
+        }
+    }
+}
+
+fn emit_setup_transition(
+    setup_trace_id: Uuid,
+    previous_state: &'static str,
+    new_state: &'static str,
+    outcome: &'static str,
+    error_class: &'static str,
+) {
+    if new_state == "failed" {
+        tracing::warn!(
+            event = "paykit_setup_flow_transition",
+            setup_trace_id = %setup_trace_id.hyphenated(),
+            previous_state,
+            new_state,
+            outcome,
+            error_class,
+            "Paykit setup flow changed state"
+        );
+    } else {
+        tracing::info!(
+            event = "paykit_setup_flow_transition",
+            setup_trace_id = %setup_trace_id.hyphenated(),
+            previous_state,
+            new_state,
+            outcome,
+            error_class,
+            "Paykit setup flow changed state"
+        );
+    }
+}
+
 pub trait Clock: Send + Sync {
     fn now(&self) -> Duration;
 }
@@ -159,6 +202,7 @@ struct State {
 }
 
 struct Flow {
+    setup_trace_id: Uuid,
     attempt: Option<Box<dyn SetupAttempt>>,
     reservation: Option<OwnedSemaphorePermit>,
     expires_at: Duration,
@@ -217,6 +261,17 @@ enum FlowStatus {
     Completing,
     Completed,
     Failed,
+}
+
+impl FlowStatus {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Completing => "completing",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -527,11 +582,13 @@ impl SetupService {
             origin,
             authorization_url: started_setup.authorization_url.clone(),
         };
+        let setup_trace_id = Uuid::new_v4();
         let mut guard = self.inner.state.lock().await;
         cleanup_expired(&mut guard, self.inner.clock.now());
         guard.flows.insert(
             flow_id,
             Flow {
+                setup_trace_id,
                 attempt: Some(started_setup.attempt),
                 reservation: Some(reservation),
                 expires_at: self.inner.clock.now() + FLOW_LIFETIME,
@@ -540,6 +597,8 @@ impl SetupService {
             },
         );
         drop(guard);
+        crate::diagnostics::link_setup_trace(setup_trace_id);
+        emit_setup_transition(setup_trace_id, "none", "pending", "started", "none");
         if self.inner.log_authorization_url {
             tracing::info!(
                 event = "paykit_setup_authorization_url",
@@ -557,13 +616,14 @@ impl SetupService {
     /// browser is backgrounded while the creator approves in Bitkit. Same rule
     /// as pubky/pubky-app#1411: the hand-off must not cancel the approval wait.
     pub async fn trigger_completion(&self, flow_id: &str) -> PollResult {
-        let (attempt, reservation, remaining) = {
+        let (attempt, reservation, remaining, setup_trace_id) = {
             let mut guard = self.inner.state.lock().await;
             let now = self.inner.clock.now();
             cleanup_expired(&mut guard, now);
             let Some(flow) = guard.flows.get_mut(flow_id) else {
                 return expired_or_unknown(&guard, flow_id);
             };
+            crate::diagnostics::link_setup_trace(flow.setup_trace_id);
             match flow.status {
                 FlowStatus::Completed => return PollResult::Complete,
                 FlowStatus::Failed => return PollResult::Failed,
@@ -579,44 +639,69 @@ impl SetupService {
                     .take()
                     .expect("pending flow has a setup reservation"),
                 flow.expires_at.saturating_sub(now),
+                flow.setup_trace_id,
             )
         };
+        emit_setup_transition(setup_trace_id, "pending", "completing", "started", "none");
         let completion_lease =
             CompletionLease::new(self.inner.clone(), flow_id.to_owned(), reservation);
         let inner = self.inner.clone();
         let flow_id = flow_id.to_owned();
-        let completion = tokio::spawn(async move {
-            // No request bounds this task, so an approval that never arrives
-            // must stop at flow expiry.
-            let completion = tokio::time::timeout(remaining, inner.completer.complete(attempt))
-                .await
-                .unwrap_or(Completion::DefinitiveFailure);
-            let mut guard = inner.state.lock().await;
-            let now = inner.clock.now();
-            cleanup_expired(&mut guard, now);
-            let result = match guard.flows.get_mut(&flow_id) {
-                None => expired_or_unknown(&guard, &flow_id),
-                Some(flow) => match completion {
-                    Completion::DurableSuccess => {
-                        flow.status = FlowStatus::Completed;
-                        PollResult::Complete
-                    }
-                    // One-shot auth requests cannot safely be replayed after any
-                    // completion failure. Fail closed rather than falsely retaining
-                    // a consumed request as pending.
-                    Completion::DefinitiveFailure
-                    | Completion::TransientOverload
-                    | Completion::TransientUnavailable => {
-                        flow.status = FlowStatus::Failed;
-                        PollResult::Failed
-                    }
-                },
-            };
-            drop(guard);
-            inner.changed.notify_waiters();
-            completion_lease.disarm();
-            result
-        });
+        let dispatch = tracing::dispatcher::get_default(Clone::clone);
+        let completion =
+            tokio::spawn(
+                async move {
+                    // No request bounds this task, so an approval that never arrives
+                    // must stop at flow expiry.
+                    let (completion, completion_failure_class) =
+                        match tokio::time::timeout(remaining, inner.completer.complete(attempt))
+                            .await
+                        {
+                            Ok(completion) => (completion, completion.failure_class()),
+                            Err(_) => (Completion::DefinitiveFailure, "timeout"),
+                        };
+                    let mut guard = inner.state.lock().await;
+                    let now = inner.clock.now();
+                    cleanup_expired(&mut guard, now);
+                    let result = match guard.flows.get_mut(&flow_id) {
+                        None => expired_or_unknown(&guard, &flow_id),
+                        Some(flow) => match completion {
+                            Completion::DurableSuccess => {
+                                flow.status = FlowStatus::Completed;
+                                emit_setup_transition(
+                                    setup_trace_id,
+                                    "completing",
+                                    "completed",
+                                    "succeeded",
+                                    "none",
+                                );
+                                PollResult::Complete
+                            }
+                            // One-shot auth requests cannot safely be replayed after any
+                            // completion failure. Fail closed rather than falsely retaining
+                            // a consumed request as pending.
+                            Completion::DefinitiveFailure
+                            | Completion::TransientOverload
+                            | Completion::TransientUnavailable => {
+                                flow.status = FlowStatus::Failed;
+                                emit_setup_transition(
+                                    setup_trace_id,
+                                    "completing",
+                                    "failed",
+                                    "failed",
+                                    completion_failure_class,
+                                );
+                                PollResult::Failed
+                            }
+                        },
+                    };
+                    drop(guard);
+                    inner.changed.notify_waiters();
+                    completion_lease.disarm();
+                    result
+                }
+                .with_subscriber(dispatch),
+            );
         // A panicked or aborted task drops its armed lease, which fails the flow.
         completion.await.unwrap_or(PollResult::Failed)
     }
@@ -680,6 +765,7 @@ impl SetupService {
         let Some(flow) = guard.flows.get(flow_id) else {
             return Err(expired_or_unknown(&guard, flow_id));
         };
+        crate::diagnostics::link_setup_trace(flow.setup_trace_id);
         match flow.status {
             FlowStatus::Failed => return Err(PollResult::Failed),
             FlowStatus::Completed => return Err(PollResult::Complete),
@@ -733,13 +819,20 @@ fn cleanup_expired(state: &mut State, now: Duration) {
         .flows
         .iter()
         .filter(|(_, flow)| now >= flow.expires_at)
-        .map(|(flow_id, _)| flow_id.clone())
+        .map(|(flow_id, flow)| (flow_id.clone(), flow.setup_trace_id, flow.status))
         .collect::<Vec<_>>();
-    for flow_id in expired_ids {
+    for (flow_id, setup_trace_id, previous_state) in expired_ids {
         // Removing the flow drops its secret-bearing setup attempt before the
         // tombstone is recorded. Tombstones retain no flow secrets.
         state.flows.remove(&flow_id);
         state.expired.insert(flow_id, now + FLOW_LIFETIME);
+        emit_setup_transition(
+            setup_trace_id,
+            previous_state.as_str(),
+            "expired",
+            "expired",
+            "timeout",
+        );
     }
 }
 
@@ -748,6 +841,13 @@ fn fail_cancelled_completion(state: &mut State, flow_id: &str) {
         && flow.status == FlowStatus::Completing
     {
         flow.status = FlowStatus::Failed;
+        emit_setup_transition(
+            flow.setup_trace_id,
+            "completing",
+            "failed",
+            "cancelled",
+            "cancelled",
+        );
     }
 }
 

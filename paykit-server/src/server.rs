@@ -54,8 +54,8 @@ use crate::{
             ElectrumAdapter, ElectrumPort, ObserverError, observe_marketplace_once, observe_once,
         },
         outbox::{
-            ProcessingHealth, RetrySchedule, process_claim_with,
-            process_reconciliation_with_health, with_claim_renewal,
+            HandoffFailure, ProcessingHealth, RetrySchedule, emit_reconciliation_transition,
+            process_claim_with, process_reconciliation_with_health, with_claim_renewal,
         },
     },
 };
@@ -598,15 +598,36 @@ async fn buyer_contacts_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtim
                     break;
                 }
             };
-            let saved = match creator_adapter(&workers, pending.creator_id).await {
-                Ok(adapter) => adapter
+            match creator_adapter(&workers, pending.creator_id).await {
+                Ok(adapter) => match adapter
                     .save_buyer_contact(&workers.invoices, &pending)
                     .await
-                    .is_ok(),
-                Err(_) => false,
-            };
-            if !saved {
-                tracing::warn!(stage = "buyer_contact_save", "Buyer contact save deferred");
+                {
+                    Ok(true) => log_buyer_contact_outcome(
+                        pending.creator_id,
+                        pending.invoice_id,
+                        "completed",
+                        "none",
+                    ),
+                    Ok(false) => log_buyer_contact_outcome(
+                        pending.creator_id,
+                        pending.invoice_id,
+                        "skipped",
+                        "no_longer_pending",
+                    ),
+                    Err(error) => log_buyer_contact_outcome(
+                        pending.creator_id,
+                        pending.invoice_id,
+                        "deferred",
+                        sdk_error_label(&error),
+                    ),
+                },
+                Err(error) => log_buyer_contact_outcome(
+                    pending.creator_id,
+                    pending.invoice_id,
+                    "deferred",
+                    error.diagnostic_label(),
+                ),
             }
         }
     }
@@ -641,11 +662,12 @@ async fn shared_transport_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runt
         };
         let limit =
             usize::try_from(workers.outbox_batch_size).expect("validated outbox batch size");
-        let deferred = maintain_transport_pass(creators, limit, runtime.clone(), |creator| {
-            let workers = workers.clone();
-            async move { maintain_creator_transport(&workers, creator, full_scan).await }
-        })
-        .await;
+        let deferred =
+            maintain_transport_pass(creators, limit, runtime.clone(), full_scan, |creator| {
+                let workers = workers.clone();
+                async move { maintain_creator_transport(&workers, creator, full_scan).await }
+            })
+            .await;
         if !runtime.may_start_worker_claim() {
             return;
         }
@@ -742,16 +764,27 @@ fn start_creator_passes<Pass, PassFuture>(
         if running.contains(&creator) {
             continue;
         }
-        if tasks.try_spawn(creator, contain_panic(stage, pass(creator))) {
+        if tasks.try_spawn(creator, contain_panic(stage, creator, pass(creator))) {
             turns.started(creator);
         }
     }
 }
 
 /// Runs `pass`, logging a panic in it instead of passing it on.
-async fn contain_panic(stage: &'static str, pass: impl Future<Output = ()> + Send) {
+async fn contain_panic(
+    stage: &'static str,
+    creator_id: Uuid,
+    pass: impl Future<Output = ()> + Send,
+) {
     if pass_panicked(pass).await {
-        tracing::error!(stage, "Paykit worker pass panicked");
+        tracing::error!(
+            event = "paykit_creator_worker_pass",
+            creator_id = %creator_id.hyphenated(),
+            stage,
+            outcome = "failed",
+            category = "panic",
+            "Paykit worker pass panicked"
+        );
     }
 }
 
@@ -807,9 +840,12 @@ async fn run_allowance_intake_pass(
     };
     if let Some((step, category)) = failure {
         tracing::warn!(
+            event = "paykit_allowance_intake_pass",
+            creator_id = %creator.hyphenated(),
             stage = "allowance_intake",
             step,
             category,
+            outcome = "failed",
             "Paykit Allowance intake failed"
         );
     }
@@ -888,9 +924,12 @@ async fn seller_receipts_pass(
     };
     if let Some((step, category)) = failure {
         tracing::warn!(
+            event = "paykit_seller_receipts_pass",
+            creator_id = %creator.hyphenated(),
             stage = "seller_receipts",
             step,
             category,
+            outcome = "failed",
             "Paykit seller Receipt read failed"
         );
     }
@@ -918,20 +957,66 @@ fn transport_maintenance_outcome(
     }
 }
 
-fn log_transport_maintenance_failure(step: &'static str, category: &'static str) {
+fn log_transport_maintenance_failure(creator_id: Uuid, step: &'static str, category: &'static str) {
     if step == "maintain_transport" && matches!(category, "transport" | "storage") {
         tracing::debug!(
+            event = "paykit_shared_transport_pass",
+            creator_id = %creator_id.hyphenated(),
             stage = "shared_transport",
             step,
             category,
+            outcome = "deferred",
             "Paykit transport maintenance failed"
         );
     } else {
         tracing::warn!(
+            event = "paykit_shared_transport_pass",
+            creator_id = %creator_id.hyphenated(),
             stage = "shared_transport",
             step,
             category,
+            outcome = "failed",
             "Paykit transport maintenance failed"
+        );
+    }
+}
+
+fn log_buyer_contact_outcome(
+    creator_id: Uuid,
+    invoice_id: Uuid,
+    outcome: &'static str,
+    category: &'static str,
+) {
+    if outcome == "completed" {
+        tracing::info!(
+            event = "paykit_buyer_contact_transition",
+            creator_id = %creator_id.hyphenated(),
+            invoice_id = %invoice_id.hyphenated(),
+            previous_state = "pending",
+            new_state = "completed",
+            outcome,
+            "Buyer contact saved"
+        );
+    } else if outcome == "skipped" {
+        tracing::debug!(
+            event = "paykit_buyer_contact_transition",
+            creator_id = %creator_id.hyphenated(),
+            invoice_id = %invoice_id.hyphenated(),
+            state = "pending",
+            outcome,
+            category,
+            "Buyer contact work no longer pending"
+        );
+    } else {
+        tracing::warn!(
+            event = "paykit_buyer_contact_transition",
+            creator_id = %creator_id.hyphenated(),
+            invoice_id = %invoice_id.hyphenated(),
+            previous_state = "pending",
+            new_state = "pending",
+            outcome,
+            category,
+            "Buyer contact save deferred"
         );
     }
 }
@@ -965,6 +1050,7 @@ async fn maintain_transport_pass<Work, WorkFuture>(
     creators: Vec<Uuid>,
     limit: usize,
     runtime: Arc<Runtime>,
+    full_scan: bool,
     mut maintain: Work,
 ) -> bool
 where
@@ -982,15 +1068,35 @@ where
             tasks.try_spawn(creator, maintain(creator));
         }
         // Drain admitted SDK work even after shutdown stops admission.
-        let Some((_, outcome)) = tasks.join_next().await else {
+        let Some((creator, outcome)) = tasks.join_next().await else {
             break;
         };
         match outcome {
-            TransportMaintenance::Complete => {}
-            TransportMaintenance::Deferred => deferred = true,
+            TransportMaintenance::Complete => {
+                if !full_scan {
+                    tracing::info!(
+                        event = "paykit_shared_transport_pass",
+                        creator_id = %creator.hyphenated(),
+                        stage = "shared_transport",
+                        outcome = "completed",
+                        "Paykit targeted transport maintenance completed"
+                    );
+                }
+            }
+            TransportMaintenance::Deferred => {
+                deferred = true;
+                tracing::debug!(
+                    event = "paykit_shared_transport_pass",
+                    creator_id = %creator.hyphenated(),
+                    stage = "shared_transport",
+                    outcome = "deferred",
+                    category = "shared_state_busy",
+                    "Paykit transport maintenance deferred"
+                );
+            }
             // One Creator's failure must not withdraw every Creator's rail.
             TransportMaintenance::Failed { step, category } => {
-                log_transport_maintenance_failure(step, category);
+                log_transport_maintenance_failure(creator, step, category);
             }
         }
     }
@@ -1395,68 +1501,42 @@ async fn process_creator_outbox(
         &workers.outbox,
         &claim,
         workers.outbox_lease_duration,
-        async {
-            let intent =
-                match workers.outbox.delivery_intent(&claim) {
-                    Ok(intent) => intent,
-                    Err(_) => {
-                        return workers.outbox.mark_permanently_failed(&claim).await.map(
-                            |transitioned| (transitioned, ProcessingHealth::PermanentFailure),
-                        );
+        process_claim_with(&workers.outbox, &claim, retry_schedule, true, |intent| {
+            let workers = &workers;
+            let guard = &guard;
+            let claim = &claim;
+            let ready_adapter = &mut ready_adapter;
+            async move {
+                let adapter = match creator_adapter(workers, creator).await {
+                    Ok(adapter) => adapter,
+                    Err(AdapterBuildError::Permanent) => return Err(HandoffFailure::Permanent),
+                    Err(AdapterBuildError::Unavailable) => {
+                        return Err(HandoffFailure::Retryable(
+                            OutboxRetryClass::AdapterUnavailable,
+                        ));
                     }
                 };
-            if let Some(deadline) = intent
-                .proposal_expires_at()
-                .map_err(|_| PersistenceError::CorruptOrMissing)?
-                && workers.outbox.proposal_expired(deadline).await?
-            {
-                return workers
-                    .outbox
-                    .mark_proposal_expired(&claim)
-                    .await
-                    .map(|transitioned| (transitioned, ProcessingHealth::Available));
-            }
-            match creator_adapter(&workers, creator).await {
-                Ok(adapter) => {
-                    let adapter = ready_adapter.insert(adapter);
-                    process_claim_with(&workers.outbox, &claim, retry_schedule, |intent| {
-                        let adapter = &*adapter;
-                        let guard = &guard;
-                        let store = &workers.outbox;
-                        let claim = &claim;
-                        async move {
-                            adapter
-                                .execute_claimed_handoff_with_guard(guard, store, claim, &intent)
-                                .await
-                        }
-                    })
-                    .await
+                let result = adapter
+                    .execute_claimed_handoff_with_guard(guard, &workers.outbox, claim, &intent)
+                    .await;
+                if result.is_ok() {
+                    *ready_adapter = Some(adapter);
                 }
-                Err(AdapterBuildError::Permanent) => workers
-                    .outbox
-                    .mark_permanently_failed(&claim)
-                    .await
-                    .map(|transitioned| (transitioned, ProcessingHealth::PermanentFailure)),
-                Err(AdapterBuildError::Unavailable) => workers
-                    .outbox
-                    .mark_retryable(
-                        &claim,
-                        retry_schedule.default_delay(),
-                        OutboxRetryClass::AdapterUnavailable,
-                    )
-                    .await
-                    .map(|transitioned| {
-                        (
-                            transitioned,
-                            ProcessingHealth::Retryable(retry_schedule.default_delay()),
-                        )
-                    }),
+                result
             }
-        },
+        }),
     )
     .await;
     if matches!(result, Ok((false, _))) {
-        tracing::warn!("outbox handoff finished without a live claim transition");
+        tracing::warn!(
+            event = "paykit_outbox_transition_skipped",
+            creator_id = %claim.creator_id().hyphenated(),
+            outbox_job_id = %claim.id().hyphenated(),
+            attempt = claim.attempt_count(),
+            expected_state = "leased",
+            outcome = "stale_claim",
+            "Outbox handoff finished without a live claim transition"
+        );
     }
     if matches!(result, Ok((true, ProcessingHealth::Available)))
         && runtime.may_start_worker_claim()
@@ -1466,8 +1546,14 @@ async fn process_creator_outbox(
             .await
     {
         tracing::warn!(
-            ?error,
-            "handed-off delivery deferred to transport maintenance"
+            event = "paykit_outbox_transport_deferred",
+            creator_id = %claim.creator_id().hyphenated(),
+            outbox_job_id = %claim.id().hyphenated(),
+            attempt = claim.attempt_count(),
+            state = "handed_off",
+            outcome = "deferred",
+            category = error.diagnostic_label(),
+            "Handed-off delivery deferred to transport maintenance"
         );
     }
     let outcome = processing_timing_outcome(&result);
@@ -1541,16 +1627,42 @@ async fn outbox_reconciliation_loop(workers: Arc<WorkerComponents>, runtime: Arc
                         process_reconciliation_with_health(&workers.outbox, &adapter, &claim, delay)
                             .await
                     }
-                    Err(AdapterBuildError::Permanent) => workers
-                        .outbox
-                        .mark_reconciliation_permanently_failed(&claim)
-                        .await
-                        .map(|transitioned| (transitioned, ProcessingHealth::PermanentFailure)),
-                    Err(AdapterBuildError::Unavailable) => workers
-                        .outbox
-                        .retry_reconciliation(&claim, delay, OutboxRetryClass::AdapterUnavailable)
-                        .await
-                        .map(|transitioned| (transitioned, ProcessingHealth::Retryable(delay))),
+                    Err(AdapterBuildError::Permanent) => {
+                        let transitioned = workers
+                            .outbox
+                            .mark_reconciliation_permanently_failed(&claim)
+                            .await?;
+                        if transitioned {
+                            emit_reconciliation_transition(
+                                &claim,
+                                claim.sdk_outbound_message_id()?,
+                                "permanently_failed",
+                                "adapter_permanent",
+                                None,
+                            );
+                        }
+                        Ok((transitioned, ProcessingHealth::PermanentFailure))
+                    }
+                    Err(AdapterBuildError::Unavailable) => {
+                        let transitioned = workers
+                            .outbox
+                            .retry_reconciliation(
+                                &claim,
+                                delay,
+                                OutboxRetryClass::AdapterUnavailable,
+                            )
+                            .await?;
+                        if transitioned {
+                            emit_reconciliation_transition(
+                                &claim,
+                                claim.sdk_outbound_message_id()?,
+                                "handed_off",
+                                "deferred",
+                                Some((OutboxRetryClass::AdapterUnavailable, delay)),
+                            );
+                        }
+                        Ok((transitioned, ProcessingHealth::Retryable(delay)))
+                    }
                 };
                 crate::diagnostics::timing(
                     "worker",
@@ -1716,8 +1828,12 @@ fn start_lifecycle_passes<Pass, PassFuture>(
             let available = !pass_panicked(work).await;
             if !available {
                 tracing::warn!(
+                    event = "paykit_payment_request_lifecycle_pass",
+                    creator_id = %creator.hyphenated(),
                     stage = "lifecycle_reconciliation",
                     step = "task_join",
+                    outcome = "failed",
+                    category = "panic",
                     "Payment request lifecycle reconciliation task failed"
                 );
             }
@@ -1731,19 +1847,29 @@ fn start_lifecycle_passes<Pass, PassFuture>(
 
 /// One Creator's receive/projection error is retried without withdrawing every
 /// Creator's rail; durable delivery failures retain their separate readiness owner.
-fn log_lifecycle_reconciliation_deferred(step: &'static str, category: &'static str) {
+fn log_lifecycle_reconciliation_deferred(
+    creator_id: Uuid,
+    step: &'static str,
+    category: &'static str,
+) {
     if step == "receive_and_project" && matches!(category, "sdk" | "partial_receive") {
         tracing::debug!(
+            event = "paykit_payment_request_lifecycle_pass",
+            creator_id = %creator_id.hyphenated(),
             stage = "lifecycle_reconciliation",
             step,
             category,
+            outcome = "deferred",
             "Creator payment request reconciliation deferred"
         );
     } else {
         tracing::warn!(
+            event = "paykit_payment_request_lifecycle_pass",
+            creator_id = %creator_id.hyphenated(),
             stage = "lifecycle_reconciliation",
             step,
             category,
+            outcome = "deferred",
             "Creator payment request reconciliation deferred"
         );
     }
@@ -1761,7 +1887,7 @@ async fn reconcile_creator_lifecycle(workers: Arc<WorkerComponents>, creator: Uu
     }
     .await;
     if let Err((step, category)) = result {
-        log_lifecycle_reconciliation_deferred(step, category);
+        log_lifecycle_reconciliation_deferred(creator, step, category);
     }
 }
 
@@ -1814,6 +1940,47 @@ fn log_electrum_observation_failure(
 
 fn is_routine_electrum_observation_failure(step: &str, category: &str) -> bool {
     matches!(step, "invoice_observation" | "marketplace_observation") && category == "unavailable"
+}
+
+#[allow(clippy::too_many_arguments)]
+fn log_electrum_target_failure(
+    step: &'static str,
+    category: &'static str,
+    creator_id: Uuid,
+    entity_kind: &'static str,
+    entity_id: Uuid,
+    consecutive_failures: u32,
+    degraded: bool,
+) {
+    if is_routine_electrum_observation_failure(step, category) {
+        tracing::debug!(
+            event = "paykit_electrum_observation_failure",
+            creator_id = %creator_id.hyphenated(),
+            entity_kind,
+            entity_id = %entity_id.hyphenated(),
+            stage = "electrum_observation",
+            step,
+            category,
+            consecutive_failures,
+            degraded,
+            outcome = "deferred",
+            "Electrum observation target failed"
+        );
+    } else {
+        tracing::warn!(
+            event = "paykit_electrum_observation_failure",
+            creator_id = %creator_id.hyphenated(),
+            entity_kind,
+            entity_id = %entity_id.hyphenated(),
+            stage = "electrum_observation",
+            step,
+            category,
+            consecutive_failures,
+            degraded,
+            outcome = "failed",
+            "Electrum observation target failed"
+        );
+    }
 }
 
 fn record_electrum_observation_failure(
@@ -1871,6 +2038,7 @@ async fn observer_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtime>) {
         }
         let started = Instant::now();
         let mut failure: Option<(&'static str, &'static str)> = None;
+        let mut target_failures = Vec::new();
         let mut observed = false;
         match workers.invoices.observation_targets().await {
             Ok(targets) if !targets.is_empty() => {
@@ -1883,6 +2051,11 @@ async fn observer_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtime>) {
                 )
                 .await
                 {
+                    target_failures.extend(targets.iter().filter_map(|target| {
+                        target.correlation().map(|correlation| {
+                            ("invoice_observation", error.diagnostic_label(), correlation)
+                        })
+                    }));
                     record_electrum_observation_failure(
                         &mut failure,
                         "invoice_observation",
@@ -1910,6 +2083,15 @@ async fn observer_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtime>) {
                 )
                 .await
                 {
+                    target_failures.extend(targets.iter().filter_map(|target| {
+                        target.correlation().map(|correlation| {
+                            (
+                                "marketplace_observation",
+                                error.diagnostic_label(),
+                                correlation,
+                            )
+                        })
+                    }));
                     record_electrum_observation_failure(
                         &mut failure,
                         "marketplace_observation",
@@ -1933,7 +2115,20 @@ async fn observer_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtime>) {
         };
         let now = tokio::time::Instant::now();
         let available = readiness.record(tick, now);
-        if let Some((step, category)) = failure {
+        for (step, category, correlation) in &target_failures {
+            log_electrum_target_failure(
+                step,
+                category,
+                correlation.creator_id,
+                correlation.entity_kind,
+                correlation.entity_id,
+                readiness.consecutive_failures,
+                !available,
+            );
+        }
+        if target_failures.is_empty()
+            && let Some((step, category)) = failure
+        {
             log_electrum_observation_failure(
                 step,
                 category,
@@ -2035,8 +2230,14 @@ impl IdentityStateReads {
                 Ok(())
             }
             Err(error) => {
+                let category = sdk_error_label(&error);
                 let mapped = map_session_validation_error(error);
-                Err(session_failure("identity_state_load", mapped))
+                crate::diagnostics::failure(
+                    "creator_session_validation",
+                    "identity_state_load",
+                    category,
+                );
+                Err(mapped)
             }
         }
     }
@@ -2292,12 +2493,56 @@ fn reader_authorization<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use std::{io::Write, sync::Mutex};
     use tracing::{Event, Level, Subscriber};
-    use tracing_subscriber::{EnvFilter, Layer, layer::Context, prelude::*};
+    use tracing_subscriber::{EnvFilter, Layer, fmt::MakeWriter, layer::Context, prelude::*};
 
     #[derive(Clone, Default)]
     struct TimingCapture(Arc<Mutex<Vec<Level>>>);
+
+    #[derive(Clone, Default)]
+    struct FieldCapture(Arc<Mutex<Vec<String>>>);
+
+    struct FieldVisitor<'a>(&'a mut String);
+
+    #[derive(Clone, Default)]
+    struct JsonWriter(Arc<Mutex<Vec<u8>>>);
+
+    struct JsonGuard(JsonWriter);
+
+    impl Write for JsonGuard {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for JsonWriter {
+        type Writer = JsonGuard;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            JsonGuard(self.clone())
+        }
+    }
+
+    impl tracing::field::Visit for FieldVisitor<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            use std::fmt::Write as _;
+            let _ = write!(self.0, "{}={value:?};", field.name());
+        }
+    }
+
+    impl<S: Subscriber> Layer<S> for FieldCapture {
+        fn on_event(&self, event: &Event<'_>, _context: Context<'_, S>) {
+            let mut fields = String::new();
+            event.record(&mut FieldVisitor(&mut fields));
+            self.0.lock().unwrap().push(fields);
+        }
+    }
 
     impl<S: Subscriber> Layer<S> for TimingCapture {
         fn on_event(&self, event: &Event<'_>, _context: Context<'_, S>) {
@@ -2354,8 +2599,16 @@ mod tests {
             .with(capture.clone());
 
         tracing::subscriber::with_default(subscriber, || {
-            log_lifecycle_reconciliation_deferred("receive_and_project", "partial_receive");
-            log_lifecycle_reconciliation_deferred("receive_and_project", "persistence");
+            log_lifecycle_reconciliation_deferred(
+                Uuid::nil(),
+                "receive_and_project",
+                "partial_receive",
+            );
+            log_lifecycle_reconciliation_deferred(
+                Uuid::nil(),
+                "receive_and_project",
+                "persistence",
+            );
         });
 
         assert_eq!(*capture.0.lock().unwrap(), vec![Level::WARN]);
@@ -2383,6 +2636,41 @@ mod tests {
         assert_eq!(*capture.0.lock().unwrap(), vec![Level::WARN]);
     }
 
+    #[test]
+    fn worker_boundary_events_expose_trusted_ids_under_production_filter() {
+        let creator = Uuid::new_v4();
+        let invoice = Uuid::new_v4();
+        let output = JsonWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(EnvFilter::new("off,paykit_server=info"))
+            .with_current_span(false)
+            .with_span_list(false)
+            .with_writer(output.clone())
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            log_transport_maintenance_failure(creator, "adapter_build", "storage");
+            log_buyer_contact_outcome(creator, invoice, "deferred", "storage");
+            log_electrum_target_failure(
+                "invoice_observation",
+                "storage",
+                creator,
+                "invoice",
+                invoice,
+                1,
+                false,
+            );
+        });
+
+        let rendered = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
+        assert!(rendered.contains(&creator.to_string()));
+        assert!(rendered.contains(&invoice.to_string()));
+        assert!(rendered.contains("\"event\":\"paykit_shared_transport_pass\""));
+        assert!(rendered.contains("\"event\":\"paykit_buyer_contact_transition\""));
+        assert!(rendered.contains("\"event\":\"paykit_electrum_observation_failure\""));
+    }
+
     #[tokio::test]
     async fn adapter_transport_categories_reach_production_filter() {
         use paykit_sdk::{
@@ -2391,7 +2679,9 @@ mod tests {
 
         type Fixture = crate::paykit::TransportOperationFixture;
 
-        async fn observe(fixture: Fixture) -> (Option<&'static str>, bool, Vec<Level>) {
+        async fn observe(
+            fixture: Fixture,
+        ) -> (Option<&'static str>, bool, Vec<Level>, Vec<String>) {
             let adapter = PaykitAdapter::for_transport_fixture(fixture);
             let outcome =
                 transport_maintenance_outcome(adapter.maintain_transport_classified().await);
@@ -2401,19 +2691,22 @@ mod tests {
             };
             let deferred = matches!(outcome, TransportMaintenance::Deferred);
             let capture = TimingCapture::default();
+            let fields = FieldCapture::default();
             let subscriber = tracing_subscriber::registry()
                 .with(EnvFilter::new("off,paykit_server=info"))
-                .with(capture.clone());
+                .with(capture.clone())
+                .with(fields.clone());
             tracing::subscriber::with_default(subscriber, || {
                 if let TransportMaintenance::Failed { step, category } = outcome {
-                    log_transport_maintenance_failure(step, category);
+                    log_transport_maintenance_failure(Uuid::nil(), step, category);
                 }
             });
             let levels = capture.0.lock().unwrap().clone();
-            (category, deferred, levels)
+            let fields = fields.0.lock().unwrap().clone();
+            (category, deferred, levels, fields)
         }
 
-        let private = "private-transport-details";
+        let private = "https://provider.invalid/session=sentinel&token=token-sentinel&xpub=xpub-sentinel&proof=proof-sentinel";
         let scenarios = vec![
             (
                 "routine then policy",
@@ -2540,10 +2833,20 @@ mod tests {
         ];
 
         for (name, fixture, expected_category, expected_deferred, expected_levels) in scenarios {
-            let (category, deferred, levels) = observe(fixture).await;
+            let (category, deferred, levels, fields) = observe(fixture).await;
             assert_eq!(category, expected_category, "{name}");
             assert_eq!(deferred, expected_deferred, "{name}");
             assert_eq!(levels, expected_levels, "{name}");
+            let rendered = fields.join("\n");
+            assert!(!rendered.contains(private), "{name}");
+            for secret in [
+                "session=sentinel",
+                "token-sentinel",
+                "xpub-sentinel",
+                "proof-sentinel",
+            ] {
+                assert!(!rendered.contains(secret), "{name}");
+            }
         }
     }
 
@@ -2573,7 +2876,7 @@ mod tests {
                 panic!("nested send failure must fail transport maintenance");
             };
             assert_eq!(*category, "other");
-            log_transport_maintenance_failure(step, category);
+            log_transport_maintenance_failure(Uuid::nil(), step, category);
             record_shared_transport_timing(true, &outcome, Instant::now());
         });
 
@@ -2585,17 +2888,29 @@ mod tests {
         let capture = TimingCapture::default();
         let subscriber = tracing_subscriber::registry().with(capture.clone());
         tracing::subscriber::with_default(subscriber, || {
-            log_transport_maintenance_failure("maintain_transport", "transport");
-            log_transport_maintenance_failure("maintain_transport", "storage");
-            log_transport_maintenance_failure("adapter_build", "adapter_unavailable");
-            log_transport_maintenance_failure("adapter_build", "transport");
-            log_transport_maintenance_failure("maintain_transport", "protocol");
+            log_transport_maintenance_failure(Uuid::nil(), "maintain_transport", "transport");
+            log_transport_maintenance_failure(Uuid::nil(), "maintain_transport", "storage");
+            log_transport_maintenance_failure(Uuid::nil(), "adapter_build", "adapter_unavailable");
+            log_transport_maintenance_failure(Uuid::nil(), "adapter_build", "transport");
+            log_transport_maintenance_failure(Uuid::nil(), "maintain_transport", "protocol");
 
-            log_lifecycle_reconciliation_deferred("receive_and_project", "sdk");
-            log_lifecycle_reconciliation_deferred("receive_and_project", "partial_receive");
-            log_lifecycle_reconciliation_deferred("adapter_build", "adapter_unavailable");
-            log_lifecycle_reconciliation_deferred("adapter_build", "sdk");
-            log_lifecycle_reconciliation_deferred("receive_and_project", "persistence");
+            log_lifecycle_reconciliation_deferred(Uuid::nil(), "receive_and_project", "sdk");
+            log_lifecycle_reconciliation_deferred(
+                Uuid::nil(),
+                "receive_and_project",
+                "partial_receive",
+            );
+            log_lifecycle_reconciliation_deferred(
+                Uuid::nil(),
+                "adapter_build",
+                "adapter_unavailable",
+            );
+            log_lifecycle_reconciliation_deferred(Uuid::nil(), "adapter_build", "sdk");
+            log_lifecycle_reconciliation_deferred(
+                Uuid::nil(),
+                "receive_and_project",
+                "persistence",
+            );
 
             log_electrum_observation_failure("invoice_observation", "unavailable", 1, false);
             log_electrum_observation_failure("marketplace_observation", "unavailable", 1, false);
@@ -3498,6 +3813,7 @@ mod tests {
             creators.clone(),
             2,
             runtime,
+            true,
             move |creator| {
                 let wait = waits.remove(&creator);
                 let started = started.clone();
@@ -3568,6 +3884,7 @@ mod tests {
             creators.clone(),
             2,
             runtime.clone(),
+            true,
             move |creator| {
                 let gate = gate.clone();
                 let started = started.clone();
@@ -3625,7 +3942,7 @@ mod tests {
             .into_iter();
             let mut seen = Vec::new();
             assert_eq!(
-                maintain_transport_pass(creators.clone(), 2, runtime, |creator| {
+                maintain_transport_pass(creators.clone(), 2, runtime, true, |creator| {
                     seen.push(creator);
                     let outcome = outcomes.next().unwrap();
                     async move { outcome }
