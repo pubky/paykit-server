@@ -2,7 +2,8 @@
 
 use super::*;
 
-/// A verified buyer awaiting private contact resolution. Identifiers must not be logged.
+/// A verified buyer awaiting private contact resolution. Internal creator/invoice UUIDs may be
+/// used for operator correlation; the Reader public key remains private and must not be logged.
 pub struct PendingBuyerContact {
     pub invoice_id: Uuid,
     pub creator_id: Uuid,

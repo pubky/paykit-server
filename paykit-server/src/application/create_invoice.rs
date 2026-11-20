@@ -656,7 +656,7 @@ impl CreateInvoiceService {
         match preflight {
             InvoicePreflight::ExactReplay => {
                 let replay_remaining = remaining_at(started, self.clock.now(), "exact_replay")?;
-                return timed_stage("exact_replay", async {
+                let result = timed_stage("exact_replay", async {
                     tokio::time::timeout(
                         replay_remaining,
                         self.store.exact_replay(
@@ -670,7 +670,13 @@ impl CreateInvoiceService {
                     .map_err(|_| deadline("exact_replay"))?
                     .map_err(|error| store_failure("exact_replay", error))
                 })
-                .await;
+                .await?;
+                crate::diagnostics::invoice_persisted(
+                    result.invoice_id(),
+                    result.payment_request_outbox_id(),
+                    result.replayed(),
+                );
+                return Ok(result);
             }
             InvoicePreflight::Conflict => {
                 diagnose("invoice_preflight", CreateInvoiceError::Conflict);
@@ -912,7 +918,7 @@ impl CreateInvoiceService {
         // Once PostgreSQL mutation starts it must be awaited to a factual
         // commit/rollback result. Canceling this future at the HTTP deadline
         // could otherwise return failure while COMMIT succeeds concurrently.
-        timed_stage("db_commit", async {
+        let result = timed_stage("db_commit", async {
             self.store
                 .create_atomic(AtomicInvoiceInput {
                     creator: &creator,
@@ -927,7 +933,13 @@ impl CreateInvoiceService {
                 .await
                 .map_err(|error| store_failure("create_atomic", error))
         })
-        .await
+        .await?;
+        crate::diagnostics::invoice_persisted(
+            result.invoice_id(),
+            result.payment_request_outbox_id(),
+            result.replayed(),
+        );
+        Ok(result)
     }
 }
 

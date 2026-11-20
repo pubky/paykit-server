@@ -2,9 +2,8 @@
 
 use std::fmt;
 
-use bitcoin::OutPoint;
-
 use crate::config::BitcoinNetwork;
+use bitcoin::OutPoint;
 
 /// One invoice address whose direct outputs should be observed.
 #[derive(Clone, PartialEq, Eq)]

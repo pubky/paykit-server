@@ -29,7 +29,7 @@ pub enum OutboxRetryClass {
 }
 
 impl OutboxRetryClass {
-    const fn as_str(self) -> &'static str {
+    pub const fn diagnostic_label(self) -> &'static str {
         match self {
             Self::AdapterUnavailable => "adapter_unavailable",
             Self::RegistryFetch => "registry_fetch",
@@ -99,6 +99,18 @@ impl HandoffResult {
             } => *outbound_message_id,
         }
     }
+
+    pub fn payment_request_id(&self) -> Option<&str> {
+        match self {
+            Self::EndpointPublication { .. } => None,
+            Self::PaymentRequestProposal {
+                payment_request_id, ..
+            }
+            | Self::PaymentRequestCancellation {
+                payment_request_id, ..
+            } => Some(payment_request_id),
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, sqlx::FromRow)]
@@ -148,6 +160,26 @@ impl ClaimedOutbox {
 
     pub fn invoice_payment_deadline(&self) -> Option<OffsetDateTime> {
         self.invoice_payment_deadline
+    }
+
+    #[cfg(test)]
+    pub(crate) fn diagnostic_fixture(
+        id: Uuid,
+        creator_id: Uuid,
+        invoice_id: Option<Uuid>,
+        attempt_count: i32,
+    ) -> Self {
+        Self {
+            id,
+            creator_id,
+            invoice_id,
+            attempt_count,
+            failure_count: 1,
+            claim_token: Uuid::new_v4(),
+            creator_lookup_hash: Vec::new(),
+            intent_envelope: Vec::new(),
+            invoice_payment_deadline: None,
+        }
     }
 }
 
@@ -200,6 +232,26 @@ impl ClaimedHandoff {
 
     pub fn intent_kind(&self) -> &str {
         &self.intent_kind
+    }
+
+    #[cfg(test)]
+    pub(crate) fn diagnostic_fixture(
+        id: Uuid,
+        creator_id: Uuid,
+        attempt_count: i32,
+        outbound_message_id: u64,
+    ) -> Self {
+        Self {
+            id,
+            creator_id,
+            attempt_count,
+            claim_token: Uuid::new_v4(),
+            sdk_outbound_message_id: outbound_message_id.to_string(),
+            intent_kind: "payment_request_proposal".to_owned(),
+            creator_lookup_hash: Vec::new(),
+            intent_envelope: Vec::new(),
+            invoice_payment_deadline: None,
+        }
     }
 }
 
@@ -767,7 +819,7 @@ impl OutboxStore {
         self.reconciliation_transition(
             claim,
             "handed_off",
-            Some(error_class.as_str()),
+            Some(error_class.diagnostic_label()),
             Some(lease_seconds(delay)?),
         )
         .await
@@ -825,7 +877,7 @@ impl OutboxStore {
         self.transition(
             claim,
             "retryable",
-            Some(error_class.as_str()),
+            Some(error_class.diagnostic_label()),
             Some(duration_milliseconds(delay)?),
         )
         .await
@@ -1037,7 +1089,7 @@ mod tests {
                 OutboxRetryClass::ReconciliationPending,
                 OutboxRetryClass::Reconciliation,
             ]
-            .map(OutboxRetryClass::as_str),
+            .map(OutboxRetryClass::diagnostic_label),
             [
                 "adapter_unavailable",
                 "registry_fetch",

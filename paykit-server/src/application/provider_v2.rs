@@ -125,11 +125,17 @@ impl ProviderV2Service {
             .map_err(map_store)?
         {
             InvoicePreflight::ExactReplay => {
-                return self
+                let result = self
                     .store
                     .provider_v2_exact_replay(&creator, &bundle_binding, &request_hash)
                     .await
-                    .map_err(map_store);
+                    .map_err(map_store)?;
+                crate::diagnostics::invoice_persisted(
+                    result.invoice_id(),
+                    result.payment_request_outbox_id(),
+                    result.replayed(),
+                );
+                return Ok(result);
             }
             InvoicePreflight::Conflict => return Err(ProviderV2Error::Conflict),
             InvoicePreflight::New => {}
@@ -225,7 +231,8 @@ impl ProviderV2Service {
             app_id: self.app_id.clone(),
             network: self.network.clone(),
         };
-        self.store
+        let result = self
+            .store
             .create_provider_v2_atomic(ProviderV2AtomicInvoiceInput {
                 creator: &creator,
                 reader: &request.reader,
@@ -238,7 +245,13 @@ impl ProviderV2Service {
                 proposal_acceptance_seconds: self.proposal_acceptance_window.as_secs(),
             })
             .await
-            .map_err(map_store)
+            .map_err(map_store)?;
+        crate::diagnostics::invoice_persisted(
+            result.invoice_id(),
+            result.payment_request_outbox_id(),
+            result.replayed(),
+        );
+        Ok(result)
     }
 
     pub async fn status(

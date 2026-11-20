@@ -13,7 +13,7 @@ impl PaykitAdapter {
         &self,
         invoices: &InvoiceStore,
         pending: &PendingBuyerContact,
-    ) -> paykit_sdk::Result<()> {
+    ) -> paykit_sdk::Result<bool> {
         if pending.creator_id != self.creator_id {
             return Err(PaykitSdkError::Identity {
                 context: "buyer contact attempt does not match Creator".into(),
@@ -27,7 +27,7 @@ impl PaykitAdapter {
             .await
             .map_err(contact_store_error)?
         {
-            return Ok(());
+            return Ok(false);
         }
         let buyer = PubkyPublicKey::from_raw_or_app_key(pending.reader.to_string())?;
         let owner = PubkyPublicKey::from_raw_or_app_key(self.creator.to_string())?;
@@ -43,7 +43,7 @@ impl PaykitAdapter {
                     .await
                     .map_err(contact_store_error)?
                 {
-                    return Ok(());
+                    return Ok(false);
                 }
                 if let Some(contact) = contact {
                     self.storage
@@ -53,7 +53,8 @@ impl PaykitAdapter {
                 invoices
                     .complete_buyer_contact(pending)
                     .await
-                    .map_err(contact_store_error)
+                    .map_err(contact_store_error)?;
+                Ok(true)
             })
             .await
     }
