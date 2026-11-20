@@ -22,6 +22,7 @@ pub struct ProviderV2AtomicInvoiceInput<'a> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProviderV2CreateResult {
     invoice_id: Uuid,
+    payment_request_outbox_id: Uuid,
     invoice_created_at: OffsetDateTime,
     proposal_expires_at: OffsetDateTime,
     deadline: OffsetDateTime,
@@ -31,6 +32,9 @@ pub struct ProviderV2CreateResult {
 impl ProviderV2CreateResult {
     pub fn invoice_id(&self) -> Uuid {
         self.invoice_id
+    }
+    pub fn payment_request_outbox_id(&self) -> Uuid {
+        self.payment_request_outbox_id
     }
     pub fn invoice_created_at(&self) -> OffsetDateTime {
         self.invoice_created_at
@@ -66,6 +70,7 @@ pub struct ProviderV2Status {
 #[derive(sqlx::FromRow)]
 struct ProviderReplayRow {
     invoice_id: Uuid,
+    payment_request_outbox_id: Uuid,
     request_hash: Vec<u8>,
     invoice_created_at: OffsetDateTime,
     proposal_expires_at: OffsetDateTime,
@@ -75,6 +80,7 @@ struct ProviderReplayRow {
 #[derive(sqlx::FromRow)]
 struct ProviderExistingRow {
     invoice_id: Uuid,
+    payment_request_outbox_id: Option<Uuid>,
     request_hash: Option<Vec<u8>>,
     invoice_created_at: OffsetDateTime,
     proposal_expires_at: Option<OffsetDateTime>,
@@ -142,11 +148,14 @@ impl InvoiceStore {
         let creator_hash = self.crypto.lookup_hash(creator.to_string().as_bytes());
         let bundle_hash = self.crypto.lookup_hash(bundle_binding);
         let row = sqlx::query_as::<_, ProviderReplayRow>(
-            "SELECT invoices.id AS invoice_id, provider.request_hash,
+            "SELECT invoices.id AS invoice_id, outbox.id AS payment_request_outbox_id,
+                    provider.request_hash,
                     invoices.invoice_created_at, provider.proposal_expires_at, provider.deadline
              FROM invoices
              JOIN creators ON creators.id = invoices.creator_id
              JOIN invoice_provider_v2 provider ON provider.invoice_id = invoices.id
+             JOIN outbox ON outbox.invoice_id = invoices.id
+                        AND outbox.intent_kind = 'payment_request_proposal'
              WHERE creators.creator_lookup_hash = $1 AND invoices.bundle_lookup_hash = $2",
         )
         .bind(creator_hash.as_bytes().as_slice())
@@ -160,6 +169,7 @@ impl InvoiceStore {
         }
         Ok(ProviderV2CreateResult {
             invoice_id: row.invoice_id,
+            payment_request_outbox_id: row.payment_request_outbox_id,
             invoice_created_at: row.invoice_created_at,
             proposal_expires_at: row.proposal_expires_at,
             deadline: row.deadline,
@@ -245,7 +255,12 @@ impl InvoiceStore {
             .map_err(|_| PersistenceError::Unavailable)?;
 
         let existing = sqlx::query_as::<_, ProviderExistingRow>(
-            "SELECT invoices.id AS invoice_id, provider.request_hash,
+            "SELECT invoices.id AS invoice_id,
+                    (SELECT outbox.id FROM outbox
+                     WHERE outbox.invoice_id = invoices.id
+                       AND outbox.intent_kind = 'payment_request_proposal')
+                        AS payment_request_outbox_id,
+                    provider.request_hash,
                     invoices.invoice_created_at, provider.proposal_expires_at, provider.deadline
              FROM invoices
              LEFT JOIN invoice_provider_v2 provider ON provider.invoice_id = invoices.id
@@ -260,11 +275,15 @@ impl InvoiceStore {
                     && row.proposal_expires_at.is_some()
                     && row.deadline.is_some() =>
             {
+                let payment_request_outbox_id = row
+                    .payment_request_outbox_id
+                    .ok_or(PersistenceError::CorruptOrMissing)?;
                 tx.commit()
                     .await
                     .map_err(|_| PersistenceError::Unavailable)?;
                 return Ok(ProviderV2CreateResult {
                     invoice_id: row.invoice_id,
+                    payment_request_outbox_id,
                     invoice_created_at: row.invoice_created_at,
                     proposal_expires_at: row.proposal_expires_at.expect("checked above"),
                     deadline: row.deadline.expect("checked above"),
@@ -510,6 +529,7 @@ impl InvoiceStore {
         self.admitted.notify_one();
         Ok(ProviderV2CreateResult {
             invoice_id,
+            payment_request_outbox_id: outbox_id,
             invoice_created_at: now,
             proposal_expires_at,
             deadline: input.deadline,

@@ -309,7 +309,8 @@ async fn idle_observer_ticks_do_not_grant_the_first_electrum_failure_grace() {
     assert_eq!(runtime.readiness().await.electrum, ComponentState::Ready);
 
     let logged_from = logs.len();
-    let (creator_id, invoice_id) = seed_unrestorable_creator_with_terminal_invoice(&database).await;
+    let (_creator_id, _invoice_id) =
+        seed_unrestorable_creator_with_terminal_invoice(&database).await;
     // The first real observation fails; well inside the 30 s grace, so only the
     // absence of any prior success can make it degrade.
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -320,14 +321,16 @@ async fn idle_observer_ticks_do_not_grant_the_first_electrum_failure_grace() {
     .await
     .expect("a first failed observation after idle ticks must degrade immediately");
     let rendered_logs = logs.rendered_since(logged_from);
-    let failure_event = rendered_logs
+    let failure_events = rendered_logs
         .lines()
-        .find(|line| line.contains("event=\"paykit_electrum_observation_failure\""))
-        .expect("failed target must emit its structured observation event");
-    assert!(failure_event.contains("Electrum observation target failed"));
-    assert!(failure_event.contains(&format!("creator_id={creator_id}")));
-    assert!(failure_event.contains("entity_kind=\"invoice\""));
-    assert!(failure_event.contains(&format!("entity_id={invoice_id}")));
+        .filter(|line| line.contains("event=\"paykit_electrum_observation_failure\""))
+        .collect::<Vec<_>>();
+    assert_eq!(failure_events.len(), 1, "one batch failure must be emitted");
+    let failure_event = failure_events[0];
+    assert!(failure_event.contains("Electrum observation tick failed"));
+    assert!(!failure_event.contains("creator_id="));
+    assert!(!failure_event.contains("entity_kind="));
+    assert!(!failure_event.contains("entity_id="));
     assert!(failure_event.contains("stage=\"electrum_observation\""));
     assert!(failure_event.contains("step=\"invoice_observation\""));
     assert!(failure_event.contains("category=\"unavailable\""));

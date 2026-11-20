@@ -282,10 +282,17 @@ async fn setup_required_is_quiet_while_unavailable_emits_one_correlated_source_e
     assert_eq!(field(event, "stage"), Some("creator_session_validation"));
     assert_eq!(field(event, "category"), Some("unavailable"));
     assert_eq!(field(event, "request_id"), Some(request_id));
+    assert!(Uuid::parse_str(field(event, "request_instance_id").unwrap()).is_ok());
     assert!(event.iter().all(|(name, _)| {
         matches!(
             name.as_str(),
-            "message" | "event" | "operation" | "stage" | "category" | "request_id"
+            "message"
+                | "event"
+                | "operation"
+                | "stage"
+                | "category"
+                | "request_id"
+                | "request_instance_id"
         )
     }));
 }

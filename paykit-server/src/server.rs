@@ -1919,20 +1919,24 @@ fn log_electrum_observation_failure(
 ) {
     if is_routine_electrum_observation_failure(step, category) {
         tracing::debug!(
+            event = "paykit_electrum_observation_failure",
             stage = "electrum_observation",
             step,
             category,
             consecutive_failures,
             degraded,
+            outcome = "deferred",
             "Electrum observation tick failed"
         );
     } else {
         tracing::warn!(
+            event = "paykit_electrum_observation_failure",
             stage = "electrum_observation",
             step,
             category,
             consecutive_failures,
             degraded,
+            outcome = "failed",
             "Electrum observation tick failed"
         );
     }
@@ -1942,59 +1946,12 @@ fn is_routine_electrum_observation_failure(step: &str, category: &str) -> bool {
     matches!(step, "invoice_observation" | "marketplace_observation") && category == "unavailable"
 }
 
-#[allow(clippy::too_many_arguments)]
-fn log_electrum_target_failure(
-    step: &'static str,
-    category: &'static str,
-    creator_id: Uuid,
-    entity_kind: &'static str,
-    entity_id: Uuid,
-    consecutive_failures: u32,
-    degraded: bool,
-) {
-    if is_routine_electrum_observation_failure(step, category) {
-        tracing::debug!(
-            event = "paykit_electrum_observation_failure",
-            creator_id = %creator_id.hyphenated(),
-            entity_kind,
-            entity_id = %entity_id.hyphenated(),
-            stage = "electrum_observation",
-            step,
-            category,
-            consecutive_failures,
-            degraded,
-            outcome = "deferred",
-            "Electrum observation target failed"
-        );
-    } else {
-        tracing::warn!(
-            event = "paykit_electrum_observation_failure",
-            creator_id = %creator_id.hyphenated(),
-            entity_kind,
-            entity_id = %entity_id.hyphenated(),
-            stage = "electrum_observation",
-            step,
-            category,
-            consecutive_failures,
-            degraded,
-            outcome = "failed",
-            "Electrum observation target failed"
-        );
-    }
-}
-
 fn record_electrum_observation_failure(
-    failure: &mut Option<(&'static str, &'static str)>,
+    failures: &mut Vec<(&'static str, &'static str)>,
     step: &'static str,
     category: &'static str,
 ) {
-    // Retain the first failure unless a later one must remain visible at INFO.
-    if failure.is_none_or(|(existing_step, existing_category)| {
-        is_routine_electrum_observation_failure(existing_step, existing_category)
-            && !is_routine_electrum_observation_failure(step, category)
-    }) {
-        *failure = Some((step, category));
-    }
+    failures.push((step, category));
 }
 
 impl ElectrumReadiness {
@@ -2037,8 +1994,7 @@ async fn observer_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtime>) {
             break;
         }
         let started = Instant::now();
-        let mut failure: Option<(&'static str, &'static str)> = None;
-        let mut target_failures = Vec::new();
+        let mut failures = Vec::with_capacity(2);
         let mut observed = false;
         match workers.invoices.observation_targets().await {
             Ok(targets) if !targets.is_empty() => {
@@ -2051,13 +2007,8 @@ async fn observer_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtime>) {
                 )
                 .await
                 {
-                    target_failures.extend(targets.iter().filter_map(|target| {
-                        target.correlation().map(|correlation| {
-                            ("invoice_observation", error.diagnostic_label(), correlation)
-                        })
-                    }));
                     record_electrum_observation_failure(
-                        &mut failure,
+                        &mut failures,
                         "invoice_observation",
                         error.diagnostic_label(),
                     );
@@ -2066,7 +2017,7 @@ async fn observer_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtime>) {
             Ok(_) => {}
             Err(error) => {
                 record_electrum_observation_failure(
-                    &mut failure,
+                    &mut failures,
                     "invoice_targets_load",
                     error.diagnostic_label(),
                 );
@@ -2083,17 +2034,8 @@ async fn observer_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtime>) {
                 )
                 .await
                 {
-                    target_failures.extend(targets.iter().filter_map(|target| {
-                        target.correlation().map(|correlation| {
-                            (
-                                "marketplace_observation",
-                                error.diagnostic_label(),
-                                correlation,
-                            )
-                        })
-                    }));
                     record_electrum_observation_failure(
-                        &mut failure,
+                        &mut failures,
                         "marketplace_observation",
                         error.diagnostic_label(),
                     );
@@ -2102,33 +2044,22 @@ async fn observer_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtime>) {
             Ok(_) => {}
             Err(error) => {
                 record_electrum_observation_failure(
-                    &mut failure,
+                    &mut failures,
                     "marketplace_targets_load",
                     error.diagnostic_label(),
                 );
             }
         }
-        let tick = match (failure, observed) {
-            (Some(_), _) => ElectrumTick::Failed,
-            (None, true) => ElectrumTick::Succeeded,
-            (None, false) => ElectrumTick::Idle,
+        let tick = if !failures.is_empty() {
+            ElectrumTick::Failed
+        } else if observed {
+            ElectrumTick::Succeeded
+        } else {
+            ElectrumTick::Idle
         };
         let now = tokio::time::Instant::now();
         let available = readiness.record(tick, now);
-        for (step, category, correlation) in &target_failures {
-            log_electrum_target_failure(
-                step,
-                category,
-                correlation.creator_id,
-                correlation.entity_kind,
-                correlation.entity_id,
-                readiness.consecutive_failures,
-                !available,
-            );
-        }
-        if target_failures.is_empty()
-            && let Some((step, category)) = failure
-        {
+        for (step, category) in failures {
             log_electrum_observation_failure(
                 step,
                 category,
@@ -2615,6 +2546,29 @@ mod tests {
     }
 
     #[test]
+    fn invoice_target_load_failure_remains_warn_visible_when_marketplace_observer_is_unavailable() {
+        let capture = TimingCapture::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(EnvFilter::new("off,paykit_server=info"))
+            .with(capture.clone());
+
+        tracing::subscriber::with_default(subscriber, || {
+            let mut failures = Vec::new();
+            record_electrum_observation_failure(&mut failures, "invoice_targets_load", "storage");
+            record_electrum_observation_failure(
+                &mut failures,
+                "marketplace_observation",
+                "unavailable",
+            );
+            for (step, category) in failures {
+                log_electrum_observation_failure(step, category, 1, false);
+            }
+        });
+
+        assert_eq!(*capture.0.lock().unwrap(), vec![Level::WARN]);
+    }
+
+    #[test]
     fn mixed_observer_failure_keeps_non_allowlisted_warn_under_production_filter() {
         let capture = TimingCapture::default();
         let subscriber = tracing_subscriber::registry()
@@ -2622,22 +2576,65 @@ mod tests {
             .with(capture.clone());
 
         tracing::subscriber::with_default(subscriber, || {
-            let mut failure = None;
-            record_electrum_observation_failure(&mut failure, "invoice_observation", "unavailable");
+            let mut failures = Vec::new();
             record_electrum_observation_failure(
-                &mut failure,
+                &mut failures,
+                "invoice_observation",
+                "unavailable",
+            );
+            record_electrum_observation_failure(
+                &mut failures,
                 "marketplace_targets_load",
                 "storage",
             );
-            let (step, category) = failure.expect("mixed tick must retain a failure");
-            log_electrum_observation_failure(step, category, 1, false);
+            for (step, category) in failures {
+                log_electrum_observation_failure(step, category, 1, false);
+            }
         });
 
         assert_eq!(*capture.0.lock().unwrap(), vec![Level::WARN]);
     }
 
     #[test]
-    fn worker_boundary_events_expose_trusted_ids_under_production_filter() {
+    fn each_failed_observation_batch_emits_one_event() {
+        let fields = FieldCapture::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(EnvFilter::new("off,paykit_server=debug"))
+            .with(fields.clone());
+
+        tracing::subscriber::with_default(subscriber, || {
+            let mut failures = Vec::new();
+            record_electrum_observation_failure(
+                &mut failures,
+                "invoice_observation",
+                "unavailable",
+            );
+            record_electrum_observation_failure(
+                &mut failures,
+                "marketplace_observation",
+                "unavailable",
+            );
+            for (step, category) in failures {
+                log_electrum_observation_failure(step, category, 1, false);
+            }
+        });
+
+        let events = fields.0.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(
+            events
+                .iter()
+                .any(|event| event.contains("invoice_observation"))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.contains("marketplace_observation"))
+        );
+    }
+
+    #[test]
+    fn worker_boundary_events_only_expose_trusted_ids_when_attributable() {
         let creator = Uuid::new_v4();
         let invoice = Uuid::new_v4();
         let output = JsonWriter::default();
@@ -2652,23 +2649,24 @@ mod tests {
         tracing::subscriber::with_default(subscriber, || {
             log_transport_maintenance_failure(creator, "adapter_build", "storage");
             log_buyer_contact_outcome(creator, invoice, "deferred", "storage");
-            log_electrum_target_failure(
-                "invoice_observation",
-                "storage",
-                creator,
-                "invoice",
-                invoice,
-                1,
-                false,
-            );
+            log_electrum_observation_failure("invoice_observation", "storage", 1, false);
         });
 
-        let rendered = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
-        assert!(rendered.contains(&creator.to_string()));
-        assert!(rendered.contains(&invoice.to_string()));
-        assert!(rendered.contains("\"event\":\"paykit_shared_transport_pass\""));
-        assert!(rendered.contains("\"event\":\"paykit_buyer_contact_transition\""));
-        assert!(rendered.contains("\"event\":\"paykit_electrum_observation_failure\""));
+        let records = String::from_utf8(output.0.lock().unwrap().clone())
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(records[0]["fields"]["creator_id"], creator.to_string());
+        assert_eq!(records[1]["fields"]["creator_id"], creator.to_string());
+        assert_eq!(records[1]["fields"]["invoice_id"], invoice.to_string());
+        assert_eq!(
+            records[2]["fields"]["event"],
+            "paykit_electrum_observation_failure"
+        );
+        assert!(records[2]["fields"].get("creator_id").is_none());
+        assert!(records[2]["fields"].get("entity_kind").is_none());
+        assert!(records[2]["fields"].get("entity_id").is_none());
     }
 
     #[tokio::test]

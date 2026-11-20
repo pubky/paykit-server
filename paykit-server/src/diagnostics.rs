@@ -73,22 +73,24 @@ pub(crate) fn failure(_operation: &'static str, stage: &'static str, category: &
             stage,
             category,
             request_id = %context.request_id.hyphenated(),
+            request_instance_id = %context.request_instance_id.hyphenated(),
             "Paykit request failed"
         );
     });
 }
 
-/// Emits validated server-owned IDs only after the atomic invoice commit returns.
+/// Emits validated server-owned IDs after a successful atomic commit or exact replay lookup.
 /// Request IDs remain transport correlation; these IDs identify durable domain work.
 pub(crate) fn invoice_persisted(invoice_id: Uuid, outbox_job_id: Uuid, replayed: bool) {
     let _ = REQUEST_CONTEXT.try_with(|context| {
         tracing::info!(
             event = "paykit_invoice_persisted",
             operation = context.operation,
-            stage = "db_commit",
+            stage = if replayed { "exact_replay" } else { "db_commit" },
             outcome = if replayed { "replayed" } else { "created" },
             truth = "persisted",
             request_id = %context.request_id.hyphenated(),
+            request_instance_id = %context.request_instance_id.hyphenated(),
             invoice_id = %invoice_id.hyphenated(),
             outbox_job_id = %outbox_job_id.hyphenated(),
             "Paykit invoice persisted"

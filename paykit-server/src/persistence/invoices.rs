@@ -540,7 +540,7 @@ impl InvoiceStore {
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
         let rows = sqlx::query_as::<_, ObservationTargetRow>(
-            "SELECT invoices.id AS invoice_id, creators.id AS creator_id, creators.creator_lookup_hash, \
+            "SELECT invoices.id AS invoice_id, creators.creator_lookup_hash, \
                     invoices.payment_record_envelope, invoices.bitcoin_address_lookup_hash, \
                     invoices.derivation_index_lookup_hash, observations.id AS observation_id, \
                     observations.observation_envelope, observations.outpoint_lookup_hash, observations.confirmations, observations.present \
@@ -645,12 +645,9 @@ impl InvoiceStore {
                 {
                     return Ok(None);
                 }
-                Ok(Some(ObservationTarget::with_correlation(
+                Ok(Some(ObservationTarget::new(
                     destination.address.clone(),
                     current,
-                    row.creator_id,
-                    "invoice",
-                    row.invoice_id,
                 )))
             })
             .collect::<Result<Vec<_>, _>>()
@@ -1988,7 +1985,6 @@ struct BitcoinObservationRow {
 #[derive(sqlx::FromRow)]
 struct ObservationTargetRow {
     invoice_id: Uuid,
-    creator_id: Uuid,
     creator_lookup_hash: Vec<u8>,
     payment_record_envelope: Vec<u8>,
     bitcoin_address_lookup_hash: Vec<u8>,

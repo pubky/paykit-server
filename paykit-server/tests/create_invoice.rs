@@ -310,7 +310,7 @@ impl InvoicePersistence for FakeStore {
             0,
             time::OffsetDateTime::UNIX_EPOCH,
             time::OffsetDateTime::UNIX_EPOCH + time::Duration::hours(24),
-            true,
+            false,
         ))
     }
 }
@@ -1299,12 +1299,92 @@ async fn setup_pending_emits_one_redacted_source_diagnostic_with_request_id() {
         Some("reader_setup_pending")
     );
     assert_eq!(event_field(&events[0], "request_id"), Some(request_id));
+    assert!(uuid::Uuid::parse_str(event_field(&events[0], "request_instance_id").unwrap()).is_ok());
     assert!(events[0].iter().all(|(name, _)| {
         matches!(
             name.as_str(),
-            "message" | "event" | "operation" | "stage" | "category" | "request_id"
+            "message"
+                | "event"
+                | "operation"
+                | "stage"
+                | "category"
+                | "request_id"
+                | "request_instance_id"
         )
     }));
+}
+
+#[tokio::test]
+async fn create_and_exact_replay_emit_persisted_ids_for_distinct_request_instances() {
+    const NIL_UUID: &str = "00000000-0000-0000-0000-000000000000";
+    let request_id = "d9428888-122b-4b85-bc8f-2c2e0bf7c874";
+    let key = SigningKey::from_bytes(&[19; 32]);
+    let store = Arc::new(FakeStore::with_preflight(InvoicePreflight::New));
+    let service = registry_service(
+        Arc::new(SequencedRegistries {
+            results: Mutex::new(VecDeque::from([Ok(Some(capable_registry()))])),
+            calls: AtomicUsize::default(),
+        }),
+        Arc::new(ImmediateRetryDelay::default()),
+        Arc::new(CountingCredentials {
+            calls: AtomicUsize::default(),
+        }),
+        store.clone(),
+    );
+    let router = operational_router(
+        invoices_router(Arc::new(service)).layer(Extension(signed_auth(&key))),
+        Arc::new(Runtime::new(Arc::new(ReadyDependency), 1)),
+    );
+    let body = serde_json_canonicalizer::to_vec(&serde_json::json!({
+        "bundle_id": BUNDLE,
+        "lock_resource": LOCK_RESOURCE,
+        "reader": reader()
+    }))
+    .unwrap();
+    let capture = EventCapture::default();
+
+    for expected_replay in [false, true] {
+        *store.preflight.lock().unwrap() = if expected_replay {
+            InvoicePreflight::ExactReplay
+        } else {
+            InvoicePreflight::New
+        };
+        let mut request = signed_invoice_request(&key, body.clone());
+        request
+            .headers_mut()
+            .insert("x-request-id", request_id.parse().unwrap());
+        let response = router
+            .clone()
+            .oneshot(request)
+            .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    let events = capture
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| event_field(event, "event") == Some("paykit_invoice_persisted"))
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(events.len(), 2);
+    assert_eq!(event_field(&events[0], "outcome"), Some("created"));
+    assert_eq!(event_field(&events[0], "stage"), Some("db_commit"));
+    assert_eq!(event_field(&events[1], "outcome"), Some("replayed"));
+    assert_eq!(event_field(&events[1], "stage"), Some("exact_replay"));
+    for event in &events {
+        assert_eq!(event_field(event, "request_id"), Some(request_id));
+        assert_eq!(event_field(event, "invoice_id"), Some(NIL_UUID));
+        assert_eq!(event_field(event, "outbox_job_id"), Some(NIL_UUID));
+        assert!(uuid::Uuid::parse_str(event_field(event, "request_instance_id").unwrap()).is_ok());
+    }
+    assert_ne!(
+        event_field(&events[0], "request_instance_id"),
+        event_field(&events[1], "request_instance_id")
+    );
 }
 
 #[tokio::test]

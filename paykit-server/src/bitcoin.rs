@@ -2,33 +2,14 @@
 
 use std::fmt;
 
-use bitcoin::OutPoint;
-use uuid::Uuid;
-
 use crate::config::BitcoinNetwork;
+use bitcoin::OutPoint;
 
 /// One invoice address whose direct outputs should be observed.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ObservationTarget {
     address: String,
     current: Option<TrackedOutput>,
-    correlation: Option<ObservationCorrelation>,
-}
-
-// Correlation enriches diagnostics but is not part of the observer input's logical value.
-impl PartialEq for ObservationTarget {
-    fn eq(&self, other: &Self) -> bool {
-        self.address == other.address && self.current == other.current
-    }
-}
-
-impl Eq for ObservationTarget {}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ObservationCorrelation {
-    pub creator_id: Uuid,
-    pub entity_kind: &'static str,
-    pub entity_id: Uuid,
 }
 
 impl ObservationTarget {
@@ -36,25 +17,6 @@ impl ObservationTarget {
         Self {
             address: address.into(),
             current,
-            correlation: None,
-        }
-    }
-
-    pub(crate) fn with_correlation(
-        address: impl Into<String>,
-        current: Option<TrackedOutput>,
-        creator_id: Uuid,
-        entity_kind: &'static str,
-        entity_id: Uuid,
-    ) -> Self {
-        Self {
-            address: address.into(),
-            current,
-            correlation: Some(ObservationCorrelation {
-                creator_id,
-                entity_kind,
-                entity_id,
-            }),
         }
     }
 
@@ -65,10 +27,6 @@ impl ObservationTarget {
     pub fn current(&self) -> Option<&TrackedOutput> {
         self.current.as_ref()
     }
-
-    pub(crate) fn correlation(&self) -> Option<ObservationCorrelation> {
-        self.correlation
-    }
 }
 
 impl fmt::Debug for ObservationTarget {
@@ -77,7 +35,6 @@ impl fmt::Debug for ObservationTarget {
             .debug_struct("ObservationTarget")
             .field("address", &"<redacted>")
             .field("has_current", &self.current.is_some())
-            .field("has_correlation", &self.correlation.is_some())
             .finish()
     }
 }
@@ -242,57 +199,4 @@ pub enum ObservationAction {
     Update,
     Replace,
     Ignore,
-}
-
-#[cfg(test)]
-mod tests {
-    use bitcoin::{OutPoint, Txid, hashes::Hash};
-
-    use super::{ObservationTarget, TrackedOutput};
-    use uuid::Uuid;
-
-    fn tracked(vout: u32, sats: u64) -> TrackedOutput {
-        TrackedOutput::new(
-            OutPoint {
-                txid: Txid::all_zeros(),
-                vout,
-            },
-            sats,
-        )
-    }
-
-    #[test]
-    fn observation_target_equality_ignores_operational_correlation() {
-        let logical = ObservationTarget::new("address", Some(tracked(1, 42)));
-        let correlated = ObservationTarget::with_correlation(
-            "address",
-            Some(tracked(1, 42)),
-            Uuid::from_u128(1),
-            "invoice",
-            Uuid::from_u128(2),
-        );
-        let differently_correlated = ObservationTarget::with_correlation(
-            "address",
-            Some(tracked(1, 42)),
-            Uuid::from_u128(3),
-            "marketplace_preparation",
-            Uuid::from_u128(4),
-        );
-
-        assert_eq!(logical, correlated);
-        assert_eq!(correlated, differently_correlated);
-        assert_ne!(
-            logical,
-            ObservationTarget::new("other", Some(tracked(1, 42)))
-        );
-        assert_ne!(logical, ObservationTarget::new("address", None));
-        assert_ne!(
-            logical,
-            ObservationTarget::new("address", Some(tracked(2, 42)))
-        );
-        assert_ne!(
-            logical,
-            ObservationTarget::new("address", Some(tracked(1, 43)))
-        );
-    }
 }

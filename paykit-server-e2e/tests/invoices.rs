@@ -1,4 +1,7 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use axum::{
@@ -49,16 +52,56 @@ use paykit_server::{
         PaymentRequestLifecycleStore, PersistenceError, ProviderV2AtomicInvoiceInput,
         run_migrations,
     },
+    runtime::{DependencyCheck, Runtime, operational_router},
 };
 use paykit_server_e2e::postgres::TestDatabase;
 use sqlx::Row;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tower::ServiceExt;
+use tracing::{Event, Subscriber, instrument::WithSubscriber};
+use tracing_subscriber::{Layer, layer::Context, prelude::*};
 
 const CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
 const PROVIDER_V2_BUNDLE: &str = "000G40R40M30E209185GR38E1W";
 const LOCK_RESOURCE: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/app.locks/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json";
 mod common;
+
+type CapturedEvents = Vec<Vec<(String, String)>>;
+
+#[derive(Clone, Default)]
+struct EventCapture(Arc<Mutex<CapturedEvents>>);
+
+impl<S: Subscriber> Layer<S> for EventCapture {
+    fn on_event(&self, event: &Event<'_>, _context: Context<'_, S>) {
+        let mut fields = Vec::new();
+        event.record(&mut FieldVisitor(&mut fields));
+        self.0.lock().unwrap().push(fields);
+    }
+}
+
+struct FieldVisitor<'a>(&'a mut Vec<(String, String)>);
+
+impl tracing::field::Visit for FieldVisitor<'_> {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn core::fmt::Debug) {
+        self.0.push((field.name().to_owned(), format!("{value:?}")));
+    }
+}
+
+fn event_field<'a>(event: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    event
+        .iter()
+        .find(|(field, _)| field == name)
+        .map(|(_, value)| value.trim_matches('"'))
+}
+
+struct ReadyDependency;
+
+#[async_trait]
+impl DependencyCheck for ReadyDependency {
+    async fn postgres_ready(&self) -> bool {
+        true
+    }
+}
 
 struct TestPayloads;
 impl InvoicePayloadFactory for TestPayloads {
@@ -672,7 +715,7 @@ async fn signed_provider_v2_usdt_create_replay_and_status_use_production_terms()
         adapters.clone(),
         adapters,
         Arc::new(creators),
-        store,
+        store.clone(),
         PaykitAppId::new("paykit-server").unwrap(),
         BitcoinNetwork::Regtest,
         Duration::from_secs(60),
@@ -680,8 +723,10 @@ async fn signed_provider_v2_usdt_create_replay_and_status_use_production_terms()
     .with_usdt(true)
     .with_exchange_rates(Arc::new(FixedRates));
     let key = SigningKey::from_bytes(&[32; 32]);
-    let router =
-        provider_v2_router(Arc::new(service)).layer(Extension(provider_v2_signed_auth(&key)));
+    let router = operational_router(
+        provider_v2_router(Arc::new(service)).layer(Extension(provider_v2_signed_auth(&key))),
+        Arc::new(Runtime::new(Arc::new(ReadyDependency), 1)),
+    );
     let deadline: OffsetDateTime = sqlx::query_scalar(
         "SELECT date_trunc('milliseconds', clock_timestamp() + INTERVAL '30 minutes')",
     )
@@ -703,31 +748,72 @@ async fn signed_provider_v2_usdt_create_replay_and_status_use_production_terms()
     }))
     .unwrap();
 
+    let request_id = "d9428888-122b-4b85-bc8f-2c2e0bf7c874";
+    let capture = EventCapture::default();
+    let mut created_request = signed_provider_v2_request(&key, "/v2/invoices", &create_body);
+    created_request
+        .headers_mut()
+        .insert("x-request-id", request_id.parse().unwrap());
     let created = exact_response_body(
         router
             .clone()
-            .oneshot(signed_provider_v2_request(
-                &key,
-                "/v2/invoices",
-                &create_body,
-            ))
+            .oneshot(created_request)
+            .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
             .await
             .unwrap(),
     )
     .await;
+    let mut replay_request = signed_provider_v2_request(&key, "/v2/invoices", &create_body);
+    replay_request
+        .headers_mut()
+        .insert("x-request-id", request_id.parse().unwrap());
     let replay = exact_response_body(
         router
             .clone()
-            .oneshot(signed_provider_v2_request(
-                &key,
-                "/v2/invoices",
-                &create_body,
-            ))
+            .oneshot(replay_request)
+            .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
             .await
             .unwrap(),
     )
     .await;
     assert_eq!(replay, created);
+
+    let invoice_id: uuid::Uuid = sqlx::query_scalar("SELECT id FROM invoices")
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+    let outbox_job_id: uuid::Uuid = sqlx::query_scalar("SELECT id FROM outbox")
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+    let invoice_id = invoice_id.to_string();
+    let outbox_job_id = outbox_job_id.to_string();
+    let events = capture
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| event_field(event, "event") == Some("paykit_invoice_persisted"))
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(events.len(), 2);
+    assert_eq!(event_field(&events[0], "outcome"), Some("created"));
+    assert_eq!(event_field(&events[0], "stage"), Some("db_commit"));
+    assert_eq!(event_field(&events[1], "outcome"), Some("replayed"));
+    assert_eq!(event_field(&events[1], "stage"), Some("exact_replay"));
+    for event in &events {
+        assert_eq!(event_field(event, "request_id"), Some(request_id));
+        assert_eq!(event_field(event, "invoice_id"), Some(invoice_id.as_str()));
+        assert_eq!(
+            event_field(event, "outbox_job_id"),
+            Some(outbox_job_id.as_str())
+        );
+        assert!(uuid::Uuid::parse_str(event_field(event, "request_instance_id").unwrap()).is_ok());
+    }
+    assert_ne!(
+        event_field(&events[0], "request_instance_id"),
+        event_field(&events[1], "request_instance_id")
+    );
 
     let mut changed: serde_json::Value = serde_json::from_slice(&create_body).unwrap();
     changed["payment"]["amount"] = serde_json::Value::String("5000002".into());

@@ -331,8 +331,9 @@ async fn proposal_expiry_boundary_is_inclusive_in_database_time() {
     database.cleanup().await;
 }
 
-struct LinkPendingAdapter {
+struct FailingAdapter {
     calls: AtomicUsize,
+    failure: paykit_server::workers::outbox::HandoffFailure,
 }
 
 struct CancellationRetryAdapter {
@@ -505,7 +506,7 @@ async fn expiry_during_link_work_prevents_the_proposal_effect() {
 }
 
 #[async_trait]
-impl Adapter for LinkPendingAdapter {
+impl Adapter for FailingAdapter {
     async fn execute_claimed_handoff(
         &self,
         _store: &OutboxStore,
@@ -513,9 +514,7 @@ impl Adapter for LinkPendingAdapter {
         _intent: &paykit_server::application::semantic_intent::DeliveryIntentV1,
     ) -> Result<HandoffResult, paykit_server::workers::outbox::HandoffFailure> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        Err(paykit_server::workers::outbox::HandoffFailure::Retryable(
-            OutboxRetryClass::LinkPending,
-        ))
+        Err(self.failure)
     }
 
     async fn fetch_registry(
@@ -581,8 +580,11 @@ async fn retry_transition_persists_and_emits_production_json_with_durable_ids() 
         .with_span_list(false)
         .with_writer(output.clone())
         .finish();
-    let adapter = LinkPendingAdapter {
+    let adapter = FailingAdapter {
         calls: AtomicUsize::new(0),
+        failure: paykit_server::workers::outbox::HandoffFailure::Retryable(
+            OutboxRetryClass::LinkPending,
+        ),
     };
 
     let transitioned =
@@ -631,6 +633,59 @@ async fn retry_transition_persists_and_emits_production_json_with_durable_ids() 
 }
 
 #[tokio::test]
+async fn cancellation_obsolete_transition_logs_the_committed_failure_state() {
+    let database = TestDatabase::create().await;
+    let outbox = queued_invoice(&database).await;
+    let claim = outbox
+        .claim(Uuid::new_v4(), 1, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .remove(0);
+    let output = JsonWriter::default();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_env_filter(EnvFilter::new("off,paykit_server=info"))
+        .with_current_span(false)
+        .with_span_list(false)
+        .with_writer(output.clone())
+        .finish();
+    let adapter = FailingAdapter {
+        calls: AtomicUsize::new(0),
+        failure: paykit_server::workers::outbox::HandoffFailure::CancellationObsolete,
+    };
+
+    assert!(
+        async { process_claim(&outbox, &adapter, &claim, Duration::ZERO).await }
+            .with_subscriber(subscriber)
+            .await
+            .unwrap()
+    );
+
+    let state: (String, Option<String>) =
+        sqlx::query_as("SELECT status, error_class FROM outbox WHERE id = $1")
+            .bind(claim.id())
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        state,
+        (
+            "permanently_failed".into(),
+            Some("cancellation_obsolete".into())
+        )
+    );
+    let records = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
+    let transition = records
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|record| record["fields"]["event"] == "paykit_outbox_transition")
+        .unwrap();
+    assert_eq!(transition["fields"]["new_state"], "permanently_failed");
+    assert_eq!(transition["fields"]["outcome"], "cancellation_obsolete");
+    database.cleanup().await;
+}
+
+#[tokio::test]
 async fn corrupt_claim_emits_durable_ids_without_inventing_payment_ids_or_false_success() {
     let database = TestDatabase::create().await;
     let outbox = queued_invoice(&database).await;
@@ -656,8 +711,11 @@ async fn corrupt_claim_emits_durable_ids_without_inventing_payment_ids_or_false_
         .with_span_list(false)
         .with_writer(output.clone())
         .finish();
-    let adapter = LinkPendingAdapter {
+    let adapter = FailingAdapter {
         calls: AtomicUsize::new(0),
+        failure: paykit_server::workers::outbox::HandoffFailure::Retryable(
+            OutboxRetryClass::LinkPending,
+        ),
     };
 
     async {
@@ -699,8 +757,11 @@ async fn corrupt_claim_emits_durable_ids_without_inventing_payment_ids_or_false_
 async fn repeated_link_pending_stops_at_authoritative_proposal_expiry() {
     let database = TestDatabase::create().await;
     let outbox = queued_invoice_with_proposal_window(&database, 2).await;
-    let adapter = LinkPendingAdapter {
+    let adapter = FailingAdapter {
         calls: AtomicUsize::new(0),
+        failure: paykit_server::workers::outbox::HandoffFailure::Retryable(
+            OutboxRetryClass::LinkPending,
+        ),
     };
     for expected_calls in 1..=2 {
         let claim = outbox

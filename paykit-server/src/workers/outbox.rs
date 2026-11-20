@@ -651,7 +651,7 @@ where
                     claim,
                     &payment_request_id,
                     payment_reference.as_deref(),
-                    "delivered",
+                    "permanently_failed",
                     "cancellation_obsolete",
                     None,
                     None,

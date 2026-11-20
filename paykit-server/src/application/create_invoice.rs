@@ -656,7 +656,7 @@ impl CreateInvoiceService {
         match preflight {
             InvoicePreflight::ExactReplay => {
                 let replay_remaining = remaining_at(started, self.clock.now(), "exact_replay")?;
-                return timed_stage("exact_replay", async {
+                let result = timed_stage("exact_replay", async {
                     tokio::time::timeout(
                         replay_remaining,
                         self.store.exact_replay(
@@ -670,7 +670,13 @@ impl CreateInvoiceService {
                     .map_err(|_| deadline("exact_replay"))?
                     .map_err(|error| store_failure("exact_replay", error))
                 })
-                .await;
+                .await?;
+                crate::diagnostics::invoice_persisted(
+                    result.invoice_id(),
+                    result.payment_request_outbox_id(),
+                    result.replayed(),
+                );
+                return Ok(result);
             }
             InvoicePreflight::Conflict => {
                 diagnose("invoice_preflight", CreateInvoiceError::Conflict);
