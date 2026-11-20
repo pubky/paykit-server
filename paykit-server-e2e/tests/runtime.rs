@@ -210,6 +210,10 @@ impl CapturedLogs {
     fn contains_since(&self, offset: usize, needle: &str) -> bool {
         String::from_utf8_lossy(&self.0.lock().unwrap()[offset..]).contains(needle)
     }
+
+    fn rendered_since(&self, offset: usize) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()[offset..]).into_owned()
+    }
 }
 
 struct Payloads(ReaderPubky);
@@ -227,10 +231,12 @@ impl InvoicePayloadFactory for Payloads {
 
 /// Seeds an unrestorable-session Creator with one invoice (an Electrum
 /// observation target) whose outbox work is already terminal.
-async fn seed_unrestorable_creator_with_terminal_invoice(database: &TestDatabase) {
+async fn seed_unrestorable_creator_with_terminal_invoice(
+    database: &TestDatabase,
+) -> (uuid::Uuid, uuid::Uuid) {
     let crypto = Arc::new(Crypto::from_master_key(&[1; 32]).unwrap());
     let creator = parse_creator(TRUSTED_KEY).unwrap();
-    CreatorStore::new(database.pool(), crypto.clone())
+    let persisted_creator = CreatorStore::new(database.pool(), crypto.clone())
         .create(&CreatorCredentials::new(
             creator.clone(),
             "invalid-session".into(),
@@ -266,6 +272,7 @@ async fn seed_unrestorable_creator_with_terminal_invoice(database: &TestDatabase
     .execute(database.pool())
     .await
     .unwrap();
+    (persisted_creator.id(), invoice.invoice_id())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -302,7 +309,7 @@ async fn idle_observer_ticks_do_not_grant_the_first_electrum_failure_grace() {
     assert_eq!(runtime.readiness().await.electrum, ComponentState::Ready);
 
     let logged_from = logs.len();
-    seed_unrestorable_creator_with_terminal_invoice(&database).await;
+    let (creator_id, invoice_id) = seed_unrestorable_creator_with_terminal_invoice(&database).await;
     // The first real observation fails; well inside the 30 s grace, so only the
     // absence of any prior success can make it degrade.
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -312,7 +319,23 @@ async fn idle_observer_ticks_do_not_grant_the_first_electrum_failure_grace() {
     })
     .await
     .expect("a first failed observation after idle ticks must degrade immediately");
-    assert!(logs.contains_since(logged_from, "Electrum observation tick failed"));
+    let rendered_logs = logs.rendered_since(logged_from);
+    let failure_event = rendered_logs
+        .lines()
+        .find(|line| line.contains("event=\"paykit_electrum_observation_failure\""))
+        .expect("failed target must emit its structured observation event");
+    assert!(failure_event.contains("Electrum observation target failed"));
+    assert!(failure_event.contains(&format!("creator_id={creator_id}")));
+    assert!(failure_event.contains("entity_kind=\"invoice\""));
+    assert!(failure_event.contains(&format!("entity_id={invoice_id}")));
+    assert!(failure_event.contains("stage=\"electrum_observation\""));
+    assert!(failure_event.contains("step=\"invoice_observation\""));
+    assert!(failure_event.contains("category=\"unavailable\""));
+    assert!(failure_event.contains("consecutive_failures=1"));
+    assert!(failure_event.contains("degraded=true"));
+    assert!(failure_event.contains("outcome=\"deferred\""));
+    assert!(!failure_event.contains("unreachable-creator-address"));
+    assert!(!failure_event.contains("invalid-session"));
     let metrics = runtime.metrics().encode().unwrap();
     assert!(metrics.contains("paykit_electrum_success_observed 0"));
     assert!(!metrics.contains("paykit_electrum_last_success_age_seconds"));
