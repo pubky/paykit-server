@@ -107,6 +107,25 @@ fn emit_corrupt_outbox_transition(claim: &ClaimedOutbox) {
     );
 }
 
+fn emit_corrupt_reconciliation_transition(
+    claim: &ClaimedHandoff,
+    outbound_message_id: Option<u64>,
+) {
+    tracing::warn!(
+        event = "paykit_outbox_transition",
+        truth = "persisted",
+        creator_id = %claim.creator_id().hyphenated(),
+        outbox_job_id = %claim.id().hyphenated(),
+        outbound_message_id,
+        attempt = claim.attempt_count(),
+        previous_state = "handed_off",
+        new_state = "permanently_failed",
+        outcome = "corrupt_intent",
+        category = "corrupt_or_missing",
+        "Paykit outbox reconciliation transitioned"
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_outbox_transition(
     claim: &ClaimedOutbox,
@@ -159,7 +178,7 @@ pub(crate) fn emit_outbox_transition(
 
 pub(crate) fn emit_reconciliation_transition(
     claim: &ClaimedHandoff,
-    outbound_message_id: u64,
+    outbound_message_id: Option<u64>,
     new_state: &'static str,
     outcome: &'static str,
     retry: Option<(RetryableHandoffStage, Duration)>,
@@ -704,7 +723,15 @@ pub async fn process_reconciliation_with_health(
             return store
                 .mark_reconciliation_permanently_failed(claim)
                 .await
-                .map(|transitioned| (transitioned, ProcessingHealth::PermanentFailure));
+                .map(|transitioned| {
+                    if transitioned {
+                        emit_corrupt_reconciliation_transition(
+                            claim,
+                            claim.sdk_outbound_message_id().ok(),
+                        );
+                    }
+                    (transitioned, ProcessingHealth::PermanentFailure)
+                });
         }
     };
 
@@ -714,7 +741,12 @@ pub async fn process_reconciliation_with_health(
             return store
                 .mark_reconciliation_permanently_failed(claim)
                 .await
-                .map(|transitioned| (transitioned, ProcessingHealth::PermanentFailure));
+                .map(|transitioned| {
+                    if transitioned {
+                        emit_corrupt_reconciliation_transition(claim, None);
+                    }
+                    (transitioned, ProcessingHealth::PermanentFailure)
+                });
         }
     };
     match adapter.outbound_status(outbound_message_id).await {
@@ -723,7 +755,7 @@ pub async fn process_reconciliation_with_health(
             if transitioned {
                 emit_reconciliation_transition(
                     claim,
-                    outbound_message_id,
+                    Some(outbound_message_id),
                     "delivered",
                     "acknowledged",
                     None,
@@ -741,7 +773,7 @@ pub async fn process_reconciliation_with_health(
             if transitioned {
                 emit_reconciliation_transition(
                     claim,
-                    outbound_message_id,
+                    Some(outbound_message_id),
                     "permanently_failed",
                     "permanent_failure",
                     None,
@@ -774,7 +806,7 @@ pub async fn process_reconciliation_with_health(
             if transitioned {
                 emit_reconciliation_transition(
                     claim,
-                    outbound_message_id,
+                    Some(outbound_message_id),
                     "permanently_failed",
                     "permanent_failure",
                     None,
@@ -836,7 +868,7 @@ async fn retry_reconciliation_after_failure(
     if transitioned {
         emit_reconciliation_transition(
             claim,
-            claim.sdk_outbound_message_id()?,
+            Some(claim.sdk_outbound_message_id()?),
             "handed_off",
             "deferred",
             Some((stage, retry_delay)),
@@ -912,7 +944,13 @@ mod tests {
                 )),
                 None,
             );
-            emit_reconciliation_transition(&handed_off, 91, "delivered", "acknowledged", None);
+            emit_reconciliation_transition(
+                &handed_off,
+                Some(91),
+                "delivered",
+                "acknowledged",
+                None,
+            );
         });
 
         let records = String::from_utf8(output.0.lock().unwrap().clone())

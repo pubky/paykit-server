@@ -1366,6 +1366,18 @@ fn processing_timing_outcome(
     }
 }
 
+fn record_outbox_reconciliation_timing(
+    result: &Result<(bool, ProcessingHealth), PersistenceError>,
+    started: Instant,
+) {
+    crate::diagnostics::timing(
+        "worker",
+        "outbox_reconciliation",
+        processing_timing_outcome(result),
+        started,
+    );
+}
+
 async fn outbox_enqueue_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtime>) {
     let owner = Uuid::new_v4();
     let limit = usize::try_from(workers.outbox_batch_size).expect("validated outbox batch size");
@@ -1627,49 +1639,40 @@ async fn outbox_reconciliation_loop(workers: Arc<WorkerComponents>, runtime: Arc
                         process_reconciliation_with_health(&workers.outbox, &adapter, &claim, delay)
                             .await
                     }
-                    Err(AdapterBuildError::Permanent) => {
-                        let transitioned = workers
-                            .outbox
-                            .mark_reconciliation_permanently_failed(&claim)
-                            .await?;
-                        if transitioned {
-                            emit_reconciliation_transition(
-                                &claim,
-                                claim.sdk_outbound_message_id()?,
-                                "permanently_failed",
-                                "adapter_permanent",
-                                None,
-                            );
-                        }
-                        Ok((transitioned, ProcessingHealth::PermanentFailure))
-                    }
-                    Err(AdapterBuildError::Unavailable) => {
-                        let transitioned = workers
-                            .outbox
-                            .retry_reconciliation(
-                                &claim,
-                                delay,
-                                OutboxRetryClass::AdapterUnavailable,
-                            )
-                            .await?;
-                        if transitioned {
-                            emit_reconciliation_transition(
-                                &claim,
-                                claim.sdk_outbound_message_id()?,
-                                "handed_off",
-                                "deferred",
-                                Some((OutboxRetryClass::AdapterUnavailable, delay)),
-                            );
-                        }
-                        Ok((transitioned, ProcessingHealth::Retryable(delay)))
-                    }
+                    Err(AdapterBuildError::Permanent) => workers
+                        .outbox
+                        .mark_reconciliation_permanently_failed(&claim)
+                        .await
+                        .map(|transitioned| {
+                            if transitioned {
+                                emit_reconciliation_transition(
+                                    &claim,
+                                    claim.sdk_outbound_message_id().ok(),
+                                    "permanently_failed",
+                                    "adapter_permanent",
+                                    None,
+                                );
+                            }
+                            (transitioned, ProcessingHealth::PermanentFailure)
+                        }),
+                    Err(AdapterBuildError::Unavailable) => workers
+                        .outbox
+                        .retry_reconciliation(&claim, delay, OutboxRetryClass::AdapterUnavailable)
+                        .await
+                        .map(|transitioned| {
+                            if transitioned {
+                                emit_reconciliation_transition(
+                                    &claim,
+                                    claim.sdk_outbound_message_id().ok(),
+                                    "handed_off",
+                                    "deferred",
+                                    Some((OutboxRetryClass::AdapterUnavailable, delay)),
+                                );
+                            }
+                            (transitioned, ProcessingHealth::Retryable(delay))
+                        }),
                 };
-                crate::diagnostics::timing(
-                    "worker",
-                    "outbox_reconciliation",
-                    processing_timing_outcome(&result),
-                    started,
-                );
+                record_outbox_reconciliation_timing(&result, started);
                 result
             });
         }
@@ -2163,11 +2166,13 @@ impl IdentityStateReads {
             Err(error) => {
                 let category = sdk_error_label(&error);
                 let mapped = map_session_validation_error(error);
-                crate::diagnostics::failure(
-                    "creator_session_validation",
-                    "identity_state_load",
-                    category,
-                );
+                if mapped == SessionValidationError::Unavailable {
+                    crate::diagnostics::failure(
+                        "creator_session_validation",
+                        "identity_state_load",
+                        category,
+                    );
+                }
                 Err(mapped)
             }
         }
@@ -2425,7 +2430,7 @@ fn reader_authorization<T>(
 mod tests {
     use super::*;
     use std::{io::Write, sync::Mutex};
-    use tracing::{Event, Level, Subscriber};
+    use tracing::{Event, Level, Subscriber, instrument::WithSubscriber};
     use tracing_subscriber::{EnvFilter, Layer, fmt::MakeWriter, layer::Context, prelude::*};
 
     #[derive(Clone, Default)]
@@ -2967,6 +2972,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn reconciliation_persistence_errors_still_emit_failed_task_timing() {
+        let capture = TimingCapture::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(EnvFilter::new("off,paykit_server=info"))
+            .with(capture.clone());
+        let result = Err(PersistenceError::Unavailable);
+
+        tracing::subscriber::with_default(subscriber, || {
+            record_outbox_reconciliation_timing(&result, Instant::now());
+        });
+
+        assert_eq!(*capture.0.lock().unwrap(), vec![Level::WARN]);
+    }
+
     fn busy() -> Result<bool, PaykitSdkError> {
         Err(PaykitSdkError::SharedStateBusy {
             context: "Pubky shared state remains locked; retry later".into(),
@@ -3086,6 +3106,51 @@ mod tests {
             map_session_validation_error(error),
             SessionValidationError::Invalid
         );
+    }
+
+    #[tokio::test]
+    async fn definitive_invalid_identity_state_errors_do_not_warn_during_status_polling() {
+        let reads = IdentityStateReads::default();
+        let creator = crate::domain::locks::parse_creator(CONFIG_KEY).unwrap();
+        let capture = TimingCapture::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(EnvFilter::new("off,paykit_server=info"))
+            .with(capture.clone());
+
+        async {
+            let (invalid, _) =
+                crate::diagnostics::scope(Uuid::new_v4(), Uuid::new_v4(), "setup_status", async {
+                    reads.outcome(
+                        &creator,
+                        Err(PaykitSdkError::Protocol {
+                            context: "definitive invalid identity state".into(),
+                            source: None,
+                        }),
+                        tokio::time::Instant::now(),
+                    )
+                })
+                .await;
+            assert_eq!(invalid, Err(SessionValidationError::Invalid));
+            assert!(capture.0.lock().unwrap().is_empty());
+
+            let (unavailable, _) =
+                crate::diagnostics::scope(Uuid::new_v4(), Uuid::new_v4(), "setup_status", async {
+                    reads.outcome(
+                        &creator,
+                        Err(PaykitSdkError::Transport {
+                            context: "identity state unavailable".into(),
+                            source: None,
+                        }),
+                        tokio::time::Instant::now(),
+                    )
+                })
+                .await;
+            assert_eq!(unavailable, Err(SessionValidationError::Unavailable));
+        }
+        .with_subscriber(subscriber)
+        .await;
+
+        assert_eq!(*capture.0.lock().unwrap(), vec![Level::WARN]);
     }
 
     #[tokio::test]

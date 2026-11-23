@@ -48,7 +48,7 @@ Covered routes:
 none -> pending -> completing -> completed
 ```
 
-One-shot failure ends `completing -> failed`; a successful event is emitted only after completer reports durable success. Spawned completion explicitly keeps logging subscriber context while correlation uses `setup_trace_id`, never bearer `flow_id`. Poll HTTP requests each receive their own HTTP IDs and link to flow only through setup lifecycle trace.
+One-shot failure ends `completing -> failed`; a successful event is emitted only after completer reports durable success. Expiry emits a timeout transition only for active `pending` or `completing` flows; cleanup still removes completed/failed flows and retains their bounded tombstones without relabeling their successful or definitive terminal result as a timeout. Spawned completion explicitly keeps logging subscriber context while correlation uses `setup_trace_id`, never bearer `flow_id`. Poll HTTP requests each receive their own HTTP IDs and link to flow only through setup lifecycle trace.
 
 ## Domain and worker milestones
 
@@ -60,7 +60,7 @@ One-shot failure ends `completing -> failed`; a successful event is emitted only
 
 Other composed worker boundaries retain only IDs already authenticated by persistence. `paykit_shared_transport_pass` carries `creator_id` for targeted success and every failure; routine full-scan success stays quiet and shared-state deferral stays DEBUG. Allowance intake, seller-receipt, and per-Creator panic events carry their owning `creator_id` but do not invent invoice/job IDs when no single durable entity exists. `paykit_buyer_contact_transition` carries persisted `creator_id` plus `invoice_id`, and reports completion only after contact storage succeeds. Electrum `observe_once` failures describe one batch whose affected target is unknown, so each failed invoice or Marketplace batch emits one aggregate `paykit_electrum_observation_failure` without `creator_id`, `entity_kind`, or `entity_id`; this avoids attributing one batch error to every originally loaded target, including provider-v2 targets removed by deadline fencing. Raw addresses, outpoints, endpoints, and provider errors remain absent. Target-enumeration failures also remain aggregate events.
 
-Corrupt outbox intent cannot supply trustworthy payment IDs. Its lease-start and successful fenced terminal transition therefore carry only persisted `creator_id`, `outbox_job_id`, optional `invoice_id`, and `attempt`, with `correlation=unavailable` / closed `corrupt_or_missing` category. A stale fenced update emits no successful transition; production reports the existing `paykit_outbox_transition_skipped` terminal outcome instead.
+Corrupt outbox intent cannot supply trustworthy payment IDs. Its lease-start and successful fenced terminal transition therefore carry only persisted `creator_id`, `outbox_job_id`, optional `invoice_id`, and `attempt`, with `correlation=unavailable` / closed `corrupt_or_missing` category. Corrupt `handed_off` reconciliation rows likewise emit WARN only after the fenced `permanently_failed` update succeeds, with `previous_state=handed_off` and `outbound_message_id` only when its persisted decimal value parses safely. A stale fenced update emits no successful transition; production reports the existing `paykit_outbox_transition_skipped` terminal outcome instead.
 
 Expected retry timeline:
 

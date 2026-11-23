@@ -754,6 +754,86 @@ async fn corrupt_claim_emits_durable_ids_without_inventing_payment_ids_or_false_
 }
 
 #[tokio::test]
+async fn corrupt_handed_off_row_warns_once_only_after_fenced_permanent_failure() {
+    let database = TestDatabase::create().await;
+    let outbox = queued_invoice(&database).await;
+    let claim = outbox
+        .claim(Uuid::new_v4(), 1, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .remove(0);
+    assert!(
+        outbox
+            .mark_handed_off(&claim, &handoff_result())
+            .await
+            .unwrap()
+    );
+    sqlx::query(
+        "UPDATE outbox
+         SET intent_envelope = decode('00', 'hex'),
+             sdk_outbound_message_id = '18446744073709551616'
+         WHERE id = $1",
+    )
+    .bind(claim.id())
+    .execute(database.pool())
+    .await
+    .unwrap();
+    let handed_off = outbox
+        .claim_reconciliation(Uuid::new_v4(), 1, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .remove(0);
+    let adapter = RetryableReconciliationAdapter {
+        calls: AtomicUsize::new(0),
+    };
+    let output = JsonWriter::default();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_env_filter(EnvFilter::new("off,paykit_server=info"))
+        .with_current_span(false)
+        .with_span_list(false)
+        .with_writer(output.clone())
+        .finish();
+
+    async {
+        assert!(
+            process_reconciliation(&outbox, &adapter, &handed_off, Duration::ZERO)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !process_reconciliation(&outbox, &adapter, &handed_off, Duration::ZERO)
+                .await
+                .unwrap()
+        );
+    }
+    .with_subscriber(subscriber)
+    .await;
+
+    let state: String = sqlx::query_scalar("SELECT status FROM outbox WHERE id = $1")
+        .bind(claim.id())
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+    assert_eq!(state, "permanently_failed");
+    assert_eq!(adapter.calls.load(Ordering::SeqCst), 0);
+    let records = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
+    let transitions = records
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|record| record["fields"]["event"] == "paykit_outbox_transition")
+        .collect::<Vec<_>>();
+    assert_eq!(transitions.len(), 1);
+    let transition = &transitions[0];
+    assert_eq!(transition["level"], "WARN");
+    assert_eq!(transition["fields"]["previous_state"], "handed_off");
+    assert_eq!(transition["fields"]["new_state"], "permanently_failed");
+    assert_eq!(transition["fields"]["outcome"], "corrupt_intent");
+    assert!(transition["fields"].get("outbound_message_id").is_none());
+    database.cleanup().await;
+}
+
+#[tokio::test]
 async fn repeated_link_pending_stops_at_authoritative_proposal_expiry() {
     let database = TestDatabase::create().await;
     let outbox = queued_invoice_with_proposal_window(&database, 2).await;

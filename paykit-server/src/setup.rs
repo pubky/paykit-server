@@ -826,13 +826,15 @@ fn cleanup_expired(state: &mut State, now: Duration) {
         // tombstone is recorded. Tombstones retain no flow secrets.
         state.flows.remove(&flow_id);
         state.expired.insert(flow_id, now + FLOW_LIFETIME);
-        emit_setup_transition(
-            setup_trace_id,
-            previous_state.as_str(),
-            "expired",
-            "expired",
-            "timeout",
-        );
+        if matches!(previous_state, FlowStatus::Pending | FlowStatus::Completing) {
+            emit_setup_transition(
+                setup_trace_id,
+                previous_state.as_str(),
+                "expired",
+                "expired",
+                "timeout",
+            );
+        }
     }
 }
 

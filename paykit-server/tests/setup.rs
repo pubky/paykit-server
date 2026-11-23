@@ -1019,6 +1019,67 @@ async fn flow_lifecycle_is_memory_only_single_initiation_and_expiry_is_terminal(
 }
 
 #[tokio::test]
+async fn cleanup_only_traces_active_setup_flows_as_expired() {
+    let capture = EventCapture::default();
+    let subscriber = tracing_subscriber::registry().with(capture.clone());
+    let clock = Arc::new(ManualClock::default());
+    let setup = service(
+        Arc::new(MockCompleter::new([
+            Completion::DurableSuccess,
+            Completion::DefinitiveFailure,
+        ])),
+        clock.clone(),
+    );
+
+    let (completed, failed, pending) = async {
+        let completed = setup
+            .begin(peer(), "https://app.example", "completed")
+            .await
+            .unwrap();
+        assert_eq!(
+            setup.trigger_completion(&completed.flow_id).await,
+            PollResult::Complete
+        );
+        let failed = setup
+            .begin(peer(), "https://app.example", "failed")
+            .await
+            .unwrap();
+        assert_eq!(
+            setup.trigger_completion(&failed.flow_id).await,
+            PollResult::Failed
+        );
+        let pending = setup
+            .begin(peer(), "https://app.example", "pending")
+            .await
+            .unwrap();
+        clock.advance(Duration::from_secs(300));
+        assert_eq!(setup.poll(&completed.flow_id).await, PollResult::Expired);
+        assert_eq!(setup.poll(&failed.flow_id).await, PollResult::Expired);
+        assert_eq!(setup.poll(&pending.flow_id).await, PollResult::Expired);
+        (completed, failed, pending)
+    }
+    .with_subscriber(subscriber)
+    .await;
+
+    assert!(!setup.flow_exists(&completed.flow_id).await);
+    assert!(!setup.flow_exists(&failed.flow_id).await);
+    assert!(!setup.flow_exists(&pending.flow_id).await);
+    let events = capture.0.lock().unwrap();
+    let expirations = events
+        .iter()
+        .filter(|event| {
+            captured_field(event, "event") == Some("paykit_setup_flow_transition")
+                && captured_field(event, "new_state") == Some("expired")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(expirations.len(), 1);
+    assert_eq!(
+        captured_field(expirations[0], "previous_state"),
+        Some("pending")
+    );
+}
+
+#[tokio::test]
 async fn expired_flows_drop_secret_attempts_but_retain_a_bounded_expired_tombstone() {
     let dropped = Arc::new(AtomicUsize::new(0));
     let clock = Arc::new(ManualClock::default());
