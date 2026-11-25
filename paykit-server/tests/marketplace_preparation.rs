@@ -1164,10 +1164,17 @@ async fn setup_pending_emits_exact_redacted_failure_stage() {
         Some("reader_setup_pending")
     );
     assert_eq!(event_field(&events[0], "request_id"), Some(request_id));
+    assert!(uuid::Uuid::parse_str(event_field(&events[0], "request_instance_id").unwrap()).is_ok());
     assert!(events[0].iter().all(|(name, _)| {
         matches!(
             name.as_str(),
-            "message" | "event" | "operation" | "stage" | "category" | "request_id"
+            "message"
+                | "event"
+                | "operation"
+                | "stage"
+                | "category"
+                | "request_id"
+                | "request_instance_id"
         )
     }));
 }

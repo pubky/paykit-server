@@ -20,6 +20,187 @@ use std::time::Duration;
 
 pub use crate::persistence::{HandoffResult, OutboxRetryClass as RetryableHandoffStage};
 
+pub(crate) fn payment_correlation(
+    claim: &ClaimedOutbox,
+    intent: &DeliveryIntentV1,
+) -> Result<(String, Option<String>), PersistenceError> {
+    match intent.operation() {
+        DeliveryOperationV1::PaymentRequestProposal { terms } => {
+            let payment_request_id = paykit_lib::PaymentRequestId::new(claim.id().to_string())
+                .map_err(|_| PersistenceError::CorruptOrMissing)?;
+            let payment_reference =
+                paykit_lib::PaymentReference::new(terms.payment_reference.clone())
+                    .map_err(|_| PersistenceError::CorruptOrMissing)?;
+            Ok((
+                payment_request_id.to_string(),
+                Some(payment_reference.to_string()),
+            ))
+        }
+        DeliveryOperationV1::PaymentRequestCancellation { payment_request_id } => {
+            let payment_request_id = paykit_lib::PaymentRequestId::new(payment_request_id.clone())
+                .map_err(|_| PersistenceError::CorruptOrMissing)?;
+            Ok((payment_request_id.to_string(), None))
+        }
+    }
+}
+
+pub(crate) fn emit_outbox_attempt_started(
+    claim: &ClaimedOutbox,
+    payment_request_id: &str,
+    payment_reference: Option<&str>,
+) {
+    if let Some(payment_reference) = payment_reference {
+        tracing::info!(
+            event = "paykit_outbox_attempt_started",
+            truth = "persisted",
+            creator_id = %claim.creator_id().hyphenated(),
+            outbox_job_id = %claim.id().hyphenated(),
+            invoice_id = claim.invoice_id().map(|id| id.hyphenated().to_string()),
+            payment_request_id,
+            payment_reference,
+            attempt = claim.attempt_count(),
+            state = "leased",
+            "Paykit outbox attempt started"
+        );
+    } else {
+        tracing::info!(
+            event = "paykit_outbox_attempt_started",
+            truth = "persisted",
+            creator_id = %claim.creator_id().hyphenated(),
+            outbox_job_id = %claim.id().hyphenated(),
+            invoice_id = claim.invoice_id().map(|id| id.hyphenated().to_string()),
+            payment_request_id,
+            attempt = claim.attempt_count(),
+            state = "leased",
+            "Paykit outbox attempt started"
+        );
+    }
+}
+
+fn emit_uncorrelated_outbox_attempt_started(claim: &ClaimedOutbox) {
+    tracing::info!(
+        event = "paykit_outbox_attempt_started",
+        truth = "persisted",
+        creator_id = %claim.creator_id().hyphenated(),
+        outbox_job_id = %claim.id().hyphenated(),
+        invoice_id = claim.invoice_id().map(|id| id.hyphenated().to_string()),
+        attempt = claim.attempt_count(),
+        state = "leased",
+        correlation = "unavailable",
+        "Paykit outbox attempt started"
+    );
+}
+
+fn emit_corrupt_outbox_transition(claim: &ClaimedOutbox) {
+    tracing::warn!(
+        event = "paykit_outbox_transition",
+        truth = "persisted",
+        creator_id = %claim.creator_id().hyphenated(),
+        outbox_job_id = %claim.id().hyphenated(),
+        invoice_id = claim.invoice_id().map(|id| id.hyphenated().to_string()),
+        attempt = claim.attempt_count(),
+        previous_state = "leased",
+        new_state = "permanently_failed",
+        outcome = "corrupt_intent",
+        category = "corrupt_or_missing",
+        "Paykit outbox state transitioned"
+    );
+}
+
+fn emit_corrupt_reconciliation_transition(
+    claim: &ClaimedHandoff,
+    outbound_message_id: Option<u64>,
+) {
+    tracing::warn!(
+        event = "paykit_outbox_transition",
+        truth = "persisted",
+        creator_id = %claim.creator_id().hyphenated(),
+        outbox_job_id = %claim.id().hyphenated(),
+        outbound_message_id,
+        attempt = claim.attempt_count(),
+        previous_state = "handed_off",
+        new_state = "permanently_failed",
+        outcome = "corrupt_intent",
+        category = "corrupt_or_missing",
+        "Paykit outbox reconciliation transitioned"
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_outbox_transition(
+    claim: &ClaimedOutbox,
+    payment_request_id: &str,
+    payment_reference: Option<&str>,
+    new_state: &'static str,
+    outcome: &'static str,
+    retry: Option<(RetryableHandoffStage, Duration)>,
+    outbound_message_id: Option<u64>,
+) {
+    let backoff_ms = retry.map(|(_, delay)| u64::try_from(delay.as_millis()).unwrap_or(u64::MAX));
+    let retry_class = retry.map(|(stage, _)| stage.diagnostic_label());
+    if let Some(payment_reference) = payment_reference {
+        tracing::info!(
+            event = "paykit_outbox_transition",
+            truth = "persisted",
+            creator_id = %claim.creator_id().hyphenated(),
+            outbox_job_id = %claim.id().hyphenated(),
+            invoice_id = claim.invoice_id().map(|id| id.hyphenated().to_string()),
+            payment_request_id,
+            payment_reference,
+            attempt = claim.attempt_count(),
+            previous_state = "leased",
+            new_state,
+            outcome,
+            retry_class,
+            backoff_ms,
+            outbound_message_id,
+            "Paykit outbox state transitioned"
+        );
+    } else {
+        tracing::info!(
+            event = "paykit_outbox_transition",
+            truth = "persisted",
+            creator_id = %claim.creator_id().hyphenated(),
+            outbox_job_id = %claim.id().hyphenated(),
+            invoice_id = claim.invoice_id().map(|id| id.hyphenated().to_string()),
+            payment_request_id,
+            attempt = claim.attempt_count(),
+            previous_state = "leased",
+            new_state,
+            outcome,
+            retry_class,
+            backoff_ms,
+            outbound_message_id,
+            "Paykit outbox state transitioned"
+        );
+    }
+}
+
+pub(crate) fn emit_reconciliation_transition(
+    claim: &ClaimedHandoff,
+    outbound_message_id: Option<u64>,
+    new_state: &'static str,
+    outcome: &'static str,
+    retry: Option<(RetryableHandoffStage, Duration)>,
+) {
+    let backoff_ms = retry.map(|(_, delay)| u64::try_from(delay.as_millis()).unwrap_or(u64::MAX));
+    let retry_class = retry.map(|(stage, _)| stage.diagnostic_label());
+    tracing::info!(
+        event = "paykit_outbox_transition",
+        truth = "persisted",
+        creator_id = %claim.creator_id().hyphenated(),
+        outbox_job_id = %claim.id().hyphenated(),
+        outbound_message_id,
+        attempt = claim.attempt_count(),
+        previous_state = "handed_off",
+        new_state,
+        outcome,
+        retry_class,
+        backoff_ms,
+        "Paykit outbox reconciliation transitioned"
+    );
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HandoffError {
     Retryable(RetryableHandoffCause),
@@ -378,7 +559,7 @@ pub async fn process_claim_with_health(
     claim: &ClaimedOutbox,
     retry_schedule: RetrySchedule,
 ) -> Result<(bool, ProcessingHealth), PersistenceError> {
-    process_claim_with(store, claim, retry_schedule, |intent| async move {
+    process_claim_with(store, claim, retry_schedule, true, |intent| async move {
         adapter.execute_claimed_handoff(store, claim, &intent).await
     })
     .await
@@ -388,6 +569,7 @@ pub(crate) async fn process_claim_with<F>(
     store: &OutboxStore,
     claim: &ClaimedOutbox,
     retry_schedule: RetrySchedule,
+    emit_start: bool,
     execute: impl FnOnce(DeliveryIntentV1) -> F,
 ) -> Result<(bool, ProcessingHealth), PersistenceError>
 where
@@ -396,10 +578,12 @@ where
     let intent = match store.delivery_intent(claim) {
         Ok(intent) => intent,
         Err(_) => {
-            return store
-                .mark_permanently_failed(claim)
-                .await
-                .map(|transitioned| (transitioned, ProcessingHealth::PermanentFailure));
+            emit_uncorrelated_outbox_attempt_started(claim);
+            let transitioned = store.mark_permanently_failed(claim).await?;
+            if transitioned {
+                emit_corrupt_outbox_transition(claim);
+            }
+            return Ok((transitioned, ProcessingHealth::PermanentFailure));
         }
     };
     let expiration = match intent.operation() {
@@ -409,36 +593,106 @@ where
             .map(DeliveryExpiration),
         DeliveryOperationV1::PaymentRequestCancellation { .. } => None,
     };
+    let (payment_request_id, payment_reference) = payment_correlation(claim, &intent)?;
+    if emit_start {
+        emit_outbox_attempt_started(claim, &payment_request_id, payment_reference.as_deref());
+    }
     if let Some(expiration) = expiration
         && store.proposal_expired(expiration.deadline()).await?
     {
         let transitioned = store.mark_proposal_expired(claim).await?;
+        if transitioned {
+            emit_outbox_transition(
+                claim,
+                &payment_request_id,
+                payment_reference.as_deref(),
+                "permanently_failed",
+                "proposal_expired",
+                None,
+                None,
+            );
+        }
         return Ok((transitioned, ProcessingHealth::Available));
     }
     match execute(intent).await {
-        Ok(result) => store
-            .mark_handed_off(claim, &result)
-            .await
-            .map(|transitioned| (transitioned, ProcessingHealth::Available)),
+        Ok(result) => {
+            let transitioned = store.mark_handed_off(claim, &result).await?;
+            if transitioned {
+                emit_outbox_transition(
+                    claim,
+                    result
+                        .payment_request_id()
+                        .unwrap_or(payment_request_id.as_str()),
+                    payment_reference.as_deref(),
+                    "handed_off",
+                    "handed_off",
+                    None,
+                    Some(result.outbound_message_id()),
+                );
+            }
+            Ok((transitioned, ProcessingHealth::Available))
+        }
         Err(HandoffFailure::Retryable(stage)) => {
             let delay = retry_schedule.delay_for(stage);
-            store
-                .mark_retryable(claim, delay, stage)
-                .await
-                .map(|transitioned| (transitioned, ProcessingHealth::Retryable(delay)))
+            let transitioned = store.mark_retryable(claim, delay, stage).await?;
+            if transitioned {
+                emit_outbox_transition(
+                    claim,
+                    &payment_request_id,
+                    payment_reference.as_deref(),
+                    "retryable",
+                    "deferred",
+                    Some((stage, delay)),
+                    None,
+                );
+            }
+            Ok((transitioned, ProcessingHealth::Retryable(delay)))
         }
-        Err(HandoffFailure::ProposalExpired) => store
-            .mark_proposal_expired(claim)
-            .await
-            .map(|transitioned| (transitioned, ProcessingHealth::Available)),
-        Err(HandoffFailure::CancellationObsolete) => store
-            .mark_cancellation_obsolete(claim)
-            .await
-            .map(|transitioned| (transitioned, ProcessingHealth::Available)),
-        Err(HandoffFailure::Permanent) => store
-            .mark_permanently_failed(claim)
-            .await
-            .map(|transitioned| (transitioned, ProcessingHealth::PermanentFailure)),
+        Err(HandoffFailure::ProposalExpired) => {
+            let transitioned = store.mark_proposal_expired(claim).await?;
+            if transitioned {
+                emit_outbox_transition(
+                    claim,
+                    &payment_request_id,
+                    payment_reference.as_deref(),
+                    "permanently_failed",
+                    "proposal_expired",
+                    None,
+                    None,
+                );
+            }
+            Ok((transitioned, ProcessingHealth::Available))
+        }
+        Err(HandoffFailure::CancellationObsolete) => {
+            let transitioned = store.mark_cancellation_obsolete(claim).await?;
+            if transitioned {
+                emit_outbox_transition(
+                    claim,
+                    &payment_request_id,
+                    payment_reference.as_deref(),
+                    "permanently_failed",
+                    "cancellation_obsolete",
+                    None,
+                    None,
+                );
+            }
+            Ok((transitioned, ProcessingHealth::Available))
+        }
+        Err(HandoffFailure::Permanent) => {
+            let transitioned = store.mark_permanently_failed(claim).await?;
+            if transitioned {
+                emit_outbox_transition(
+                    claim,
+                    &payment_request_id,
+                    payment_reference.as_deref(),
+                    "permanently_failed",
+                    "permanent_failure",
+                    None,
+                    None,
+                );
+            }
+            Ok((transitioned, ProcessingHealth::PermanentFailure))
+        }
     }
 }
 
@@ -469,7 +723,15 @@ pub async fn process_reconciliation_with_health(
             return store
                 .mark_reconciliation_permanently_failed(claim)
                 .await
-                .map(|transitioned| (transitioned, ProcessingHealth::PermanentFailure));
+                .map(|transitioned| {
+                    if transitioned {
+                        emit_corrupt_reconciliation_transition(
+                            claim,
+                            claim.sdk_outbound_message_id().ok(),
+                        );
+                    }
+                    (transitioned, ProcessingHealth::PermanentFailure)
+                });
         }
     };
 
@@ -479,23 +741,46 @@ pub async fn process_reconciliation_with_health(
             return store
                 .mark_reconciliation_permanently_failed(claim)
                 .await
-                .map(|transitioned| (transitioned, ProcessingHealth::PermanentFailure));
+                .map(|transitioned| {
+                    if transitioned {
+                        emit_corrupt_reconciliation_transition(claim, None);
+                    }
+                    (transitioned, ProcessingHealth::PermanentFailure)
+                });
         }
     };
     match adapter.outbound_status(outbound_message_id).await {
-        Ok(Some(OutboundPrivateMessageStatus::Sent)) => store
-            .mark_delivered(claim)
-            .await
-            .map(|transitioned| (transitioned, ProcessingHealth::Available)),
+        Ok(Some(OutboundPrivateMessageStatus::Sent)) => {
+            let transitioned = store.mark_delivered(claim).await?;
+            if transitioned {
+                emit_reconciliation_transition(
+                    claim,
+                    Some(outbound_message_id),
+                    "delivered",
+                    "acknowledged",
+                    None,
+                );
+            }
+            Ok((transitioned, ProcessingHealth::Available))
+        }
         Ok(Some(
             OutboundPrivateMessageStatus::Invalid
             | OutboundPrivateMessageStatus::RecoveryRequired
             | OutboundPrivateMessageStatus::Superseded,
         ))
-        | Ok(None) => store
-            .mark_reconciliation_permanently_failed(claim)
-            .await
-            .map(|transitioned| (transitioned, ProcessingHealth::PermanentFailure)),
+        | Ok(None) => {
+            let transitioned = store.mark_reconciliation_permanently_failed(claim).await?;
+            if transitioned {
+                emit_reconciliation_transition(
+                    claim,
+                    Some(outbound_message_id),
+                    "permanently_failed",
+                    "permanent_failure",
+                    None,
+                );
+            }
+            Ok((transitioned, ProcessingHealth::PermanentFailure))
+        }
         Ok(_) => {
             retry_reconciliation_after_failure(
                 store,
@@ -516,10 +801,19 @@ pub async fn process_reconciliation_with_health(
             )
             .await
         }
-        Err(HandoffError::Permanent) => store
-            .mark_reconciliation_permanently_failed(claim)
-            .await
-            .map(|transitioned| (transitioned, ProcessingHealth::PermanentFailure)),
+        Err(HandoffError::Permanent) => {
+            let transitioned = store.mark_reconciliation_permanently_failed(claim).await?;
+            if transitioned {
+                emit_reconciliation_transition(
+                    claim,
+                    Some(outbound_message_id),
+                    "permanently_failed",
+                    "permanent_failure",
+                    None,
+                );
+            }
+            Ok((transitioned, ProcessingHealth::PermanentFailure))
+        }
     }
 }
 
@@ -568,8 +862,132 @@ async fn retry_reconciliation_after_failure(
     {
         stage = RetryableHandoffStage::ReconciliationPending;
     }
-    store
+    let transitioned = store
         .retry_reconciliation(claim, retry_delay, stage)
-        .await
-        .map(|transitioned| (transitioned, ProcessingHealth::Retryable(retry_delay)))
+        .await?;
+    if transitioned {
+        emit_reconciliation_transition(
+            claim,
+            Some(claim.sdk_outbound_message_id()?),
+            "handed_off",
+            "deferred",
+            Some((stage, retry_delay)),
+        );
+    }
+    Ok((transitioned, ProcessingHealth::Retryable(retry_delay)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        io::Write,
+        sync::{Arc, Mutex},
+    };
+    use tracing_subscriber::{EnvFilter, fmt::MakeWriter};
+    use uuid::Uuid;
+
+    #[derive(Clone, Default)]
+    struct JsonWriter(Arc<Mutex<Vec<u8>>>);
+
+    struct Guard(JsonWriter);
+
+    impl Write for Guard {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for JsonWriter {
+        type Writer = Guard;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            Guard(self.clone())
+        }
+    }
+
+    #[test]
+    fn production_json_exposes_worker_correlation_without_secret_material() {
+        let creator_id = Uuid::new_v4();
+        let outbox_job_id = Uuid::new_v4();
+        let invoice_id = Uuid::new_v4();
+        let payment_request_id = outbox_job_id.to_string();
+        let payment_reference = Uuid::new_v4().to_string();
+        let output = JsonWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(EnvFilter::new("off,paykit_server=info"))
+            .with_current_span(false)
+            .with_span_list(false)
+            .with_writer(output.clone())
+            .finish();
+        let claim =
+            ClaimedOutbox::diagnostic_fixture(outbox_job_id, creator_id, Some(invoice_id), 3);
+        let handed_off = ClaimedHandoff::diagnostic_fixture(outbox_job_id, creator_id, 4, 91);
+
+        tracing::subscriber::with_default(subscriber, || {
+            emit_outbox_attempt_started(&claim, &payment_request_id, Some(&payment_reference));
+            emit_outbox_transition(
+                &claim,
+                &payment_request_id,
+                Some(&payment_reference),
+                "retryable",
+                "deferred",
+                Some((
+                    RetryableHandoffStage::LinkPending,
+                    Duration::from_millis(500),
+                )),
+                None,
+            );
+            emit_reconciliation_transition(
+                &handed_off,
+                Some(91),
+                "delivered",
+                "acknowledged",
+                None,
+            );
+        });
+
+        let records = String::from_utf8(output.0.lock().unwrap().clone())
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 3);
+        assert_eq!(
+            records[0]["fields"]["event"],
+            "paykit_outbox_attempt_started"
+        );
+        assert_eq!(records[0]["fields"]["state"], "leased");
+        assert_eq!(records[0]["fields"]["creator_id"], creator_id.to_string());
+        assert_eq!(
+            records[1]["fields"]["outbox_job_id"],
+            outbox_job_id.to_string()
+        );
+        assert_eq!(records[1]["fields"]["invoice_id"], invoice_id.to_string());
+        assert_eq!(
+            records[1]["fields"]["payment_request_id"],
+            payment_request_id
+        );
+        assert_eq!(records[1]["fields"]["payment_reference"], payment_reference);
+        assert_eq!(records[1]["fields"]["retry_class"], "link_pending");
+        assert_eq!(records[1]["fields"]["backoff_ms"], 500);
+        assert_eq!(records[2]["fields"]["previous_state"], "handed_off");
+        assert_eq!(records[2]["fields"]["new_state"], "delivered");
+        assert_eq!(records[2]["fields"]["outbound_message_id"], 91);
+        let rendered = serde_json::to_string(&records).unwrap();
+        for secret in [
+            "https://provider.invalid/session=sentinel",
+            "token-sentinel",
+            "xpub-sentinel",
+            "proof-sentinel",
+        ] {
+            assert!(!rendered.contains(secret));
+        }
+    }
 }

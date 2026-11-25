@@ -48,7 +48,8 @@ use crate::{
     },
     persistence::{
         ClaimedOutbox, CreatorStore, InvoiceStore, MarketplacePreparationStore, OutboxStore,
-        PaymentDrainStore, PaymentRequestLifecycleStore, PersistenceError, RequiredReceiveTarget,
+        PaymentDrainStore, PaymentRequestLifecycleApply, PaymentRequestLifecycleStore,
+        PersistenceError, RequiredReceiveTarget,
     },
     workers::outbox::{
         Adapter, HandoffError, HandoffFailure, HandoffResult, RetryableHandoffCause,
@@ -743,10 +744,31 @@ impl PaykitAdapter {
         let projections = lifecycle_projections(&records, &self.app_id);
         let creator_id = self.creator_id;
         project_lifecycles_after_receive(projections, receive_health, |projection| async move {
-            lifecycles
+            let applied = lifecycles
                 .apply(creator_id, &projection)
                 .await
                 .map_err(map_projection_persistence_error)?;
+            match applied {
+                PaymentRequestLifecycleApply::Applied => tracing::info!(
+                    event = "paykit_payment_request_lifecycle_transition",
+                    truth = "persisted",
+                    creator_id = %creator_id.hyphenated(),
+                    payment_request_id = projection.payment_request_id,
+                    new_state = projection.request_state.as_str(),
+                    outcome = "applied",
+                    "Paykit payment request lifecycle persisted"
+                ),
+                PaymentRequestLifecycleApply::ExactReplay => tracing::debug!(
+                    event = "paykit_payment_request_lifecycle_transition",
+                    truth = "persisted",
+                    creator_id = %creator_id.hyphenated(),
+                    payment_request_id = projection.payment_request_id,
+                    new_state = projection.request_state.as_str(),
+                    outcome = "replayed",
+                    "Paykit payment request lifecycle replayed"
+                ),
+                PaymentRequestLifecycleApply::NotAttributable => {}
+            }
             Ok(())
         })
         .await?;

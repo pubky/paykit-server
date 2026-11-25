@@ -1,6 +1,7 @@
 use std::{
     any::Any,
     collections::VecDeque,
+    io::Write,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{
         Arc,
@@ -29,6 +30,7 @@ use paykit_server::{
     config::{BitcoinNetwork, PAYKIT_CLIENT_ID},
     http::setup::{setup_router, setup_router_with_trusted_proxy_hops},
     real_setup::validate_xpub,
+    runtime::{DependencyCheck, Runtime, operational_router},
     setup::{
         BeginError, Completion, ManualClock, PollResult, ReconnectScope, SetupAttempt,
         SetupCompleter, SetupLimits, SetupService, StartedSetup,
@@ -37,7 +39,8 @@ use paykit_server::{
 use tokio::sync::{Mutex, Notify, Semaphore};
 use tower::ServiceExt;
 use tracing::{Event, Subscriber, instrument::WithSubscriber};
-use tracing_subscriber::{Layer, layer::Context, prelude::*};
+use tracing_subscriber::{EnvFilter, Layer, fmt::MakeWriter, layer::Context, prelude::*};
+use uuid::Uuid;
 
 fn account_xpub(network: Network, coin_type: u32, account_index: u32) -> Xpub {
     let secp = Secp256k1::new();
@@ -598,6 +601,43 @@ type CapturedEventFields = Vec<Vec<(String, String)>>;
 #[derive(Clone, Default)]
 struct EventCapture(Arc<std::sync::Mutex<CapturedEventFields>>);
 
+#[derive(Clone, Default)]
+struct JsonWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+struct JsonWriteGuard(JsonWriter);
+
+impl Write for JsonWriteGuard {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> MakeWriter<'a> for JsonWriter {
+    type Writer = JsonWriteGuard;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        JsonWriteGuard(self.clone())
+    }
+}
+
+struct ReadyDependency;
+
+#[async_trait]
+impl DependencyCheck for ReadyDependency {
+    async fn postgres_ready(&self) -> bool {
+        true
+    }
+}
+
+fn operational_runtime() -> Arc<Runtime> {
+    Arc::new(Runtime::new(Arc::new(ReadyDependency), 1))
+}
+
 impl<S> Layer<S> for EventCapture
 where
     S: Subscriber,
@@ -630,6 +670,13 @@ fn authorization_url_events(capture: &EventCapture) -> Vec<Vec<(String, String)>
         })
         .cloned()
         .collect()
+}
+
+fn captured_field<'a>(fields: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    fields
+        .iter()
+        .find(|(field, _)| field == name)
+        .map(|(_, value)| value.trim_matches('"'))
 }
 
 #[tokio::test]
@@ -673,6 +720,157 @@ async fn authorization_url_event_is_emitted_once_only_when_enabled() {
                     .any(|(_, value)| value.contains(authorization_url))
             );
         }
+    }
+}
+
+#[tokio::test]
+async fn spawned_completion_keeps_one_safe_workflow_trace_across_state_transitions() {
+    let capture = EventCapture::default();
+    let subscriber = tracing_subscriber::registry().with(capture.clone());
+    let setup = service(
+        Arc::new(MockCompleter::new([Completion::DurableSuccess])),
+        Arc::new(ManualClock::default()),
+    );
+
+    let flow = async {
+        let flow = setup
+            .begin(peer(), "https://app.example/callback", "private-state")
+            .await
+            .unwrap();
+        assert_eq!(
+            setup.trigger_completion(&flow.flow_id).await,
+            PollResult::Complete
+        );
+        flow
+    }
+    .with_subscriber(subscriber)
+    .await;
+
+    let events = capture.0.lock().unwrap();
+    let lifecycle = events
+        .iter()
+        .filter(|event| captured_field(event, "event") == Some("paykit_setup_flow_transition"))
+        .collect::<Vec<_>>();
+    assert_eq!(lifecycle.len(), 3);
+    let trace_id = captured_field(lifecycle[0], "setup_trace_id").unwrap();
+    assert!(Uuid::parse_str(trace_id).is_ok());
+    assert_eq!(captured_field(lifecycle[0], "previous_state"), Some("none"));
+    assert_eq!(captured_field(lifecycle[0], "new_state"), Some("pending"));
+    assert_eq!(
+        captured_field(lifecycle[1], "previous_state"),
+        Some("pending")
+    );
+    assert_eq!(
+        captured_field(lifecycle[1], "new_state"),
+        Some("completing")
+    );
+    assert_eq!(
+        captured_field(lifecycle[2], "previous_state"),
+        Some("completing")
+    );
+    assert_eq!(captured_field(lifecycle[2], "new_state"), Some("completed"));
+    assert!(lifecycle.iter().all(|event| {
+        captured_field(event, "setup_trace_id") == Some(trace_id)
+            && captured_field(event, "flow_id").is_none()
+    }));
+    let rendered = format!("{events:?}");
+    assert!(!rendered.contains(&flow.flow_id));
+    assert!(!rendered.contains("private-state"));
+}
+
+#[tokio::test]
+async fn production_json_links_http_instances_to_one_safe_setup_trace() {
+    let request_id = "d9428888-122b-4b85-bc8f-2c2e0bf7c874";
+    let output = JsonWriter::default();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_env_filter(EnvFilter::new("off,paykit_server=info"))
+        .with_current_span(false)
+        .with_span_list(false)
+        .with_writer(output.clone())
+        .finish();
+    let sensitive_authorization_url = "pubkyauth://signin?session=session-sentinel&token=token-sentinel&xpub=xpub-sentinel&proof=proof-sentinel";
+    let setup = service(
+        Arc::new(UrlCompleter(sensitive_authorization_url.to_owned())),
+        Arc::new(ManualClock::default()),
+    );
+    let router = operational_router(setup_router(setup), operational_runtime());
+
+    let (flow_id, terminal_status) = async {
+        let mut begin = Request::builder()
+            .method(Method::GET)
+            .uri("/setup?return_to=https%3A%2F%2Fapp.example%2Fcallback&state=private-state")
+            .header("x-request-id", request_id)
+            .body(Body::empty())
+            .unwrap();
+        begin
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::new(peer(), 12345)));
+        let begin = router.clone().oneshot(begin).await.unwrap();
+        let page = body(begin).await;
+        let flow_json = page
+            .split_once("const flowId=")
+            .unwrap()
+            .1
+            .split_once(';')
+            .unwrap()
+            .0;
+        let flow_id = serde_json::from_str::<String>(flow_json).unwrap();
+
+        let mut complete = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/setup/{flow_id}/complete"))
+            .header("x-request-id", request_id)
+            .body(Body::empty())
+            .unwrap();
+        complete
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::new(peer(), 12345)));
+        let terminal_status = router.oneshot(complete).await.unwrap().status();
+        (flow_id, terminal_status)
+    }
+    .with_subscriber(subscriber)
+    .await;
+    assert_eq!(terminal_status, StatusCode::OK);
+
+    let records = String::from_utf8(output.0.lock().unwrap().clone())
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let links = records
+        .iter()
+        .filter(|record| record["fields"]["event"] == "paykit_setup_request_link")
+        .collect::<Vec<_>>();
+    assert_eq!(links.len(), 2);
+    assert_eq!(links[0]["fields"]["request_id"], request_id);
+    assert_eq!(links[1]["fields"]["request_id"], request_id);
+    assert_ne!(
+        links[0]["fields"]["request_instance_id"],
+        links[1]["fields"]["request_instance_id"]
+    );
+    assert_eq!(
+        links[0]["fields"]["setup_trace_id"],
+        links[1]["fields"]["setup_trace_id"]
+    );
+    let trace_id = links[0]["fields"]["setup_trace_id"].as_str().unwrap();
+    assert!(Uuid::parse_str(trace_id).is_ok());
+    assert!(records.iter().any(|record| {
+        record["fields"]["event"] == "paykit_setup_flow_transition"
+            && record["fields"]["setup_trace_id"] == trace_id
+            && record["fields"]["new_state"] == "completed"
+    }));
+    let rendered = serde_json::to_string(&records).unwrap();
+    assert!(!rendered.contains(&flow_id));
+    assert!(!rendered.contains("private-state"));
+    assert!(!rendered.contains("pubkyauth://"));
+    for secret in [
+        "session-sentinel",
+        "token-sentinel",
+        "xpub-sentinel",
+        "proof-sentinel",
+    ] {
+        assert!(!rendered.contains(secret));
     }
 }
 
@@ -818,6 +1016,67 @@ async fn flow_lifecycle_is_memory_only_single_initiation_and_expiry_is_terminal(
     assert_eq!(setup.poll(&flow.flow_id).await, PollResult::Expired);
     let replacement = service(Arc::new(MockCompleter::new([])), clock);
     assert_eq!(replacement.poll(&flow.flow_id).await, PollResult::Unknown);
+}
+
+#[tokio::test]
+async fn cleanup_only_traces_active_setup_flows_as_expired() {
+    let capture = EventCapture::default();
+    let subscriber = tracing_subscriber::registry().with(capture.clone());
+    let clock = Arc::new(ManualClock::default());
+    let setup = service(
+        Arc::new(MockCompleter::new([
+            Completion::DurableSuccess,
+            Completion::DefinitiveFailure,
+        ])),
+        clock.clone(),
+    );
+
+    let (completed, failed, pending) = async {
+        let completed = setup
+            .begin(peer(), "https://app.example", "completed")
+            .await
+            .unwrap();
+        assert_eq!(
+            setup.trigger_completion(&completed.flow_id).await,
+            PollResult::Complete
+        );
+        let failed = setup
+            .begin(peer(), "https://app.example", "failed")
+            .await
+            .unwrap();
+        assert_eq!(
+            setup.trigger_completion(&failed.flow_id).await,
+            PollResult::Failed
+        );
+        let pending = setup
+            .begin(peer(), "https://app.example", "pending")
+            .await
+            .unwrap();
+        clock.advance(Duration::from_secs(300));
+        assert_eq!(setup.poll(&completed.flow_id).await, PollResult::Expired);
+        assert_eq!(setup.poll(&failed.flow_id).await, PollResult::Expired);
+        assert_eq!(setup.poll(&pending.flow_id).await, PollResult::Expired);
+        (completed, failed, pending)
+    }
+    .with_subscriber(subscriber)
+    .await;
+
+    assert!(!setup.flow_exists(&completed.flow_id).await);
+    assert!(!setup.flow_exists(&failed.flow_id).await);
+    assert!(!setup.flow_exists(&pending.flow_id).await);
+    let events = capture.0.lock().unwrap();
+    let expirations = events
+        .iter()
+        .filter(|event| {
+            captured_field(event, "event") == Some("paykit_setup_flow_transition")
+                && captured_field(event, "new_state") == Some("expired")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(expirations.len(), 1);
+    assert_eq!(
+        captured_field(expirations[0], "previous_state"),
+        Some("pending")
+    );
 }
 
 #[tokio::test]
