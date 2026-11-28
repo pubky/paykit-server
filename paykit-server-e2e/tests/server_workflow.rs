@@ -596,6 +596,43 @@ struct ServerProcess {
     database_url: String,
 }
 
+async fn wait_until_admitting(address: SocketAddr) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if tokio::net::TcpStream::connect(address).await.is_ok() {
+            let response = send_http(address, readiness_request()).await;
+            if let Ok(body) = serde_json::from_slice::<serde_json::Value>(&response.body)
+                && body["postgres"] == "ready"
+            {
+                return;
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "server did not claim ownership and open admission"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+fn terminate_gracefully(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        let _ = Command::new("kill")
+            .args(["-TERM", &child.id().to_string()])
+            .status();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if let Ok(Some(_)) = child.try_wait() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 impl ServerProcess {
     fn spawn(database_url: &str, signing_key: &SigningKey, address: SocketAddr) -> Self {
         let config_path =
@@ -620,13 +657,8 @@ impl ServerProcess {
         }
     }
 
-    fn id(&self) -> u32 {
-        self.child.id()
-    }
-
     fn restart(&mut self) {
-        self.child.kill().unwrap();
-        self.child.wait().unwrap();
+        terminate_gracefully(&mut self.child);
         self.child = Command::new(paykit_server_binary())
             .env("PAYKIT_CONFIG", &self.config_path)
             .env("PAYKIT_DATABASE_URL", &self.database_url)
@@ -640,8 +672,7 @@ impl ServerProcess {
 
 impl Drop for ServerProcess {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        terminate_gracefully(&mut self.child);
         let _ = fs::remove_file(&self.config_path);
     }
 }
@@ -1119,7 +1150,7 @@ async fn protocol_real_provider_v2_drain_fence_survives_process_race_and_restart
     let address_a = reserve_loopback_address();
     let address_b = reserve_loopback_address();
     let server_a = ServerProcess::spawn(database.database_url(), &signing_key, address_a);
-    wait_until_listening(address_a).await;
+    wait_until_admitting(address_a).await;
 
     let deadline = (time::OffsetDateTime::now_utc()
         .replace_nanosecond(0)
@@ -1180,8 +1211,21 @@ async fn protocol_real_provider_v2_drain_fence_survives_process_race_and_restart
             );
         }
     }
-    let server_b = ServerProcess::spawn(database.database_url(), &signing_key, address_b);
-    assert_ne!(server_a.id(), server_b.id());
+    // The binary's process lock admits one process per database, so the racing
+    // server runs in this process, where `run_until` takes no lock. It shares
+    // nothing with server A but the database.
+    let racing_config = config(database.database_url(), &signing_key, "50ms");
+    let racing_pool = initialize_database(&racing_config).await.unwrap();
+    let racing_listener = tokio::net::TcpListener::bind(address_b).await.unwrap();
+    let (stop_racing_server, racing_server_stopped) = tokio::sync::oneshot::channel::<()>();
+    let racing_server = tokio::spawn(
+        Server::build(racing_config, racing_pool)
+            .await
+            .unwrap()
+            .run_until(racing_listener, async move {
+                let _ = racing_server_stopped.await;
+            }),
+    );
     wait_until_listening(address_b).await;
     let mut drain_while_create_uncommitted = tokio::spawn({
         let request = drain_request(&signing_key, &creator_before_drain);
@@ -1212,7 +1256,8 @@ async fn protocol_real_provider_v2_drain_fence_survives_process_race_and_restart
         "uncommitted-create drain response: {}",
         String::from_utf8_lossy(&drain_while_create_uncommitted.body)
     );
-    drop(server_b);
+    stop_racing_server.send(()).unwrap();
+    racing_server.await.unwrap().unwrap();
 
     assert_eq!(
         create_before.status,
@@ -1222,7 +1267,7 @@ async fn protocol_real_provider_v2_drain_fence_survives_process_race_and_restart
     );
     drop(server_a);
     let mut server_b = ServerProcess::spawn(database.database_url(), &signing_key, address_b);
-    wait_until_listening(address_b).await;
+    wait_until_admitting(address_b).await;
     accept_provider_v2_request(&peer_sdk, &creator_before_drain, &bundle_before_drain).await;
     let mut drain_after = send_http(
         address_b,
@@ -1259,7 +1304,7 @@ async fn protocol_real_provider_v2_drain_fence_survives_process_race_and_restart
     assert_eq!(frozen_provider_v2_count, 1);
 
     server_b.restart();
-    wait_until_listening(address_b).await;
+    wait_until_admitting(address_b).await;
     let drain_replay = send_http(
         address_b,
         drain_request(&signing_key, &creator_before_drain),

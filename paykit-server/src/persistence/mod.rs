@@ -8,6 +8,7 @@ mod migrations;
 mod outbox;
 mod payment_drains;
 mod payment_request_lifecycles;
+mod process_lock;
 mod usdt_attempts;
 
 pub use creators::{CreatorCredentials, CreatorSetupLock, CreatorStore, PersistedCreator};
@@ -30,4 +31,9 @@ pub use outbox::{ClaimedHandoff, ClaimedOutbox, HandoffResult, OutboxRetryClass,
 pub use payment_drains::{PaymentDrainSnapshot, PaymentDrainStore};
 pub use payment_request_lifecycles::{
     PaymentRequestLifecycleApply, PaymentRequestLifecycleStore, RequiredReceiveTarget,
+};
+pub use process_lock::{
+    PROCESS_ADVISORY_LOCK_KEY, PROCESS_LOCK_APPLICATION_NAME, ProcessLock, ProcessLockLoss,
+    ProcessLockState, ProcessLockTiming, ProcessOwnership, clear_process_owner_if_claimed,
+    release_process_ownership,
 };
